@@ -1,0 +1,7 @@
+{
+  "us_stocks": ["SPY", "QQQ", "NVDA", "AAPL", "MSFT", "TSLA"],
+  "a_shares": ["000001.SS", "510300.SS", "600519.SS", "300750.SZ", "601899.SS"],
+  "commodities": ["GC=F", "SI=F", "CL=F", "HG=F", "NG=F"],
+  "crypto": ["BTC/USDT", "ETH/USDT", "SOL/USDT"],
+  "macro": ["^VIX", "^TNX", "DX-Y.NYB"]
+}

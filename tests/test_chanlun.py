@@ -194,6 +194,161 @@ class TestChanlunEngine(unittest.TestCase):
         self.assertLess(last_stroke["end_price"], 85.0)
         self.assertTrue(res["momentum_assessment"]["is_capital_consensus"])
 
+    def test_lesson5_stroke_revision_and_lesson10_compact_zhongshu(self):
+        # Simple 3-stroke uptrend (no entering pullback consolidation) should NOT invent a Zhongshu
+        df_simple = build_wave_df([(100.0, 1), (118.0, 8), (110.0, 7), (132.0, 9), (124.0, 7)])
+        res_simple = analyze_chanlun(df_simple, timeframe_label="日线")
+        self.assertEqual(res_simple["zhongshu_count"], 0)
+
+        # Consolidation Zhongshu: core box must stay strictly 3 strokes even when 5 more strokes oscillate inside
+        df_ext = build_wave_df([
+            (95.0, 1),
+            (120.0, 10),  # entering up stroke
+            (105.0, 8),   # b1
+            (118.0, 8),   # b2
+            (106.0, 8),   # b3 -> core box ends here
+            (117.0, 8),   # osc 1
+            (107.0, 8),   # osc 2
+            (116.0, 8),   # osc 3
+            (108.0, 8),   # osc 4
+            (115.0, 8),   # confirms osc 3 & 4
+        ])
+        res_ext = analyze_chanlun(df_ext, timeframe_label="日线")
+        zs = res_ext["latest_zhongshu"]
+        self.assertIsNotNone(zs)
+        self.assertEqual(zs["stroke_count"], 3)
+        self.assertTrue(zs["is_extended"])
+        self.assertGreaterEqual(zs["oscillation_strokes"], 3)
+        # Core box end_date must precede the final oscillation bar
+        self.assertLess(zs["end_date"], str(df_ext.index[-1].date()))
+
+    def test_lesson9_14_steep_crash_non_divergence_and_lesson11_trigger(self):
+        # Prior slow drop 15 bars vs sharp 3-bar crash (-22%) -> should NOT be labeled as weak divergence
+        rows = []
+        # Initial rise to 130
+        for p in np.linspace(100.0, 130.0, 12):
+            rows.append((p - 0.5, p + 0.5, p - 0.8, p))
+        # First down leg: 130 -> 105 over 14 bars
+        for p in np.linspace(129.0, 105.0, 14):
+            rows.append((p + 0.8, p + 1.0, p - 0.5, p))
+        # Bounce: 105 -> 118 over 8 bars
+        for p in np.linspace(106.0, 118.0, 8):
+            rows.append((p - 0.6, p + 0.5, p - 0.8, p))
+        # Sharp 3-bar crash: 118 -> 92
+        rows.append((116.0, 117.0, 108.0, 109.0))
+        rows.append((108.0, 109.0, 99.0, 100.0))
+        rows.append((99.0, 100.0, 92.0, 93.0))
+        # Rebound 2 bars to confirm bottom fractal & check Lesson 5/11
+        rows.append((94.0, 98.0, 93.5, 97.5))
+        rows.append((98.0, 104.0, 97.0, 103.0))
+        df = make_df(rows, start="2026-01-01")
+        res = analyze_chanlun(df, timeframe_label="日线")
+        # Confirm 118->92 was captured by Lesson 5 revision as a confirmed down stroke with strong class
+        down_strokes = [s for s in res["recent_strokes"] if s["direction"] == "down"]
+        self.assertTrue(any(s["end_price"] <= 92.5 and s["is_confirmed"] for s in down_strokes))
+        # Test Lesson 11 trigger when no reverse K-line exists inside down stroke, and later bar breaks its high
+        df_no_rev = make_df([
+            (115.0, 116.0, 110.0, 111.0),
+            (111.0, 112.0, 106.0, 107.0),
+            (107.0, 108.0, 100.0, 101.0),  # pure yin down stroke ending at high=108/101
+            (102.0, 109.0, 101.0, 108.5),  # breaks above stroke's last bar high
+        ], start="2026-02-01")
+        from chanlun import Stroke, detect_stroke_end_trigger
+        pure_dn = Stroke(
+            direction="down", start_date="2026-02-02", end_date="2026-02-04",
+            start_price=116.0, end_price=100.0, high=116.0, low=100.0,
+            start_merged_idx=0, end_merged_idx=2, start_raw_idx=0, end_raw_idx=2,
+            raw_bars=3, pct_change=-13.8, macd_area=5.0, macd_peak=2.0, dif_extreme=-2.0,
+            efficiency=4.6, avg_vol_ratio=1.0, is_confirmed=True,
+        )
+        trig_no_rev = detect_stroke_end_trigger(df_no_rev, [pure_dn])
+        self.assertIsNotNone(trig_no_rev)
+        self.assertTrue(trig_no_rev["triggered"])
+
+    def test_segment_zhongshu_upgrade_on_nine_strokes(self):
+        # Build confirmed segments + 9-stroke oscillation so Stroke ZS upgrades cleanly to confirmed Segment ZS
+        points = [
+            (120.0, 1), (95.0, 8), (112.0, 7), (102.0, 7), (132.0, 8),  # Seg 1 up (95->132)
+            (108.0, 7), (122.0, 7), (100.0, 7),                         # Seg 2 down (132->100)
+            (126.0, 7), (110.0, 7), (135.0, 7),                         # Seg 3 up (100->135)
+            (114.0, 7), (124.0, 7), (108.0, 7), (121.0, 7), (109.0, 7), (120.0, 7), (110.0, 7), (119.0, 7), (106.0, 7),  # Seg 4 down (9+ strokes)
+            (128.0, 7), (115.0, 7), (136.0, 7), (125.0, 7),             # Seg 5 up confirms Seg 4 with all-confirmed strokes
+        ]
+        df = build_wave_df(points)
+        res = analyze_chanlun(df, timeframe_label="日线")
+        self.assertGreaterEqual(len(res["segment_zhongshus"]), 1)
+        self.assertEqual(res["zhongshu_level"], "segment")
+        self.assertIn("段中枢", res["zhongshu_level_label"])
+
+    def test_codex_regressions_segments_tiers_fake_yin_and_fresh_divergence(self):
+        from chanlun import Stroke, build_segments, evaluate_daily_signal_tier, _has_lesson5_substructure, Fractal
+
+        def mk(d, sp, ep, idx):
+            return Stroke(
+                direction=d, start_date=f"2026-01-{idx*2+1:02d}", end_date=f"2026-01-{idx*2+2:02d}",
+                start_price=sp, end_price=ep, high=max(sp, ep), low=min(sp, ep),
+                start_merged_idx=idx*4, end_merged_idx=idx*4+4, start_raw_idx=idx*4, end_raw_idx=idx*4+4,
+                raw_bars=5, pct_change=0.0, macd_area=10.0, macd_peak=2.0, dif_extreme=1.0,
+                efficiency=1.0, avg_vol_ratio=1.0, is_confirmed=True,
+            )
+
+        # 1) Trailing counter stroke must not end an up segment; no skipped strokes / adjacent same-dir segments / 1-stroke confirmed segments
+        segs1 = build_segments([mk("up", 100, 120, 0), mk("down", 120, 110, 1), mk("up", 110, 130, 2), mk("down", 130, 115, 3)])
+        self.assertEqual([(s.direction, s.start_price, s.end_price) for s in segs1], [("up", 100, 130)])
+        segs2 = build_segments([
+            mk("up", 100, 120, 0), mk("down", 120, 110, 1), mk("up", 110, 130, 2),
+            mk("down", 130, 95, 3), mk("up", 95, 135, 4), mk("down", 135, 105, 5), mk("up", 105, 145, 6),
+        ])
+        for a, b in zip(segs2, segs2[1:]):
+            self.assertNotEqual(a.direction, b.direction)
+        self.assertEqual(segs2[-1].end_price, 145)
+        for seg in segs2:
+            if seg.is_confirmed:
+                self.assertGreaterEqual(seg.stroke_count, 3)
+
+        # Unconfirmed right-edge stroke must NOT confirm prior segment break
+        s_unconf = [
+            mk("up", 100, 120, 0), mk("down", 120, 110, 1), mk("up", 110, 130, 2),
+            mk("down", 130, 105, 3), mk("up", 105, 122, 4),
+        ]
+        s_last_unconf = mk("down", 122, 102, 5)
+        s_last_unconf.is_confirmed = False
+        segs_unconf = build_segments(s_unconf + [s_last_unconf])
+        self.assertTrue(all(not s.is_confirmed for s in segs_unconf))
+
+        # 2) Non-first 3B vs watch-only tier separation + "找大哥(多强空弱)" must NOT trigger sell branch
+        t_non_first = evaluate_daily_signal_tier({"signals": ["日线非首中枢三买确认(回踩不破ZG=100+底分型)"], "price_vs_zhongshu": "above_zg(+1%)"})
+        self.assertIn("非首中枢", t_non_first["summary"])
+        t_watch = evaluate_daily_signal_tier({"signals": ["日线首中枢准三买观察(回踩ZG=100上方)"], "price_vs_zhongshu": "above_zg(+1%)"})
+        self.assertNotEqual(t_watch["tier"], "买卖点信号")
+        t_brother = evaluate_daily_signal_tier({"signals": ["日线3出(D3·首次底抬高)/二买确认(回踩不破前低95.0+找大哥(多强空弱))"], "price_vs_zhongshu": "inside_zs(50%)"})
+        self.assertIn("建仓", t_brother["action_bias"])
+        self.assertNotIn("做空", t_brother["action_bias"])
+
+        # 3) Fake yin (closes > prev_close) must NOT pass Lesson 5 substructure as a real pullback
+        df_fake = make_df([
+            (100.0, 102.0, 99.5, 101.0),
+            (103.0, 103.5, 101.5, 102.0),  # fake yin: close < open, BUT close 102.0 > prev_close 101.0!
+            (102.2, 104.5, 102.0, 104.0),
+        ], start="2026-03-01")
+        f_bot = Fractal(kind="bottom", merged_idx=0, high=102.0, low=99.5, price=99.5, raw_idx=0, date="2026-03-01", confirmed_by_idx=1, confirmed_date="2026-03-02", strength="strong")
+        f_top = Fractal(kind="top", merged_idx=2, high=104.5, low=102.0, price=104.5, raw_idx=2, date="2026-03-03", confirmed_by_idx=3, confirmed_date="2026-03-04", strength="strong")
+        self.assertFalse(_has_lesson5_substructure(df_fake, f_bot, f_top))
+
+        # 4) Fresh 2-bar rebound right after a slow divergent drop must preserve 1B divergence signal,
+        # while high-peak (area_ratio=0.50, peak_ratio=1.50) capital-consensus must NOT trigger divergence 1B
+        df_div = build_wave_df([(120.0, 1), (130.0, 8), (95.0, 8), (108.0, 8), (93.0, 18), (97.0, 3)])
+        res_div = analyze_chanlun(df_div, timeframe_label="日线")
+        self.assertIn("背驰", " ".join(res_div["signals"]))
+
+        from chanlun import classify_chanlun_signals, MergedBar
+        s_prev = Stroke("down", "2026-01-01", "2026-01-15", 120, 100, 120, 100, 0, 10, 0, 10, 11, -16.7, 20.0, 2.0, -2.0, 1.5, 1.0, True, 4, "中")
+        s_up1 = Stroke("up", "2026-01-15", "2026-01-22", 100, 110, 110, 100, 10, 15, 10, 15, 6, 10.0, 5.0, 1.0, 0.5, 1.6, 1.0, True, 4, "中")
+        s_curr_dn = Stroke("down", "2026-01-22", "2026-01-30", 110, 96, 110, 96, 15, 20, 15, 20, 6, -12.7, 10.0, 3.0, -2.5, 2.1, 1.0, True, 4, "中")
+        s_bounce = Stroke("up", "2026-01-30", "2026-02-01", 96, 99, 99, 96, 20, 21, 20, 21, 2, 3.1, 1.0, 0.5, -1.5, 1.5, 1.0, False, 4, "中")
+        _, _, sigs_cons = classify_chanlun_signals("日线", 99.0, [], [], [], [s_prev, s_up1, s_curr_dn, s_bounce], [], {"verdict": "lower_high_rebound"})
+        self.assertNotIn("一买", " ".join(sigs_cons))
+
 
 if __name__ == "__main__":
     unittest.main()

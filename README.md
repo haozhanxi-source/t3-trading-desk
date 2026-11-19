@@ -6,10 +6,10 @@
 
 - `AGENTS.md`：1Q~1Y 大逻辑 + 第一层 7 维驱动框架 + 第二层多空双向日线缠论过筛与执行工作流指令
 - `watchlist.json`：跨市场核心观察列表（分析与寻猎时支持任意跨市场标的实时拉取）
-- `universes.json`：主题与大宗商品 8 大类、航运、股票赛道、主流外汇（`fx_majors`）、加密货币共 17 个标的池
+- `universes.json`：大宗商品 8 大类、航运、主流外汇（`fx_majors`）、美股与 A 股一级行业 ETF 定价锚（`us_sectors` / `a_shares_etfs`）及随投研沉淀的主题标的池（共 18 个基础池，支持通过 `--save-universe` 随行情按需生长）
 - `scripts/chanlun.py`：日线缠论核心引擎（K线包含、分型、严格笔、多中枢识别、MACD力度面积对比、资金一致性 vs 背驰判别）
 - `scripts/market_snapshot.py`：单标的行情（默认 3 年日线，支持 yfinance 与 akshare 国内期货主力连续）、日线缠论结构、基本面/资金费率与宏观数据抓取
-- `scripts/scan_opportunities.py`：跨市场自选股/主题池（`--universe`）/临时列表（`--symbols`）日线缠论信号扫描
+- `scripts/scan_opportunities.py`：按自上而下推演出的板块池（`--universe`）或现场梳理的产业链龙头列表（`--symbols`）跑日线缠论过筛，并支持 `--save-universe` 沉淀新板块池
 - `tests/test_chanlun.py` & `tests/test_market_and_scan.py`：缠论核心引擎、国内期货/外汇适配与机会扫描单元测试
 - `reports/`：保存生成的分析报告
 
@@ -34,4 +34,7 @@
 .venv/bin/python scripts/scan_opportunities.py --list-universes
 .venv/bin/python scripts/scan_opportunities.py --universe commodities_ferrous fx_majors us_power_grid --sort tier
 .venv/bin/python scripts/scan_opportunities.py --symbols NVDA 螺纹 KC=F 欧元美元 BTC --sort tier
+
+# 当第一层自上而下想到新细分板块时，现场切入验证并按需沉淀为新标的池
+.venv/bin/python scripts/scan_opportunities.py --symbols 300308 300502 300394 601138 --save-universe a_shares_optical_ai --description "A股光模块与AI算力硬件龙头" --sort tier
 ```

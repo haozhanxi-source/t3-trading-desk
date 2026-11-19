@@ -82,6 +82,44 @@ def load_universes(universes_path: str | None = None) -> dict:
         return json.load(f)
 
 
+def save_universe(
+    name: str,
+    symbols: list[str],
+    description: str = "",
+    universes_path: str | None = None,
+) -> dict:
+    """Persist or update a top-down discovered sector universe in universes.json."""
+    pool_name = (name or "").strip()
+    if not pool_name:
+        raise ValueError("Universe name cannot be empty")
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for sym in symbols:
+        s = str(sym).strip()
+        if not s:
+            continue
+        dedup_key = normalize_symbol(s)[0]
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        cleaned.append(s)
+    if not cleaned:
+        raise ValueError(f"Cannot save empty symbol list for universe {pool_name!r}")
+
+    path = universes_path or DEFAULT_UNIVERSES_PATH
+    universes = load_universes(path) if os.path.exists(path) else {}
+    existing_desc = universes.get(pool_name, {}).get("description", "")
+    final_desc = description.strip() or existing_desc or f"自上而下投研沉淀标的池 ({pool_name})"
+    universes[pool_name] = {
+        "description": final_desc,
+        "symbols": cleaned,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(universes, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return universes[pool_name]
+
+
 def resolve_targets(
     universe_names: list[str] | None = None,
     symbols: list[str] | None = None,
@@ -232,6 +270,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="3y",
         help="History period passed to snapshot fetcher (default: 3y)",
     )
+    parser.add_argument(
+        "--save-universe",
+        metavar="NAME",
+        help="Save or update the resolved symbol list into universes.json under NAME for future reuse",
+    )
+    parser.add_argument(
+        "--description",
+        default="",
+        help="Description used when --save-universe is specified",
+    )
     return parser
 
 
@@ -246,6 +294,14 @@ def main(argv: list[str] | None = None):
 
     try:
         targets = resolve_targets(universe_names=args.universe, symbols=args.symbols)
+        if args.save_universe:
+            pool_name = args.save_universe.strip()
+            save_universe(
+                name=pool_name,
+                symbols=[sym for _, sym in targets],
+                description=args.description,
+            )
+            targets = [(pool_name, sym) for _, sym in targets]
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(2)

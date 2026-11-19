@@ -25,6 +25,7 @@ from scan_opportunities import (  # noqa: E402
     load_universes,
     main as scan_main,
     resolve_targets,
+    save_universe,
     scan_targets,
     sort_scan_rows,
 )
@@ -201,10 +202,26 @@ class TestScanOpportunities(unittest.TestCase):
         self.assertIn("shipping", universes)
         self.assertIn("us_power_grid", universes)
         self.assertIn("fx_majors", universes)
+        self.assertIn("a_shares_etfs", universes)
         for name, meta in universes.items():
             self.assertIn("description", meta, msg=name)
             self.assertIn("symbols", meta, msg=name)
             self.assertGreater(len(meta["symbols"]), 0, msg=name)
+
+    def test_save_universe_persists_deduped_pool(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            u_path = os.path.join(tmpdir, "universes.json")
+            saved = save_universe(
+                name="a_shares_grid_export",
+                symbols=["002028", "002028.SZ", "600406"],
+                description="A股电网设备出海龙头",
+                universes_path=u_path,
+            )
+            self.assertEqual(saved["description"], "A股电网设备出海龙头")
+            self.assertEqual(saved["symbols"], ["002028", "600406"])
+            loaded = load_universes(u_path)
+            self.assertIn("a_shares_grid_export", loaded)
+            self.assertEqual(loaded["a_shares_grid_export"]["symbols"], ["002028", "600406"])
 
     def test_resolve_targets_dedup_and_unknown_universe(self):
         with tempfile.TemporaryDirectory() as tmpdir:

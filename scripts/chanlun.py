@@ -1176,7 +1176,11 @@ def assess_momentum(strokes: list[Stroke]) -> dict:
     - 非背驰背离 (Non-Divergence Pullback, 第14课): MACD area looks small only due to steep 1-3 class crash/surge ("还有力量").
     """
     if not strokes:
-        return {"verdict": "insufficient_data"}
+        return {
+            "verdict": "insufficient_data",
+            "momentum_reliable": False,
+            "momentum_reliability_note": "笔结构样本不足，无法进行同向笔力度对比",
+        }
 
     curr = strokes[-1]
     same_dir = [s for s in strokes[:-1] if s.direction == curr.direction]
@@ -1189,12 +1193,35 @@ def assess_momentum(strokes: list[Stroke]) -> dict:
             "verdict": "single_stroke_no_comparison",
             "is_capital_consensus": False,
             "is_divergence_candidate": False,
+            "momentum_reliable": False,
+            "momentum_reliability_note": "无前序同向笔可对比，MACD面积比不适用",
         }
 
     prev = same_dir[-1]
     area_ratio = round(curr.macd_area / prev.macd_area, 2) if prev.macd_area > 0 else None
     peak_ratio = round(curr.macd_peak / prev.macd_peak, 2) if prev.macd_peak > 0 else None
     slope_ratio = round(curr.efficiency / prev.efficiency, 2) if prev.efficiency > 0 else None
+
+    unreliable_reasons: list[str] = []
+    if area_ratio is not None and area_ratio >= 8.0 and curr.raw_bars <= 4:
+        unreliable_reasons.append(f"当前笔仅{curr.raw_bars}根K线且面积比达{area_ratio}x(小分母放大)")
+    elif curr.raw_bars <= 3:
+        unreliable_reasons.append(f"当前笔仅{curr.raw_bars}根K线")
+    if prev.raw_bars <= 3:
+        unreliable_reasons.append(f"前同向笔仅{prev.raw_bars}根K线")
+    if prev.macd_area < 1e-6 and curr.macd_area < 1e-6:
+        unreliable_reasons.append("前后笔MACD柱面积均近零")
+    elif prev.macd_area < 1e-6:
+        unreliable_reasons.append("前同向笔MACD柱面积近零")
+    elif curr.macd_area < 1e-6:
+        unreliable_reasons.append("当前笔MACD柱面积近零")
+
+    momentum_reliable = len(unreliable_reasons) == 0
+    momentum_reliability_note: Optional[str] = (
+        None
+        if momentum_reliable
+        else f"{'、'.join(unreliable_reasons)}，MACD面积比失真，改看价格幅度与DIF极值"
+    )
 
     if curr.direction == "down":
         made_new_extreme = curr.end_price < prev.end_price
@@ -1250,6 +1277,8 @@ def assess_momentum(strokes: list[Stroke]) -> dict:
         "is_capital_consensus": is_consensus,
         "is_divergence_candidate": is_divergence,
         "is_non_divergence_power": is_non_divergence_power,
+        "momentum_reliable": momentum_reliable,
+        "momentum_reliability_note": momentum_reliability_note,
     }
 
 
@@ -1468,7 +1497,7 @@ def classify_chanlun_signals(
     return macro_structure, pos_vs_zs, signals
 
 
-def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线") -> dict:
+def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线", full_export: bool = False) -> dict:
     """Run full 19-lesson practical Chanlun + MACD analysis on an OHLCV DataFrame."""
     if not df.empty:
         df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -1519,7 +1548,7 @@ def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线") -> dict:
             "strength": lf.strength,
         }
 
-    return {
+    result = {
         "timeframe": timeframe_label,
         "raw_bars": len(df),
         "merged_bars": len(merged),
@@ -1540,6 +1569,12 @@ def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线") -> dict:
         "momentum_assessment": momentum,
         "signals": signals,
     }
+    if full_export:
+        result["all_strokes"] = [asdict(s) for s in strokes]
+        result["all_segments"] = [asdict(s) for s in segments]
+        result["all_stroke_zhongshus"] = [asdict(z) for z in stroke_zss]
+        result["all_segment_zhongshus"] = [asdict(z) for z in segment_zss]
+    return result
 
 
 def evaluate_daily_signal_tier(daily: dict) -> dict:

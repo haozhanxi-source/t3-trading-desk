@@ -349,6 +349,140 @@ class TestChanlunEngine(unittest.TestCase):
         _, _, sigs_cons = classify_chanlun_signals("日线", 99.0, [], [], [], [s_prev, s_up1, s_curr_dn, s_bounce], [], {"verdict": "lower_high_rebound"})
         self.assertNotIn("一买", " ".join(sigs_cons))
 
+    def test_assess_momentum_reliability_flags(self):
+        from chanlun import Stroke
+
+        def mk_stroke(direction, sp, ep, raw_bars, macd_area, macd_peak=2.0, dif=-1.5, idx=0):
+            pct = round(((ep / sp) - 1.0) * 100.0, 2)
+            eff = round(abs(pct) / max(1, raw_bars), 3)
+            return Stroke(
+                direction=direction,
+                start_date=f"2026-01-{idx * 2 + 1:02d}",
+                end_date=f"2026-01-{idx * 2 + 2:02d}",
+                start_price=sp,
+                end_price=ep,
+                high=max(sp, ep),
+                low=min(sp, ep),
+                start_merged_idx=idx * 5,
+                end_merged_idx=idx * 5 + raw_bars,
+                start_raw_idx=idx * 5,
+                end_raw_idx=idx * 5 + raw_bars,
+                raw_bars=raw_bars,
+                pct_change=pct,
+                macd_area=macd_area,
+                macd_peak=macd_peak,
+                dif_extreme=dif,
+                efficiency=eff,
+                avg_vol_ratio=1.0,
+                is_confirmed=True,
+            )
+
+        # Insufficient data & single stroke branches
+        m_empty = assess_momentum([])
+        self.assertEqual(m_empty["verdict"], "insufficient_data")
+        self.assertFalse(m_empty["momentum_reliable"])
+        self.assertIsInstance(m_empty["momentum_reliability_note"], str)
+        self.assertTrue(len(m_empty["momentum_reliability_note"]) > 0)
+
+        s_single = mk_stroke("down", 120.0, 100.0, raw_bars=8, macd_area=12.0, idx=0)
+        m_single = assess_momentum([s_single])
+        self.assertEqual(m_single["verdict"], "single_stroke_no_comparison")
+        self.assertFalse(m_single["momentum_reliable"])
+        self.assertIsInstance(m_single["momentum_reliability_note"], str)
+
+        s_mid_up = mk_stroke("up", 100.0, 110.0, raw_bars=6, macd_area=6.0, dif=1.0, idx=1)
+
+        # Short current stroke (<= 3 bars)
+        s_short_curr = mk_stroke("down", 110.0, 95.0, raw_bars=2, macd_area=4.0, idx=2)
+        m_short_curr = assess_momentum([s_single, s_mid_up, s_short_curr])
+        self.assertFalse(m_short_curr["momentum_reliable"])
+        self.assertIn("仅2根K线", m_short_curr["momentum_reliability_note"])
+        self.assertIn("失真", m_short_curr["momentum_reliability_note"])
+
+        # Short previous stroke (<= 3 bars)
+        s_short_prev = mk_stroke("down", 120.0, 105.0, raw_bars=3, macd_area=5.0, idx=0)
+        s_norm_curr = mk_stroke("down", 110.0, 95.0, raw_bars=8, macd_area=10.0, idx=2)
+        m_short_prev = assess_momentum([s_short_prev, s_mid_up, s_norm_curr])
+        self.assertFalse(m_short_prev["momentum_reliable"])
+        self.assertIn("仅3根K线", m_short_prev["momentum_reliability_note"])
+
+        # Zero prev.macd_area
+        s_zero_prev = mk_stroke("down", 120.0, 105.0, raw_bars=7, macd_area=0.0, idx=0)
+        m_zero_prev = assess_momentum([s_zero_prev, s_mid_up, s_norm_curr])
+        self.assertFalse(m_zero_prev["momentum_reliable"])
+        self.assertIsNone(m_zero_prev["area_ratio_vs_prev"])
+        self.assertIn("近零", m_zero_prev["momentum_reliability_note"])
+
+        # Zero curr.macd_area
+        s_zero_curr = mk_stroke("down", 110.0, 95.0, raw_bars=7, macd_area=0.0, idx=2)
+        m_zero_curr = assess_momentum([s_single, s_mid_up, s_zero_curr])
+        self.assertFalse(m_zero_curr["momentum_reliable"])
+        self.assertIn("近零", m_zero_curr["momentum_reliability_note"])
+
+        # Extreme ratio (>= 8.0x) on 4-bar stroke
+        s_small_prev = mk_stroke("down", 120.0, 112.0, raw_bars=6, macd_area=0.5, macd_peak=0.2, idx=0)
+        s_spike_curr = mk_stroke("down", 116.0, 98.0, raw_bars=4, macd_area=5.325, macd_peak=2.0, idx=2)
+        m_spike = assess_momentum([s_small_prev, s_mid_up, s_spike_curr])
+        self.assertEqual(m_spike["area_ratio_vs_prev"], 10.65)
+        self.assertFalse(m_spike["momentum_reliable"])
+        self.assertIn("10.65x", m_spike["momentum_reliability_note"])
+
+        # Normal comparison (>= 6 bars, non-zero areas, reasonable ratio)
+        s_ok_prev = mk_stroke("down", 120.0, 102.0, raw_bars=8, macd_area=14.0, macd_peak=2.5, dif=-2.0, idx=0)
+        s_ok_curr = mk_stroke("down", 112.0, 96.0, raw_bars=7, macd_area=16.0, macd_peak=2.8, dif=-2.4, idx=2)
+        m_ok = assess_momentum([s_ok_prev, s_mid_up, s_ok_curr])
+        self.assertTrue(m_ok["momentum_reliable"])
+        self.assertIsNone(m_ok["momentum_reliability_note"])
+        self.assertTrue(m_ok["is_capital_consensus"])
+
+    def test_analyze_chanlun_full_export_and_snapshot_flag(self):
+        from unittest.mock import patch
+        import market_snapshot
+
+        points = [
+            (120.0, 1), (95.0, 8), (112.0, 7), (102.0, 7), (132.0, 8),
+            (108.0, 7), (122.0, 7), (100.0, 7),
+            (126.0, 7), (110.0, 7), (135.0, 7),
+            (114.0, 7), (124.0, 7), (108.0, 7), (121.0, 7), (109.0, 7), (120.0, 7), (110.0, 7), (119.0, 7), (106.0, 7),
+            (128.0, 7), (115.0, 7), (136.0, 7), (125.0, 7),
+        ]
+        df = build_wave_df(points)
+
+        full_keys = ("all_strokes", "all_segments", "all_stroke_zhongshus", "all_segment_zhongshus")
+
+        res_default = analyze_chanlun(df, timeframe_label="日线")
+        for key in full_keys:
+            self.assertNotIn(key, res_default)
+
+        res_full = analyze_chanlun(df, timeframe_label="日线", full_export=True)
+        for key in full_keys:
+            self.assertIn(key, res_full)
+            self.assertIsInstance(res_full[key], list)
+
+        self.assertGreater(len(res_full["all_strokes"]), len(res_full["recent_strokes"]))
+        self.assertEqual(res_full["all_strokes"][-5:], res_full["recent_strokes"])
+        self.assertEqual(len(res_full["all_segments"]), res_full["segment_count"])
+        self.assertEqual(res_full["all_stroke_zhongshus"][-3:], res_full["stroke_zhongshus"])
+        self.assertEqual(res_full["all_segment_zhongshus"][-3:], res_full["segment_zhongshus"])
+        self.assertGreaterEqual(len(res_full["all_segment_zhongshus"]), 1)
+
+        # Verify market_snapshot.get_snapshot forwards full_chanlun to analyze_chanlun
+        with patch("market_snapshot.fetch_cn_future_daily", return_value=df):
+            snap_default = market_snapshot.get_snapshot("I0", include_macro=False, include_fundamentals=False)
+            snap_full = market_snapshot.get_snapshot(
+                "I0", include_macro=False, include_fundamentals=False, full_chanlun=True
+            )
+        for key in full_keys:
+            self.assertNotIn(key, snap_default["chanlun"]["daily"])
+            self.assertIn(key, snap_full["chanlun"]["daily"])
+
+        # Verify CLI --full-chanlun flag passes full_chanlun=True
+        with patch("market_snapshot.get_snapshot", return_value={"ok": True}) as mock_snap, \
+             patch("sys.argv", ["market_snapshot.py", "NVDA", "--no-macro", "--full-chanlun"]), \
+             patch("builtins.print"):
+            market_snapshot.main()
+        mock_snap.assert_called_once_with("NVDA", period="3y", include_macro=False, full_chanlun=True)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -793,6 +793,8 @@ def classify_chanlun_signals(
 
 def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线") -> dict:
     """Run full Chanlun analysis on an OHLCV DataFrame."""
+    if not df.empty:
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
     if df.empty or len(df) < 15:
         return {"error": f"Insufficient bars ({len(df)}) for Chanlun analysis"}
 

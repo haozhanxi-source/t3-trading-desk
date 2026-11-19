@@ -136,7 +136,7 @@ def fetch_macro_context() -> dict:
     ctx = {}
     for sym, label in [("^VIX", "VIX"), ("^TNX", "US10Y_Yield"), ("DX-Y.NYB", "DXY_USD_Index")]:
         try:
-            df = yf.Ticker(sym).history(period="10d")
+            df = yf.Ticker(sym).history(period="10d").dropna(subset=["Close"])
             if len(df) >= 2:
                 last = float(df["Close"].iloc[-1])
                 prev = float(df["Close"].iloc[-2])
@@ -158,6 +158,8 @@ def get_snapshot(
     yf_sym, asset_class = normalize_symbol(raw_symbol)
     ticker = yf.Ticker(yf_sym)
     df = ticker.history(period=period, interval="1d")
+    if not df.empty:
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
     if df.empty:
         return {"error": f"No OHLCV data returned for {raw_symbol} (normalized: {yf_sym})"}
 

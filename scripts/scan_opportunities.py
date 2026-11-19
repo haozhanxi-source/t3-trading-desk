@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan watchlist across US stocks, A-shares, Commodities, and Crypto for medium/low-frequency setups."""
+"""Scan watchlist across US stocks, A-shares, Commodities, and Crypto using Chanlun structure & momentum."""
 import json
 import os
 import sys
@@ -8,39 +8,61 @@ sys.path.insert(0, os.path.dirname(__file__))
 from market_snapshot import get_snapshot
 
 
-def classify_signals(snap: dict) -> list[str]:
+def format_fractal_label(frac: dict | None) -> str:
+    if not frac:
+        return "无"
+    kind_zh = "底分型" if frac["kind"] == "bottom" else "顶分型"
+    fresh = "刚确认" if frac.get("just_confirmed") else f"{frac.get('confirmed_merged_bars_ago')}K前"
+    return f"{kind_zh}({fresh}/{frac.get('strength', 'standard')})"
+
+
+def format_momentum_label(mom: dict) -> str:
+    verdict = mom.get("verdict", "insufficient_data")
+    ar = mom.get("area_ratio_vs_prev")
+    pr = mom.get("peak_ratio_vs_prev")
+    ratio_str = f"area={ar}x,peak={pr}x" if ar is not None else "首笔样本"
+
+    verdict_map = {
+        "capital_consensus_down": "空头资金方向一致",
+        "capital_consensus_up": "多头资金方向一致",
+        "divergence_candidate_down": "下跌力度衰减(疑似底背驰)",
+        "divergence_candidate_up": "上涨力度衰减(疑似顶背驰)",
+        "higher_low_pullback": "回踩不破前低",
+        "lower_high_rebound": "反弹不过前高",
+        "neutral_extension_down": "向下笔延伸(力度中性)",
+        "neutral_extension_up": "向上笔延伸(力度中性)",
+    }
+    label = verdict_map.get(verdict, verdict)
+    return f"{label} ({ratio_str})"
+
+
+def collect_signals(snap: dict) -> list[str]:
     if "error" in snap:
         return [f"ERROR: {snap['error']}"]
-    t = snap["technicals"]
-    signals = []
-    rsi = t.get("rsi14")
-    regime = t.get("trend_regime")
-    d20 = t.get("dist_ema20_pct", 0)
-    d200 = t.get("dist_ema200_pct", 0)
-    last = t.get("last_close")
-    h20 = t.get("high_20d")
-    l20 = t.get("low_20d")
 
-    if regime in ("strong_uptrend", "uptrend") and -3.5 <= d20 <= 1.5 and rsi is not None and rsi < 55:
-        signals.append("上升趋势回踩EMA20关注区")
-    if d200 > 0 and rsi is not None and rsi <= 38:
-        signals.append("多头结构超卖回调(RSI<=38)")
-    if rsi is not None and rsi <= 30:
-        signals.append("极度超卖(RSI<=30)")
-    elif rsi is not None and rsi >= 72:
-        signals.append("短期超买/注意止盈风险(RSI>=72)")
-    if last and h20 and last >= h20 * 0.995:
-        signals.append("创20日新高/突破观察")
-    if last and l20 and last <= l20 * 1.005:
-        signals.append("测试20日低点支撑")
+    cl = snap.get("chanlun", {})
+    daily = cl.get("daily", {})
+    weekly = cl.get("weekly", {})
+    mtf = cl.get("mtf_resonance", {})
+
+    signals = []
+    if mtf.get("resonance"):
+        signals.append(f"【{mtf['resonance']}】")
+
+    signals.extend(daily.get("signals", []))
+
+    for ws in weekly.get("signals", []):
+        if any(k in ws for k in ("买", "卖", "背驰", "资金方向一致")):
+            signals.append(ws)
 
     funding = snap.get("crypto_perp_funding", {})
     for ex, info in funding.items():
         ann = info.get("funding_annualized_pct")
         if ann is not None and (ann >= 15 or ann <= -5):
-            signals.append(f"{ex}永续年化资金费率异动({ann}%)")
+            side = "多头杠杆拥挤" if ann >= 15 else "空头资金费率一致看空"
+            signals.append(f"{ex}永续年化费率{ann}%({side})")
 
-    return signals or ["常规震荡/无极端信号"]
+    return signals or ["常规结构运行"]
 
 
 def main():
@@ -51,21 +73,34 @@ def main():
     rows = []
     for bucket in ["us_stocks", "a_shares", "commodities", "crypto"]:
         for sym in wl.get(bucket, []):
-            snap = get_snapshot(sym, period="1y", include_macro=False)
+            snap = get_snapshot(sym, period="2y", include_macro=False, include_fundamentals=False)
             if "error" in snap:
                 rows.append({"market": bucket, "symbol": sym, "error": snap["error"]})
                 continue
+
             t = snap["technicals"]
+            cl = snap["chanlun"]
+            daily = cl["daily"]
+            weekly = cl["weekly"]
+            mtf = cl["mtf_resonance"]
+            zs = daily.get("latest_zhongshu")
+
             rows.append({
                 "market": bucket,
                 "symbol": snap["symbol"],
                 "close": t["last_close"],
                 "ret_5d_%": t["return_5d_pct"],
                 "ret_20d_%": t["return_20d_pct"],
-                "rsi14": t["rsi14"],
                 "atr_%": t["atr14_pct"],
-                "regime": t["trend_regime"],
-                "signals": classify_signals(snap),
+                "signal_tier": mtf.get("tier"),
+                "weekly_momentum": format_momentum_label(weekly.get("momentum_assessment", {})),
+                "daily_structure": daily.get("macro_structure"),
+                "daily_zs": [zs["zd"], zs["zg"]] if zs else None,
+                "pos_vs_zs": daily.get("price_vs_zhongshu"),
+                "daily_fractal": format_fractal_label(daily.get("latest_fractal")),
+                "daily_momentum": format_momentum_label(daily.get("momentum_assessment", {})),
+                "action_bias": mtf.get("action_bias"),
+                "signals": collect_signals(snap),
             })
 
     print(json.dumps(rows, ensure_ascii=False, indent=2))

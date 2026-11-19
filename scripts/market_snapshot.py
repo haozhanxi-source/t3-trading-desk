@@ -15,7 +15,7 @@ import pandas as pd
 import yfinance as yf
 
 sys.path.insert(0, os.path.dirname(__file__))
-from chanlun import analyze_chanlun, compute_macd, evaluate_mtf_resonance, resample_to_weekly
+from chanlun import analyze_chanlun, compute_macd, evaluate_daily_signal_tier
 
 COMMODITY_ALIASES = {
     "GOLD": "GC=F", "XAU": "GC=F", "黄金": "GC=F",
@@ -165,9 +165,7 @@ def get_snapshot(
 
     indicators = compute_indicators(df)
     daily_cl = analyze_chanlun(df, timeframe_label="日线")
-    weekly_df = resample_to_weekly(df)
-    weekly_cl = analyze_chanlun(weekly_df, timeframe_label="周线")
-    mtf = evaluate_mtf_resonance(weekly_cl, daily_cl)
+    signal_summary = evaluate_daily_signal_tier(daily_cl)
 
     fundamentals = {}
     if include_fundamentals:
@@ -191,9 +189,8 @@ def get_snapshot(
         "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "technicals": indicators,
         "chanlun": {
-            "mtf_resonance": mtf,
+            "signal_summary": signal_summary,
             "daily": daily_cl,
-            "weekly": weekly_cl,
         },
         "fundamentals": fundamentals,
     }

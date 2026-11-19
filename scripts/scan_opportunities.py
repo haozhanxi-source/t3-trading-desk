@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scan watchlist across US stocks, A-shares, Commodities, and Crypto using Chanlun structure & momentum."""
+"""Scan watchlist across US stocks, A-shares, Commodities, and Crypto using Daily Chanlun structure & momentum."""
 import json
 import os
 import sys
@@ -42,18 +42,13 @@ def collect_signals(snap: dict) -> list[str]:
 
     cl = snap.get("chanlun", {})
     daily = cl.get("daily", {})
-    weekly = cl.get("weekly", {})
-    mtf = cl.get("mtf_resonance", {})
+    summary = cl.get("signal_summary", {})
 
     signals = []
-    if mtf.get("resonance"):
-        signals.append(f"【{mtf['resonance']}】")
+    if summary.get("summary"):
+        signals.append(f"【{summary['summary']}】")
 
     signals.extend(daily.get("signals", []))
-
-    for ws in weekly.get("signals", []):
-        if any(k in ws for k in ("买", "卖", "背驰", "资金方向一致")):
-            signals.append(ws)
 
     funding = snap.get("crypto_perp_funding", {})
     for ex, info in funding.items():
@@ -62,7 +57,7 @@ def collect_signals(snap: dict) -> list[str]:
             side = "多头杠杆拥挤" if ann >= 15 else "空头资金费率一致看空"
             signals.append(f"{ex}永续年化费率{ann}%({side})")
 
-    return signals or ["常规结构运行"]
+    return signals or ["常规日线结构运行"]
 
 
 def main():
@@ -81,8 +76,7 @@ def main():
             t = snap["technicals"]
             cl = snap["chanlun"]
             daily = cl["daily"]
-            weekly = cl["weekly"]
-            mtf = cl["mtf_resonance"]
+            summary = cl["signal_summary"]
             zs = daily.get("latest_zhongshu")
 
             rows.append({
@@ -91,15 +85,16 @@ def main():
                 "close": t["last_close"],
                 "ret_5d_%": t["return_5d_pct"],
                 "ret_20d_%": t["return_20d_pct"],
+                "ret_60d_%": t["return_60d_pct"],
                 "atr_%": t["atr14_pct"],
-                "signal_tier": mtf.get("tier"),
-                "weekly_momentum": format_momentum_label(weekly.get("momentum_assessment", {})),
+                "signal_tier": summary.get("tier"),
                 "daily_structure": daily.get("macro_structure"),
+                "daily_zs_count": daily.get("zhongshu_count"),
                 "daily_zs": [zs["zd"], zs["zg"]] if zs else None,
                 "pos_vs_zs": daily.get("price_vs_zhongshu"),
                 "daily_fractal": format_fractal_label(daily.get("latest_fractal")),
                 "daily_momentum": format_momentum_label(daily.get("momentum_assessment", {})),
-                "action_bias": mtf.get("action_bias"),
+                "action_bias": summary.get("action_bias"),
                 "signals": collect_signals(snap),
             })
 

@@ -842,6 +842,7 @@ def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线") -> dict:
         "price_vs_zhongshu": pos_vs_zs,
         "latest_fractal": latest_frac,
         "latest_zhongshu": asdict(zhongshus[-1]) if zhongshus else None,
+        "recent_zhongshus": [asdict(z) for z in zhongshus[-3:]],
         "zhongshu_count": len(zhongshus),
         "recent_strokes": [asdict(s) for s in strokes[-5:]],
         "momentum_assessment": momentum,
@@ -849,82 +850,58 @@ def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线") -> dict:
     }
 
 
-def resample_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    """Resample daily OHLCV DataFrame to weekly bars (week ending Friday)."""
-    agg = {
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-    }
-    if "Volume" in df.columns:
-        agg["Volume"] = "sum"
-    weekly = df.resample("W-FRI").agg(agg).dropna(subset=["Open", "High", "Low", "Close"])
-    return weekly
+def evaluate_daily_signal_tier(daily: dict) -> dict:
+    """Classify actionable tier and bias purely from Daily Chanlun structure."""
+    if "error" in daily:
+        return {"tier": "数据不足", "summary": daily["error"], "action_bias": "跳过"}
 
-
-def evaluate_mtf_resonance(weekly: dict, daily: dict) -> dict:
-    """Combine Weekly and Daily Chanlun structures into a multi-timeframe (区间套) reading."""
-    if "error" in weekly or "error" in daily:
-        return {"resonance": "单周期结构", "summary": daily.get("signals", ["数据不足"])[0]}
-
-    w_mom = weekly.get("momentum_assessment", {})
     d_mom = daily.get("momentum_assessment", {})
-    w_dir = w_mom.get("active_direction")
     d_dir = d_mom.get("active_direction")
-
-    w_cons = w_mom.get("is_capital_consensus", False)
     d_cons = d_mom.get("is_capital_consensus", False)
-    w_div = w_mom.get("is_divergence_candidate", False)
     d_div = d_mom.get("is_divergence_candidate", False)
+    pos = daily.get("price_vs_zhongshu", "")
+    sigs = daily.get("signals", [])
+    sigs_str = " ".join(sigs)
 
-    d_sigs_str = " ".join(daily.get("signals", []))
-    w_frac = weekly.get("latest_fractal") or {}
-
-    if w_dir == "down" and d_dir == "down" and (w_cons or d_cons) and not d_div:
-        resonance = "周日共振向下·资金方向一致"
-        action_bias = "顺势空头/持币观望，严禁逆势接飞刀"
+    if "三买" in sigs_str:
+        tier = "买卖点信号"
+        summary = "日线三买/准三买结构"
+        action_bias = "回踩不破中枢上沿 ZG 配合日线底分型确认，顺势做多观察"
+    elif "三卖" in sigs_str:
+        tier = "买卖点信号"
+        summary = "日线三卖/准三卖结构"
+        action_bias = "反抽不过中枢下沿 ZD 配合顶分型受阻，顺势减仓/做空观察"
+    elif "一买" in sigs_str or "二买" in sigs_str:
+        tier = "买卖点信号"
+        summary = "日线一买/二买结构触发"
+        action_bias = "围绕日线底分型确认与前低/中枢下沿防守，评估中长线建仓"
+    elif "一卖" in sigs_str or "二卖" in sigs_str:
+        tier = "买卖点信号"
+        summary = "日线一卖/二卖结构触发"
+        action_bias = "高点承压配合日线顶分型确认，注意止盈或减仓防守"
+    elif d_cons and d_dir == "down":
         tier = "资金一致推进(勿逆势)"
-    elif w_dir == "up" and d_dir == "up" and (w_cons or d_cons) and not d_div:
-        resonance = "周日共振向上·资金方向一致"
-        action_bias = "主升/向上离开段延续，持仓观察或顺势跟进"
+        summary = "日线空头资金方向一致推进"
+        action_bias = "向下离开段未见背驰，尊重空头主导资金方向，严禁逆势接飞刀"
+    elif d_cons and d_dir == "up":
         tier = "资金一致推进(顺势)"
-    elif "三买" in d_sigs_str and w_dir == "up":
-        resonance = "周线多头+日线三买共振"
-        action_bias = "中低频高胜率顺势买点观察区"
-        tier = "买卖点信号"
-    elif "三卖" in d_sigs_str and w_dir == "down":
-        resonance = "周线空头+日线三卖共振"
-        action_bias = "中低频顺势减仓/做空观察区"
-        tier = "买卖点信号"
-    elif d_div and d_dir == "down" and (w_div or (w_frac.get("kind") == "bottom" and w_frac.get("confirmed_merged_bars_ago", 99) <= 2) or "above_zg" in weekly.get("price_vs_zhongshu", "")):
-        resonance = "大级别支撑/减速+日线底背驰(区间套)"
-        action_bias = "关注日线底分型确认后的一买/盘背买点"
-        tier = "区间套买卖点"
-    elif d_div and d_dir == "up" and (w_div or (w_frac.get("kind") == "top" and w_frac.get("confirmed_merged_bars_ago", 99) <= 2)):
-        resonance = "周线承压/减速+日线顶背驰(区间套)"
-        action_bias = "注意止盈与减仓，观察日线顶分型确认"
-        tier = "区间套买卖点"
-    elif "二买" in d_sigs_str or "三买" in d_sigs_str or "一买" in d_sigs_str or "二卖" in d_sigs_str or "三卖" in d_sigs_str or "一卖" in d_sigs_str:
-        resonance = "日线买卖点结构触发"
-        action_bias = "结合周线中枢位置控制仓位与止损"
-        tier = "买卖点信号"
+        summary = "日线多头资金方向一致推进"
+        action_bias = "向上离开段动能充沛未背驰，顺势持有或等待日线回踩买点"
     elif d_div:
-        resonance = "日线力度背驰观察"
-        action_bias = "等待分型停顿确认，勿提前抢跑"
         tier = "背驰观察"
-    elif d_cons:
-        dir_label = "向下" if d_dir == "down" else "向上"
-        resonance = f"日线{dir_label}资金方向一致(周线缓冲)"
-        action_bias = "尊重当前日线主导资金方向，等待结构转折信号"
-        tier = "资金一致推进"
-    else:
-        resonance = "周日结构分化/中枢震荡"
-        action_bias = "按中枢下沿支撑/上沿阻力高抛低吸或观望"
+        summary = "日线力度衰减·疑似背驰"
+        action_bias = "等待日线顶/底分型停顿确认后再行动，勿提前抢跑"
+    elif pos.startswith("inside_zs"):
         tier = "中枢震荡"
+        summary = "日线中枢内部震荡"
+        action_bias = "观察日线中枢下沿 ZD 支撑与上沿 ZG 突破方向"
+    else:
+        tier = "常规结构运行"
+        summary = sigs[0] if sigs else "日线结构运行中"
+        action_bias = "跟踪当前日线笔延伸及后续分型确认"
 
     return {
         "tier": tier,
-        "resonance": resonance,
+        "summary": summary,
         "action_bias": action_bias,
     }

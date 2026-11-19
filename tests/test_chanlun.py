@@ -18,7 +18,7 @@ from chanlun import (
     compute_macd,
     detect_fractals,
     detect_zhongshus,
-    evaluate_mtf_resonance,
+    evaluate_daily_signal_tier,
     process_inclusion,
 )
 from market_snapshot import compute_indicators
@@ -155,22 +155,26 @@ class TestChanlunEngine(unittest.TestCase):
         self.assertIn("atr14", ind)
         self.assertIn("macd_dif", ind)
 
-    def test_mtf_resonance_consensus_warning(self):
-        weekly = {
-            "momentum_assessment": {"active_direction": "down", "is_capital_consensus": True, "is_divergence_candidate": False},
-            "price_vs_zhongshu": "below_zd(-5.0%)",
-            "latest_fractal": {"kind": "top", "confirmed_merged_bars_ago": 3},
-            "signals": ["周线向下离开段·资金方向一致"],
-        }
+    def test_daily_signal_tier_consensus_and_nan_guard(self):
         daily = {
             "momentum_assessment": {"active_direction": "down", "is_capital_consensus": True, "is_divergence_candidate": False},
             "price_vs_zhongshu": "below_zd(-8.0%)",
             "latest_fractal": {"kind": "top", "confirmed_merged_bars_ago": 4},
             "signals": ["日线向下离开段·资金方向一致"],
         }
-        mtf = evaluate_mtf_resonance(weekly, daily)
-        self.assertIn("资金方向一致", mtf["resonance"])
-        self.assertIn("勿逆势", mtf["tier"])
+        res = evaluate_daily_signal_tier(daily)
+        self.assertIn("资金方向一致", res["summary"])
+        self.assertIn("勿逆势", res["tier"])
+
+        # Verify NaN placeholder rows at right edge are dropped cleanly
+        df = build_wave_df([(100.0, 1), (110.0, 10), (102.0, 10)])
+        nan_row = pd.DataFrame(
+            {"Open": [np.nan], "High": [np.nan], "Low": [np.nan], "Close": [np.nan], "Volume": [0.0]},
+            index=[df.index[-1] + pd.Timedelta(days=1)],
+        )
+        df_with_nan = pd.concat([df, nan_row])
+        cl = analyze_chanlun(df_with_nan, timeframe_label="日线")
+        self.assertEqual(cl["raw_bars"], len(df))
 
     def test_right_edge_stroke_extension(self):
         # Prior down 120->105, bounce to 112 (6 bars), minor pause 102->104 (2 bars), then crash to 82 at right edge

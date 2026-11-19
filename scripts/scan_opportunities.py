@@ -73,7 +73,7 @@ def main():
     rows = []
     for bucket in ["us_stocks", "a_shares", "commodities", "crypto"]:
         for sym in wl.get(bucket, []):
-            snap = get_snapshot(sym, period="2y", include_macro=False, include_fundamentals=False)
+            snap = get_snapshot(sym, period="3y", include_macro=False, include_fundamentals=False)
             if "error" in snap:
                 rows.append({"market": bucket, "symbol": sym, "error": snap["error"]})
                 continue

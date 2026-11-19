@@ -151,7 +151,7 @@ def fetch_macro_context() -> dict:
 
 def get_snapshot(
     raw_symbol: str,
-    period: str = "2y",
+    period: str = "3y",
     include_macro: bool = True,
     include_fundamentals: bool = True,
 ) -> dict:
@@ -211,7 +211,7 @@ def get_snapshot(
 def main():
     parser = argparse.ArgumentParser(description="Fetch multi-market snapshot & Chanlun indicators")
     parser.add_argument("symbol", help="Ticker e.g. NVDA, 600519, BTC, GC=F, 黄金, 原油")
-    parser.add_argument("--period", default="2y", help="History period (default: 2y)")
+    parser.add_argument("--period", default="3y", help="History period (default: 3y)")
     parser.add_argument("--no-macro", action="store_true", help="Skip macro context fetch")
     args = parser.parse_args()
     data = get_snapshot(args.symbol, period=args.period, include_macro=not args.no_macro)

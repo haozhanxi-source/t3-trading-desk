@@ -1,0 +1,70 @@
+{
+  "commodities_energy": {
+    "description": "能源化工原油与天然气（海外期货 + 国内原油/燃料油/LPG）",
+    "symbols": ["CL=F", "BZ=F", "NG=F", "HO=F", "RB=F", "SC0", "FU0", "PG0"]
+  },
+  "commodities_precious": {
+    "description": "贵金属（COMEX/NYMEX 金银铂钯 + 沪金/沪银）",
+    "symbols": ["GC=F", "SI=F", "PL=F", "PA=F", "AU0", "AG0"]
+  },
+  "commodities_base": {
+    "description": "有色与基本金属（COMEX 铜/铝 + 沪铜/沪铝/沪锌/沪镍/沪锡/沪铅）",
+    "symbols": ["HG=F", "ALI=F", "CU0", "AL0", "ZN0", "NI0", "SN0", "PB0"]
+  },
+  "commodities_ferrous": {
+    "description": "黑色金属产业链（铁矿/螺纹/热卷/焦炭/焦煤/硅铁/锰硅 + 美热卷）",
+    "symbols": ["I0", "RB0", "HC0", "J0", "JM0", "SF0", "SM0", "HRC=F"]
+  },
+  "commodities_grains_oilseeds": {
+    "description": "谷物与油脂油料（CBOT 玉米/大豆/小麦/豆粕/豆油 + 连盘/郑盘豆粕油脂玉米）",
+    "symbols": ["ZC=F", "ZS=F", "ZW=F", "ZM=F", "ZL=F", "M0", "Y0", "P0", "OI0", "C0"]
+  },
+  "commodities_softs": {
+    "description": "软商品（ICE 咖啡/可可/原糖/美棉/橙汁 + 郑糖/郑棉）",
+    "symbols": ["KC=F", "CC=F", "SB=F", "CT=F", "OJ=F", "SR0", "CF0"]
+  },
+  "commodities_livestock": {
+    "description": "畜牧与生猪（CME 活牛/瘦肉猪/育肥牛 + 大商所生猪）",
+    "symbols": ["LE=F", "HE=F", "GF=F", "LH0"]
+  },
+  "commodities_chem_newenergy": {
+    "description": "化工与新能源金属（PTA/甲醇/PVC/纯碱/玻璃/橡胶/碳酸锂/工业硅/多晶硅）",
+    "symbols": ["TA0", "MA0", "V0", "SA0", "FG0", "RU0", "LC0", "SI0", "PS0"]
+  },
+  "shipping": {
+    "description": "航运期货（集运指数欧线）",
+    "symbols": ["EC0"]
+  },
+  "metals_equities": {
+    "description": "金属矿业与资源股/ETF（美股矿业 ETF 与龙头 + A股有色龙头）",
+    "symbols": ["COPX", "GDX", "XME", "FCX", "SCCO", "AA", "NEM", "MP", "512400.SS", "601899.SS", "603993.SS", "601600.SS"]
+  },
+  "us_sectors": {
+    "description": "美股宽基与主要行业 ETF",
+    "symbols": ["SPY", "QQQ", "IWM", "XLK", "SMH", "XLU", "XLE", "XLI", "XLF", "XLV", "ITA", "XLB", "XLP", "XLY"]
+  },
+  "us_power_grid": {
+    "description": "美股电力、核电与电网基建",
+    "symbols": ["XLU", "CEG", "VST", "GEV", "ETN", "VRT", "PWR"]
+  },
+  "us_semis_ai": {
+    "description": "美股半导体与 AI 算力/存储",
+    "symbols": ["SMH", "NVDA", "AVGO", "TSM", "MU", "MRVL", "AMD"]
+  },
+  "us_megacap_cashflow": {
+    "description": "美股大型科技现金流巨头",
+    "symbols": ["AAPL", "MSFT", "GOOGL", "AMZN", "META"]
+  },
+  "a_shares_themes": {
+    "description": "A股核心指数与主题龙头（沪深300/有色/新能源/机器人/黄金铜/消费）",
+    "symbols": ["510300.SS", "512400.SS", "300750.SZ", "002050.SZ", "601899.SS", "600519.SS"]
+  },
+  "crypto_majors": {
+    "description": "主流加密货币现货与永续资金费率",
+    "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+  },
+  "fx_majors": {
+    "description": "全球主流外汇与美元指数（多空双向：美元指数/欧元/日元/英镑/澳元/人民币/加元）",
+    "symbols": ["DX-Y.NYB", "EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X", "USDCNY=X", "USDCAD=X"]
+  }
+}

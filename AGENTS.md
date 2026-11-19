@@ -1,11 +1,14 @@
 # 中低频多智能体投研工作流（T3 Trading Desk · 缠论版）
 
-本项目使用 **T3 Code 原生多智能体 + 日线级别缠论结构脚本** 复现 TradingAgents 的投研决策流程，专注于**未来 1 个季度至 1 年（1Q ~ 1Y）的战略与结构性波段头寸机会**，覆盖 **美股、A股、加密货币、大宗商品**。
+本项目使用 **T3 Code 原生多智能体 + 日线级别缠论结构脚本** 复现 TradingAgents 的投研决策流程，专注于**未来 1 个季度至 1 年（1Q ~ 1Y）的战略与结构性波段头寸机会**，覆盖 **美股、A股、大宗商品（海外+国内期货 8 大类）、外汇（FX）、加密货币**。
 
 > **核心交易哲学**：
 > 1. **摒弃传统均值回归指标**：不使用 RSI 超买/超卖、布林带或均线回踩作为买卖依据。极端单边涨跌往往代表**资金方向的高度一致（未背驰的离开段）**，而非恐慌抄底或摸顶信号。
 > 2. **严格锚定日线级别缠论结构**：周线级别 K 线周期过大、过于滞后，仅作心理背景而不作为交易执行与信号触发依据。一切买卖点与风控严格建立在**3 年日线 K 线样本上的缠论几何结构（日线分型、严格笔、单/双中枢演化、日线一/二/三类买卖点）+ 动力学力度对比（MACD 柱面积/峰值/DIF 与斜率效率）**之上。
-> 3. **1Q~1Y 大逻辑驱动**：真正具备季度至年度级别空间的大机会，源于**国际地缘局势、宏观利率与流动性周期、以及技术发展与产业供需变革**的共振，最终落脚到**日线级别缠论买卖点**的清晰建仓与止损执行。
+> 3. **1Q~1Y 大逻辑驱动**：真正具备季度至年度级别空间的大机会，源于**国际地缘与资源国政策叙事、中美宏观双核与流动性周期、商品未来供需平衡预期（投产与需求）、以及技术发展与产业变革**的共振，最终落脚到**日线级别缠论买卖点**的清晰建仓与止损执行。
+> 4. **跨资产多空非对称原则**：
+>    - **股票（美股 / A股）**：长期具备盈利增长与抗通胀属性，中长线**以做多（日线一买/二买/三买 + 多头资金一致顺势）为主**；日线卖点主要用于止盈平仓、规避接飞刀或阶段性对冲。
+>    - **大宗商品、外汇（FX）、加密合约**：属于**多空双向完全对称**的保证金工具，**做多（日线一/二/三买、多头资金一致）与做空（日线一/二/三卖、空头资金一致）及同板块多空配对（Pair Trade）同等重要**。
 >
 > **免责声明**：本项目仅用于个人投研、数据整理与策略推演，不构成投资建议，不连接实盘自动下单。
 
@@ -20,36 +23,38 @@
   - A股：`600519` 或 `600519.SS` / `300750.SZ`
   - 海外大宗商品（yfinance）：覆盖 **能源、贵金属、基本金属、黑色（美热卷）、谷物油脂、软商品、畜牧**，如 `GC=F`（`黄金`）、`SI=F`（`白银`）、`CL=F`（`原油`）、`HG=F`（`铜`）、`NG=F`（`天然气`）、`KC=F`（`咖啡`）、`CC=F`（`可可`）、`SB=F`（`原糖`）、`CT=F`（`美棉`）、`LE=F`（`活牛`）、`HE=F`（`瘦肉猪`）、`PL=F`（`铂金`）、`PA=F`（`钯金`）、`ALI=F`（`铝`）
   - 国内期货主力连续（akshare / 新浪财经）：严格匹配 `^[A-Z]{1,2}0$`、中文别名或 `CN:` 前缀（避免与美股英文代码如 `PTA` 冲突），覆盖 **黑色、能化、有色、贵金属、农产品、生猪、新能源金属、航运** 8 大类，如 `I0`（`铁矿`/`铁矿石`）、`RB0`（`螺纹`/`螺纹钢`）、`HC0`（`热卷`）、`J0`（`焦炭`）、`JM0`（`焦煤`）、`LC0`（`碳酸锂`）、`SI0`（`工业硅`）、`PS0`（`多晶硅`）、`LH0`（`生猪`）、`M0`（`豆粕`）、`Y0`（`豆油`）、`P0`（`棕榈油`）、`OI0`（`菜油`）、`SR0`（`白糖`）、`CF0`（`棉花`）、`TA0`（`PTA期货`/`CN:PTA`）、`MA0`（`甲醇`）、`V0`（`PVC期货`/`CN:PVC`）、`SA0`（`纯碱`）、`FG0`（`玻璃`）、`RU0`（`橡胶`）、`CU0`（`沪铜`）、`AL0`（`沪铝`）、`ZN0`（`沪锌`）、`NI0`（`沪镍`）、`SN0`（`沪锡`）、`AU0`（`沪金`）、`AG0`（`沪银`）、`EC0`（`集运欧线`）、`SC0`（`上海原油`）
+  - 外汇与宏观汇率（yfinance）：支持 `EURUSD=X`（`欧元美元`）、`USDJPY=X`（`美元日元`）、`GBPUSD=X`（`英镑美元`）、`AUDUSD=X`（`澳元美元`）、`USDCNY=X`（`美元人民币`）、`USDCAD=X`（`美元加元`）、`DX-Y.NYB`（`DXY`/`美元指数`）
   - 加密货币：`BTC`、`ETH`、`SOL`（自动附带 OKX / Bybit / Binance 现货价与永续年化资金费率）
 - 多市场缠论机会扫描：`scripts/scan_opportunities.py`（默认读取 `watchlist.json`；支持 `--universe <池名...>` 读取 `universes.json`、支持 `--symbols <标的...>`、`--list-universes`、`--sort tier`，输出日线结构类型、中枢数量与最新中枢区间 `[ZD, ZG]`、最新分型、力度比与买卖点/资金一致性信号；近 3 个中枢完整序列由 `market_snapshot.py` 输出）
-- 主题与板块标的池：`universes.json`（涵盖大宗商品 8 大类、航运、金属矿业股、美股行业/电力电网/AI半导体/现金流巨头、A股主题、主流加密）
+- 主题与板块标的池：`universes.json`（涵盖大宗商品 8 大类、航运、金属矿业股、美股行业/电力电网/AI半导体/现金流巨头、A股主题、主流外汇、主流加密共 17 个标的池）
 
 ---
 
 ## 当用户要求“扫描今天的机会 / 寻找中长线交易头寸”时：
 
-每日机会扫描不只局限于自选列表，应按 **“第一层：7 维驱动框架主动寻猎（自上而下 + 自下而上） + 第二层：日线缠论结构批量验证”** 双线推进：
+每日机会扫描不只局限于自选列表，应按 **“第一层：7 维驱动框架主动寻猎（自上而下 + 自下而上，兼顾多头与商品/外汇空头大逻辑） + 第二层：日线缠论结构批量过筛（多头买点 + 商品/外汇空头卖点 + 同板块多空配对）”** 双线推进：
 
 1. **自选与主题池日线缠论扫描**：
    - 运行 `.venv/bin/python scripts/scan_opportunities.py` 扫描 `watchlist.json`；
-   - 第一层定出潜在板块后，使用 `.venv/bin/python scripts/scan_opportunities.py --universe <池名1> [<池名2> ...] --sort tier` 或 `--symbols <标的1> <标的2> ...` 批量跑日线缠论结构，按**日线买卖点信号 / 背驰观察 / 资金方向一致推进段 / 中枢震荡**分层梳理。
+   - 第一层定出潜在板块后，使用 `.venv/bin/python scripts/scan_opportunities.py --universe <池名1> [<池名2> ...] --sort tier` 或 `--symbols <标的1> <标的2> ...` 批量跑日线缠论结构，按**日线买卖点信号（一二三买 / 一二三卖） / 背驰观察 / 资金方向一致推进段（多头一致 / 空头一致） / 中枢震荡**分层梳理。
    - `universes.json` 可用池名清单（`--list-universes` 可实时查看）：
-     - 商品与航运：`commodities_energy`、`commodities_precious`、`commodities_base`、`commodities_ferrous`、`commodities_grains_oilseeds`、`commodities_softs`、`commodities_livestock`、`commodities_chem_newenergy`、`shipping`
-     - 股票与加密：`metals_equities`、`us_sectors`、`us_power_grid`、`us_semis_ai`、`us_megacap_cashflow`、`a_shares_themes`、`crypto_majors`
+     - 商品与航运（多空双向）：`commodities_energy`、`commodities_precious`、`commodities_base`、`commodities_ferrous`、`commodities_grains_oilseeds`、`commodities_softs`、`commodities_livestock`、`commodities_chem_newenergy`、`shipping`
+     - 外汇与加密（多空双向）：`fx_majors`、`crypto_majors`
+     - 股票与行业 ETF（做多为主，卖点作止盈/规避）：`metals_equities`、`us_sectors`、`us_power_grid`、`us_semis_ai`、`us_megacap_cashflow`、`a_shares_themes`
 2. **7 维驱动框架主动寻猎（自上而下 + 自下而上，突破自选列表限制，着眼未来 1 个季度 ~ 1 年）**：
-   结合当日实时联网检索，从以下 7 个维度思考并寻找潜在大周期头寸方向与代表板块：
-   1) **宏观双核**：美国利率路径/美债长端/美元/全球流动性 + 中国财政脉冲/地产政策/社融信用周期（单列中国，直接决定黑色系、化工品与 A 股主线）——*典型板块*：`us_sectors`、`commodities_precious`、`commodities_ferrous`、`commodities_chem_newenergy`、`a_shares_themes`
-   2) **地缘与贸易政策**：地缘冲突升级、能源与航运咽喉（如霍尔木兹/红海）、关税摩擦、科技出口管制与关键矿产资源安全——*典型板块*：`commodities_energy`、`shipping`、`metals_equities`、`us_sectors`（ITA/XLE）
+   结合当日实时联网检索，从以下 7 个维度思考并寻找潜在大周期**做多或做空（商品/外汇）**头寸方向与代表板块：
+   1) **宏观双核**：美国利率路径/美债长端/美元周期/全球流动性 + 中国财政脉冲/地产政策/社融信用周期（单列中国，直接决定黑色系、化工品、人民币汇率与 A 股主线）——*典型板块*：`fx_majors`、`us_sectors`、`commodities_precious`、`commodities_ferrous`、`commodities_chem_newenergy`、`a_shares_themes`
+   2) **地缘、资源国政策叙事与贸易壁垒**：地缘冲突升级、能源与航运咽喉（如霍尔木兹/红海）、**资源国国家政策叙事（主产国出口禁令/配额、资源民族主义、矿业税费调整、国家战略收储，如印尼镍/铝土矿、智利/刚果金铜钴、南美锂、OPEC+ 减增产策略）**、关税壁垒与科技出口管制——*典型板块*：`commodities_energy`、`commodities_base`、`shipping`、`metals_equities`、`commodities_ferrous`
    3) **技术与产业迭代**：AI 算力代际切换与存储芯片周期、电力与电网设备瓶颈、人形机器人与自动驾驶商业化、新能源技术迭代——*典型板块*：`us_semis_ai`、`us_power_grid`、`us_megacap_cashflow`、`a_shares_themes`
-   4) **商品供需与库存周期 + 天气气候**：长期产能出清/资本开支不足/低库存补库、猪周期、航运周期；厄尔尼诺/拉尼娜、产区干旱/寒潮/飓风冲击——*典型板块*：`commodities_base`、`commodities_grains_oilseeds`、`commodities_softs`、`commodities_livestock`、`commodities_energy`、`shipping`
-   5) **产业政策与监管**：财政补贴与以旧换新、国内限产/反内卷与产能整合、医药集采、数字资产法案与现货 ETF 审批——*典型板块*：`commodities_ferrous`、`commodities_chem_newenergy`、`a_shares_themes`、`crypto_majors`
-   6) **资金流与市场结构**：ETF 申赎资金流向、CFTC 持仓极端拥挤与空头回补、加密永续合约资金费率极值、核心指数纳入/剔除、大额回购与限售股解禁——*典型板块*：`crypto_majors`、`us_sectors`、`commodities_precious`、`metals_equities`
+   4) **商品供需平衡预期（投产 vs 需求）、库存周期与天气气候**：**当前供需平衡表与未来 1Q~1Y 供需平衡预期（新产能投产/爬坡进度 vs 下游需求增量或坍塌预期，决定商品中长线多空主方向）**；长期产能出清/资本开支不足/库存去化或累库周期（猪周期、航运周期）；厄尔尼诺/拉尼娜、产区干旱/寒潮/飓风冲击——*典型板块*：`commodities_base`、`commodities_grains_oilseeds`、`commodities_softs`、`commodities_livestock`、`commodities_energy`、`commodities_chem_newenergy`
+   5) **产业政策与监管**：财政补贴与以旧换新、国内限产/反内卷与产能整合、生物柴油掺混政策、医药集采、数字资产法案与现货 ETF 审批——*典型板块*：`commodities_ferrous`、`commodities_chem_newenergy`、`commodities_grains_oilseeds`、`a_shares_themes`、`crypto_majors`
+   6) **资金流与市场结构**：ETF 申赎资金流向、CFTC 持仓极端拥挤与多空回补、套息交易（Carry Trade）平仓、加密永续合约资金费率极值、核心指数纳入/剔除、大额回购与解禁——*典型板块*：`fx_majors`、`crypto_majors`、`us_sectors`、`commodities_precious`、`metals_equities`
    7) **公司特质与突发供给冲击**：季度业绩拐点、重大并购/资产分拆、大型矿难/工人罢工/港口封锁、动植物疫病、主产国突发出口禁令——*典型板块*：`metals_equities`、`us_power_grid`、`commodities_base`、`commodities_softs`、`commodities_livestock`
    - **筛选硬性规则**：
      - **(a) 多维共振门槛**：每个产出板块必须明确标注 **“主驱动维度 + 次驱动维度”**，**至少 2 个维度形成共振**才允许进入 1Q~1Y 重点候选池；
-     - **(b) 严禁凭超跌抄底**：**“长期下跌后出清”只作为第一层的行业/周期线索**；针对这类左侧底部反转候选，第二层入场触发必须是**日线底背驰一买或回踩二买缠论结构**（对于已向上突破中枢的右侧趋势标的，则正常适用**日线三买或顺势推进**规则），严禁以“超跌/超卖”为由在空头资金一致下杀段提前接飞刀（绝不引入 RSI 等均值回归指标）。
-3. **日线缠论结构批量与单标的双重验证**：对第一层筛选出的共振板块，先用 `.venv/bin/python scripts/scan_opportunities.py --universe <池名> --sort tier`（或 `--symbols ...`）批量扫描日线缠论结构；再对重点扩展标的现场调用 `.venv/bin/python scripts/market_snapshot.py <候选标的>` 检验其**日线多中枢演化与最新日线买卖点位置**（清晰分辨“日线一/二/三买启动”与“空头资金方向一致推进段严禁逆势”）。
-4. **聚焦推荐**：筛选出 **2~4 个最具 1Q~1Y 头寸潜力的重点候选**（可涵盖自选内与新发掘标的，写明主/次驱动维度与日线缠论信号层），询问用户对哪一个展开下方的 **第 1~4 步深度投研**。
+     - **(b) 严禁凭超跌抄底 / 严禁末端盲目追空**：**“长期下跌后出清”只作为第一层线索**，针对左侧底部反转候选，第二层做多触发必须是**日线底背驰一买或回踩二买**（而已突破中枢的右侧趋势标的适用**日线三买或顺势推进**）；同理，**商品与外汇做空优先选择“刚跌破日线中枢下沿 `ZD` 反抽不过的日线三卖”或“反弹不过前高的日线二卖”**，不在已远离中枢 `-30% ~ -40%` 处盲目追空（绝不引入 RSI 等均值回归指标）。
+3. **日线缠论结构批量过筛（分清多头、空头与配对）**：对第一层筛选出的共振板块，先用 `.venv/bin/python scripts/scan_opportunities.py --universe <池名> --sort tier`（或 `--symbols ...`）批量扫描日线缠论结构，按 **【做多通过（股票+强势商品/外汇）】**、**【做空通过（过剩/破位商品+弱势非美货币/加密）】** 与 **【同板块多空配对（Pair Trade）】** 清晰归类；禁止输出晦涩的内部变量名或超宽混乱表格。
+4. **聚焦推荐**：筛选出 **3~6 个最具 1Q~1Y 头寸潜力的重点候选**（包含做多候选、商品/外汇做空候选及跨品种多空配对，写明主/次驱动维度、日线买卖点类型与关键中枢 `[ZD, ZG]`），询问用户对哪一个展开下方的 **第 1~4 步深度投研**。
 
 ---
 

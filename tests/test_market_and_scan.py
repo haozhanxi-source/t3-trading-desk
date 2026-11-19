@@ -88,6 +88,11 @@ class TestNormalizeSymbol(unittest.TestCase):
         self.assertEqual(normalize_symbol("咖啡"), ("KC=F", "commodity"))
         self.assertEqual(normalize_symbol("铝"), ("ALI=F", "commodity"))
         self.assertEqual(normalize_symbol("^VIX"), ("^VIX", "macro"))
+        self.assertEqual(normalize_symbol("DXY"), ("DX-Y.NYB", "macro"))
+        self.assertEqual(normalize_symbol("美元指数"), ("DX-Y.NYB", "macro"))
+        self.assertEqual(normalize_symbol("EURUSD=X"), ("EURUSD=X", "fx"))
+        self.assertEqual(normalize_symbol("美元日元"), ("USDJPY=X", "fx"))
+        self.assertEqual(normalize_symbol("USDCNY"), ("USDCNY=X", "fx"))
 
 
 class TestCnFutureFrameAndPeriod(unittest.TestCase):
@@ -195,6 +200,7 @@ class TestScanOpportunities(unittest.TestCase):
         self.assertIn("commodities_chem_newenergy", universes)
         self.assertIn("shipping", universes)
         self.assertIn("us_power_grid", universes)
+        self.assertIn("fx_majors", universes)
         for name, meta in universes.items():
             self.assertIn("description", meta, msg=name)
             self.assertIn("symbols", meta, msg=name)

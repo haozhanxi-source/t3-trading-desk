@@ -86,6 +86,16 @@ CN_PREFIX_ALIASES = {
     "PVC": "V0",
 }
 
+FX_ALIASES = {
+    "DXY": "DX-Y.NYB", "美元指数": "DX-Y.NYB",
+    "EURUSD": "EURUSD=X", "欧元美元": "EURUSD=X", "欧元": "EURUSD=X",
+    "USDJPY": "USDJPY=X", "美元日元": "USDJPY=X", "日元": "USDJPY=X",
+    "GBPUSD": "GBPUSD=X", "英镑美元": "GBPUSD=X", "英镑": "GBPUSD=X",
+    "AUDUSD": "AUDUSD=X", "澳元美元": "AUDUSD=X", "澳元": "AUDUSD=X",
+    "USDCNY": "USDCNY=X", "美元人民币": "USDCNY=X", "人民币": "USDCNY=X",
+    "USDCAD": "USDCAD=X", "美元加元": "USDCAD=X", "加元": "USDCAD=X",
+}
+
 
 def normalize_symbol(raw: str):
     s = raw.strip()
@@ -103,6 +113,12 @@ def normalize_symbol(raw: str):
             return CN_PREFIX_ALIASES[cn_upper], "cn_future"
         if CN_FUTURE_RE.fullmatch(cn_upper):
             return cn_upper, "cn_future"
+    if s in FX_ALIASES:
+        target = FX_ALIASES[s]
+        return target, ("macro" if target == "DX-Y.NYB" else "fx")
+    if upper in FX_ALIASES:
+        target = FX_ALIASES[upper]
+        return target, ("macro" if target == "DX-Y.NYB" else "fx")
     if s in COMMODITY_ALIASES:
         target = COMMODITY_ALIASES[s]
         asset_class = "cn_future" if CN_FUTURE_RE.fullmatch(target) else "commodity"
@@ -113,6 +129,8 @@ def normalize_symbol(raw: str):
         return target, asset_class
     if upper.endswith("=F"):
         return upper, "commodity"
+    if upper.endswith("=X"):
+        return upper, "fx"
     if upper.startswith("^") or upper == "DX-Y.NYB":
         return upper, "macro"
     # A-share 6-digit code
@@ -402,7 +420,7 @@ def get_snapshot(
         daily_cl = analyze_chanlun(df, timeframe_label="日线")
         signal_summary = evaluate_daily_signal_tier(daily_cl)
 
-        if include_fundamentals and asset_class != "cn_future" and ticker is not None:
+        if include_fundamentals and asset_class not in ("cn_future", "fx") and ticker is not None:
             try:
                 info = ticker.info or {}
                 fields = [

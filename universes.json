@@ -62,5 +62,9 @@
   "crypto_majors": {
     "description": "主流加密货币现货与永续资金费率",
     "symbols": ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+  },
+  "fx_majors": {
+    "description": "全球主流外汇与美元指数（多空双向：美元指数/欧元/日元/英镑/澳元/人民币/加元）",
+    "symbols": ["DX-Y.NYB", "EURUSD=X", "USDJPY=X", "GBPUSD=X", "AUDUSD=X", "USDCNY=X", "USDCAD=X"]
   }
 }

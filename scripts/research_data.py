@@ -52,6 +52,7 @@ except ImportError:  # pragma: no cover
 
 sys.path.insert(0, os.path.dirname(__file__))
 from market_snapshot import get_snapshot, normalize_symbol  # noqa: E402
+import research_extensions as rext  # noqa: E402
 
 HTTP_TIMEOUT = 15
 SEC_HEADERS = {
@@ -104,6 +105,7 @@ CN_FUTURE_META: dict[str, tuple[str, str, str]] = {
 
 INVENTORY_EM_BLACKLIST = {"原油", "燃油", "低硫燃料油", "纯碱"}
 TERM_STRUCTURE_SKIP = {"PTA", "原油"}
+SPOT_BASIS_SKIP = {"SC", "EC"}
 
 CFTC_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
     "HG=F": {"code": "085692", "patterns": ["COPPER- #1 - COMMODITY EXCHANGE", "COPPER- #1"]},
@@ -219,28 +221,12 @@ def _to_int(raw: Any) -> int | None:
     return int(round(f))
 
 
-_STDOUT_FILTER_LOCK = threading.Lock()
-_SILENCED_THREAD_IDS: set[int] = set()
-_ORIGINAL_STDOUT: Any = None
-
-
-class _ThreadFilteredStdout:
-    """Drop stdout writes ONLY from explicitly silenced worker threads; never block main thread stdout."""
-
-    def __init__(self, target):
-        self._target = target
-
-    def write(self, data: str) -> int:
-        if threading.get_ident() in _SILENCED_THREAD_IDS:
-            return len(data)
-        return self._target.write(data)
-
-    def flush(self) -> None:
-        if threading.get_ident() not in _SILENCED_THREAD_IDS:
-            self._target.flush()
-
-    def __getattr__(self, name: str):
-        return getattr(self._target, name)
+# Share a single process-wide stdout filter registry & timeout runner with research_extensions
+# so overlapping worker threads across both modules never double-wrap or leak sys.stdout.
+_STDOUT_FILTER_LOCK = rext._STDOUT_FILTER_LOCK
+_SILENCED_THREAD_IDS = rext._SILENCED_THREAD_IDS
+_ThreadFilteredStdout = rext._ThreadFilteredStdout
+_run_with_timeout = rext._run_with_timeout
 
 
 def _sanitize_for_json(obj: Any) -> Any:
@@ -257,54 +243,6 @@ def _sanitize_for_json(obj: Any) -> Any:
     if isinstance(obj, (np.bool_, bool)):
         return bool(obj)
     return obj
-
-
-def _install_stdout_filter_if_needed() -> None:
-    global _ORIGINAL_STDOUT
-    if not isinstance(sys.stdout, _ThreadFilteredStdout):
-        _ORIGINAL_STDOUT = sys.stdout
-        sys.stdout = _ThreadFilteredStdout(_ORIGINAL_STDOUT)
-
-
-def _restore_stdout_if_idle() -> None:
-    global _ORIGINAL_STDOUT
-    if not _SILENCED_THREAD_IDS and isinstance(sys.stdout, _ThreadFilteredStdout) and _ORIGINAL_STDOUT is not None:
-        sys.stdout = _ORIGINAL_STDOUT
-        _ORIGINAL_STDOUT = None
-
-
-def _run_with_timeout(fn, timeout_s: float = 15.0, silence_stdout: bool = False):
-    """Run fn in a daemon thread with bounded wall-clock wait.
-
-    Daemon threads never block Python interpreter exit even if an underlying third-party
-    HTTP call ignores socket timeouts, and thread-local stdout filtering restores sys.stdout when idle.
-    """
-    result_box: dict[str, Any] = {}
-
-    def _worker() -> None:
-        tid = threading.get_ident()
-        if silence_stdout:
-            with _STDOUT_FILTER_LOCK:
-                _install_stdout_filter_if_needed()
-                _SILENCED_THREAD_IDS.add(tid)
-        try:
-            result_box["value"] = fn()
-        except Exception as exc:
-            result_box["error"] = exc
-        finally:
-            if silence_stdout:
-                with _STDOUT_FILTER_LOCK:
-                    _SILENCED_THREAD_IDS.discard(tid)
-                    _restore_stdout_if_idle()
-
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
-    t.join(timeout=timeout_s)
-    if t.is_alive():
-        raise TimeoutError(f"Operation timed out after {timeout_s}s")
-    if "error" in result_box:
-        raise result_box["error"]
-    return result_box.get("value")
 
 
 def _run_source(source_name: str, fn, sources_status: dict[str, Any]) -> dict[str, Any]:
@@ -831,6 +769,7 @@ def summarize_term_structure(raw_data: pd.DataFrame | list[dict[str, Any]]) -> d
         raise ValueError("No valid dated futures contracts found for term structure")
 
     contracts.sort(key=lambda c: c["_sort_month"])
+    sort_months = [int(c["_sort_month"]) for c in contracts]
     for c in contracts:
         c.pop("_sort_month", None)
 
@@ -843,6 +782,20 @@ def summarize_term_structure(raw_data: pd.DataFrame | list[dict[str, Any]]) -> d
         if len(contracts) >= 2 and front["price"] > 0
         else None
     )
+
+    ann_roll_near: float | None = None
+    ann_roll_curve: float | None = None
+    if len(contracts) >= 2:
+        second = contracts[1]
+        y1, m1 = divmod(sort_months[0], 100)
+        y2, m2 = divmod(sort_months[1], 100)
+        yb, mb = divmod(sort_months[-1], 100)
+        months_near = (y2 - y1) * 12 + (m2 - m1)
+        months_far = (yb - y1) * 12 + (mb - m1)
+        if months_near > 0 and second["price"] > 0:
+            ann_roll_near = round(((front["price"] / second["price"]) - 1.0) * (12.0 / months_near) * 100.0, 3)
+        if months_far > 0 and back["price"] > 0:
+            ann_roll_curve = round(((front["price"] / back["price"]) - 1.0) * (12.0 / months_far) * 100.0, 3)
 
     if len(contracts) < 2:
         structure = "insufficient_contracts"
@@ -864,76 +817,72 @@ def summarize_term_structure(raw_data: pd.DataFrame | list[dict[str, Any]]) -> d
         "near_minus_far_spread": spread_near_minus_far,
         "far_minus_near_spread": spread_far_minus_near,
         "far_vs_near_pct": spread_pct,
+        "annualized_roll_yield_near_pct": ann_roll_near,
+        "annualized_roll_yield_curve_pct": ann_roll_curve,
         "contracts": contracts,
     }
 
 
-def parse_farside_btc_etf_html(html_text: str, last_n: int = 5) -> dict[str, Any]:
-    """Parse Farside Investors BTC Spot ETF daily flow HTML table."""
-    if not html_text or not html_text.strip():
-        raise ValueError("Empty Farside HTML")
-    tables = re.findall(r"<table.*?>.*?</table>", html_text, re.S | re.I)
-    target_table = None
-    for tb in tables:
-        if "Total" in tb and ("IBIT" in tb or "FBTC" in tb or "GBTC" in tb):
-            target_table = tb
-            break
-    if target_table is None:
-        raise ValueError("BTC ETF flow table not found in Farside HTML")
+def _format_btc_etf_compat(strict: dict[str, Any], last_n: int = 5) -> dict[str, Any]:
+    """Map strict ``rext.parse_farside_etf_html(..., 'BTC')`` output into compatible BTC ETF schema."""
+    raw_recent = strict.get("recent_daily") or []
+    complete_recent = [
+        r for r in raw_recent if r.get("total_usd_m") is not None and not r.get("is_partial_report")
+    ]
+    selected = complete_recent[-last_n:] if last_n > 0 else []
+    recent_daily_flows = [
+        {
+            "date": r["date"],
+            "total_net_flow_musd": r["total_usd_m"],
+            "etf_flows_musd": r.get("etf_flows_usd_m") or {},
+        }
+        for r in selected
+    ]
+    if last_n == 5:
+        recent_sum = strict.get("rolling_5d_usd_m")
+    elif selected:
+        # Require contiguous complete days in raw_recent ending at the last complete row
+        last_idx = max(
+            (i for i, r in enumerate(raw_recent) if r.get("total_usd_m") is not None and not r.get("is_partial_report")),
+            default=-1,
+        )
+        if last_idx >= last_n - 1:
+            win = raw_recent[last_idx - last_n + 1 : last_idx + 1]
+            if all(r.get("total_usd_m") is not None and not r.get("is_partial_report") for r in win):
+                recent_sum = round(sum(float(r["total_usd_m"]) for r in win), 2)
+            else:
+                recent_sum = None
+        else:
+            recent_sum = None
+    else:
+        recent_sum = None
 
-    raw_rows = re.findall(r"<tr.*?>(.*?)</tr>", target_table, re.S | re.I)
-    parsed_rows: list[list[str]] = []
-    for tr in raw_rows:
-        cells = re.findall(r"<t[hd].*?>(.*?)</t[hd]>", tr, re.S | re.I)
-        cleaned = [
-            html_lib.unescape(re.sub(r"<[^>]+>", "", c)).strip()
-            for c in cells
-        ]
-        if cleaned:
-            parsed_rows.append(cleaned)
-
-    headers: list[str] = []
-    date_rows: list[dict[str, Any]] = []
-    summary_total: dict[str, Any] | None = None
-
-    date_re = re.compile(r"^\d{1,2}\s+[A-Za-z]{3}\s+\d{4}$|^\d{4}-\d{2}-\d{2}$")
-    for r in parsed_rows:
-        first = r[0]
-        if not headers and ("IBIT" in r or "FBTC" in r):
-            headers = [h if h else (f"col_{i}" if i > 0 else "Date") for i, h in enumerate(r)]
-            if headers and headers[-1].startswith("col_"):
-                headers[-1] = "Total"
-            continue
-        if date_re.match(first):
-            total_val = _to_float(r[-1])
-            etf_flows: dict[str, float | None] = {}
-            if headers and len(headers) == len(r):
-                for h_name, cell_val in zip(headers[1:-1], r[1:-1]):
-                    etf_flows[h_name] = _to_float(cell_val)
-            date_rows.append(
-                {
-                    "date": first,
-                    "total_net_flow_musd": total_val,
-                    "etf_flows_musd": etf_flows,
-                }
-            )
-        elif first.lower() == "total":
-            summary_total = {"cumulative_net_flow_musd": _to_float(r[-1])}
-
-    if not date_rows:
-        raise ValueError("No daily BTC ETF flow rows parsed from Farside HTML")
-
-    recent = date_rows[-last_n:]
-    non_null_flows = [r["total_net_flow_musd"] for r in recent if r["total_net_flow_musd"] is not None]
-    recent_sum = round(sum(non_null_flows), 2) if non_null_flows else None
-    return {
+    cum_val = strict.get("cumulative_total_usd_m")
+    out: dict[str, Any] = {
         "unit": "USD Millions",
-        "recent_days_count": len(recent),
-        "recent_valid_days_count": len(non_null_flows),
+        "latest_date": strict.get("latest_date"),
+        "latest_total_usd_m": strict.get("latest_total_usd_m"),
+        "latest_partial_report": strict.get("latest_partial_report"),
+        "complete_days_available": strict.get("complete_days_available"),
+        "rolling_5d_usd_m": strict.get("rolling_5d_usd_m"),
+        "rolling_20d_usd_m": strict.get("rolling_20d_usd_m"),
+        "recent_days_count": len(recent_daily_flows),
+        "recent_valid_days_count": len(recent_daily_flows),
         "recent_total_net_flow_musd": recent_sum,
-        "recent_daily_flows": recent,
-        "cumulative_summary": summary_total,
+        "recent_daily_flows": recent_daily_flows,
+        "cumulative_summary": {"cumulative_net_flow_musd": cum_val} if cum_val is not None else None,
     }
+    if strict.get("coverage_note"):
+        out["coverage_note"] = strict["coverage_note"]
+    if strict.get("source_url"):
+        out["source_url"] = strict["source_url"]
+    return out
+
+
+def parse_farside_btc_etf_html(html_text: str, last_n: int = 5) -> dict[str, Any]:
+    """Parse Farside Investors BTC Spot ETF daily flow HTML table via strict parser."""
+    strict = rext.parse_farside_etf_html(html_text, asset="BTC", recent_limit=max(10, int(last_n) + 5))
+    return _format_btc_etf_compat(strict, last_n=last_n)
 
 
 # ---------------------------------------------------------------------------
@@ -1097,8 +1046,37 @@ def fetch_yfinance_consensus(symbol: str) -> dict[str, Any]:
         )
     )
 
+    def _fetch_val_pos() -> dict[str, Any]:
+        info_data: dict[str, Any] | None = None
+        cal_data: Any = None
+        info_err: str | None = None
+        cal_err: str | None = None
+        try:
+            raw_info = tk.info
+            info_data = raw_info if isinstance(raw_info, dict) else None
+        except Exception as exc:
+            info_err = str(exc)
+        try:
+            cal_data = tk.calendar
+        except Exception as exc:
+            cal_err = str(exc)
+        if info_data is None and cal_data is None and (info_err or cal_err):
+            return {"error": info_err or cal_err}
+        extracted = rext.extract_us_valuation_positioning(info_data, cal_data)
+        has_any_metric = any(v is not None for v in extracted.values())
+        if not has_any_metric and (info_err or cal_err):
+            return {"error": info_err or cal_err}
+        if info_err:
+            extracted["info_error"] = info_err
+        if cal_err:
+            extracted["calendar_error"] = cal_err
+        return extracted
+
+    val_pos = _safe_attr(_fetch_val_pos)
+
     sub_sections = {
         "analyst_price_targets": price_targets,
+        "valuation_and_positioning": val_pos,
         "earnings_estimate": earnings_est,
         "revenue_estimate": revenue_est,
         "eps_trend": eps_trend,
@@ -1112,12 +1090,20 @@ def fetch_yfinance_consensus(symbol: str) -> dict[str, Any]:
         if isinstance(v, dict):
             if "error" in v or not v:
                 return False
-            return any(_section_has_data(child) for child in v.values())
+            return any(
+                _section_has_data(child)
+                for k, child in v.items()
+                if not str(k).endswith("_error")
+            )
         if isinstance(v, list):
             return any(_section_has_data(child) for child in v)
         return True
 
-    err_count = sum(1 for v in sub_sections.values() if isinstance(v, dict) and "error" in v)
+    err_count = sum(
+        1
+        for v in sub_sections.values()
+        if isinstance(v, dict) and ("error" in v or "info_error" in v or "calendar_error" in v)
+    )
     valid_count = sum(1 for v in sub_sections.values() if _section_has_data(v))
     if valid_count == 0:
         status = "error"
@@ -1247,6 +1233,8 @@ def _call_spot_price_with_timeout(date_str: str, spot_code: str, timeout_s: floa
 def fetch_cn_future_spot_basis(spot_code: str) -> dict[str, Any]:
     if ak is None:
         raise RuntimeError("akshare is not installed")
+    if (spot_code or "").strip().upper() in SPOT_BASIS_SKIP:
+        return {"status": "skipped", "reason": f"Symbol not covered by 100ppi spot-basis table: {spot_code}"}
     today = datetime.now().date()
     bdays = pd.bdate_range(end=today, periods=5)[::-1]
     last_err: Exception | None = None
@@ -1282,10 +1270,15 @@ def fetch_cn_future_spot_basis(spot_code: str) -> dict[str, Any]:
     raise ValueError(f"No spot/basis data found for {spot_code} in last 5 business days")
 
 
-def fetch_cn_future_term_structure(cn_name: str) -> dict[str, Any]:
+def fetch_cn_future_term_structure(cn_name: str, spot_code: str | None = None) -> dict[str, Any]:
     if ak is None:
         raise RuntimeError("akshare is not installed")
     if cn_name in TERM_STRUCTURE_SKIP:
+        pref = (spot_code or "").strip().upper()
+        if pref in rext.CN_DAILY_TERM_STRUCTURE_DEFAULTS:
+            summary = rext.fetch_cn_daily_term_structure(pref)
+            summary["symbol_cn"] = cn_name
+            return summary
         return {"status": "skipped", "reason": f"Skipped timeout-prone realtime symbol: {cn_name}"}
     df = _run_with_timeout(lambda: ak.futures_zh_realtime(symbol=cn_name), timeout_s=HTTP_TIMEOUT)
     if df is None or df.empty:
@@ -1597,20 +1590,8 @@ def fetch_crypto_exchange_oi(exchange_id: str, base: str) -> dict[str, Any]:
 
 
 def fetch_farside_btc_etf_flows() -> dict[str, Any]:
-    url = "https://farside.co.uk/btc/"
-    html_text = None
-    if curl_requests is not None:
-        try:
-            r = curl_requests.get(url, impersonate="chrome", timeout=HTTP_TIMEOUT)
-            if r.status_code == 200 and "<table" in r.text:
-                html_text = r.text
-        except Exception:
-            html_text = None
-    if html_text is None:
-        r = requests.get(url, headers=DEFAULT_BROWSER_HEADERS, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        html_text = r.text
-    return parse_farside_btc_etf_html(html_text, last_n=5)
+    strict = rext.fetch_farside_etf_flows("BTC")
+    return _format_btc_etf_compat(strict, last_n=5)
 
 
 def fetch_fred_macro() -> dict[str, Any]:
@@ -1710,6 +1691,18 @@ def collect_research_data(
     if snapshot.get("asset_class"):
         asset_class = snapshot["asset_class"]
 
+    snap_known_prices: dict[str, float] = {}
+    snap_known_dates: dict[str, str] = {}
+    snap_tech = snapshot.get("technicals") if isinstance(snapshot, dict) else None
+    if isinstance(snap_tech, dict):
+        snap_close = _to_float(snap_tech.get("last_close"))
+        snap_bar_date = snap_tech.get("as_of_bar") or snapshot.get("as_of_bar")
+        snap_dt = rext._parse_date_obj(snap_bar_date) if snap_bar_date else None
+        today_utc = datetime.now(timezone.utc).date()
+        if snap_close is not None and snap_close > 0 and snap_dt is not None and abs((today_utc - snap_dt).days) <= 5:
+            snap_known_prices[norm_sym.upper()] = snap_close
+            snap_known_dates[norm_sym.upper()] = snap_dt.isoformat()
+
     fundamentals_and_supply: dict[str, Any] = {}
 
     if asset_class == "us_stock_or_etf":
@@ -1729,12 +1722,16 @@ def collect_research_data(
         fundamentals_and_supply["ths_profit_forecast"] = _run_source(
             "ths_profit_forecast", lambda: fetch_ashare_profit_forecast(code6), sources_status
         )
+        fundamentals_and_supply["valuation_5y_em"] = _run_source(
+            "valuation_5y_em", lambda: rext.fetch_ashare_valuation_percentiles(code6), sources_status
+        )
         fundamentals_and_supply["hsgt_fund_flow"] = _run_source(
             "hsgt_fund_flow", fetch_ashare_hsgt_flow, sources_status
         )
 
     elif asset_class == "cn_future":
-        meta = CN_FUTURE_META.get(norm_sym)
+        sym_upper = norm_sym.upper()
+        meta = CN_FUTURE_META.get(sym_upper)
         if meta is not None:
             cn_name, spot_code, macro_sector = meta
             fundamentals_and_supply["inventory_em"] = _run_source(
@@ -1744,8 +1741,24 @@ def collect_research_data(
                 "spot_and_basis", lambda: fetch_cn_future_spot_basis(spot_code), sources_status
             )
             fundamentals_and_supply["term_structure"] = _run_source(
-                "term_structure", lambda: fetch_cn_future_term_structure(cn_name), sources_status
+                "term_structure",
+                lambda: fetch_cn_future_term_structure(cn_name, spot_code=spot_code),
+                sources_status,
             )
+            if sym_upper in rext.CROSS_MARKET_SPREAD_SPECS:
+                fundamentals_and_supply["cross_market_spread"] = _run_source(
+                    "cross_market_spread",
+                    lambda: rext.fetch_cross_market_spread(
+                        sym_upper,
+                        known_prices=snap_known_prices,
+                        known_dates=snap_known_dates,
+                    ),
+                    sources_status,
+                )
+            if sym_upper in rext.FREIGHT_ROUTING:
+                fundamentals_and_supply["baltic_freight"] = _run_source(
+                    "baltic_freight", lambda: rext.fetch_freight_indices(sym_upper), sources_status
+                )
             if include_macro:
                 fundamentals_and_supply["nbs_sector_output"] = _run_source(
                     "nbs_sector_output", lambda: fetch_china_nbs_sector(macro_sector), sources_status
@@ -1758,19 +1771,49 @@ def collect_research_data(
             sources_status["cn_future_meta"] = {"status": "skipped", "reason": f"Unmapped symbol: {norm_sym}"}
 
     elif asset_class == "commodity":
+        sym_upper = norm_sym.upper()
         fundamentals_and_supply["cftc_cot"] = _run_source(
-            "cftc_cot", lambda: fetch_cftc_cot(norm_sym), sources_status
+            "cftc_cot", lambda: fetch_cftc_cot(sym_upper), sources_status
         )
         fundamentals_and_supply["eia"] = _run_source(
-            "eia", lambda: fetch_eia_data(norm_sym), sources_status
+            "eia", lambda: fetch_eia_data(sym_upper), sources_status
         )
-        if norm_sym.upper() in USDA_WASDE_SYMBOLS:
+        if sym_upper in USDA_WASDE_SYMBOLS:
             fundamentals_and_supply["usda_wasde"] = _run_source(
-                "usda_wasde", lambda: fetch_usda_wasde(norm_sym), sources_status
+                "usda_wasde", lambda: fetch_usda_wasde(sym_upper), sources_status
+            )
+        if sym_upper in rext.OVERSEAS_TERM_STRUCTURE_SPECS:
+            fundamentals_and_supply["term_structure"] = _run_source(
+                "term_structure", lambda: rext.fetch_overseas_term_structure(sym_upper), sources_status
+            )
+        if sym_upper in rext.CROSS_MARKET_SPREAD_SPECS:
+            fundamentals_and_supply["cross_market_spread"] = _run_source(
+                "cross_market_spread",
+                lambda: rext.fetch_cross_market_spread(
+                    sym_upper,
+                    known_prices=snap_known_prices,
+                    known_dates=snap_known_dates,
+                ),
+                sources_status,
+            )
+        if sym_upper in rext.FREIGHT_ROUTING:
+            fundamentals_and_supply["baltic_freight"] = _run_source(
+                "baltic_freight", lambda: rext.fetch_freight_indices(sym_upper), sources_status
+            )
+
+    elif asset_class == "fx" or norm_sym.upper() == "DX-Y.NYB":
+        sym_upper = norm_sym.upper()
+        if sym_upper in rext.CFTC_TFF_FX_SPECS:
+            fundamentals_and_supply["cftc_fx_cot"] = _run_source(
+                "cftc_fx_cot", lambda: rext.fetch_cftc_fx_cot(sym_upper), sources_status
+            )
+        if sym_upper in rext.FX_RATE_DIFF_SPECS:
+            fundamentals_and_supply["rate_differential"] = _run_source(
+                "rate_differential", lambda: rext.fetch_fx_rate_differential(sym_upper), sources_status
             )
 
     elif asset_class == "crypto":
-        base = norm_sym.replace("-USD", "")
+        base = norm_sym.replace("-USD", "").upper()
         fundamentals_and_supply["stablecoins_defillama"] = _run_source(
             "stablecoins_defillama", fetch_defillama_stablecoins, sources_status
         )
@@ -1785,6 +1828,10 @@ def collect_research_data(
         if base == "BTC":
             fundamentals_and_supply["farside_btc_etf"] = _run_source(
                 "farside_btc_etf", fetch_farside_btc_etf_flows, sources_status
+            )
+        elif base == "ETH":
+            fundamentals_and_supply["farside_eth_etf"] = _run_source(
+                "farside_eth_etf", lambda: rext.fetch_farside_etf_flows("ETH"), sources_status
             )
 
     macro_dual_core: dict[str, Any]
@@ -1814,7 +1861,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Layer-3 unified free data aggregator for multi-market trading research."
     )
-    parser.add_argument("symbol", help="Target symbol e.g. PWR, 600519, LC0, CU0, RB0, CL=F, NG=F, HG=F, ZC=F, BTC")
+    parser.add_argument(
+        "symbol",
+        help="Target symbol e.g. PWR, 600519, LC0, CU0, SC0, I0, LH0, CL=F, HG=F, USDJPY=X, USDCNY=X, BTC, ETH",
+    )
     parser.add_argument("--period", default="3y", help="History period passed to market_snapshot (default: 3y)")
     parser.add_argument("--no-macro", action="store_true", help="Skip US FRED and China macro dual-core fetch")
     parser.add_argument("--full-chanlun", action="store_true", help="Request full Chanlun detail if supported")

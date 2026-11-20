@@ -251,6 +251,43 @@ class TestResearchArchive(unittest.TestCase):
             self.assertIn("preserved-note", after_fail["thesis_md"])
             self.assertEqual(after_fail["evidence_count"], 2)
 
+            # 7) FX archive template, commodity trading-structure section, and new trigger kinds
+            init_archive("USDJPY=X", name="美元日元", thesis_summary="美日利差收窄测试", research_root=tmpdir)
+            fx_loaded = load_archive("USDJPY=X", research_root=tmpdir)
+            self.assertEqual(fx_loaded["market"], "FX")
+            self.assertIn("利差与货币政策路径", fx_loaded["thesis_md"])
+            self.assertIn("红蓝辩论反方必答 5 问", fx_loaded["thesis_md"])
+            self.assertIn("第四层：交易表达、缠论执行与触发器监控", fx_loaded["thesis_md"])
+            fx_st = update_state(
+                "USDJPY=X",
+                {
+                    "triggers": [
+                        {"id": "r1", "kind": "rate_diff", "metric": "us_jp_10y_bp", "operator": "<", "threshold": 200.0, "action": "利差收窄"},
+                        {"id": "t1", "kind": "term_structure", "metric": "roll_yield_pct", "operator": "<", "threshold": 0.0, "action": "转Contango"},
+                        {"id": "f1", "kind": "freight", "metric": "bdti", "operator": ">", "threshold": 5500.0, "action": "运费预警"},
+                        {"id": "s1", "kind": "spread", "metric": "brent_wti", "operator": "<", "threshold": 4.0, "action": "跨区收窄"},
+                    ]
+                },
+                research_root=tmpdir,
+            )
+            self.assertEqual(len(fx_st["triggers"]), 4)
+            with self.assertRaises(ValueError):
+                update_state(
+                    "USDJPY=X",
+                    {"triggers": [{"id": "badk", "kind": "unknown_kind", "metric": "x", "operator": ">", "threshold": 1, "action": "a"}]},
+                    research_root=tmpdir,
+                )
+            with self.assertRaises(ValueError):
+                update_state(
+                    "USDJPY=X",
+                    {"triggers": [{"id": "nullk", "kind": None, "metric": "x", "operator": ">", "threshold": 1, "action": "a"}]},
+                    research_root=tmpdir,
+                )
+            self.assertIn("核心宏观与利差证伪阈值", fx_loaded["thesis_md"])
+            init_archive("CL=F", name="WTI原油", research_root=tmpdir)
+            cl_loaded = load_archive("CL=F", research_root=tmpdir)
+            self.assertIn("供需与交易结构证伪阈值", cl_loaded["thesis_md"])
+
 
 if __name__ == "__main__":
     unittest.main()

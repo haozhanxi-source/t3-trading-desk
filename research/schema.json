@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-07/schema",
+  "title": "T3 Trading Desk Layer 3 & Layer 4 Research/Execution State Schema",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "revision",
+    "instrument",
+    "status",
+    "thesis_summary",
+    "triggers",
+    "events",
+    "source_watermarks",
+    "updated_at_utc"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "revision": { "type": "integer", "minimum": 1 },
+    "instrument": {
+      "type": "object",
+      "required": ["market", "symbol", "asset_class"],
+      "properties": {
+        "market": { "type": "string", "enum": ["US", "A_SHARE", "CN_FUTURES", "COMMODITIES", "FX", "CRYPTO", "MACRO"] },
+        "symbol": { "type": "string" },
+        "name": { "type": "string" },
+        "asset_class": { "type": "string" },
+        "subtype": { "type": "string", "description": "Equity: A成长/B强周期/C现金流/D困境反转; Commodity: 能源/有色/黑色/农产/化工新材料等; FX: G10利差/避险/商品货币/新兴市场" },
+        "cik": { "type": ["string", "null"] }
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": ["watchlist", "actionable_long", "actionable_short", "pair_trade", "holding", "rejected"]
+    },
+    "direction_bias": { "type": "string", "enum": ["long", "short", "neutral", "pair"] },
+    "layer1_drivers": {
+      "type": "object",
+      "properties": {
+        "primary": { "type": "string" },
+        "secondary": { "type": "string" }
+      }
+    },
+    "thesis_summary": { "type": "string" },
+    "chanlun_anchors": {
+      "type": "object",
+      "properties": {
+        "as_of_bar": { "type": ["string", "null"] },
+        "zhongshu_level": { "type": ["string", "null"] },
+        "zd": { "type": ["number", "null"] },
+        "zg": { "type": ["number", "null"] },
+        "tactical_stop": { "type": ["number", "null"] },
+        "structural_invalidation": { "type": ["number", "null"] },
+        "target_zone": { "type": ["string", "null"] }
+      }
+    },
+    "valuation_or_balance": {
+      "type": "object",
+      "description": "Equity EPSxPE scenarios, Commodity Q+1..Q+4 supply-demand balance & term-structure summary, or FX rate-diff/TFF positioning summary"
+    },
+    "triggers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "metric", "operator", "threshold", "action"],
+        "properties": {
+          "id": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "fundamental",
+              "supply_demand",
+              "policy",
+              "chanlun",
+              "macro",
+              "term_structure",
+              "freight",
+              "spread",
+              "rate_diff"
+            ]
+          },
+          "metric": { "type": "string" },
+          "operator": { "type": "string", "enum": [">", ">=", "<", "<=", "==", "contains", "event"] },
+          "threshold": {},
+          "unit": { "type": "string" },
+          "status": { "type": "string", "enum": ["armed", "triggered", "resolved"] },
+          "action": { "type": "string" },
+          "last_checked_at": { "type": ["string", "null"] },
+          "last_value": {}
+        }
+      }
+    },
+    "pending_verifications": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["date", "title"],
+        "properties": {
+          "date": { "type": "string" },
+          "title": { "type": "string" },
+          "category": { "type": "string" },
+          "status": { "type": "string", "enum": ["upcoming", "done", "cancelled"] }
+        }
+      }
+    },
+    "source_watermarks": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "created_at_utc": { "type": "string" },
+    "updated_at_utc": { "type": "string" }
+  }
+}

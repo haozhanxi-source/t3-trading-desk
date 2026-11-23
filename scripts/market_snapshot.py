@@ -397,6 +397,7 @@ def get_snapshot(
     period: str = "3y",
     include_macro: bool = True,
     include_fundamentals: bool = True,
+    full_chanlun: bool = False,
 ) -> dict:
     try:
         norm_sym, asset_class = normalize_symbol(raw_symbol)
@@ -417,7 +418,7 @@ def get_snapshot(
             return {"error": f"No OHLCV data returned for {raw_symbol} (normalized: {norm_sym})"}
 
         indicators = compute_indicators(df)
-        daily_cl = analyze_chanlun(df, timeframe_label="日线")
+        daily_cl = analyze_chanlun(df, timeframe_label="日线", full_export=full_chanlun)
         signal_summary = evaluate_daily_signal_tier(daily_cl)
 
         if include_fundamentals and asset_class not in ("cn_future", "fx") and ticker is not None:
@@ -465,8 +466,18 @@ def main():
     parser.add_argument("symbol", help="Ticker e.g. NVDA, 600519, BTC, GC=F, I0, 铁矿, 黄金, 原油")
     parser.add_argument("--period", default="3y", help="History period (default: 3y)")
     parser.add_argument("--no-macro", action="store_true", help="Skip macro context fetch")
+    parser.add_argument(
+        "--full-chanlun",
+        action="store_true",
+        help="Include full strokes, segments, and Zhongshu lists in Chanlun output",
+    )
     args = parser.parse_args()
-    data = get_snapshot(args.symbol, period=args.period, include_macro=not args.no_macro)
+    data = get_snapshot(
+        args.symbol,
+        period=args.period,
+        include_macro=not args.no_macro,
+        full_chanlun=args.full_chanlun,
+    )
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 

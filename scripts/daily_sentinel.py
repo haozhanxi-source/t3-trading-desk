@@ -1795,8 +1795,9 @@ def _is_known_exchange_intraday_break(
 
     Excludes official scheduled breaks only:
       - ``a_share`` (Shanghai): lunch 11:30 -> 13:00
-      - ``cn_future`` (Shanghai): morning 10:15 -> 10:30, lunch 11:30 -> 13:30,
-        night-to-day 01:00/02:30 -> 09:00, day-to-night 15:00 -> 21:00
+      - ``cn_future`` (Shanghai): morning break (10:15 -> 10:30 or Sina merged 10:00 -> 10:45),
+        lunch break (11:30 -> 13:30 or Sina merged 11:15 -> 13:45),
+        night-to-day (00:00/00:30/01:00/02:00/02:30 -> 09:00), day-to-night (15:00 -> 21:00)
       - ``commodity`` / ``fx`` (New York): CME daily maintenance 17:00 -> 18:00 ET
     """
     ac_norm = (asset_class or "").strip().lower()
@@ -1812,15 +1813,24 @@ def _is_known_exchange_intraday_break(
         curr_s_hm = (curr_s.hour, curr_s.minute)
         if ac_norm == "a_share":
             return curr_s_hm == (13, 0) and (prev_e_hm == (11, 30) or prev_s_hm == (11, 30))
-        # cn_future
-        if curr_s_hm == (10, 30) and (prev_e_hm == (10, 15) or prev_s_hm == (10, 15)):
-            return True
-        if curr_s_hm == (13, 30) and (prev_e_hm == (11, 30) or prev_s_hm == (11, 30)):
-            return True
-        if curr_s_hm == (9, 0) and (
-            prev_e_hm in {(1, 0), (2, 30)} or prev_s_hm in {(1, 0), (2, 30)}
+        # cn_future: support both standard exchange clocks and Sina bar-end merged-stub timestamps
+        # Morning 10:15-10:30 break (standard 10:15->10:30, or Sina 10:00 end -> 10:45 end i.e. 10:15 start)
+        if (curr_s_hm == (10, 30) and (prev_e_hm == (10, 15) or prev_s_hm == (10, 15))) or (
+            curr_s_hm == (10, 15) and (prev_e_hm == (10, 0) or prev_s_hm == (10, 0))
         ):
             return True
+        # Lunch 11:30-13:30 break (standard 11:30->13:30, or Sina 11:15 end -> 13:45 end i.e. 13:15 start)
+        if curr_s_hm in {(13, 15), (13, 30)} and (
+            prev_e_hm in {(11, 15), (11, 30)} or prev_s_hm in {(11, 15), (11, 30)}
+        ):
+            return True
+        # Night-to-day break (SHFE/INE/DCE/CZCE night close -> 09:00 day open)
+        if curr_s_hm == (9, 0) and (
+            prev_e_hm in {(0, 0), (0, 30), (1, 0), (2, 0), (2, 30)}
+            or prev_s_hm in {(0, 0), (0, 30), (1, 0), (2, 0), (2, 30)}
+        ):
+            return True
+        # Day-to-night break (15:00 day close -> 21:00 night open)
         if curr_s_hm == (21, 0) and (prev_e_hm == (15, 0) or prev_s_hm == (15, 0)):
             return True
         return False

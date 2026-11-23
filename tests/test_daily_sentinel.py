@@ -2569,6 +2569,55 @@ class TestRound3Hardening(unittest.TestCase):
         self.assertEqual(res["status"], ds.STATUS_YELLOW)
         self.assertIn("intraday_internal_bar_gap", {a["code"] for a in res["yellow_alerts"]})
 
+    def test_real_sina_cn_future_merged_breaks_do_not_false_alarm(self):
+        # Real Sina CU0 30m bar-end timestamps: 00:00->09:30, 10:00->10:45 (45m), 11:15->13:45 (150m), 15:00->21:30
+        snap_cu = {
+            "asset_class": "cn_future",
+            "technicals": {"as_of_bar": "2026-11-23", "last_close": 92000.0},
+            "intraday_technicals": {
+                "as_of_bar": "2026-11-23T14:45:00+08:00",
+                "as_of_bar_utc": "2026-11-23T06:45:00+00:00",
+                "bar_interval": "30m",
+                "bar_timestamp_anchor": "end",
+                "bar_is_closed": True,
+                "last_close": 92000.0,
+                "recent_bars_ohlc": [
+                    {"bar": "2026-11-23T00:00:00+08:00", "bar_utc": "2026-11-22T16:00:00+00:00", "open": 92500, "high": 92600, "low": 92400, "close": 92500},
+                    {"bar": "2026-11-23T09:30:00+08:00", "bar_utc": "2026-11-23T01:30:00+00:00", "open": 92400, "high": 92500, "low": 92200, "close": 92300},
+                    {"bar": "2026-11-23T10:00:00+08:00", "bar_utc": "2026-11-23T02:00:00+00:00", "open": 92300, "high": 92400, "low": 92100, "close": 92200},
+                    {"bar": "2026-11-23T10:45:00+08:00", "bar_utc": "2026-11-23T02:45:00+00:00", "open": 92200, "high": 92300, "low": 92000, "close": 92100},
+                    {"bar": "2026-11-23T11:15:00+08:00", "bar_utc": "2026-11-23T03:15:00+00:00", "open": 92100, "high": 92200, "low": 92000, "close": 92050},
+                    {"bar": "2026-11-23T13:45:00+08:00", "bar_utc": "2026-11-23T05:45:00+00:00", "open": 92050, "high": 92150, "low": 91950, "close": 92000},
+                    {"bar": "2026-11-23T14:15:00+08:00", "bar_utc": "2026-11-23T06:15:00+00:00", "open": 92000, "high": 92100, "low": 91950, "close": 92000},
+                    {"bar": "2026-11-23T14:45:00+08:00", "bar_utc": "2026-11-23T06:45:00+00:00", "open": 92000, "high": 92100, "low": 91950, "close": 92000},
+                ],
+            },
+        }
+        ext_ok = ds._collect_eligible_ohlc_extrema(
+            snap_cu,
+            effective_ts_utc="2026-11-22T15:30:00+00:00",
+            asset_class="cn_future",
+            now_utc=datetime(2026, 11, 23, 7, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(ext_ok[4], f"Unexpected gap on real Sina CN future breaks: {ext_ok[4]}")
+
+        # Dropping 14:15 bar (13:45 -> 14:45 real missing bar!) MUST STILL trigger intraday_internal_bar_gap!
+        snap_cu_hole = {
+            **snap_cu,
+            "intraday_technicals": {
+                **snap_cu["intraday_technicals"],
+                "recent_bars_ohlc": [b for b in snap_cu["intraday_technicals"]["recent_bars_ohlc"] if "14:15" not in b["bar"]],
+            },
+        }
+        ext_hole = ds._collect_eligible_ohlc_extrema(
+            snap_cu_hole,
+            effective_ts_utc="2026-11-22T15:30:00+00:00",
+            asset_class="cn_future",
+            now_utc=datetime(2026, 11, 23, 7, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(ext_hole[4])
+        self.assertIn("intraday_internal_bar_gap", ext_hole[4])
+
 
 if __name__ == "__main__":
     unittest.main()

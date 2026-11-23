@@ -239,23 +239,61 @@ class TestExpressionCarryAndGate(unittest.TestCase):
         self.assertFalse(res["vetoed"])
         self.assertEqual(res["curve_structure"], "Backwardation")
         self.assertEqual(res["divergence_regime"], "strong_reality_weak_expectation")
-        # Binding / front-aware carry picks steeper drag (-14.0% vs -12.0%)
+        # Survival Rule #1: primary medium-frequency carry uses full-curve (-12.0%);
+        # near-month squeeze (-14.0%) is exposed separately as near_carry_stress_rr_ratio!
         self.assertEqual(res["curve_annualized_carry_pct"], -12.0)
         self.assertEqual(res["near_annualized_carry_pct"], -14.0)
-        self.assertEqual(res["annualized_carry_pct"], -14.0)
+        self.assertEqual(res["annualized_carry_pct"], -12.0)
         self.assertAlmostEqual(res["curve_horizon_carry_pct"], -12.0 * (90.0 / 365.0), places=3)
         self.assertAlmostEqual(res["near_horizon_carry_pct"], -14.0 * (90.0 / 365.0), places=3)
-        self.assertAlmostEqual(res["horizon_carry_pct"], -14.0 * (90.0 / 365.0), places=3)
+        self.assertAlmostEqual(res["horizon_carry_pct"], -12.0 * (90.0 / 365.0), places=3)
         self.assertAlmostEqual(res["carry_to_target_ratio"], res["horizon_carry_pct"] / 15.0, places=3)
         self.assertAlmostEqual(
             res["carry_adjusted_rr_ratio"],
-            (15.0 + res["horizon_carry_pct"]) / 3.0,
+            (15.0 + res["curve_horizon_carry_pct"]) / 3.0,
+            places=3,
+        )
+        self.assertAlmostEqual(
+            res["near_carry_stress_rr_ratio"],
+            (15.0 + res["near_horizon_carry_pct"]) / 3.0,
             places=3,
         )
         self.assertEqual(res["expression_recommendation"], "prefer_far_month_short_or_bear_spread")
         self.assertIn("空远月合约", res["contract_guidance"])
 
-        # Flat full-curve + steep near-month Backwardation (+24% roll -> -24% short carry)
+        # Real-world CU0 survival-rule proof: -39.8% near-month squeeze vs -5.4% full-curve Back
+        # MUST NOT veto a 3.5x raw R:R far-month short (curve carry-adj R:R = +2.89 >= 2.5)!
+        cu_live_expr = evaluate_expression_and_carry(
+            direction="short",
+            asset_class="cn_future",
+            term_structure={
+                "status": "ok",
+                "structure": "Backwardation",
+                "annualized_roll_yield_near_pct": 39.8,
+                "annualized_roll_yield_curve_pct": 5.4,
+            },
+            holding_horizon_days=90,
+            expected_move_pct=7.61,
+            stop_distance_pct=2.17,
+        )
+        self.assertFalse(cu_live_expr["vetoed"])
+        self.assertGreater(cu_live_expr["carry_adjusted_rr_ratio"], 2.5)
+        self.assertLess(cu_live_expr["near_carry_stress_rr_ratio"], 0.0)
+        self.assertEqual(cu_live_expr["expression_recommendation"], "prefer_far_month_short_or_bear_spread")
+        cu_live_gate = evaluate_four_quadrant_gate(
+            direction="short",
+            asset_class="cn_future",
+            has_l1_l2_evidence=True,
+            daily_alignment={"alignment_status": "aligned_trigger", "daily_bias": "short", "intraday_action": "entry_short"},
+            rr_ratio=3.5,
+            carry_adjusted_rr_ratio=cu_live_expr["carry_adjusted_rr_ratio"],
+            total_quantity=1,
+            within_capital_limits=True,
+        )
+        self.assertTrue(cu_live_gate["actionable"])
+        self.assertEqual(cu_live_gate["decision"], "actionable_short")
+
+        # Flat full-curve + steep near-month Backwardation (+24% roll -> -24% short near carry)
         res_flat_steep_front = evaluate_expression_and_carry(
             direction="short",
             asset_class="cn_future",
@@ -274,10 +312,11 @@ class TestExpressionCarryAndGate(unittest.TestCase):
         self.assertEqual(res_flat_steep_front["near_annualized_carry_pct"], -24.0)
         self.assertEqual(res_flat_steep_front["curve_horizon_carry_pct"], 0.0)
         self.assertAlmostEqual(res_flat_steep_front["near_horizon_carry_pct"], -24.0 * (90.0 / 365.0), places=3)
-        self.assertAlmostEqual(res_flat_steep_front["horizon_carry_pct"], -24.0 * (90.0 / 365.0), places=3)
+        self.assertAlmostEqual(res_flat_steep_front["horizon_carry_pct"], 0.0, places=3)
+        self.assertAlmostEqual(res_flat_steep_front["carry_adjusted_rr_ratio"], 5.0, places=3)
         self.assertAlmostEqual(
-            res_flat_steep_front["carry_adjusted_rr_ratio"],
-            (15.0 + res_flat_steep_front["horizon_carry_pct"]) / 3.0,
+            res_flat_steep_front["near_carry_stress_rr_ratio"],
+            (15.0 + res_flat_steep_front["near_horizon_carry_pct"]) / 3.0,
             places=3,
         )
         self.assertTrue(any("squeeze" in w or "挤仓" in w for w in res_flat_steep_front["warnings"]))
@@ -999,8 +1038,30 @@ class TestPositionPlanner(unittest.TestCase):
         self.assertEqual(w1_payload["four_quadrant_gate"]["decision"], "actionable_short")
         self.assertEqual(w1_payload["four_quadrant_gate"]["checks"]["daily_alignment_status"], "aligned_trigger")
 
-        # Steep near-month Backwardation (+30%) pushing carry-adjusted R:R below min_rr MUST block actionable_short
+        # Survival Rule #1: steep near-month squeeze ONLY (curve=12%, near=30%) MUST NOT veto a far-month short;
+        # it emits near_carry_stress_rr_ratio + squeeze warning while full-curve steep Back (curve=30%) blocks!
+        w1_near_squeeze = json.loads(json.dumps(w1_live_ctx))
+        w1_near_squeeze["research"]["fundamentals_and_supply"]["term_structure"]["annualized_roll_yield_near_pct"] = 30.0
+        buf_near = io.StringIO()
+        with patch.object(tp, "_fetch_live_context", return_value=w1_near_squeeze), redirect_stdout(buf_near):
+            rc_near = tp.main([
+                "--symbol", "CU0", "--direction", "short", "--live",
+                "--target", "86000", "--equity", "1000000", "--account-currency", "CNY",
+                "--risk-pct", "1.0", "--confirm-l1-l2",
+            ])
+        self.assertEqual(rc_near, 0)
+        near_payload = json.loads(buf_near.getvalue())
+        self.assertEqual(near_payload["four_quadrant_gate"]["decision"], "actionable_short")
+        self.assertTrue(near_payload["four_quadrant_gate"]["actionable"])
+        self.assertLess(near_payload["expression_and_carry"]["near_carry_stress_rr_ratio"], 2.5)
+        self.assertEqual(
+            near_payload["expression_and_carry"]["expression_recommendation"],
+            "prefer_far_month_short_or_bear_spread",
+        )
+
+        # Steep FULL-CURVE Backwardation (curve=30%) pushing curve carry-adjusted R:R below min_rr blocks!
         w1_steep_carry = json.loads(json.dumps(w1_live_ctx))
+        w1_steep_carry["research"]["fundamentals_and_supply"]["term_structure"]["annualized_roll_yield_curve_pct"] = 30.0
         w1_steep_carry["research"]["fundamentals_and_supply"]["term_structure"]["annualized_roll_yield_near_pct"] = 30.0
         buf_steep = io.StringIO()
         with patch.object(tp, "_fetch_live_context", return_value=w1_steep_carry), redirect_stdout(buf_steep):
@@ -1324,15 +1385,53 @@ class TestPositionPlanner(unittest.TestCase):
         self.assertFalse(res_future_daily["four_quadrant_gate"]["actionable"])
         self.assertIn("daily_future_timestamp", res_future_daily["four_quadrant_gate"]["checks"]["upstream_errors"])
 
-        # 1e) --live with 5-hour-old 30m bar (> 4h threshold for non-crypto) -> stale_intraday_30m_snapshot -> blocked!
-        stale_5h_str = (now_utc - timedelta(hours=5)).strftime("%Y-%m-%d %H:%M:%S+00:00")
-        stale_5h_ctx = _base_live_ctx()
-        stale_5h_ctx["snapshot"]["intraday_technicals"]["as_of_bar"] = stale_5h_str
-        stale_5h_ctx["snapshot"]["intraday_technicals"]["as_of_bar_utc"] = stale_5h_str
-        res_stale_5h = _run_live(stale_5h_ctx)
-        self.assertEqual(res_stale_5h["four_quadrant_gate"]["decision"], "watchlist_upstream_error")
-        self.assertFalse(res_stale_5h["four_quadrant_gate"]["actionable"])
-        self.assertIn("stale_intraday_30m_snapshot", res_stale_5h["four_quadrant_gate"]["checks"]["upstream_errors"])
+        # 1e) During active CN trading session (Mon 14:30 Shanghai = 06:30 UTC), a 5-hour-old 30m bar
+        #     (> 4h threshold) MUST be blocked as stale_intraday_30m_snapshot!
+        in_session_cn_utc = datetime(2026, 11, 23, 6, 30, tzinfo=timezone.utc)  # Mon 14:30 Asia/Shanghai
+        stale_5h_snap = {
+            "technicals": {"as_of_bar": "2026-11-23"},
+            "intraday_technicals": {
+                "as_of_bar": "2026-11-23T01:30:00+00:00",  # 5h ago (09:30 Shanghai)
+                "as_of_bar_utc": "2026-11-23T01:30:00+00:00",
+                "bar_is_closed": True,
+            },
+        }
+        errs_in_session, _, _ = tp._check_live_upstream_health(
+            stale_5h_snap, {"sources_status": {"market_snapshot": {"status": "ok"}}}, "cn_future",
+            now_utc=in_session_cn_utc,
+        )
+        self.assertIn("stale_intraday_30m_snapshot", errs_in_session)
+
+        # 1e-2) Outside market hours (Saturday morning US / evening after close), the latest closed Friday
+        #       30m bar (< 4 calendar days) MUST be allowed for after-hours/weekend trade planning!
+        saturday_utc = datetime(2026, 11, 21, 15, 0, tzinfo=timezone.utc)  # Sat 10:00 ET (closed)
+        friday_close_snap = {
+            "technicals": {"as_of_bar": "2026-11-20"},
+            "intraday_technicals": {
+                "as_of_bar": "2026-11-20T15:30:00-05:00",  # Fri last 30m bar (~18.5h ago)
+                "as_of_bar_utc": "2026-11-20T20:30:00+00:00",
+                "bar_is_closed": True,
+            },
+        }
+        errs_weekend, _, _ = tp._check_live_upstream_health(
+            friday_close_snap, {"sources_status": {"market_snapshot": {"status": "ok"}}}, "us_stock_or_etf",
+            now_utc=saturday_utc,
+        )
+        self.assertEqual(errs_weekend, [])
+        # But > 4 calendar days old even on a weekend MUST still be rejected!
+        old_weekend_snap = {
+            "technicals": {"as_of_bar": "2026-11-20"},
+            "intraday_technicals": {
+                "as_of_bar": "2026-11-16T15:30:00-05:00",  # 5 days ago
+                "as_of_bar_utc": "2026-11-16T20:30:00+00:00",
+                "bar_is_closed": True,
+            },
+        }
+        errs_old_weekend, _, _ = tp._check_live_upstream_health(
+            old_weekend_snap, {"sources_status": {"market_snapshot": {"status": "ok"}}}, "us_stock_or_etf",
+            now_utc=saturday_utc,
+        )
+        self.assertIn("stale_intraday_30m_snapshot", errs_old_weekend)
 
         # 1f) --live with 3-hour-old crypto 30m bar (> 2h threshold for crypto) -> stale_intraday_30m_snapshot -> blocked!
         stale_3h_btc_str = (now_utc - timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S+00:00")

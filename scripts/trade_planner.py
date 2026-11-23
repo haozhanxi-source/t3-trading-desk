@@ -27,6 +27,7 @@ import sys
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_FLOOR
 from typing import Any
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(__file__))
 from market_snapshot import normalize_symbol  # noqa: E402
@@ -1133,6 +1134,8 @@ def evaluate_expression_and_carry(
                 "curve_horizon_carry_pct": None,
                 "carry_to_target_ratio": None,
                 "carry_adjusted_rr_ratio": None,
+                "curve_carry_adjusted_rr_ratio": None,
+                "near_carry_stress_rr_ratio": None,
                 "expression_recommendation": "data_stale_refresh_required",
                 "contract_guidance": (
                     "期限结构数据异常或已过期（stale/error），拒绝基于陈旧曲线计算展期收益或推荐具体近远月合约，"
@@ -1159,20 +1162,16 @@ def evaluate_expression_and_carry(
         sign = 1.0 if norm_dir == "long" else -1.0
         near_carry = round(sign * roll_near, 4) if roll_near is not None else None
         curve_carry = round(sign * roll_curve, 4) if roll_curve is not None else None
-        _, near_horizon_carry, _, _ = _finish_carry(near_carry)
-        _, curve_horizon_carry, _, _ = _finish_carry(curve_carry)
+        _, near_horizon_carry, _, near_carry_stress_rr = _finish_carry(near_carry)
+        _, curve_horizon_carry, _, curve_carry_adj_rr = _finish_carry(curve_carry)
 
-        # Most binding / front-aware carry: if either near or full-curve imposes drag (< 0),
-        # take the steeper negative carry so front-month roll drag is NEVER masked by a flat back end.
-        valid_carries = [c for c in (curve_carry, near_carry) if c is not None]
-        if not valid_carries:
-            binding_carry_raw: float | None = None
-        elif any(c < 0 for c in valid_carries):
-            binding_carry_raw = min(valid_carries)
-        else:
-            binding_carry_raw = curve_carry if curve_carry is not None else near_carry
-
-        ann_carry, horizon_carry, carry_to_target, carry_adj_rr = _finish_carry(binding_carry_raw)
+        # Survival Rule #1 ("大B结构绝不否决做空"): for 1Q~1Y medium-frequency trades,
+        # evaluate carry-adjusted R:R using full-curve/far-month carry (falling back to near_carry
+        # only when curve_carry is unavailable), while exposing near_carry_stress_rr_ratio as an
+        # explicit front-month squeeze stress test so a 1-month near squeeze (e.g. CU0 -39.8% front
+        # vs -5.4% curve) guides the trader into far-month contracts instead of vetoing the short!
+        primary_carry_raw = curve_carry if curve_carry is not None else near_carry
+        ann_carry, horizon_carry, carry_to_target, carry_adj_rr = _finish_carry(primary_carry_raw)
 
         # Explicitly tag "强现实 vs 弱预期" / "弱现实 vs 强预期" divergence regimes
         if norm_dir == "short" and norm_struct == "Backwardation":
@@ -1300,6 +1299,8 @@ def evaluate_expression_and_carry(
             "curve_horizon_carry_pct": curve_horizon_carry,
             "carry_to_target_ratio": carry_to_target,
             "carry_adjusted_rr_ratio": carry_adj_rr,
+            "curve_carry_adjusted_rr_ratio": curve_carry_adj_rr,
+            "near_carry_stress_rr_ratio": near_carry_stress_rr,
             "expression_recommendation": expr_rec,
             "contract_guidance": guidance,
             "monitoring_points": monitoring_points,
@@ -2285,6 +2286,55 @@ def _extract_source_status(entry: Any) -> tuple[str, str]:
     return "", ""
 
 
+def _is_market_in_regular_session(eff_now_utc: datetime, asset_class: str | None) -> bool:
+    """Return True if ``eff_now_utc`` falls inside active regular trading hours for ``asset_class``.
+
+    - ``crypto``: 24/7 (always True).
+    - ``us_stock_or_etf``: Mon-Fri 09:30-16:00 America/New_York.
+    - ``a_share``: Mon-Fri 09:30-11:30 or 13:00-15:00 Asia/Shanghai.
+    - ``cn_future``: Mon-Fri 09:00-11:30, 13:30-15:00, 21:00-24:00 or Tue-Sat 00:00-02:30 Asia/Shanghai.
+    - ``commodity`` / ``fx``: Sun 18:00 through Fri 17:00 America/New_York (excluding daily 17:00-18:00 break).
+    """
+    norm_ac = str(asset_class or "").strip().lower()
+    if norm_ac == "crypto":
+        return True
+    if norm_ac == "us_stock_or_etf":
+        ny = eff_now_utc.astimezone(ZoneInfo("America/New_York"))
+        if ny.weekday() >= 5:
+            return False
+        hm = (ny.hour, ny.minute)
+        return (9, 30) <= hm < (16, 0)
+    if norm_ac == "a_share":
+        sh = eff_now_utc.astimezone(ZoneInfo("Asia/Shanghai"))
+        if sh.weekday() >= 5:
+            return False
+        hm = (sh.hour, sh.minute)
+        return ((9, 30) <= hm < (11, 30)) or ((13, 0) <= hm < (15, 0))
+    if norm_ac == "cn_future":
+        sh = eff_now_utc.astimezone(ZoneInfo("Asia/Shanghai"))
+        wd = sh.weekday()  # Mon=0 .. Sun=6
+        hm = (sh.hour, sh.minute)
+        if wd <= 4:
+            if ((9, 0) <= hm < (11, 30)) or ((13, 30) <= hm < (15, 0)) or (hm >= (21, 0)):
+                return True
+        if 1 <= wd <= 5 and hm < (2, 30):
+            return True
+        return False
+    if norm_ac in {"commodity", "fx"}:
+        ny = eff_now_utc.astimezone(ZoneInfo("America/New_York"))
+        wd = ny.weekday()
+        hm = (ny.hour, ny.minute)
+        if wd == 5:  # Saturday closed
+            return False
+        if wd == 6:  # Sunday opens 18:00 ET
+            return hm >= (18, 0)
+        if wd == 4:  # Friday closes 17:00 ET
+            return hm < (17, 0)
+        # Mon-Thu: 23h trading excluding 17:00-18:00 daily maintenance
+        return not ((17, 0) <= hm < (18, 0))
+    return True
+
+
 def _check_live_upstream_health(
     snap: dict[str, Any] | None,
     res: dict[str, Any] | None,
@@ -2307,6 +2357,7 @@ def _check_live_upstream_health(
     norm_ac = str(asset_class or "").strip().lower()
     max_stale_days = 1.0 if norm_ac == "crypto" else 4.0
     max_intraday_stale_hours = 2.0 if norm_ac == "crypto" else 4.0
+    in_session = _is_market_in_regular_session(eff_now, norm_ac)
     future_tolerance = timedelta(minutes=5)
 
     def _is_missing_ts(val: Any) -> bool:
@@ -2387,8 +2438,14 @@ def _check_live_upstream_health(
                 errors.append("intraday_future_timestamp")
             else:
                 i_age_hours = (eff_now - i_dt).total_seconds() / 3600.0
-                if i_age_hours > max_intraday_stale_hours:
-                    errors.append("stale_intraday_30m_snapshot")
+                if in_session:
+                    if i_age_hours > max_intraday_stale_hours:
+                        errors.append("stale_intraday_30m_snapshot")
+                else:
+                    # After-hours / overnight / weekend planning mode: allow the latest closed 30m bar
+                    # from the most recent trading session within max_stale_days (4d non-crypto).
+                    if (i_age_hours / 24.0) > max_stale_days:
+                        errors.append("stale_intraday_30m_snapshot")
 
     if stale_flagged:
         errors.append("stale_market_snapshot")

@@ -33,13 +33,16 @@
 - `AGENTS.md`：四层投研与执行完整工作流指令（第一层 7 维驱动 → 第二层日线缠论过筛 → 第三层纯深度研究与红蓝对抗 → 第四层交易表达与风控监控）
 - `watchlist.json`：跨市场核心观察列表（分析与寻猎时支持任意跨市场标的实时拉取）
 - `universes.json`：大宗商品 8 大类、航运、主流外汇（`fx_majors`）、美股与 A 股一级行业 ETF 定价锚（`us_sectors` / `a_shares_etfs`）及随投研沉淀的主题标的池（共 18 个基础池，支持通过 `--save-universe` 随行情按需生长）
-- `scripts/chanlun.py`：日线缠论核心引擎（第 5 课连阴连阳笔修正、第 10 课前三笔笔中枢与九段升级段中枢、1~8 类笔强弱 + MACD 合参及 `momentum_reliable` 失真防护、3出/4出/首中枢三买信号）
-- `scripts/market_snapshot.py`：单标的行情（默认 3 年日线，支持 `--full-chanlun` 全量导出、yfinance 与 akshare 国内期货主力连续）、日线缠论结构、基本面/资金费率与宏观数据抓取
+- `scripts/chanlun.py`：多级别缠论核心引擎（支持日线定方向 + 30min/15min/60min 日内精确结构与无损时间戳、第 5 课连阴连阳笔修正、第 10 课前三笔笔中枢与九段升级段中枢、1~8 类笔强弱 + MACD 合参及 `momentum_reliable` 失真防护、3出/4出/首中枢三买信号、`assess_dual_timeframe_alignment` 双级别联立评估）
+- `scripts/market_snapshot.py`：单标的行情与双级别缠论快照（默认 3 年日线，支持 `--interval 30m` 6 大类资产日内拉取、`--dual` 日线+30min 区间套联立与 `--full-chanlun` 全量导出）
 - `scripts/scan_opportunities.py`：按自上而下推演出的板块池（`--universe`）或现场梳理的产业链龙头列表（`--symbols`）跑日线缠论过筛，并支持 `--save-universe` 沉淀新板块池
 - `scripts/research_data.py`：按品种白名单精准路由的多资产免费硬数据聚合器（美股 SEC/yfinance、A 股财报/5 年估值分位、商品库存/基差/内外期限结构与 Roll Yield/跨市比价/波罗的海运价/CFTC/EIA/USDA、外汇 CFTC TFF/10Y 利差、加密稳定币/BTC+ETH ETF、FRED/中国宏观）
 - `scripts/research_archive.py` & `research/schema.json`：按标的持续沉淀 `thesis.md`（内置股票 / 大宗商品 / 外汇三类第三层+第四层分离模板）/ `state.json`（含价格、期限结构、运价、价差、利差等多维触发器）/ `evidence.jsonl` 的增量研究与监控档案管理器
-- `tests/`：离线单元测试（`test_chanlun.py`、`test_market_and_scan.py`、`test_research_data.py`、`test_research_archive.py`）
-- `research/` & `reports/`：单标的增量研究档案与分析报告
+- `scripts/trade_planner.py`：第四层交易表达、大 B 结构劈叉权衡、四象限闸门与 30min 风险预算算仓器（内置 46 个国内外期货精确乘数表、支持 `--live` 实盘双级别联动）
+- `scripts/portfolio_manager.py` & `portfolio/schema.json`：第四层单一板块龙头独占制持仓风控账本（单 SQLite 事务 `portfolio.db` + 原子镜像 JSON、龙头切换、双寡头共享额度、严禁浮亏摊平、减仓 `trim`、移动止损释风险；默认 `portfolio/` 运行态文件已 `.gitignore` 保护，如使用自定义 `--portfolio-dir` 请置于仓库外或补充忽略规则）
+- `scripts/daily_sentinel.py`：第四层持仓每日哨兵（自动扫描所有 `holding` 持仓，每日双轨核查日线/30min 缠论与核心逻辑高频指标，输出 🔴 果断撤离 / 🟡 松动警戒 / 🟢 稳固持有）
+- `tests/`：离线单元测试（`test_chanlun.py`、`test_market_and_scan.py`、`test_research_data.py`、`test_research_archive.py`、`test_layer4_planner_portfolio.py`、`test_daily_sentinel.py`）
+- `research/`、`portfolio/` & `reports/`：单标的增量研究档案、本地持仓风控模板与分析报告
 
 ## 快速测试
 
@@ -76,4 +79,12 @@
 .venv/bin/python scripts/research_archive.py init PWR --name "Quanta Services" --subtype "A成长+B工程周期"
 .venv/bin/python scripts/research_archive.py init USDJPY=X --name "美元日元" --subtype "G10利差"
 .venv/bin/python scripts/research_archive.py list
+
+# 第四层：双级别（日线定方向 + 30min 诞生交易）快照、交易表达算仓、龙头账本与持仓每日哨兵
+.venv/bin/python scripts/market_snapshot.py CU0 --dual --no-macro
+.venv/bin/python scripts/market_snapshot.py PWR --interval 30m
+.venv/bin/python scripts/trade_planner.py --symbol CU0 --direction short --live --target 85000 --equity 1000000 --risk-pct 1.0
+.venv/bin/python scripts/portfolio_manager.py init --equity 1000000 --base-currency CNY
+.venv/bin/python scripts/portfolio_manager.py summary
+.venv/bin/python scripts/daily_sentinel.py --format markdown --include-watchlist
 ```

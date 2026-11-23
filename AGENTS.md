@@ -22,8 +22,8 @@
 ## 环境与脚本
 
 - Python 虚拟环境：`.venv/bin/python`
-- 缠论引擎：`scripts/chanlun.py`（日线 K 线包含处理、顶底分型、第 5 课连阴连阳笔修正、第 10 课紧凑前三笔笔中枢与九段升级段中枢、1~8 类笔强弱 + MACD 合参及 `momentum_reliable` 力度比可靠性提示、第 11 课反向 K 线笔结束触发、第 13/15 课 3出/4出/2+3 与首中枢三买限制）
-- 行情与缠论快照：`scripts/market_snapshot.py <标的>`（默认 `--period 3y` 日线；`--full-chanlun` 可导出全量 3 年笔/线段/笔中枢/段中枢供第三层深研与画图）
+- 缠论引擎：`scripts/chanlun.py`（支持日线与 30min/15min/60min 多级别无损时间戳、K 线包含处理、顶底分型、第 5 课连阴连阳笔修正、第 10 课紧凑前三笔笔中枢与九段升级段中枢、1~8 类笔强弱 + MACD 合参及 `momentum_reliable` 力度比可靠性提示、第 11 课反向 K 线笔结束触发、第 13/15 课 3出/4出/2+3 与首中枢三买限制，以及 `assess_dual_timeframe_alignment` 日线定方向 + 30min 区间套联立评估）
+- 行情与缠论快照：`scripts/market_snapshot.py <标的>`（默认 `--period 3y` 日线；支持 `--interval 30m` 6 大类资产日内 30min 缠论、`--dual` 一键输出日线方向 + 30min 精确触发与止损噪点压缩比、`--full-chanlun` 全量导出供深研与画图）
   - 美股：`NVDA`、`SPY`、`QQQ`（支持任意美股/ETF 代码实时抓取）
   - A股：`600519` 或 `600519.SS` / `300750.SZ`
   - 海外大宗商品（yfinance）：覆盖 **能源、贵金属、基本金属、黑色（美热卷）、谷物油脂、软商品、畜牧**，如 `GC=F`（`黄金`）、`SI=F`（`白银`）、`CL=F`（`原油`）、`HG=F`（`铜`）、`NG=F`（`天然气`）、`KC=F`（`咖啡`）、`CC=F`（`可可`）、`SB=F`（`原糖`）、`CT=F`（`美棉`）、`LE=F`（`活牛`）、`HE=F`（`瘦肉猪`）、`PL=F`（`铂金`）、`PA=F`（`钯金`）、`ALI=F`（`铝`）
@@ -47,6 +47,9 @@
     - **加密货币**：DefiLlama 稳定币总市值 + OKX/Binance 永续 OI + **Farside BTC 与 ETH 现货 ETF 每日净流量** + 资金费率；
     - **宏观双核**：FRED 免 Key CSV（`DFII10`/`DGS10`/`T10YIE`/`FEDFUNDS`/`M2SL`/`PCOPPUSDM`）+ 中国 PMI/海关进出口。
 - 第三层/第四层增量研究与监控档案：`scripts/research_archive.py`（目录 `research/<市场>/<规范代码>/`，自动区分股票/大宗商品/外汇专用模板，含 `thesis.md` 第三层研究与第四层执行卡片及只追加修订日志、`state.json` 版本号/多维触发器/游标、`evidence.jsonl` `L1~L4` 分级事实库；支持 `init` / `load` / `append-evidence` / `update-state` / `append-log` / `check-triggers` / `list`）
+- 第四层交易表达与风险预算算仓器：`scripts/trade_planner.py`（内置 30 个国内期货 + 16 个海外期货含美分报价精确乘数表、A 股 100 股/美股/外汇/加密最小手数取整；支持 `--live` 联立日线+30min 缠论与曲线数据；显式评估**大 B 结构强现实 vs 弱预期劈叉且永不否决做空**，输出四象限终裁、近远月表达建议、单手超预算保护与浮盈加仓分批计划）
+- 第四层单一板块龙头独占制持仓账本：`scripts/portfolio_manager.py` & `portfolio/schema.json`（单 SQLite 事务 `portfolio.db` + 原子镜像 `account.json`/`positions.json`/`journal.jsonl`，已加入 `.gitignore` 严防实盘资金误提交；强制执行**单一板块龙头独占制**、原龙头→新龙头原子 `rotate` 切换（先结算旧龙头盈亏再校验新龙头风险额度）、双寡头共享单板块风险额度、严禁浮亏摊平、减仓 `trim`、移动止损只紧不松且保本自动释放风险额度、跨币种汇率强制校验、回撤阶梯降仓与跨板块宏大因子叠加预警）
+- 第四层持仓每日哨兵：`scripts/daily_sentinel.py`（自动汇聚 `portfolio/positions.json` 与 `research/*/state.json` 中所有 `holding` 持仓，按需附加 `--include-watchlist` 观察池轻量刷新；每日双轨巡检 **30min/日线缠论与止损防线 + 核心高频指标触发器 + 14 天事件/财报/移仓窗口 + 数据完整性**，输出 **🔴 果断撤离 / 🟡 指标松动警戒 / 🟢 稳固持有** 三档指令与浮盈移动止损建议，支持 `--fail-on-red` 自动化集成）
 
 ---
 

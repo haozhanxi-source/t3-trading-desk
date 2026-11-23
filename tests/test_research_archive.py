@@ -284,9 +284,13 @@ class TestResearchArchive(unittest.TestCase):
                     research_root=tmpdir,
                 )
             self.assertIn("核心宏观与利差证伪阈值", fx_loaded["thesis_md"])
+            self.assertIn("30min 缠论结构中诞生交易", fx_loaded["thesis_md"])
+            self.assertIn("核心逻辑或关键指标一旦松动随时果断撤离", fx_loaded["thesis_md"])
             init_archive("CL=F", name="WTI原油", research_root=tmpdir)
             cl_loaded = load_archive("CL=F", research_root=tmpdir)
             self.assertIn("供需与交易结构证伪阈值", cl_loaded["thesis_md"])
+            self.assertIn("大 B 结构绝非做空禁区", cl_loaded["thesis_md"])
+            self.assertIn("单一板块龙头独占制", cl_loaded["thesis_md"])
 
 
 if __name__ == "__main__":

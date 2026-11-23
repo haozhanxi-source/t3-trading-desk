@@ -11,7 +11,9 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from chanlun import (
+    _format_bar_timestamps,
     analyze_chanlun,
+    assess_dual_timeframe_alignment,
     assess_momentum,
     build_pivots,
     build_strokes,
@@ -19,7 +21,9 @@ from chanlun import (
     detect_fractals,
     detect_zhongshus,
     evaluate_daily_signal_tier,
+    evaluate_signal_tier,
     process_inclusion,
+    select_active_zhongshus,
 )
 from market_snapshot import compute_indicators
 
@@ -482,6 +486,520 @@ class TestChanlunEngine(unittest.TestCase):
              patch("builtins.print"):
             market_snapshot.main()
         mock_snap.assert_called_once_with("NVDA", period="3y", include_macro=False, full_chanlun=True)
+
+    def test_intraday_timestamp_preservation_and_dynamic_labels(self):
+        # 1) _format_bar_timestamps daily vs tz-aware daily vs intraday vs duplicate calendar dates
+        daily_idx = pd.date_range("2026-01-05", periods=5, freq="B")
+        self.assertEqual(_format_bar_timestamps(daily_idx)[0], "2026-01-05")
+        daily_tz_idx = pd.date_range("2026-01-05", periods=5, freq="B", tz="America/New_York")
+        self.assertEqual(_format_bar_timestamps(daily_tz_idx)[0], "2026-01-05")
+
+        intra_idx = pd.date_range("2026-01-05 09:30", periods=4, freq="30min")
+        self.assertEqual(
+            _format_bar_timestamps(intra_idx),
+            ["2026-01-05 09:30", "2026-01-05 10:00", "2026-01-05 10:30", "2026-01-05 11:00"],
+        )
+        dup_midnight_idx = pd.DatetimeIndex(["2026-01-05 00:00", "2026-01-05 00:00"])
+        self.assertEqual(_format_bar_timestamps(dup_midnight_idx), ["2026-01-05 00:00", "2026-01-05 00:00"])
+
+        # 2) Build intraday 30m wave DataFrame and verify timestamps + dynamic 30分钟 labels
+        df_base = build_wave_df([
+            (100.0, 1),
+            (118.0, 8),
+            (105.0, 8),
+            (119.0, 8),
+            (106.0, 8),
+            (135.0, 10),
+            (123.0, 7),
+            (126.0, 3),
+        ])
+        df_30m = df_base.copy()
+        df_30m.index = pd.date_range("2026-03-02 09:30", periods=len(df_30m), freq="30min")
+
+        ind_30m = compute_indicators(df_30m)
+        self.assertRegex(ind_30m["as_of_bar"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        ind_daily = compute_indicators(df_base)
+        self.assertRegex(ind_daily["as_of_bar"], r"^\d{4}-\d{2}-\d{2}$")
+
+        res_30m = analyze_chanlun(df_30m, timeframe_label="30分钟")
+        self.assertNotIn("error", res_30m)
+        self.assertEqual(res_30m["timeframe"], "30分钟")
+        self.assertEqual(res_30m["zhongshu_level_label"], "30分钟笔中枢")
+        self.assertNotIn("日线", res_30m["zhongshu_level_label"])
+        for st in res_30m["recent_strokes"]:
+            self.assertRegex(st["start_date"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+            self.assertRegex(st["end_date"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertRegex(res_30m["latest_zhongshu"]["start_date"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertRegex(res_30m["latest_zhongshu"]["end_date"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertRegex(res_30m["latest_fractal"]["date"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+        self.assertRegex(res_30m["stroke_end_trigger"]["ref_date"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+        sig_30m = evaluate_signal_tier(res_30m)
+        self.assertIn("30分钟", sig_30m["summary"])
+        self.assertNotIn("日线", sig_30m["summary"])
+        self.assertNotIn("日线", sig_30m["action_bias"])
+
+        # Segment Zhongshu upgrade on 30m should carry "30分钟一级线段中枢(...)"
+        seg_points = [
+            (120.0, 1), (95.0, 8), (112.0, 7), (102.0, 7), (132.0, 8),
+            (108.0, 7), (122.0, 7), (100.0, 7),
+            (126.0, 7), (110.0, 7), (135.0, 7),
+            (114.0, 7), (124.0, 7), (108.0, 7), (121.0, 7), (109.0, 7), (120.0, 7), (110.0, 7), (119.0, 7), (106.0, 7),
+            (128.0, 7), (115.0, 7), (136.0, 7), (125.0, 7),
+        ]
+        df_seg_30m = build_wave_df(seg_points)
+        df_seg_30m.index = pd.date_range("2026-03-02 09:30", periods=len(df_seg_30m), freq="30min")
+        res_seg_30m = analyze_chanlun(df_seg_30m, timeframe_label="30分钟")
+        self.assertEqual(res_seg_30m["zhongshu_level"], "segment")
+        self.assertTrue(res_seg_30m["zhongshu_level_label"].startswith("30分钟一级线段中枢("))
+        self.assertNotIn("日线", res_seg_30m["zhongshu_level_label"])
+
+        # Direct select_active_zhongshus empty-case label check
+        lvl, lbl, zss = select_active_zhongshus([], [], [], timeframe_label="15分钟")
+        self.assertEqual((lvl, lbl, zss), ("stroke", "15分钟笔中枢", []))
+
+        # evaluate_signal_tier explicit override & backward-compatible evaluate_daily_signal_tier
+        mock_zs = {"price_vs_zhongshu": "inside_zs(50%)", "signals": []}
+        self.assertIn("60分钟", evaluate_signal_tier(mock_zs, timeframe_label="60分钟")["summary"])
+        self.assertIn("60分钟", evaluate_signal_tier(mock_zs, timeframe_label="60分钟")["action_bias"])
+        self.assertIn("日线", evaluate_daily_signal_tier(mock_zs)["summary"])
+        self.assertIn("30分钟", evaluate_daily_signal_tier({"timeframe": "30分钟", **mock_zs})["summary"])
+
+    def test_assess_dual_timeframe_alignment_all_regimes(self):
+        expected_keys = {
+            "desired_direction",
+            "daily_bias",
+            "daily_tier",
+            "daily_summary",
+            "daily_signal_meta",
+            "daily_zd",
+            "daily_zg",
+            "daily_tactical_stop",
+            "daily_structural_stop",
+            "daily_reverse_k_watch",
+            "intraday_timeframe",
+            "intraday_bias",
+            "intraday_action",
+            "intraday_tier",
+            "intraday_summary",
+            "intraday_signal_meta",
+            "intraday_zd",
+            "intraday_zg",
+            "intraday_tactical_stop",
+            "intraday_reverse_k_watch",
+            "aligned",
+            "alignment_status",
+            "noise_reduction_pct",
+            "notes",
+        }
+
+        daily_long = {
+            "timeframe": "日线",
+            "last_close": 120.0,
+            "price_vs_zhongshu": "above_zg(+9.09%)",
+            "latest_zhongshu": {"zd": 100.0, "zg": 110.0},
+            "momentum_assessment": {"active_direction": "up", "is_capital_consensus": True},
+            "stroke_end_trigger": {"direction": "up", "level": 108.0, "triggered": False},
+            "recent_strokes": [{"direction": "up", "start_price": 106.0, "end_price": 120.0, "low": 106.0, "high": 120.0, "is_confirmed": False}],
+            "signals": ["日线首中枢三买确认(回踩不破ZG=110.0+底分型)"],
+        }
+        intraday_long_3b = {
+            "timeframe": "30分钟",
+            "last_close": 120.0,
+            "price_vs_zhongshu": "above_zg(+2.56%)",
+            "latest_zhongshu": {"zd": 115.0, "zg": 117.0},
+            "momentum_assessment": {"active_direction": "up", "is_capital_consensus": False},
+            "stroke_end_trigger": {"direction": "up", "level": 117.6, "triggered": False},
+            "recent_strokes": [{"direction": "up", "start_price": 117.2, "end_price": 120.0, "low": 117.2, "high": 120.0, "is_confirmed": False}],
+            "signals": ["30分钟首中枢三买确认(回踩不破ZG=117.0+底分型)"],
+        }
+
+        # 1) Aligned long trigger: structural stops separated from Lesson 11 reverse-K watch
+        #    noise_reduction_pct = (1 - (120.0 - 117.2) / (120.0 - 106.0)) * 100 = (1 - 2.8 / 14.0) * 100 = 80.0%
+        a_long = assess_dual_timeframe_alignment(daily_long, intraday_long_3b, desired_direction="long")
+        self.assertEqual(set(a_long.keys()), expected_keys)
+        self.assertTrue(a_long["aligned"])
+        self.assertEqual(a_long["alignment_status"], "aligned_trigger")
+        self.assertEqual(a_long["daily_bias"], "long")
+        self.assertEqual(a_long["intraday_bias"], "long")
+        self.assertEqual(a_long["intraday_action"], "entry_long")
+        self.assertTrue(a_long["intraday_signal_meta"]["confirmed"])
+        self.assertEqual(a_long["intraday_signal_meta"]["signal_type"], "confirmed_buy")
+        self.assertEqual(a_long["daily_zd"], 100.0)
+        self.assertEqual(a_long["daily_zg"], 110.0)
+        self.assertEqual(a_long["daily_tactical_stop"], 106.0)
+        self.assertEqual(a_long["daily_structural_stop"], 100.0)
+        self.assertEqual(a_long["daily_reverse_k_watch"], 108.0)
+        self.assertEqual(a_long["intraday_zd"], 115.0)
+        self.assertEqual(a_long["intraday_zg"], 117.0)
+        self.assertEqual(a_long["intraday_tactical_stop"], 117.2)
+        self.assertEqual(a_long["intraday_reverse_k_watch"], 117.6)
+        self.assertEqual(a_long["noise_reduction_pct"], 80.0)
+
+        # 2) Symmetric short alignment when desired_direction is None:
+        #    daily_tactical_stop=110.0, daily_structural_stop=112.0 (ZG), daily_reverse_k_watch=108.0
+        #    intraday_tactical_stop=102.0 -> noise_reduction_pct = (1 - 2.0 / 10.0) * 100 = 80.0%
+        daily_short = {
+            "timeframe": "日线",
+            "last_close": 100.0,
+            "price_vs_zhongshu": "below_zd(-5.0%)",
+            "latest_zhongshu": {"zd": 105.0, "zg": 112.0},
+            "momentum_assessment": {"active_direction": "down", "is_capital_consensus": True},
+            "reverse_k_trigger": 108.0,
+            "recent_strokes": [{"direction": "down", "start_price": 110.0, "end_price": 100.0, "low": 100.0, "high": 110.0, "is_confirmed": False}],
+            "signals": ["日线向下离开段·资金方向一致"],
+        }
+        intraday_short_3s = {
+            "timeframe": "30分钟",
+            "last_close": 100.0,
+            "price_vs_zhongshu": "below_zd(-1.5%)",
+            "latest_zhongshu": {"zd": 101.5, "zg": 103.5},
+            "momentum_assessment": {"active_direction": "down", "is_capital_consensus": False},
+            "recent_strokes": [{"direction": "down", "start_price": 102.0, "end_price": 100.0, "low": 100.0, "high": 102.0, "is_confirmed": False}],
+            "signals": ["30分钟首中枢三卖确认(反抽不过ZD=101.5+顶分型)"],
+        }
+        a_short = assess_dual_timeframe_alignment(daily_short, intraday_short_3s)
+        self.assertTrue(a_short["aligned"])
+        self.assertEqual(a_short["alignment_status"], "aligned_trigger")
+        self.assertEqual(a_short["daily_bias"], "short")
+        self.assertEqual(a_short["daily_signal_meta"]["signal_type"], "momentum_short")
+        self.assertFalse(a_short["daily_signal_meta"]["confirmed"])
+        self.assertEqual(a_short["intraday_action"], "entry_short")
+        self.assertTrue(a_short["intraday_signal_meta"]["confirmed"])
+        self.assertEqual(a_short["intraday_signal_meta"]["signal_type"], "confirmed_sell")
+        self.assertEqual(a_short["daily_tactical_stop"], 110.0)
+        self.assertEqual(a_short["daily_structural_stop"], 112.0)
+        self.assertEqual(a_short["daily_reverse_k_watch"], 108.0)
+        self.assertEqual(a_short["intraday_tactical_stop"], 102.0)
+        self.assertIsNone(a_short["intraday_reverse_k_watch"])
+        self.assertEqual(a_short["noise_reduction_pct"], 80.0)
+
+        # 3) Daily opposes desired_direction -> vetoed even when 30m shows long signal
+        a_oppose = assess_dual_timeframe_alignment(daily_short, intraday_long_3b, desired_direction="long")
+        self.assertFalse(a_oppose["aligned"])
+        self.assertEqual(a_oppose["alignment_status"], "daily_opposes_direction")
+
+        # 4) Daily OK, 30m still oscillating -> daily_ok_wait_30m
+        intraday_wait = {
+            "timeframe": "30分钟",
+            "last_close": 120.0,
+            "price_vs_zhongshu": "inside_zs(50%)",
+            "latest_zhongshu": {"zd": 118.0, "zg": 122.0},
+            "momentum_assessment": {"active_direction": "down", "is_capital_consensus": False},
+            "signals": ["30分钟中枢震荡中([ZD=118.0, ZG=122.0])"],
+        }
+        a_wait = assess_dual_timeframe_alignment(daily_long, intraday_wait, desired_direction="long")
+        self.assertFalse(a_wait["aligned"])
+        self.assertEqual(a_wait["alignment_status"], "daily_ok_wait_30m")
+        self.assertEqual(a_wait["intraday_action"], "wait_structure")
+
+        # 5) Exhaustion warnings: non-first ZS 3B and non-divergence counter-signal steep crash
+        intraday_nonfirst_3b = {
+            "timeframe": "30分钟",
+            "last_close": 125.0,
+            "price_vs_zhongshu": "above_zg(+2.0%)",
+            "signals": ["30分钟第2个中枢·非首中枢三买确认(回踩不破ZG=122.0+底分型)"],
+        }
+        a_exh1 = assess_dual_timeframe_alignment(daily_long, intraday_nonfirst_3b, desired_direction="long")
+        self.assertFalse(a_exh1["aligned"])
+        self.assertEqual(a_exh1["intraday_action"], "exhaustion_warning")
+        self.assertEqual(a_exh1["alignment_status"], "daily_ok_wait_30m")
+        self.assertTrue(a_exh1["intraday_signal_meta"]["is_exhaustion"])
+        self.assertFalse(a_exh1["intraday_signal_meta"]["confirmed"])
+
+        intraday_steep_crash = {
+            "timeframe": "30分钟",
+            "last_close": 115.0,
+            "price_vs_zhongshu": "below_zd(-2.0%)",
+            "momentum_assessment": {"active_direction": "down", "is_non_divergence_power": True},
+            "signals": ["30分钟非背驰背离(急跌2类笔·斜率2.5x,area=0.4x·仍有空头力量勿猜1买)"],
+        }
+        a_exh2 = assess_dual_timeframe_alignment(daily_long, intraday_steep_crash, desired_direction="long")
+        self.assertFalse(a_exh2["aligned"])
+        self.assertEqual(a_exh2["intraday_action"], "exhaustion_warning")
+        self.assertEqual(a_exh2["intraday_signal_meta"]["signal_type"], "steep_non_div_down")
+        self.assertFalse(a_exh2["intraday_signal_meta"]["confirmed"])
+
+        # 6) Neutral daily -> neutral_wait
+        daily_neutral = {
+            "timeframe": "日线",
+            "price_vs_zhongshu": "inside_zs(50%)",
+            "signals": ["日线中枢震荡中([ZD=100.0, ZG=110.0])"],
+        }
+        a_neutral = assess_dual_timeframe_alignment(daily_neutral, intraday_long_3b, desired_direction="long")
+        self.assertFalse(a_neutral["aligned"])
+        self.assertEqual(a_neutral["alignment_status"], "neutral_wait")
+        self.assertIsNone(a_neutral["noise_reduction_pct"])
+
+        # 7) Invalid desired_direction raises ValueError
+        with self.assertRaises(ValueError):
+            assess_dual_timeframe_alignment(daily_long, intraday_long_3b, desired_direction="sideways")
+
+    def test_codex_round1_dst_signal_meta_stops_and_unclamped_noise(self):
+        # 1) DST fall-back timezone offset preservation: 01:30-04:00 vs 01:30-05:00 stay distinct
+        dst_idx = pd.date_range("2026-11-01 00:30", periods=5, freq="30min", tz="America/New_York")
+        formatted_dst = _format_bar_timestamps(dst_idx)
+        self.assertEqual(
+            formatted_dst,
+            [
+                "2026-11-01T00:30-04:00",
+                "2026-11-01T01:00-04:00",
+                "2026-11-01T01:30-04:00",
+                "2026-11-01T01:00-05:00",
+                "2026-11-01T01:30-05:00",
+            ],
+        )
+        self.assertEqual(len(set(formatted_dst)), 5)
+
+        # 2) Candidate ("一买候选" / "一卖候选" / "疑似" / "准") and bare 30m "多头资金方向一致推进"
+        #    MUST have confirmed=False and produce wait_structure (NOT aligned_trigger)
+        daily_cons_up = {
+            "timeframe": "日线",
+            "last_close": 100.0,
+            "price_vs_zhongshu": "above_zg(+4.0%)",
+            "latest_zhongshu": {"zd": 85.0, "zg": 96.0},
+            "momentum_assessment": {"active_direction": "up", "is_capital_consensus": True},
+            "recent_strokes": [{"direction": "up", "start_price": 92.0, "end_price": 100.0, "low": 92.0, "high": 100.0, "is_confirmed": False}],
+            "signals": ["日线多头资金方向一致推进(area=1.3x,peak=1.2x·3类笔)"],
+        }
+
+        candidate_cases = [
+            "30分钟盘整背驰+底分型结构(一买候选·5类笔·area=0.45x)",
+            "30分钟盘整背驰+底分型确认(一买候选·6类弱笔·area=0.40x)",
+            "30分钟下跌力度衰减(疑似盘整背驰·5类笔·area=0.50x·待底分型)",
+            "30分钟首中枢准三买观察(回踩ZG=98.0上方)",
+        ]
+        for sig_text in candidate_cases:
+            intra_cand = {
+                "timeframe": "30分钟",
+                "last_close": 100.0,
+                "latest_fractal": {"kind": "bottom", "date": "2026-11-01T01:30-04:00", "confirmed_date": "2026-11-01T01:00-05:00", "just_confirmed": True},
+                "signals": [sig_text],
+            }
+            sig_eval = evaluate_signal_tier(intra_cand, timeframe_label="30分钟")
+            self.assertEqual(sig_eval["signal_meta"]["signal_type"], "candidate_buy", msg=sig_text)
+            self.assertEqual(sig_eval["signal_meta"]["direction"], "long", msg=sig_text)
+            self.assertFalse(sig_eval["signal_meta"]["confirmed"], msg=sig_text)
+            self.assertEqual(sig_eval["signal_meta"]["signal_timestamp"], "2026-11-01T01:00-05:00")
+
+            aln = assess_dual_timeframe_alignment(daily_cons_up, intra_cand, desired_direction="long")
+            self.assertEqual(aln["daily_bias"], "long")
+            self.assertEqual(aln["intraday_action"], "wait_structure", msg=sig_text)
+            self.assertFalse(aln["aligned"], msg=sig_text)
+            self.assertEqual(aln["alignment_status"], "daily_ok_wait_30m", msg=sig_text)
+
+        # Candidate sell ("一卖候选") also stays confirmed=False
+        intra_cand_sell = {
+            "timeframe": "30分钟",
+            "last_close": 100.0,
+            "signals": ["30分钟趋势背驰+顶分型确认(一卖候选·6类弱笔·area=0.42x)"],
+        }
+        sell_cand_eval = evaluate_signal_tier(intra_cand_sell, timeframe_label="30分钟")
+        self.assertEqual(sell_cand_eval["signal_meta"]["signal_type"], "candidate_sell")
+        self.assertEqual(sell_cand_eval["signal_meta"]["direction"], "short")
+        self.assertFalse(sell_cand_eval["signal_meta"]["confirmed"])
+
+        # Bare 30m "多头资金方向一致推进" -> momentum_long, confirmed=False, wait_structure (NOT entry_long!)
+        intra_bare_mom = {
+            "timeframe": "30分钟",
+            "last_close": 100.0,
+            "price_vs_zhongshu": "above_zg(+2.0%)",
+            "momentum_assessment": {"active_direction": "up", "is_capital_consensus": True},
+            "signals": ["30分钟多头资金方向一致推进(area=1.2x,peak=1.1x·3类笔)"],
+        }
+        mom_eval = evaluate_signal_tier(intra_bare_mom, timeframe_label="30分钟")
+        self.assertEqual(mom_eval["signal_meta"]["signal_type"], "momentum_long")
+        self.assertEqual(mom_eval["signal_meta"]["direction"], "long")
+        self.assertFalse(mom_eval["signal_meta"]["confirmed"])
+        aln_mom = assess_dual_timeframe_alignment(daily_cons_up, intra_bare_mom, desired_direction="long")
+        self.assertEqual(aln_mom["daily_bias"], "long")
+        self.assertEqual(aln_mom["intraday_action"], "wait_structure")
+        self.assertFalse(aln_mom["aligned"])
+        self.assertEqual(aln_mom["alignment_status"], "daily_ok_wait_30m")
+
+        # Weak daily running stroke ("常规运行中") MUST stay daily_bias == "neutral"
+        daily_weak = {
+            "timeframe": "日线",
+            "last_close": 100.0,
+            "price_vs_zhongshu": "no_zhongshu",
+            "momentum_assessment": {"active_direction": "up", "verdict": "neutral_extension_up"},
+            "signals": ["日线向上笔常规运行中(6类弱笔)"],
+        }
+        aln_weak = assess_dual_timeframe_alignment(daily_weak, intra_bare_mom, desired_direction="long")
+        self.assertEqual(aln_weak["daily_bias"], "neutral")
+        self.assertEqual(aln_weak["alignment_status"], "neutral_wait")
+
+        # 3) Confirmed 30m 1B / 2B / 3B all give confirmed=True and aligned_trigger
+        confirmed_buy_signals = [
+            "30分钟盘整背驰+底分型启动(一买/盘背·5类笔·area=0.45x)",
+            "30分钟3出(D3·首次底抬高)/二买确认(回踩不破前低95.0+找大哥(多强空弱))",
+            "30分钟首中枢三买确认(回踩不破ZG=97.0+底分型)",
+        ]
+        for sig_text in confirmed_buy_signals:
+            intra_conf = {
+                "timeframe": "30分钟",
+                "last_close": 100.0,
+                "recent_strokes": [{"direction": "up", "start_price": 96.0, "end_price": 100.0, "low": 96.0, "high": 100.0, "is_confirmed": False}],
+                "signals": [sig_text],
+            }
+            aln_conf = assess_dual_timeframe_alignment(daily_cons_up, intra_conf, desired_direction="long")
+            self.assertTrue(aln_conf["intraday_signal_meta"]["confirmed"], msg=sig_text)
+            self.assertEqual(aln_conf["intraday_signal_meta"]["signal_type"], "confirmed_buy", msg=sig_text)
+            self.assertEqual(aln_conf["intraday_action"], "entry_long", msg=sig_text)
+            self.assertTrue(aln_conf["aligned"], msg=sig_text)
+            self.assertEqual(aln_conf["alignment_status"], "aligned_trigger", msg=sig_text)
+
+        # 4) Untriggered 1-bar micro reverse-K (99 vs swing low 90 at price 100) goes to intraday_reverse_k_watch,
+        #    NOT intraday_tactical_stop; daily_structural_stop extracts Daily ZD/ZG separately
+        intra_micro_revk = {
+            "timeframe": "30分钟",
+            "last_close": 100.0,
+            "latest_zhongshu": {"zd": 91.0, "zg": 95.0},
+            "stroke_end_trigger": {
+                "direction": "up",
+                "trigger_kind": "break_prev_bar_low",
+                "level": 99.0,
+                "triggered": False,
+            },
+            "recent_strokes": [
+                {"direction": "down", "start_price": 98.0, "end_price": 90.0, "low": 90.0, "high": 98.0, "is_confirmed": True},
+                {"direction": "up", "start_price": 90.0, "end_price": 100.0, "low": 90.0, "high": 100.0, "is_confirmed": False},
+            ],
+            "signals": ["30分钟首中枢三买确认(回踩不破ZG=95.0+底分型)"],
+        }
+        aln_stop = assess_dual_timeframe_alignment(daily_cons_up, intra_micro_revk, desired_direction="long")
+        self.assertEqual(aln_stop["intraday_tactical_stop"], 90.0)
+        self.assertEqual(aln_stop["intraday_reverse_k_watch"], 99.0)
+        self.assertEqual(aln_stop["daily_tactical_stop"], 92.0)
+        self.assertEqual(aln_stop["daily_structural_stop"], 85.0)
+
+        # Daily structural stop fallback when Zhongshu ZD is above ref_price (e.g. 1B bottom reversal)
+        daily_no_prot_zs = {
+            "timeframe": "日线",
+            "last_close": 100.0,
+            "latest_zhongshu": {"zd": 110.0, "zg": 120.0},
+            "recent_strokes": [
+                {"direction": "down", "start_price": 115.0, "end_price": 94.0, "low": 94.0, "high": 115.0, "is_confirmed": True},
+                {"direction": "up", "start_price": 94.0, "end_price": 100.0, "low": 94.0, "high": 100.0, "is_confirmed": False},
+            ],
+            "signals": ["日线盘整背驰+底分型启动(一买/盘背·5类笔·area=0.4x)"],
+        }
+        aln_fb = assess_dual_timeframe_alignment(daily_no_prot_zs, intra_micro_revk, desired_direction="long")
+        self.assertEqual(aln_fb["daily_structural_stop"], 94.0)
+
+        # 5) Negative noise_reduction_pct is NOT clamped to -100.0:
+        #    ref_price=100, daily_stop=95 (dist=5), intraday_stop=85 (dist=15 = 3x daily) -> -200.0%
+        daily_tight = {
+            "timeframe": "日线",
+            "last_close": 100.0,
+            "latest_zhongshu": {"zd": 90.0, "zg": 96.0},
+            "recent_strokes": [{"direction": "up", "start_price": 95.0, "end_price": 100.0, "low": 95.0, "high": 100.0, "is_confirmed": False}],
+            "signals": ["日线首中枢三买确认(回踩不破ZG=96.0+底分型)"],
+        }
+        intra_wide = {
+            "timeframe": "30分钟",
+            "last_close": 100.0,
+            "latest_zhongshu": {"zd": 85.0, "zg": 92.0},
+            "recent_strokes": [{"direction": "up", "start_price": 85.0, "end_price": 100.0, "low": 85.0, "high": 100.0, "is_confirmed": False}],
+            "signals": ["30分钟首中枢三买确认(回踩不破ZG=92.0+底分型)"],
+        }
+        aln_neg = assess_dual_timeframe_alignment(daily_tight, intra_wide, desired_direction="long")
+        self.assertEqual(aln_neg["daily_tactical_stop"], 95.0)
+        self.assertEqual(aln_neg["intraday_tactical_stop"], 85.0)
+        self.assertEqual(aln_neg["noise_reduction_pct"], -200.0)
+
+    def test_codex_round2_neutral_extension_momentum_guard(self):
+        # 1) Codex repro: daily signals contain "空头资金方向一致推进" while momentum_assessment regime is neutral_extension_down
+        #    -> MUST downgrade to weak_momentum_short with confirmed=False, momentum_confirmed=False
+        for mom_payload in (
+            {"active_direction": "down", "regime": "neutral_extension_down"},
+            {"active_direction": "down", "regime": "neutral_extension_down", "is_capital_consensus": False},
+            {"active_direction": "down", "regime": "neutral_extension_down", "is_capital_consensus": True},
+            {"active_direction": "down", "verdict": "neutral_extension_down", "is_capital_consensus": False},
+            {"active_direction": "down", "regime": "single_stroke_no_comparison"},
+            {"active_direction": "down", "regime": "weak_down_extension"},
+        ):
+            daily_neutral_down = {
+                "timeframe": "日线",
+                "last_close": 100.0,
+                "price_vs_zhongshu": "inside_zs(50%)",
+                "momentum_assessment": mom_payload,
+                "signals": ["日线空头资金方向一致推进"],
+            }
+            ev = evaluate_signal_tier(daily_neutral_down, timeframe_label="日线")
+            meta = ev["signal_meta"]
+            self.assertEqual(meta["signal_type"], "weak_momentum_short", msg=mom_payload)
+            self.assertEqual(meta["direction"], "short", msg=mom_payload)
+            self.assertFalse(meta["confirmed"], msg=mom_payload)
+            self.assertFalse(meta["momentum_confirmed"], msg=mom_payload)
+            self.assertNotEqual(ev["tier"], "资金一致推进(勿逆势)", msg=mom_payload)
+
+            # Dual alignment must NOT treat downgraded neutral extension as strong daily short bias
+            intra_ok = {
+                "timeframe": "30分钟",
+                "last_close": 100.0,
+                "price_vs_zhongshu": "inside_zs(50%)",
+                "signals": ["30分钟中枢震荡中([ZD=98.0, ZG=102.0])"],
+            }
+            aln = assess_dual_timeframe_alignment(daily_neutral_down, intra_ok, desired_direction="long")
+            self.assertEqual(aln["daily_bias"], "neutral", msg=mom_payload)
+            self.assertEqual(aln["daily_signal_meta"]["signal_type"], "weak_momentum_short", msg=mom_payload)
+            self.assertFalse(aln["daily_signal_meta"]["momentum_confirmed"], msg=mom_payload)
+
+        # Symmetric bullish guard: neutral_extension_up + "多头资金方向一致推进" -> weak_momentum_long
+        daily_neutral_up = {
+            "timeframe": "日线",
+            "last_close": 100.0,
+            "price_vs_zhongshu": "inside_zs(50%)",
+            "momentum_assessment": {"active_direction": "up", "regime": "neutral_extension_up"},
+            "signals": ["日线多头资金方向一致推进"],
+        }
+        ev_up_weak = evaluate_signal_tier(daily_neutral_up, timeframe_label="日线")
+        self.assertEqual(ev_up_weak["signal_meta"]["signal_type"], "weak_momentum_long")
+        self.assertEqual(ev_up_weak["signal_meta"]["direction"], "long")
+        self.assertFalse(ev_up_weak["signal_meta"]["confirmed"])
+        self.assertFalse(ev_up_weak["signal_meta"]["momentum_confirmed"])
+
+        # 2) Real capital consensus regimes -> momentum_confirmed=True and momentum_short / momentum_long
+        for strong_down_mom in (
+            {"active_direction": "down", "regime": "capital_consensus_down", "is_capital_consensus": True},
+            {"regime": "capital_consensus_down"},
+            {"regime": "strong_down_continuation"},
+            {"active_direction": "down", "verdict": "capital_consensus_down", "is_capital_consensus": True},
+        ):
+            daily_strong_down = {
+                "timeframe": "日线",
+                "last_close": 90.0,
+                "price_vs_zhongshu": "below_zd(-5.0%)",
+                "momentum_assessment": strong_down_mom,
+                "signals": ["日线空头资金方向一致推进"],
+            }
+            ev_sd = evaluate_signal_tier(daily_strong_down, timeframe_label="日线")
+            self.assertEqual(ev_sd["signal_meta"]["signal_type"], "momentum_short", msg=strong_down_mom)
+            self.assertEqual(ev_sd["signal_meta"]["direction"], "short", msg=strong_down_mom)
+            self.assertFalse(ev_sd["signal_meta"]["confirmed"], msg=strong_down_mom)
+            self.assertTrue(ev_sd["signal_meta"]["momentum_confirmed"], msg=strong_down_mom)
+
+        for strong_up_mom in (
+            {"active_direction": "up", "regime": "capital_consensus_up", "is_capital_consensus": True},
+            {"regime": "strong_up_continuation"},
+        ):
+            daily_strong_up = {
+                "timeframe": "日线",
+                "last_close": 115.0,
+                "price_vs_zhongshu": "above_zg(+5.0%)",
+                "momentum_assessment": strong_up_mom,
+                "signals": ["日线多头资金方向一致推进"],
+            }
+            ev_su = evaluate_signal_tier(daily_strong_up, timeframe_label="日线")
+            self.assertEqual(ev_su["signal_meta"]["signal_type"], "momentum_long", msg=strong_up_mom)
+            self.assertEqual(ev_su["signal_meta"]["direction"], "long", msg=strong_up_mom)
+            self.assertFalse(ev_su["signal_meta"]["confirmed"], msg=strong_up_mom)
+            self.assertTrue(ev_su["signal_meta"]["momentum_confirmed"], msg=strong_up_mom)
+
+        # Insufficient data also exposes momentum_confirmed=False
+        ev_err = evaluate_signal_tier({"error": "Insufficient bars"})
+        self.assertFalse(ev_err["signal_meta"]["momentum_confirmed"])
 
 
 if __name__ == "__main__":

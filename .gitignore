@@ -4,3 +4,10 @@ __pycache__/
 .pytest_cache/
 .env
 reports/*.html
+portfolio/portfolio.db
+portfolio/portfolio.db-wal
+portfolio/portfolio.db-shm
+portfolio/account.json
+portfolio/positions.json
+portfolio/journal.jsonl
+portfolio/.portfolio.lock

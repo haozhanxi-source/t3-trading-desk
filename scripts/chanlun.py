@@ -13,6 +13,7 @@ Aligned with the 19-lesson practical Chanlun system + MACD confirmation:
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -120,6 +121,73 @@ def compute_macd(close: pd.Series) -> tuple[pd.Series, pd.Series, pd.Series]:
     return dif, dea, hist
 
 
+def _format_bar_timestamps(index, force_intraday: bool = False) -> list[str]:
+    """Format bar timestamps:
+    - tz-aware intraday: ISO 8601 with tz offset at minute precision (e.g. '2026-11-01T01:30-04:00')
+    - naive intraday: 'YYYY-MM-DD HH:MM'
+    - pure daily: 'YYYY-MM-DD'
+    """
+    if index is None or len(index) == 0:
+        return []
+
+    items = list(index)
+    parsed: list[Optional[pd.Timestamp]] = []
+    has_time = False
+    seen_dates: set[str] = set()
+    has_dup_dates = False
+
+    for idx in items:
+        ts: Optional[pd.Timestamp] = None
+        if isinstance(idx, (pd.Timestamp, datetime)):
+            ts = pd.Timestamp(idx)
+        elif hasattr(idx, "year") and hasattr(idx, "month") and hasattr(idx, "day"):
+            ts = pd.Timestamp(idx)
+        else:
+            try:
+                cand = pd.Timestamp(idx)
+                if pd.notna(cand):
+                    ts = cand
+            except Exception:
+                ts = None
+
+        parsed.append(ts)
+        if ts is not None and pd.notna(ts):
+            if ts.hour != 0 or ts.minute != 0 or ts.second != 0 or ts.microsecond != 0:
+                has_time = True
+            d_key = ts.strftime("%Y-%m-%d")
+            if d_key in seen_dates:
+                has_dup_dates = True
+            else:
+                seen_dates.add(d_key)
+
+    is_intraday = bool(force_intraday or has_time or has_dup_dates)
+    out: list[str] = []
+    for raw_idx, ts in zip(items, parsed, strict=True):
+        if ts is not None and pd.notna(ts):
+            if is_intraday:
+                if ts.tzinfo is not None:
+                    out.append(ts.isoformat(timespec="minutes"))
+                else:
+                    out.append(ts.strftime("%Y-%m-%d %H:%M"))
+            else:
+                out.append(ts.strftime("%Y-%m-%d"))
+        else:
+            out.append(str(raw_idx))
+    return out
+
+
+def _ts_ge(a: Optional[str], b: Optional[str]) -> bool:
+    """Compare two formatted bar timestamp strings chronologically (handling ISO tz offsets)."""
+    if not a or not b:
+        return False
+    if "T" in a and "T" in b:
+        try:
+            return datetime.fromisoformat(a) >= datetime.fromisoformat(b)
+        except ValueError:
+            pass
+    return a >= b
+
+
 def process_inclusion(df: pd.DataFrame) -> list[MergedBar]:
     """Perform standard Chanlun K-line inclusion processing from left to right."""
     if df.empty:
@@ -130,7 +198,7 @@ def process_inclusion(df: pd.DataFrame) -> list[MergedBar]:
     opens = df["Open"].astype(float).values if "Open" in df else df["Close"].astype(float).values
     closes = df["Close"].astype(float).values
     vols = df["Volume"].astype(float).values if "Volume" in df else np.zeros(len(df))
-    dates = [str(idx.date()) for idx in df.index]
+    dates = _format_bar_timestamps(df.index)
 
     merged: list[MergedBar] = []
     direction = 1
@@ -1030,17 +1098,19 @@ def select_active_zhongshus(
     stroke_zss: list[Zhongshu],
     segment_zss: list[Zhongshu],
     strokes: list[Stroke],
+    timeframe_label: str = "日线",
 ) -> tuple[str, str, list[Zhongshu]]:
     """Switch dynamically from Stroke Zhongshu to Segment Zhongshu when wide oscillation upgrades
     the structure (9+ strokes around the old box or >=6 strokes stale without a fresh stroke box).
     """
+    tf = timeframe_label or "日线"
     if not stroke_zss and segment_zss:
-        return "segment", "日线一级线段中枢(段中枢)", segment_zss
+        return "segment", f"{tf}一级线段中枢(段中枢)", segment_zss
     if not stroke_zss:
-        return "stroke", "日线笔中枢", []
+        return "stroke", f"{tf}笔中枢", []
 
     latest_st = stroke_zss[-1]
-    strokes_since_box = sum(1 for s in strokes if s.is_confirmed and s.start_date >= latest_st.end_date)
+    strokes_since_box = sum(1 for s in strokes if s.is_confirmed and _ts_ge(s.start_date, latest_st.end_date))
 
     # Upgrade trigger: 9+ strokes around old box OR >=6 strokes elapsed since core box ended
     needs_upgrade = latest_st.is_nine_upgrade or strokes_since_box >= 6
@@ -1048,11 +1118,11 @@ def select_active_zhongshus(
         latest_seg = segment_zss[-1]
         # Prefer segment Zhongshu if it extends closer to current price action than the stale stroke box
         seg_reach = latest_seg.oscillation_end_date or latest_seg.end_date
-        if seg_reach >= latest_st.end_date:
+        if _ts_ge(seg_reach, latest_st.end_date):
             reason = "九段升级" if latest_st.is_nine_upgrade else "震荡拓宽升级"
-            return "segment", f"日线一级线段中枢({reason})", segment_zss
+            return "segment", f"{tf}一级线段中枢({reason})", segment_zss
 
-    return "stroke", "日线笔中枢", stroke_zss
+    return "stroke", f"{tf}笔中枢", stroke_zss
 
 
 def detect_stroke_end_trigger(df: Optional[pd.DataFrame], strokes: list[Stroke]) -> Optional[dict]:
@@ -1071,7 +1141,8 @@ def detect_stroke_end_trigger(df: Optional[pd.DataFrame], strokes: list[Stroke])
     closes = sub["Close"].astype(float).values
     highs = sub["High"].astype(float).values
     lows = sub["Low"].astype(float).values
-    dates = [str(idx.date()) for idx in sub.index]
+    all_dates = _format_bar_timestamps(df.index)
+    dates = all_dates[lo_r : hi_r + 1]
 
     last_close = float(df["Close"].iloc[-1])
     last_high = float(df["High"].iloc[-1])
@@ -1294,9 +1365,11 @@ def classify_chanlun_signals(
     stroke_end_trigger: Optional[dict] = None,
     segments: Optional[list[Segment]] = None,
     zhongshu_level: str = "stroke",
-    zhongshu_level_label: str = "日线笔中枢",
+    zhongshu_level_label: Optional[str] = None,
 ) -> tuple[str, str, list[str]]:
     """Produce macro structure, Zhongshu position, and 19-lesson tactical Chanlun signals."""
+    if not zhongshu_level_label:
+        zhongshu_level_label = f"{timeframe_label}笔中枢"
     signals: list[str] = []
 
     # 1. Macro structure from Zhongshu sequence
@@ -1426,7 +1499,7 @@ def classify_chanlun_signals(
                 prior_up = [s for s in strokes[:-2] if s.direction == "up"]
                 brother_strong = bool(prior_up and (prev_up.high > prior_up[-1].high or abs(prev_up.pct_change) > abs(curr.pct_change)))
                 # Distinguish D3 (first higher low after down leg) vs D4 (2nd higher low / post-ZS)
-                is_d4 = bool(latest_zs and latest_zs.end_date >= prev_dn.start_date and len(prev_same) >= 2 and prev_same[-1].end_price > prev_same[-2].end_price)
+                is_d4 = bool(latest_zs and _ts_ge(latest_zs.end_date, prev_dn.start_date) and len(prev_same) >= 2 and prev_same[-1].end_price > prev_same[-2].end_price)
                 out_tag = "4出(D4)" if is_d4 else "3出(D3·首次底抬高)"
                 mode_tag = "2+3买" if has_3b else "二买"
                 trig_ok = bool(stroke_end_trigger and stroke_end_trigger.get("triggered"))
@@ -1441,7 +1514,7 @@ def classify_chanlun_signals(
             if curr.end_price < prev_up.end_price:
                 prior_dn = [s for s in strokes[:-2] if s.direction == "down"]
                 brother_strong = bool(prior_dn and (prev_dn.low < prior_dn[-1].low or abs(prev_dn.pct_change) > abs(curr.pct_change)))
-                is_d4 = bool(latest_zs and latest_zs.end_date >= prev_up.start_date and len(prev_same) >= 2 and prev_same[-1].end_price < prev_same[-2].end_price)
+                is_d4 = bool(latest_zs and _ts_ge(latest_zs.end_date, prev_up.start_date) and len(prev_same) >= 2 and prev_same[-1].end_price < prev_same[-2].end_price)
                 out_tag = "4出(D4)空" if is_d4 else "3出(D3·首次顶降低)"
                 mode_tag = "2+3卖" if has_3s else "二卖"
                 trig_ok = bool(stroke_end_trigger and stroke_end_trigger.get("triggered"))
@@ -1515,7 +1588,9 @@ def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线", full_expo
     segments = build_segments(strokes)
     stroke_zss = detect_zhongshus(strokes, last_close)
     segment_zss = detect_segment_zhongshus(segments)
-    zs_level, zs_level_label, zhongshus = select_active_zhongshus(stroke_zss, segment_zss, strokes)
+    zs_level, zs_level_label, zhongshus = select_active_zhongshus(
+        stroke_zss, segment_zss, strokes, timeframe_label=timeframe_label
+    )
     momentum = assess_momentum(strokes)
     stroke_end_trigger = detect_stroke_end_trigger(df, strokes)
 
@@ -1550,6 +1625,7 @@ def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线", full_expo
 
     result = {
         "timeframe": timeframe_label,
+        "last_close": round(last_close, 4),
         "raw_bars": len(df),
         "merged_bars": len(merged),
         "macro_structure": macro_structure,
@@ -1577,88 +1653,855 @@ def analyze_chanlun(df: pd.DataFrame, timeframe_label: str = "日线", full_expo
     return result
 
 
-def evaluate_daily_signal_tier(daily: dict) -> dict:
-    """Classify actionable tier and bias purely from Daily Chanlun structure."""
-    if "error" in daily:
-        return {"tier": "数据不足", "summary": daily["error"], "action_bias": "跳过"}
+def _extract_signal_timestamp(cl: dict) -> Optional[str]:
+    """Extract the most relevant bar timestamp associated with the current Chanlun signal."""
+    lf = cl.get("latest_fractal") if isinstance(cl.get("latest_fractal"), dict) else None
+    if lf and lf.get("just_confirmed"):
+        ts = lf.get("confirmed_date") or lf.get("date")
+        if isinstance(ts, str) and ts.strip():
+            return ts.strip()
+    trig = cl.get("stroke_end_trigger") if isinstance(cl.get("stroke_end_trigger"), dict) else None
+    if trig and trig.get("triggered"):
+        ts = trig.get("ref_date")
+        if isinstance(ts, str) and ts.strip():
+            return ts.strip()
+    strokes = cl.get("recent_strokes") or []
+    if strokes and isinstance(strokes[-1], dict):
+        ts = strokes[-1].get("end_date")
+        if isinstance(ts, str) and ts.strip():
+            return ts.strip()
+    if lf:
+        ts = lf.get("confirmed_date") or lf.get("date")
+        if isinstance(ts, str) and ts.strip():
+            return ts.strip()
+    lz = cl.get("latest_zhongshu") if isinstance(cl.get("latest_zhongshu"), dict) else None
+    if lz:
+        ts = lz.get("oscillation_end_date") or lz.get("end_date")
+        if isinstance(ts, str) and ts.strip():
+            return ts.strip()
+    return None
 
-    d_mom = daily.get("momentum_assessment", {})
+
+def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = None) -> dict:
+    """Classify actionable tier, bias, and structured signal_meta from Chanlun structure on any timeframe."""
+    if not isinstance(chanlun_result, dict) or "error" in chanlun_result:
+        err = chanlun_result.get("error", "数据不足") if isinstance(chanlun_result, dict) else "数据不足"
+        return {
+            "tier": "数据不足",
+            "summary": err,
+            "action_bias": "跳过",
+            "signal_meta": {
+                "signal_type": "insufficient_data",
+                "direction": "neutral",
+                "confirmed": False,
+                "momentum_confirmed": False,
+                "is_exhaustion": False,
+                "signal_timestamp": None,
+            },
+        }
+
+    tf = timeframe_label or chanlun_result.get("timeframe") or "日线"
+    d_mom = chanlun_result.get("momentum_assessment", {}) or {}
     d_dir = d_mom.get("active_direction")
-    d_cons = d_mom.get("is_capital_consensus", False)
-    d_div = d_mom.get("is_divergence_candidate", False)
-    d_non_div = d_mom.get("is_non_divergence_power", False)
-    pos = daily.get("price_vs_zhongshu", "")
-    sigs = daily.get("signals", [])
-    sigs_str = " ".join(sigs)
+    d_cons = bool(d_mom.get("is_capital_consensus", False))
+    d_div = bool(d_mom.get("is_divergence_candidate", False))
+    d_non_div = bool(d_mom.get("is_non_divergence_power", False))
+    raw_regime = str(d_mom.get("regime") or "").strip().lower()
+    raw_verdict = str(d_mom.get("verdict") or "").strip().lower()
+    regime = raw_regime or raw_verdict
+    regimes_present = {r for r in (raw_regime, raw_verdict) if r}
 
-    # Distinguish confirmed actionable signals vs unconfirmed watch/reserve signals without substring collisions
-    has_first_zs_3b = any(("首中枢三买确认" in s or "段首中枢三买确认" in s) and "非首中枢" not in s for s in sigs)
-    has_first_zs_3s = any(("首中枢三卖确认" in s or "段首中枢三卖确认" in s) and "非首中枢" not in s for s in sigs)
-    has_2p3_buy = any("2+3买确认" in s for s in sigs)
-    has_2p3_sell = any("2+3卖确认" in s for s in sigs)
-    has_nonfirst_3b = any("非首中枢三买确认" in s for s in sigs)
-    has_nonfirst_3s = any("非首中枢三卖确认" in s for s in sigs)
-    has_d3_d4_buy = any(("3出(D3" in s or "4出(D4" in s) and ("确认" in s or "启动" in s) and "4出(D4)空" not in s and "顶降低" not in s and "二卖" not in s and "2+3卖" not in s for s in sigs)
-    has_d3_d4_sell = any(("3出(D3" in s or "4出(D4" in s) and ("确认" in s or "启动" in s) and ("4出(D4)空" in s or "顶降低" in s or "二卖" in s or "2+3卖" in s or "空强多弱" in s) for s in sigs)
-    has_1b_2b = any(("一买" in s or "二买" in s) and ("确认" in s or "启动" in s or "候选" in s) for s in sigs)
-    has_1s_2s = any(("一卖" in s or "二卖" in s) and ("确认" in s or "启动" in s or "候选" in s) for s in sigs)
-    has_watch_only = any(("准三买观察" in s or "准三卖观察" in s or "蓄势" in s) for s in sigs)
+    strong_down_regimes = {"capital_consensus_down", "strong_down_continuation"}
+    strong_up_regimes = {"capital_consensus_up", "strong_up_continuation"}
+    weak_or_neutral_exact = {
+        "neutral",
+        "insufficient_data",
+        "higher_low_pullback",
+        "lower_high_rebound",
+        "divergence_candidate_down",
+        "divergence_candidate_up",
+    }
+
+    def _is_weak_or_neutral_regime(r: str) -> bool:
+        return bool(r) and (
+            r.startswith(("neutral_", "single_stroke", "weak"))
+            or r in weak_or_neutral_exact
+        )
+
+    has_neutral_or_weak_regime = any(_is_weak_or_neutral_regime(r) for r in regimes_present)
+    regime_strong_down = any(r in strong_down_regimes for r in regimes_present) and not has_neutral_or_weak_regime
+    regime_strong_up = any(r in strong_up_regimes for r in regimes_present) and not has_neutral_or_weak_regime
+    cons_explicitly_false = d_mom.get("is_capital_consensus") is False
+
+    pos = chanlun_result.get("price_vs_zhongshu", "") or ""
+    sigs = [str(s) for s in (chanlun_result.get("signals", []) or [])]
+    sig_ts = _extract_signal_timestamp(chanlun_result)
+
+    # Candidate/unconfirmed markers MUST never be promoted to confirmed 1/2/3 buy/sell
+    unconfirmed_tokens = ("候选", "疑似", "准", "观察", "蓄势")
+
+    def _has_unconfirmed(sig: str) -> bool:
+        return any(tok in sig for tok in unconfirmed_tokens)
+
+    # Confirmed actionable signals require explicit "确认" or "启动" AND zero unconfirmed markers
+    has_first_zs_3b = any(
+        "三买" in s and ("确认" in s or "启动" in s) and "非首中枢" not in s and not _has_unconfirmed(s)
+        for s in sigs
+    )
+    has_first_zs_3s = any(
+        "三卖" in s and ("确认" in s or "启动" in s) and "非首中枢" not in s and not _has_unconfirmed(s)
+        for s in sigs
+    )
+    has_2p3_buy = any(
+        "2+3买" in s and ("确认" in s or "启动" in s) and not _has_unconfirmed(s)
+        for s in sigs
+    )
+    has_2p3_sell = any(
+        "2+3卖" in s and ("确认" in s or "启动" in s) and not _has_unconfirmed(s)
+        for s in sigs
+    )
+    has_nonfirst_3b = any(
+        "非首中枢三买" in s and ("确认" in s or "启动" in s) and not _has_unconfirmed(s)
+        for s in sigs
+    )
+    has_nonfirst_3s = any(
+        "非首中枢三卖" in s and ("确认" in s or "启动" in s) and not _has_unconfirmed(s)
+        for s in sigs
+    )
+    has_d3_d4_buy = any(
+        ("3出(D3" in s or "4出(D4" in s)
+        and ("确认" in s or "启动" in s)
+        and not _has_unconfirmed(s)
+        and "4出(D4)空" not in s
+        and "顶降低" not in s
+        and "二卖" not in s
+        and "2+3卖" not in s
+        for s in sigs
+    )
+    has_d3_d4_sell = any(
+        ("3出(D3" in s or "4出(D4" in s)
+        and ("确认" in s or "启动" in s)
+        and not _has_unconfirmed(s)
+        and ("4出(D4)空" in s or "顶降低" in s or "二卖" in s or "2+3卖" in s or "空强多弱" in s)
+        for s in sigs
+    )
+    has_1b_2b = any(
+        ("一买" in s or "二买" in s) and ("确认" in s or "启动" in s) and not _has_unconfirmed(s)
+        for s in sigs
+    )
+    has_1s_2s = any(
+        ("一卖" in s or "二卖" in s) and ("确认" in s or "启动" in s) and not _has_unconfirmed(s)
+        for s in sigs
+    )
+
+    has_non_div_down = (
+        (d_non_div and d_dir == "down")
+        or ("non_divergence_down" in regimes_present)
+        or any("非背驰" in s and "急跌" in s for s in sigs)
+    ) and not has_neutral_or_weak_regime
+    has_non_div_up = (
+        (d_non_div and d_dir == "up")
+        or ("non_divergence_up" in regimes_present)
+        or any("非背驰" in s and "急拉" in s for s in sigs)
+    ) and not has_neutral_or_weak_regime
+
+    has_consensus_down_text = any(
+        ("空头资金方向一致" in s or "向下离开段·资金方向一致" in s) for s in sigs
+    )
+    has_consensus_up_text = any(
+        ("多头资金方向一致" in s or "向上离开段·资金方向一致" in s) for s in sigs
+    )
+    has_strong_consensus_down = (
+        regime_strong_down
+        or (d_cons and d_dir == "down" and not has_neutral_or_weak_regime)
+        or (has_consensus_down_text and not has_neutral_or_weak_regime and not cons_explicitly_false)
+    )
+    has_strong_consensus_up = (
+        regime_strong_up
+        or (d_cons and d_dir == "up" and not has_neutral_or_weak_regime)
+        or (has_consensus_up_text and not has_neutral_or_weak_regime and not cons_explicitly_false)
+    )
+    has_weak_consensus_down = (
+        not has_strong_consensus_down
+        and (has_consensus_down_text or (d_cons and d_dir == "down"))
+    )
+    has_weak_consensus_up = (
+        not has_strong_consensus_up
+        and (has_consensus_up_text or (d_cons and d_dir == "up"))
+    )
+
+    buy_cand_tokens = ("一买", "二买", "三买", "2+3买", "底分型", "底抬高", "下跌力度衰减", "不破前低")
+    sell_cand_tokens = ("一卖", "二卖", "三卖", "2+3卖", "顶分型", "顶降低", "上涨力度衰减", "不过前高")
+    has_candidate_buy = any(
+        _has_unconfirmed(s)
+        and any(tok in s for tok in buy_cand_tokens)
+        and not any(tok in s for tok in sell_cand_tokens)
+        for s in sigs
+    )
+    has_candidate_sell = any(
+        _has_unconfirmed(s) and any(tok in s for tok in sell_cand_tokens)
+        for s in sigs
+    )
+    has_watch_only = has_candidate_buy or has_candidate_sell or any(_has_unconfirmed(s) for s in sigs)
+
+    confirmed = False
+    momentum_confirmed = False
+    is_exhaustion = False
+    signal_type = "neutral"
+    direction = "neutral"
 
     if has_2p3_buy or has_first_zs_3b:
         tier = "买卖点信号"
-        summary = "日线首中枢三买 / 2+3买结构"
-        action_bias = "回踩不破首中枢上沿 ZG 配合日线底分型/破反向阳线，顺势做多"
+        summary = f"{tf}首中枢三买 / 2+3买结构"
+        action_bias = f"回踩不破首中枢上沿 ZG 配合{tf}底分型/破反向阳线，顺势做多"
+        signal_type = "confirmed_buy"
+        direction = "long"
+        confirmed = True
+        momentum_confirmed = bool(regime_strong_up or (d_cons and d_dir == "up" and not has_neutral_or_weak_regime))
     elif has_2p3_sell or has_first_zs_3s:
         tier = "买卖点信号"
-        summary = "日线首中枢三卖 / 2+3卖结构"
+        summary = f"{tf}首中枢三卖 / 2+3卖结构"
         action_bias = "反抽不过首中枢下沿 ZD 配合顶分型/破反向阴线，顺势减仓或做空"
+        signal_type = "confirmed_sell"
+        direction = "short"
+        confirmed = True
+        momentum_confirmed = bool(regime_strong_down or (d_cons and d_dir == "down" and not has_neutral_or_weak_regime))
     elif has_d3_d4_sell or has_1s_2s:
         tier = "买卖点信号"
-        summary = "日线 3出/4出/一二卖结构触发"
+        summary = f"{tf} 3出/4出/一二卖结构触发"
         action_bias = "反弹不过前高配合顶分型或破反向阴线，顺势减仓/做空"
+        signal_type = "confirmed_sell"
+        direction = "short"
+        confirmed = True
+        momentum_confirmed = bool(regime_strong_down or (d_cons and d_dir == "down" and not has_neutral_or_weak_regime))
     elif has_d3_d4_buy or has_1b_2b:
         tier = "买卖点信号"
-        summary = "日线 3出/4出/一二买结构触发"
+        summary = f"{tf} 3出/4出/一二买结构触发"
         action_bias = "围绕底抬高与破反向阳线触发，结合前低防守评估中长线建仓"
+        signal_type = "confirmed_buy"
+        direction = "long"
+        confirmed = True
+        momentum_confirmed = bool(regime_strong_up or (d_cons and d_dir == "up" and not has_neutral_or_weak_regime))
     elif has_nonfirst_3b:
         tier = "买卖点信号"
-        summary = "日线非首中枢三买(防追高)"
+        summary = f"{tf}非首中枢三买(防追高)"
         action_bias = "已属多中枢后段三买，注意仓位克制，防延伸背驰"
+        signal_type = "exhaustion_buy_warn"
+        direction = "long"
+        confirmed = False
+        momentum_confirmed = bool(regime_strong_up or (d_cons and d_dir == "up" and not has_neutral_or_weak_regime))
+        is_exhaustion = True
     elif has_nonfirst_3s:
         tier = "买卖点信号"
-        summary = "日线非首中枢三卖(防追空)"
+        summary = f"{tf}非首中枢三卖(防追空)"
         action_bias = "已属多中枢后段三卖，谨防末端急跌出清后反抽"
-    elif d_non_div and d_dir == "down":
+        signal_type = "exhaustion_sell_warn"
+        direction = "short"
+        confirmed = False
+        momentum_confirmed = bool(regime_strong_down or (d_cons and d_dir == "down" and not has_neutral_or_weak_regime))
+        is_exhaustion = True
+    elif has_non_div_down:
         tier = "资金一致推进(勿逆势)"
-        summary = "日线非背驰急跌(仍有空头力量)"
+        summary = f"{tf}非背驰急跌(仍有空头力量)"
         action_bias = "虽MACD面积缩但属急跌强笔，严禁当一买盲目抄底，等底抬高3出"
-    elif d_non_div and d_dir == "up":
+        signal_type = "steep_non_div_down"
+        direction = "short"
+        confirmed = False
+        momentum_confirmed = True
+    elif has_non_div_up:
         tier = "资金一致推进(顺势)"
-        summary = "日线非背驰急拉(仍有多头力量)"
+        summary = f"{tf}非背驰急拉(仍有多头力量)"
         action_bias = "急拉强笔不猜顶，等回调弱势3出/4出再评估"
-    elif d_cons and d_dir == "down":
+        signal_type = "steep_non_div_up"
+        direction = "long"
+        confirmed = False
+        momentum_confirmed = True
+    elif has_strong_consensus_down:
         tier = "资金一致推进(勿逆势)"
-        summary = "日线空头资金方向一致推进"
+        summary = f"{tf}空头资金方向一致推进"
         action_bias = "向下离开段未见背驰，尊重空头主导资金方向，严禁逆势接飞刀"
-    elif d_cons and d_dir == "up":
+        signal_type = "momentum_short"
+        direction = "short"
+        confirmed = False
+        momentum_confirmed = True
+    elif has_strong_consensus_up:
         tier = "资金一致推进(顺势)"
-        summary = "日线多头资金方向一致推进"
-        action_bias = "向上离开段动能充沛未背驰，顺势持有或等待日线回踩买点"
+        summary = f"{tf}多头资金方向一致推进"
+        action_bias = f"向上离开段动能充沛未背驰，顺势持有或等待{tf}回踩买点"
+        signal_type = "momentum_long"
+        direction = "long"
+        confirmed = False
+        momentum_confirmed = True
+    elif has_weak_consensus_down:
+        tier = "常规结构运行"
+        summary = f"{tf}弱空头动能延伸(未确认资金一致)"
+        action_bias = f"动能评估为中性/未确认({regime or '未满足强一致标准'})，不视作强资金一致推进，继续跟踪{tf}结构确认"
+        signal_type = "weak_momentum_short"
+        direction = "short"
+        confirmed = False
+        momentum_confirmed = False
+    elif has_weak_consensus_up:
+        tier = "常规结构运行"
+        summary = f"{tf}弱多头动能延伸(未确认资金一致)"
+        action_bias = f"动能评估为中性/未确认({regime or '未满足强一致标准'})，不视作强资金一致推进，继续跟踪{tf}结构确认"
+        signal_type = "weak_momentum_long"
+        direction = "long"
+        confirmed = False
+        momentum_confirmed = False
     elif d_div or has_watch_only:
         tier = "背驰观察"
-        summary = "日线准买卖点/背驰观察(待确认)"
+        summary = f"{tf}准买卖点/背驰观察(待确认)"
         action_bias = "等待破反向K线或底/顶分型停顿确认后再行动，勿提前抢跑"
+        if has_candidate_sell and not has_candidate_buy:
+            signal_type = "candidate_sell"
+            direction = "short"
+        elif has_candidate_buy and not has_candidate_sell:
+            signal_type = "candidate_buy"
+            direction = "long"
+        elif d_div and d_dir == "down":
+            signal_type = "candidate_buy"
+            direction = "long"
+        elif d_div and d_dir == "up":
+            signal_type = "candidate_sell"
+            direction = "short"
+        elif has_candidate_buy:
+            signal_type = "candidate_buy"
+            direction = "long"
+        elif has_candidate_sell:
+            signal_type = "candidate_sell"
+            direction = "short"
+        else:
+            signal_type = "neutral"
+            direction = "neutral"
+        confirmed = False
+        momentum_confirmed = False
     elif pos.startswith("inside_zs"):
         tier = "中枢震荡"
-        summary = "日线中枢内部震荡"
-        action_bias = "观察日线中枢下沿 ZD 支撑与上沿 ZG 突破方向"
+        summary = f"{tf}中枢内部震荡"
+        action_bias = f"观察{tf}中枢下沿 ZD 支撑与上沿 ZG 突破方向"
+        signal_type = "consolidation"
+        direction = "neutral"
+        confirmed = False
+        momentum_confirmed = False
     else:
         tier = "常规结构运行"
-        summary = sigs[0] if sigs else "日线结构运行中"
-        action_bias = "跟踪当前日线笔延伸及第11课反向K线破位触发"
+        summary = sigs[0] if sigs else f"{tf}结构运行中"
+        action_bias = f"跟踪当前{tf}笔延伸及第11课反向K线破位触发"
+        signal_type = "neutral"
+        direction = "neutral"
+        confirmed = False
+        momentum_confirmed = False
 
     return {
         "tier": tier,
         "summary": summary,
         "action_bias": action_bias,
+        "signal_meta": {
+            "signal_type": signal_type,
+            "direction": direction,
+            "confirmed": confirmed,
+            "momentum_confirmed": momentum_confirmed,
+            "is_exhaustion": is_exhaustion,
+            "signal_timestamp": sig_ts,
+        },
+    }
+
+
+def evaluate_daily_signal_tier(daily: dict) -> dict:
+    """Backward-compatible wrapper delegating to evaluate_signal_tier."""
+    tf = daily.get("timeframe") if isinstance(daily, dict) else None
+    return evaluate_signal_tier(daily, timeframe_label=tf or "日线")
+
+
+def _as_finite_float(val) -> Optional[float]:
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, (int, float, np.floating, np.integer)):
+        fval = float(val)
+        return fval if np.isfinite(fval) else None
+    return None
+
+
+def _infer_structure_bias(cl: Optional[dict], sig_tier: dict) -> str:
+    """Infer 'long' / 'short' / 'neutral' directional bias from Chanlun structure & signal_meta.
+
+    Capital-consensus momentum (多头/空头资金方向一致推进) and confirmed/exhaustion directional
+    signals establish bias, while weak/neutral running strokes (常规运行中) stay 'neutral'.
+    """
+    if not isinstance(cl, dict) or "error" in cl:
+        return "neutral"
+
+    meta = sig_tier.get("signal_meta") if isinstance(sig_tier, dict) else None
+    if isinstance(meta, dict):
+        sig_type = meta.get("signal_type")
+        sig_dir = meta.get("direction")
+        if sig_type in (
+            "confirmed_buy",
+            "confirmed_sell",
+            "exhaustion_buy_warn",
+            "exhaustion_sell_warn",
+            "momentum_long",
+            "momentum_short",
+            "steep_non_div_up",
+            "steep_non_div_down",
+        ) and sig_dir in ("long", "short"):
+            return sig_dir
+
+    pos = cl.get("price_vs_zhongshu", "") or ""
+    mom = cl.get("momentum_assessment", {}) or {}
+    verdict = str(mom.get("regime") or mom.get("verdict") or "").strip().lower()
+
+    if pos.startswith("above_zg"):
+        if verdict in ("divergence_candidate_up", "capital_consensus_down", "strong_down_continuation", "non_divergence_down"):
+            return "neutral"
+        return "long"
+    if pos.startswith("below_zd"):
+        if verdict in ("divergence_candidate_down", "capital_consensus_up", "strong_up_continuation", "non_divergence_up"):
+            return "neutral"
+        return "short"
+    if pos.startswith("inside_zs"):
+        return "neutral"
+
+    if verdict in ("capital_consensus_up", "strong_up_continuation", "non_divergence_up"):
+        return "long"
+    if verdict in ("capital_consensus_down", "strong_down_continuation", "non_divergence_down"):
+        return "short"
+
+    macro = cl.get("macro_structure", "") or ""
+    if macro == "双中枢上涨趋势":
+        return "long"
+    if macro == "双中枢下跌趋势":
+        return "short"
+    return "neutral"
+
+
+def _extract_ref_price(daily_cl: Optional[dict], intraday_cl: Optional[dict]) -> Optional[float]:
+    for cl in (intraday_cl, daily_cl):
+        if not isinstance(cl, dict):
+            continue
+        lc = _as_finite_float(cl.get("last_close"))
+        if lc is not None:
+            return lc
+    for cl in (intraday_cl, daily_cl):
+        if not isinstance(cl, dict):
+            continue
+        strokes = cl.get("recent_strokes") or []
+        if strokes and isinstance(strokes[-1], dict):
+            ep = _as_finite_float(strokes[-1].get("end_price"))
+            if ep is not None:
+                return ep
+    return None
+
+
+def _extract_reverse_k_watch(
+    cl: Optional[dict],
+    trade_dir: Optional[str],
+    ref_price: Optional[float],
+) -> Optional[float]:
+    """Extract Lesson 11 reverse-K micro-watch level separately from structural tactical stops."""
+    if not isinstance(cl, dict) or "error" in cl:
+        return None
+
+    def _side_ok(level: float) -> bool:
+        if ref_price is None or trade_dir not in ("long", "short"):
+            return True
+        if trade_dir == "long":
+            return level < ref_price
+        return level > ref_price
+
+    for key in ("reverse_k_trigger", "stroke_end_trigger"):
+        trig = cl.get(key)
+        if trig is None:
+            continue
+        direct_val = _as_finite_float(trig)
+        if direct_val is not None and _side_ok(direct_val):
+            return round(direct_val, 4)
+        if isinstance(trig, dict):
+            lvl = _as_finite_float(trig.get("level"))
+            t_dir = trig.get("direction")
+            dir_matches = (
+                t_dir is None
+                or trade_dir is None
+                or (trade_dir == "long" and t_dir == "up")
+                or (trade_dir == "short" and t_dir == "down")
+            )
+            if lvl is not None and dir_matches and _side_ok(lvl):
+                return round(lvl, 4)
+    return None
+
+
+def _extract_tactical_stop(
+    cl: Optional[dict],
+    trade_dir: Optional[str],
+    ref_price: Optional[float],
+) -> Optional[float]:
+    """Extract structural tactical stop from stroke extreme, confirmed opposite fractal, or Zhongshu ZD/ZG.
+
+    Intentionally excludes Lesson 11 1-bar micro reverse-K levels (exposed separately via
+    _extract_reverse_k_watch) so tactical stops anchor on real Chanlun structure.
+    """
+    if not isinstance(cl, dict) or "error" in cl:
+        return None
+
+    def _side_ok(level: float) -> bool:
+        if ref_price is None or trade_dir not in ("long", "short"):
+            return True
+        if trade_dir == "long":
+            return level < ref_price
+        return level > ref_price
+
+    strokes = [s for s in (cl.get("recent_strokes") or []) if isinstance(s, dict)]
+    latest_frac = cl.get("latest_fractal") if isinstance(cl.get("latest_fractal"), dict) else None
+    latest_zs = cl.get("latest_zhongshu") if isinstance(cl.get("latest_zhongshu"), dict) else None
+
+    candidates: list[float] = []
+    if trade_dir == "long":
+        if strokes:
+            curr = strokes[-1]
+            if curr.get("direction") == "up":
+                for field in ("start_price", "low"):
+                    v = _as_finite_float(curr.get(field))
+                    if v is not None:
+                        candidates.append(v)
+            elif curr.get("direction") == "down":
+                for field in ("low", "end_price"):
+                    v = _as_finite_float(curr.get(field))
+                    if v is not None:
+                        candidates.append(v)
+        for s in reversed(strokes):
+            if s.get("direction") == "down" and s.get("is_confirmed", True):
+                for field in ("end_price", "low"):
+                    v = _as_finite_float(s.get(field))
+                    if v is not None:
+                        candidates.append(v)
+        if latest_frac and latest_frac.get("kind") == "bottom":
+            v = _as_finite_float(latest_frac.get("price"))
+            if v is not None:
+                candidates.append(v)
+        for s in reversed(strokes):
+            for field in ("low", "start_price"):
+                v = _as_finite_float(s.get(field))
+                if v is not None:
+                    candidates.append(v)
+        if latest_zs:
+            v = _as_finite_float(latest_zs.get("zd"))
+            if v is not None:
+                candidates.append(v)
+    elif trade_dir == "short":
+        if strokes:
+            curr = strokes[-1]
+            if curr.get("direction") == "down":
+                for field in ("start_price", "high"):
+                    v = _as_finite_float(curr.get(field))
+                    if v is not None:
+                        candidates.append(v)
+            elif curr.get("direction") == "up":
+                for field in ("high", "end_price"):
+                    v = _as_finite_float(curr.get(field))
+                    if v is not None:
+                        candidates.append(v)
+        for s in reversed(strokes):
+            if s.get("direction") == "up" and s.get("is_confirmed", True):
+                for field in ("end_price", "high"):
+                    v = _as_finite_float(s.get(field))
+                    if v is not None:
+                        candidates.append(v)
+        if latest_frac and latest_frac.get("kind") == "top":
+            v = _as_finite_float(latest_frac.get("price"))
+            if v is not None:
+                candidates.append(v)
+        for s in reversed(strokes):
+            for field in ("high", "start_price"):
+                v = _as_finite_float(s.get(field))
+                if v is not None:
+                    candidates.append(v)
+        if latest_zs:
+            v = _as_finite_float(latest_zs.get("zg"))
+            if v is not None:
+                candidates.append(v)
+    else:
+        if strokes:
+            v = _as_finite_float(strokes[-1].get("start_price"))
+            if v is not None:
+                candidates.append(v)
+
+    for cand in candidates:
+        if _side_ok(cand):
+            return round(cand, 4)
+    return None
+
+
+def _extract_structural_stop(
+    cl: Optional[dict],
+    trade_dir: Optional[str],
+    ref_price: Optional[float],
+) -> Optional[float]:
+    """Extract structural invalidation anchor: Zhongshu ZD (long) / ZG (short) on protective side,
+    falling back to confirmed swing extreme when Zhongshu edge is absent or not protective.
+    """
+    if not isinstance(cl, dict) or "error" in cl:
+        return None
+
+    def _side_ok(level: float) -> bool:
+        if ref_price is None or trade_dir not in ("long", "short"):
+            return True
+        if trade_dir == "long":
+            return level < ref_price
+        return level > ref_price
+
+    latest_zs = cl.get("latest_zhongshu") if isinstance(cl.get("latest_zhongshu"), dict) else None
+    if latest_zs is not None:
+        if trade_dir == "long":
+            zd = _as_finite_float(latest_zs.get("zd"))
+            if zd is not None and _side_ok(zd):
+                return round(zd, 4)
+        elif trade_dir == "short":
+            zg = _as_finite_float(latest_zs.get("zg"))
+            if zg is not None and _side_ok(zg):
+                return round(zg, 4)
+
+    strokes = [s for s in (cl.get("recent_strokes") or []) if isinstance(s, dict)]
+    latest_frac = cl.get("latest_fractal") if isinstance(cl.get("latest_fractal"), dict) else None
+    candidates: list[float] = []
+
+    if trade_dir == "long":
+        for s in reversed(strokes):
+            if s.get("is_confirmed", True) and s.get("direction") == "down":
+                for field in ("low", "end_price"):
+                    v = _as_finite_float(s.get(field))
+                    if v is not None:
+                        candidates.append(v)
+        for s in reversed(strokes):
+            if s.get("is_confirmed", True):
+                for field in ("low", "start_price"):
+                    v = _as_finite_float(s.get(field))
+                    if v is not None:
+                        candidates.append(v)
+        if latest_frac and latest_frac.get("kind") == "bottom":
+            v = _as_finite_float(latest_frac.get("price"))
+            if v is not None:
+                candidates.append(v)
+        if latest_zs is not None:
+            for field in ("dd", "oscillation_dd"):
+                v = _as_finite_float(latest_zs.get(field))
+                if v is not None:
+                    candidates.append(v)
+        for s in reversed(strokes):
+            for field in ("low", "start_price"):
+                v = _as_finite_float(s.get(field))
+                if v is not None:
+                    candidates.append(v)
+    elif trade_dir == "short":
+        for s in reversed(strokes):
+            if s.get("is_confirmed", True) and s.get("direction") == "up":
+                for field in ("high", "end_price"):
+                    v = _as_finite_float(s.get(field))
+                    if v is not None:
+                        candidates.append(v)
+        for s in reversed(strokes):
+            if s.get("is_confirmed", True):
+                for field in ("high", "start_price"):
+                    v = _as_finite_float(s.get(field))
+                    if v is not None:
+                        candidates.append(v)
+        if latest_frac and latest_frac.get("kind") == "top":
+            v = _as_finite_float(latest_frac.get("price"))
+            if v is not None:
+                candidates.append(v)
+        if latest_zs is not None:
+            for field in ("gg", "oscillation_gg"):
+                v = _as_finite_float(latest_zs.get(field))
+                if v is not None:
+                    candidates.append(v)
+        for s in reversed(strokes):
+            for field in ("high", "start_price"):
+                v = _as_finite_float(s.get(field))
+                if v is not None:
+                    candidates.append(v)
+
+    for cand in candidates:
+        if _side_ok(cand):
+            return round(cand, 4)
+    return None
+
+
+def assess_dual_timeframe_alignment(
+    daily_cl: dict,
+    intraday_cl: dict,
+    desired_direction: Optional[str] = None,
+) -> dict:
+    """Assess dual-timeframe Chanlun alignment ('日线定方向 + 30min 诞生交易')."""
+    norm_dir: Optional[str] = None
+    if desired_direction is not None:
+        cleaned = str(desired_direction).strip().lower()
+        if cleaned:
+            if cleaned not in ("long", "short"):
+                raise ValueError(
+                    f"Unsupported desired_direction: {desired_direction!r}; expected 'long', 'short', or None"
+                )
+            norm_dir = cleaned
+
+    daily_tf = (daily_cl.get("timeframe") if isinstance(daily_cl, dict) else None) or "日线"
+    intraday_tf = (intraday_cl.get("timeframe") if isinstance(intraday_cl, dict) else None) or "30分钟"
+
+    daily_sig = evaluate_signal_tier(daily_cl, timeframe_label=daily_tf)
+    intraday_sig = evaluate_signal_tier(intraday_cl, timeframe_label=intraday_tf)
+    daily_signal_meta = daily_sig.get("signal_meta") or {
+        "signal_type": "insufficient_data",
+        "direction": "neutral",
+        "confirmed": False,
+        "momentum_confirmed": False,
+        "is_exhaustion": False,
+        "signal_timestamp": None,
+    }
+    intraday_signal_meta = intraday_sig.get("signal_meta") or {
+        "signal_type": "insufficient_data",
+        "direction": "neutral",
+        "confirmed": False,
+        "momentum_confirmed": False,
+        "is_exhaustion": False,
+        "signal_timestamp": None,
+    }
+
+    daily_bias = _infer_structure_bias(daily_cl, daily_sig)
+    intraday_bias = _infer_structure_bias(intraday_cl, intraday_sig)
+
+    intraday_summary = intraday_sig.get("summary", "") or ""
+    intraday_tier = intraday_sig.get("tier", "数据不足")
+    ref_dir = norm_dir or (daily_bias if daily_bias in ("long", "short") else None)
+
+    intra_type = intraday_signal_meta.get("signal_type", "neutral")
+    intra_dir = intraday_signal_meta.get("direction", "neutral")
+    intra_confirmed = bool(intraday_signal_meta.get("confirmed", False))
+    intra_exhaustion = bool(intraday_signal_meta.get("is_exhaustion", False))
+
+    if (
+        not isinstance(intraday_cl, dict)
+        or "error" in intraday_cl
+        or intraday_tier == "数据不足"
+        or intra_type == "insufficient_data"
+    ):
+        intraday_action = "wait_structure"
+    elif intra_exhaustion or intra_type in ("exhaustion_buy_warn", "exhaustion_sell_warn"):
+        intraday_action = "exhaustion_warning"
+    elif intra_type == "steep_non_div_down":
+        intraday_action = "exhaustion_warning" if ref_dir != "short" else "wait_structure"
+    elif intra_type == "steep_non_div_up":
+        intraday_action = "exhaustion_warning" if ref_dir != "long" else "wait_structure"
+    elif intra_confirmed and intra_dir == "long":
+        intraday_action = "entry_long"
+    elif intra_confirmed and intra_dir == "short":
+        intraday_action = "entry_short"
+    else:
+        intraday_action = "wait_structure"
+
+    daily_zs = daily_cl.get("latest_zhongshu") if isinstance(daily_cl, dict) else None
+    intraday_zs = intraday_cl.get("latest_zhongshu") if isinstance(intraday_cl, dict) else None
+    daily_zd = _as_finite_float(daily_zs.get("zd")) if isinstance(daily_zs, dict) else None
+    daily_zg = _as_finite_float(daily_zs.get("zg")) if isinstance(daily_zs, dict) else None
+    intraday_zd = _as_finite_float(intraday_zs.get("zd")) if isinstance(intraday_zs, dict) else None
+    intraday_zg = _as_finite_float(intraday_zs.get("zg")) if isinstance(intraday_zs, dict) else None
+
+    stop_dir = ref_dir or (intraday_bias if intraday_bias in ("long", "short") else None)
+    if stop_dir is None and isinstance(intraday_cl, dict):
+        act = (intraday_cl.get("momentum_assessment") or {}).get("active_direction")
+        if act == "up":
+            stop_dir = "long"
+        elif act == "down":
+            stop_dir = "short"
+
+    ref_price = _extract_ref_price(daily_cl, intraday_cl)
+    daily_tactical_stop = _extract_tactical_stop(daily_cl, stop_dir, ref_price)
+    daily_structural_stop = _extract_structural_stop(daily_cl, stop_dir, ref_price)
+    daily_reverse_k_watch = _extract_reverse_k_watch(daily_cl, stop_dir, ref_price)
+    intraday_tactical_stop = _extract_tactical_stop(intraday_cl, stop_dir, ref_price)
+    intraday_reverse_k_watch = _extract_reverse_k_watch(intraday_cl, stop_dir, ref_price)
+
+    if norm_dir is not None:
+        opposite = "short" if norm_dir == "long" else "long"
+        if daily_bias == opposite:
+            aligned = False
+            alignment_status = "daily_opposes_direction"
+        elif daily_bias == norm_dir and intraday_action == f"entry_{norm_dir}":
+            aligned = True
+            alignment_status = "aligned_trigger"
+        elif daily_bias == norm_dir:
+            aligned = False
+            alignment_status = "daily_ok_wait_30m"
+        else:
+            aligned = False
+            alignment_status = "neutral_wait"
+    else:
+        if daily_bias == "long" and intraday_action == "entry_long":
+            aligned = True
+            alignment_status = "aligned_trigger"
+        elif daily_bias == "short" and intraday_action == "entry_short":
+            aligned = True
+            alignment_status = "aligned_trigger"
+        elif daily_bias in ("long", "short"):
+            aligned = False
+            alignment_status = "daily_ok_wait_30m"
+        else:
+            aligned = False
+            alignment_status = "neutral_wait"
+
+    noise_reduction_pct: Optional[float] = None
+    if ref_price is not None and daily_tactical_stop is not None and intraday_tactical_stop is not None:
+        both_below = daily_tactical_stop < ref_price and intraday_tactical_stop < ref_price
+        both_above = daily_tactical_stop > ref_price and intraday_tactical_stop > ref_price
+        if both_below or both_above:
+            daily_dist = abs(ref_price - daily_tactical_stop)
+            intraday_dist = abs(ref_price - intraday_tactical_stop)
+            if daily_dist > 0:
+                raw_pct = (1.0 - intraday_dist / daily_dist) * 100.0
+                noise_reduction_pct = round(min(100.0, raw_pct), 2)
+
+    notes: list[str] = []
+    if alignment_status == "aligned_trigger":
+        notes.append(f"大小级别共振：日线定方向({daily_bias}) + {intraday_tf}诞生交易({intraday_action})")
+    elif alignment_status == "daily_opposes_direction":
+        notes.append(f"日线方向({daily_bias})与目标方向({norm_dir})相悖，严禁逆日线建仓")
+    elif alignment_status == "daily_ok_wait_30m":
+        if intraday_action == "exhaustion_warning":
+            notes.append(f"日线方向({daily_bias})顺向，但{intraday_tf}出现末端追击/非背驰警告({intraday_summary})，耐心等次级别回踩再切入")
+        else:
+            notes.append(f"日线方向({daily_bias})已确认，等待{intraday_tf}走出明确结构触发点(当前:{intraday_summary})")
+    else:
+        notes.append(f"日线处于中性/震荡状态({daily_sig.get('summary', '')})，暂不强行开仓")
+
+    if noise_reduction_pct is not None:
+        if noise_reduction_pct >= 0:
+            notes.append(
+                f"止损噪点压缩 {noise_reduction_pct:.2f}% (日线防守 {daily_tactical_stop} -> {intraday_tf}紧凑防守 {intraday_tactical_stop})"
+            )
+        else:
+            notes.append(
+                f"{intraday_tf}止损距离宽于日线 (噪点压缩 {noise_reduction_pct:.2f}%，日线防守 {daily_tactical_stop} vs {intraday_tf}防守 {intraday_tactical_stop})"
+            )
+
+    return {
+        "desired_direction": norm_dir,
+        "daily_bias": daily_bias,
+        "daily_tier": daily_sig.get("tier", "数据不足"),
+        "daily_summary": daily_sig.get("summary", ""),
+        "daily_signal_meta": daily_signal_meta,
+        "daily_zd": daily_zd,
+        "daily_zg": daily_zg,
+        "daily_tactical_stop": daily_tactical_stop,
+        "daily_structural_stop": daily_structural_stop,
+        "daily_reverse_k_watch": daily_reverse_k_watch,
+        "intraday_timeframe": intraday_tf,
+        "intraday_bias": intraday_bias,
+        "intraday_action": intraday_action,
+        "intraday_tier": intraday_tier,
+        "intraday_summary": intraday_summary,
+        "intraday_signal_meta": intraday_signal_meta,
+        "intraday_zd": intraday_zd,
+        "intraday_zg": intraday_zg,
+        "intraday_tactical_stop": intraday_tactical_stop,
+        "intraday_reverse_k_watch": intraday_reverse_k_watch,
+        "aligned": aligned,
+        "alignment_status": alignment_status,
+        "noise_reduction_pct": noise_reduction_pct,
+        "notes": notes,
     }

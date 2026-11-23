@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://t3-trading-desk.local/portfolio/schema.json",
+  "title": "Layer-4 Portfolio Storage Schemas",
+  "description": "JSON Schema definitions for local Layer-4 portfolio state managed by scripts/portfolio_manager.py. Canonical transactional storage is portfolio.db (SQLite WAL + synchronous=FULL, single BEGIN IMMEDIATE...COMMIT boundary covering account, positions, meta, and journal); account.json, positions.json, and journal.jsonl are atomically exported read-only JSON mirrors. Live portfolio state files are intentionally excluded from git.",
+  "type": "object",
+  "properties": {
+    "storage_engine": {
+      "type": "string",
+      "const": "sqlite_wal_with_json_mirrors",
+      "description": "portfolio.db is canonical transactional truth; account.json, positions.json, and journal.jsonl are read-only mirrors."
+    },
+    "account": { "$ref": "#/$defs/account" },
+    "positions_document": { "$ref": "#/$defs/positions_document" },
+    "journal_entry": { "$ref": "#/$defs/journal_entry" }
+  },
+  "$defs": {
+    "drawdown_step": {
+      "type": "object",
+      "required": ["drawdown_pct", "risk_scale"],
+      "additionalProperties": false,
+      "properties": {
+        "drawdown_pct": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 100,
+          "description": "Drawdown percentage from peak_equity at which this risk scaling step triggers."
+        },
+        "risk_scale": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "description": "Multiplier applied to single-sector, total-portfolio, and macro-factor risk budgets."
+        }
+      }
+    },
+    "account": {
+      "type": "object",
+      "description": "Schema for portfolio/account.json mirror (canonical row stored in portfolio.db table account). Bounds enforced identically by init_portfolio and update_account: equity > 0, peak_equity >= equity > 0, 0 < default_risk_per_trade_pct <= 10.0, 0 < max_total_open_risk_pct <= 50.0, 0 < max_macro_factor_risk_pct <= 50.0.",
+      "required": [
+        "schema_version",
+        "base_currency",
+        "equity",
+        "peak_equity",
+        "default_risk_per_trade_pct",
+        "max_total_open_risk_pct",
+        "max_macro_factor_risk_pct",
+        "drawdown_steps",
+        "updated_at_utc"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "type": "integer", "const": 1 },
+        "base_currency": { "type": "string", "minLength": 1, "examples": ["USD", "CNY"] },
+        "equity": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "Current ledger equity in base_currency (> 0); updated atomically on trim, close, and rotate_leader."
+        },
+        "peak_equity": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "description": "High-water mark equity (>= equity > 0) used for drawdown step-down scaling."
+        },
+        "default_risk_per_trade_pct": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 10,
+          "description": "Single-sector risk budget percentage (0 < x <= 10.0; also shared cap for co-leader duopolies)."
+        },
+        "max_total_open_risk_pct": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 50,
+          "description": "Maximum aggregate open risk percentage across all open positions (0 < x <= 50.0) before drawdown scaling."
+        },
+        "max_macro_factor_risk_pct": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 50,
+          "description": "Maximum aggregate open risk percentage across positions sharing the same macro factor tag (0 < x <= 50.0)."
+        },
+        "drawdown_steps": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/drawdown_step" }
+        },
+        "updated_at_utc": { "type": "string" }
+      }
+    },
+    "tranche": {
+      "type": "object",
+      "required": ["tranche_index", "timestamp_utc", "price", "quantity", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "tranche_index": { "type": "integer", "minimum": 1 },
+        "timestamp_utc": { "type": "string" },
+        "price": { "type": "number", "exclusiveMinimum": 0 },
+        "quantity": { "type": "number", "exclusiveMinimum": 0 },
+        "reason": { "type": "string" }
+      }
+    },
+    "position": {
+      "type": "object",
+      "required": [
+        "position_id",
+        "symbol",
+        "raw_symbol",
+        "asset_class",
+        "direction",
+        "status",
+        "sector_theme",
+        "leader_role",
+        "co_leader_reason",
+        "macro_factors",
+        "contract_symbol",
+        "multiplier",
+        "margin_rate",
+        "fx_to_account",
+        "quantity",
+        "initial_quantity",
+        "avg_entry_price",
+        "initial_entry_price",
+        "tactical_stop_30m",
+        "initial_stop_30m",
+        "structural_stop_daily",
+        "target_price",
+        "initial_risk_amount",
+        "current_open_risk_amount",
+        "locked_profit_amount",
+        "slot_risk_share",
+        "exit_red_lines",
+        "tranches",
+        "partial_realized_pnl",
+        "notes",
+        "opened_at_utc",
+        "updated_at_utc",
+        "closed_at_utc",
+        "exit_price",
+        "exit_reason",
+        "exit_category",
+        "realized_pnl",
+        "r_multiple"
+      ],
+      "properties": {
+        "position_id": { "type": "string", "minLength": 1 },
+        "symbol": { "type": "string", "minLength": 1 },
+        "raw_symbol": { "type": "string" },
+        "asset_class": {
+          "type": "string",
+          "enum": ["us_stock_or_etf", "a_share", "cn_future", "commodity", "fx", "crypto", "macro"]
+        },
+        "direction": { "type": "string", "enum": ["long", "short"] },
+        "status": { "type": "string", "enum": ["open", "closed"] },
+        "sector_theme": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Normalized sector/theme key governed by single-sector leader exclusivity."
+        },
+        "leader_role": {
+          "type": "string",
+          "enum": ["sole_leader", "co_leader"],
+          "description": "sole_leader occupies the sector slot alone; co_leader requires explicit reason and shared sector risk budget (max 2)."
+        },
+        "co_leader_reason": { "type": "string" },
+        "macro_factors": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "contract_symbol": { "type": "string" },
+        "quote_currency": { "type": "string", "minLength": 1 },
+        "multiplier": { "type": "number", "exclusiveMinimum": 0 },
+        "margin_rate": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "fx_to_account": { "type": "number", "exclusiveMinimum": 0 },
+        "estimated_margin_account": { "type": "number", "minimum": 0 },
+        "quantity": { "type": "number", "exclusiveMinimum": 0 },
+        "initial_quantity": { "type": "number", "exclusiveMinimum": 0 },
+        "avg_entry_price": { "type": "number", "exclusiveMinimum": 0 },
+        "initial_entry_price": { "type": "number", "exclusiveMinimum": 0 },
+        "tactical_stop_30m": { "type": "number", "exclusiveMinimum": 0 },
+        "initial_stop_30m": { "type": "number", "exclusiveMinimum": 0 },
+        "structural_stop_daily": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+        "target_price": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+        "initial_risk_amount": { "type": "number", "minimum": 0 },
+        "current_open_risk_amount": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Recomputed whenever stops tighten or tranches are added; reaches 0.0 at breakeven or profit."
+        },
+        "locked_profit_amount": { "type": "number", "minimum": 0 },
+        "slot_risk_share": { "type": "number", "minimum": 0, "maximum": 1 },
+        "exit_red_lines": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Daily/30m Chanlun, curve/spread, and fundamental KPI exit triggers checked daily by Sentinel."
+        },
+        "tranches": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/tranche" }
+        },
+        "partial_realized_pnl": { "type": "number" },
+        "notes": { "type": "string" },
+        "opened_at_utc": { "type": "string" },
+        "updated_at_utc": { "type": "string" },
+        "closed_at_utc": { "type": ["string", "null"] },
+        "exit_price": { "type": ["number", "null"] },
+        "exit_reason": { "type": ["string", "null"] },
+        "exit_category": { "type": ["string", "null"] },
+        "realized_pnl": { "type": ["number", "null"] },
+        "r_multiple": { "type": ["number", "null"] },
+        "rotated_from_position_id": { "type": "string" },
+        "rotated_to_position_id": { "type": "string" }
+      }
+    },
+    "positions_document": {
+      "type": "object",
+      "description": "Schema for portfolio/positions.json",
+      "required": ["schema_version", "revision", "positions", "updated_at_utc"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": { "type": "integer", "const": 1 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "positions": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/position" }
+        },
+        "updated_at_utc": { "type": "string" }
+      }
+    },
+    "journal_entry": {
+      "type": "object",
+      "description": "Schema for each newline-delimited JSON record in portfolio/journal.jsonl",
+      "required": [
+        "timestamp_utc",
+        "action",
+        "position_id",
+        "symbol",
+        "sector_theme",
+        "direction",
+        "risk_delta",
+        "reason"
+      ],
+      "properties": {
+        "timestamp_utc": { "type": "string" },
+        "action": {
+          "type": "string",
+          "enum": ["open", "add_on_profit", "trail_stop", "rotate_leader", "trim", "close"]
+        },
+        "leg": { "type": "string", "enum": ["close_old_leader", "open_new_leader"] },
+        "rotation_id": { "type": "string" },
+        "position_id": { "type": "string" },
+        "symbol": { "type": "string" },
+        "sector_theme": { "type": "string" },
+        "direction": { "type": "string", "enum": ["long", "short"] },
+        "price": { "type": "number" },
+        "stop_30m": { "type": "number" },
+        "old_stop_30m": { "type": "number" },
+        "new_stop_30m": { "type": "number" },
+        "quantity": { "type": "number" },
+        "add_quantity": { "type": "number" },
+        "trim_quantity": { "type": "number" },
+        "risk_delta": { "type": "number" },
+        "added_tranche_risk_amount": { "type": "number", "minimum": 0 },
+        "realized_pnl": { "type": "number" },
+        "partial_realized_pnl": { "type": "number" },
+        "equity_after": { "type": "number", "exclusiveMinimum": 0 },
+        "r_multiple": { "type": ["number", "null"] },
+        "exit_category": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

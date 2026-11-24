@@ -16,6 +16,8 @@ export interface ZhongshuBoxDrawItem {
   label: string;
   startTime: Time;
   endTime: Time;
+  startLabel?: string;
+  endLabel?: string;
   zd: number;
   zg: number;
   dd?: number;
@@ -70,7 +72,7 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
         if (bottom < 0 || top > h) continue;
         const height = Math.max(2, bottom - top);
 
-        const isSeg = box.kind === "segment" || box.isNineUpgrade;
+        const isSeg = box.kind === "segment";
         const fill = isSeg ? pal.zsSegFill : pal.zsStrokeFill;
         const border = isSeg ? pal.zsSegBorder : pal.zsStrokeBorder;
 
@@ -78,9 +80,9 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
         ctx.fillStyle = fill;
         ctx.fillRect(left, top, width, height);
 
-        /* Crisp ZG (top) and ZD (bottom) horizontal boundaries */
+        /* Crisp ZG (top) and ZD (bottom) horizontal boundaries (segment > stroke visual hierarchy) */
         ctx.strokeStyle = border;
-        ctx.lineWidth = isSeg ? 1.75 : 1.35;
+        ctx.lineWidth = isSeg ? 2.0 : box.isNineUpgrade ? 1.5 : 1.1;
         ctx.setLineDash([]);
         ctx.beginPath();
         ctx.moveTo(left, top);
@@ -100,7 +102,7 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
         ctx.stroke();
         ctx.setLineDash([]);
 
-        /* Inline Zhongshu badge (`笔中枢 Z1` / `段中枢 S1`) wearing primary ink token */
+        /* Inline Zhongshu badge (`笔中枢 Z1` / `线段中枢 S1`) wearing primary ink token */
         if (width >= 34 && top >= -12 && top <= h - 6) {
           const text = width >= 118 ? `${box.label} [${box.rangeText}]` : box.label;
           ctx.font = '600 10.5px system-ui, -apple-system, "Segoe UI", sans-serif';

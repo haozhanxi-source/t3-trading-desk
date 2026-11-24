@@ -132,7 +132,6 @@ export function WarRoomView({
         : rawLoadedIv === "30m" || rawLoadedIv === "30min"
           ? "30m"
           : interval;
-  const isLoaded30m = rawLoadedIv === "30m" || rawLoadedIv === "30min";
   const switchingInterval = Boolean(loading && rawLoadedIv && loadedInterval !== interval);
 
   return (
@@ -293,32 +292,20 @@ export function WarRoomView({
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
         <ChanlunChart
           title={`3年日线缠论图 · ${data?.symbol || symbol}`}
-          subtitle="定主方向、笔/段中枢 [ZD, ZG] 空间与 MACD 动力学对比"
+          subtitle="定主方向、笔中枢/线段中枢 [ZD, ZG] 空间与 MACD 动力学对比"
           bars={data?.ohlcv_daily ?? []}
           chanlun={daily}
           signalSummary={data?.chanlun?.signal_summary}
           intraday={false}
-          defenseLines={{
-            structuralStopDaily: dual?.daily_structural_stop ?? daily?.latest_zhongshu?.zd,
-            tacticalStop30m: isLoaded30m ? dual?.intraday_tactical_stop : undefined,
-            tacticalStopLabel: "30m 战术止损",
-            reverseKWatch: dual?.daily_reverse_k_watch ?? daily?.stroke_end_trigger?.level,
-          }}
         />
 
         <ChanlunChart
           title={`${loadedInterval} 缠论执行图 · ${data?.symbol || symbol}`}
-          subtitle="诞生精确 1/2/3 买卖点、第 11 课反向 K 线与紧凑战术止损"
+          subtitle="诞生精确 1/2/3 买卖点与小级别笔中枢/线段中枢结构"
           bars={data?.ohlcv_intraday ?? []}
           chanlun={intraday}
           signalSummary={data?.chanlun?.intraday_signal_summary}
           intraday
-          defenseLines={{
-            tacticalStop30m: dual?.intraday_tactical_stop,
-            tacticalStopLabel: `${loadedInterval} 战术止损`,
-            structuralStopDaily: dual?.daily_structural_stop,
-            reverseKWatch: dual?.intraday_reverse_k_watch ?? intraday?.stroke_end_trigger?.level,
-          }}
         />
       </div>
 

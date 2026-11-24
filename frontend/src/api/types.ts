@@ -364,6 +364,8 @@ export interface ChanlunTimeframe {
   } | null;
   latest_zhongshu?: Zhongshu | null;
   recent_zhongshus?: Zhongshu[];
+  stroke_zhongshus?: Zhongshu[];
+  segment_zhongshus?: Zhongshu[];
   all_strokes?: ChanlunStroke[];
   all_segments?: ChanlunSegment[];
   all_stroke_zhongshus?: Zhongshu[];

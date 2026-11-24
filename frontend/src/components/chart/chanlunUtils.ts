@@ -41,8 +41,12 @@ export interface PreparedChanlunSeries {
   macdDea: LineData<Time>[];
   confirmedStrokes: LineData<Time>[];
   unconfirmedStroke: LineData<Time>[];
-  segments: LineData<Time>[];
-  zhongshuBoxes: ZhongshuBoxDrawItem[];
+  confirmedSegments: LineData<Time>[];
+  unconfirmedSegments: LineData<Time>[];
+  strokeZhongshuBoxes: ZhongshuBoxDrawItem[];
+  segmentZhongshuBoxes: ZhongshuBoxDrawItem[];
+  latestStrokeZhongshu: Zhongshu | null;
+  latestSegmentZhongshu: Zhongshu | null;
   markers: SeriesMarker<Time>[];
 }
 
@@ -234,7 +238,7 @@ function mapZhongshus(
 
     if (!startBar || !endBar) continue;
     const [b1, b2] = startBar.idx <= endBar.idx ? [startBar, endBar] : [endBar, startBar];
-    const prefix = kind === "segment" || zs.is_nine_upgrade ? `段中枢 S${zs.zs_id}` : `笔中枢 Z${zs.zs_id}`;
+    const prefix = kind === "segment" ? `线段中枢 S${zs.zs_id}` : `笔中枢 Z${zs.zs_id}`;
     const suffix = zs.is_nine_upgrade ? "·九段" : zs.is_extended ? "·扩展" : "";
     const truncTag = clampedLeft ? "·左截断" : clampedRight ? "·右截断" : "";
     out.push({
@@ -243,6 +247,8 @@ function mapZhongshus(
       label: `${prefix}${suffix}${truncTag}`,
       startTime: b1.time,
       endTime: b2.time,
+      startLabel: b1.label,
+      endLabel: b2.label,
       zd: zs.zd,
       zg: zs.zg,
       dd: zs.dd,
@@ -396,29 +402,110 @@ export function prepareChanlunSeries(
     }
   }
 
-  /* Segments (线段) */
-  const segPts: { idx: number; time: Time; value: number }[] = [];
-  for (const seg of tf?.all_segments ?? []) {
+  /* Segments (线段): confirmed segments are solid; uncertain trailing segment / extension to latest price is dashed */
+  type SegmentChain = {
+    data: LineData<Time>[];
+    lastIdx: number | null;
+    hadGap: boolean;
+  };
+  const confirmedChain: SegmentChain = { data: [], lastIdx: null, hadGap: false };
+  const unconfirmedChain: SegmentChain = { data: [], lastIdx: null, hadGap: false };
+
+  const appendToChain = (
+    chain: SegmentChain,
+    sb: IndexedBar,
+    startPrice: number,
+    eb: IndexedBar,
+    endPrice: number,
+  ): boolean => {
+    if (!Number.isFinite(startPrice) || !Number.isFinite(endPrice) || sb.idx >= eb.idx) {
+      chain.hadGap = true;
+      return false;
+    }
+    if (chain.lastIdx === null) {
+      chain.data.push({ time: sb.time, value: startPrice }, { time: eb.time, value: endPrice });
+    } else if (sb.idx < chain.lastIdx) {
+      chain.hadGap = true;
+      return false;
+    } else if (!chain.hadGap && sb.idx === chain.lastIdx) {
+      chain.data.push({ time: eb.time, value: endPrice });
+    } else {
+      /* Lightweight Charts LineSeries connects all non-whitespace points continuously; restart at the latest contiguous chain across any gap */
+      chain.data.length = 0;
+      chain.data.push({ time: sb.time, value: startPrice }, { time: eb.time, value: endPrice });
+    }
+    chain.lastIdx = eb.idx;
+    chain.hadGap = false;
+    return true;
+  };
+
+  const allSegments = tf?.all_segments ?? [];
+  let hasAnyUnconfirmedSeg = false;
+  let lastSegResolvedAndConfirmed = false;
+  let lastSegEnd: { idx: number; time: Time; value: number } | null = null;
+
+  for (let i = 0; i < allSegments.length; i++) {
+    const seg = allSegments[i];
+    if (!seg) continue;
+    const isLast = i === allSegments.length - 1;
+    if (!seg.is_confirmed) hasAnyUnconfirmedSeg = true;
     const sb = resolve(seg.start_date);
     const eb = resolve(seg.end_date);
-    if (!sb || !eb) continue;
-    segPts.push({ idx: sb.idx, time: sb.time, value: seg.start_price });
-    segPts.push({ idx: eb.idx, time: eb.time, value: seg.end_price });
+    if (!sb || !eb) {
+      if (seg.is_confirmed) confirmedChain.hadGap = true;
+      else unconfirmedChain.hadGap = true;
+      continue;
+    }
+    const ok = seg.is_confirmed
+      ? appendToChain(confirmedChain, sb, seg.start_price, eb, seg.end_price)
+      : appendToChain(unconfirmedChain, sb, seg.start_price, eb, seg.end_price);
+    if (ok && isLast) {
+      lastSegResolvedAndConfirmed = seg.is_confirmed;
+      lastSegEnd = { idx: eb.idx, time: eb.time, value: seg.end_price };
+    }
   }
 
-  /* Zhongshu boxes: stroke zhongshus + segment zhongshus */
+  /* Extend uncertain dashed tail to latest bar close ONLY when the true last segment resolved cleanly */
+  if (lastBar && lastSegEnd && lastSegEnd.idx < lastBar.idx) {
+    if (!hasAnyUnconfirmedSeg && lastSegResolvedAndConfirmed) {
+      unconfirmedChain.data.push(
+        { time: lastSegEnd.time, value: lastSegEnd.value },
+        { time: lastBar.time, value: lastBar.close },
+      );
+    } else if (hasAnyUnconfirmedSeg && !unconfirmedChain.hadGap && unconfirmedChain.lastIdx === lastSegEnd.idx) {
+      unconfirmedChain.data.push({ time: lastBar.time, value: lastBar.close });
+    }
+  }
+
+  /* Zhongshu boxes: strictly separate stroke zhongshus (笔中枢) and segment zhongshus (线段中枢) */
   const strokeZsSrc =
-    tf?.all_stroke_zhongshus && tf.all_stroke_zhongshus.length > 0
+    tf?.all_stroke_zhongshus !== undefined
       ? tf.all_stroke_zhongshus
-      : tf?.recent_zhongshus && tf.recent_zhongshus.length > 0
-        ? tf.recent_zhongshus
-        : tf?.latest_zhongshu
-          ? [tf.latest_zhongshu]
+      : tf?.stroke_zhongshus !== undefined
+        ? tf.stroke_zhongshus
+        : tf?.zhongshu_level !== "segment"
+          ? tf?.recent_zhongshus && tf.recent_zhongshus.length > 0
+            ? tf.recent_zhongshus
+            : tf?.latest_zhongshu
+              ? [tf.latest_zhongshu]
+              : []
           : [];
-  const zhongshuBoxes = [
-    ...mapZhongshus(strokeZsSrc, "stroke", resolve, firstBar, lastBar, intraday),
-    ...mapZhongshus(tf?.all_segment_zhongshus, "segment", resolve, firstBar, lastBar, intraday),
-  ];
+  const segmentZsSrc =
+    tf?.all_segment_zhongshus !== undefined
+      ? tf.all_segment_zhongshus
+      : tf?.segment_zhongshus !== undefined
+        ? tf.segment_zhongshus
+        : tf?.zhongshu_level === "segment"
+          ? tf?.recent_zhongshus && tf.recent_zhongshus.length > 0
+            ? tf.recent_zhongshus
+            : tf?.latest_zhongshu
+              ? [tf.latest_zhongshu]
+              : []
+          : [];
+  const strokeZhongshuBoxes = mapZhongshus(strokeZsSrc, "stroke", resolve, firstBar, lastBar, intraday);
+  const segmentZhongshuBoxes = mapZhongshus(segmentZsSrc, "segment", resolve, firstBar, lastBar, intraday);
+  const latestStrokeZhongshu = strokeZsSrc.length > 0 ? (strokeZsSrc[strokeZsSrc.length - 1] ?? null) : null;
+  const latestSegmentZhongshu = segmentZsSrc.length > 0 ? (segmentZsSrc[segmentZsSrc.length - 1] ?? null) : null;
 
   /* Markers: latest fractal + recent stroke turning points + strict signal_meta buy/sell marker */
   const rawMarkers: { idx: number; marker: SeriesMarker<Time> }[] = [];
@@ -498,8 +585,12 @@ export function prepareChanlunSeries(
     macdDea,
     confirmedStrokes: toSortedLine(confirmedPts),
     unconfirmedStroke: toSortedLine(unconfirmedPts),
-    segments: toSortedLine(segPts),
-    zhongshuBoxes,
+    confirmedSegments: confirmedChain.data,
+    unconfirmedSegments: unconfirmedChain.data,
+    strokeZhongshuBoxes,
+    segmentZhongshuBoxes,
+    latestStrokeZhongshu,
+    latestSegmentZhongshu,
     markers: rawMarkers.map((x) => x.marker),
   };
 }

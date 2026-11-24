@@ -48,6 +48,8 @@ function deriveLabelFromDescription(name: string, description?: string | null): 
 }
 
 export function getUniverseLabel(name: string, description?: string | null): string {
+  if (!name) return "";
+  if (name.toLowerCase() === "adhoc" || name.toLowerCase() === "custom") return "临时自选";
   const preset = UNIVERSE_DISPLAY_MAP[name];
   if (preset) return preset.label;
   return deriveLabelFromDescription(name, description);

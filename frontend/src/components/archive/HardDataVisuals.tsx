@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { ExternalLink, RefreshCw, Table2 } from "lucide-react";
 import type { Dict, ResearchDataResponse } from "../../api/types";
 import { fmtCompact, fmtFixed, fmtNum, fmtPct, fmtPrice, shortTime, toNum } from "../../lib/format";
+import { formatSymbolWithCode } from "../../lib/symbols";
 import { useTheme } from "../../lib/theme";
 import { SourceStatusBadge, StatusBadge } from "../ui/StatusBadge";
 
@@ -19,6 +20,286 @@ function asObj(v: unknown): Dict | null {
 
 function asArr(v: unknown): Dict[] {
   return Array.isArray(v) ? (v.filter((x) => x && typeof x === "object") as Dict[]) : [];
+}
+
+const KEY_ZH_LABELS: Record<string, string> = {
+  status: "状态",
+  source: "数据源",
+  date: "日期",
+  report_date: "报告期",
+  updated_at: "更新时间",
+  spot_price: "现货报价",
+  futures_price: "期货主力价",
+  main_price: "主力合约价",
+  basis: "现货基差",
+  basis_pct: "基差率 (%)",
+  structure: "基差结构",
+  latest_inventory: "最新显性库存",
+  inventory: "库存量",
+  stock: "库存",
+  unit: "单位",
+  change: "环比变动",
+  change_pct: "环比变动 (%)",
+  yoy_pct: "同比变动 (%)",
+  domestic_symbol: "内盘合约",
+  domestic_price: "内盘价格",
+  foreign_symbol: "外盘合约",
+  foreign_price: "外盘价格",
+  fx_usdcny: "美元兑人民币",
+  raw_ratio: "内外比价",
+  import_parity: "进口折算成本",
+  import_margin_pct: "进口盈亏率 (%)",
+  spread: "价差",
+  bdi: "BDI 干散货指数",
+  bci: "BCI 好望角型",
+  bsi: "BSI 超灵便型",
+  bdti: "BDTI 原油运输",
+  bcti: "BCTI 成品油运输",
+  latest_value: "最新值",
+  prev_value: "前值",
+  series_id: "序列代码",
+  dfii10: "10Y 美债实际利率 (%)",
+  dgs10: "10Y 美债名义收益率 (%)",
+  t10yie: "10Y 盈亏平衡通胀 (%)",
+  fedfunds: "联邦基金有效利率 (%)",
+  m2sl: "美国 M2 货币供应",
+  pcoppusdm: "IMF 全球铜基准价",
+  manufacturing_pmi: "中国官方制造业 PMI",
+  caixin_pmi: "财新制造业 PMI",
+  exports_yoy_pct: "出口同比 (%)",
+  imports_yoy_pct: "进口同比 (%)",
+  stablecoin_mcap_usd: "稳定币总市值 (USD)",
+  open_interest: "未平仓合约 (OI)",
+  funding_rate_annualized_pct: "永续年化资金费率 (%)",
+  net_flow_usd_m: "现货 ETF 净流入 ($M)",
+};
+
+const MODULE_ZH_TITLES: Record<string, string> = {
+  cftc_disagg_cot: "CFTC 商品生产商与管理基金持仓",
+  eia_weekly: "EIA 周度库存与产量",
+  usda_wasde: "USDA WASDE 供需平衡表",
+  nbs_monthly: "国家统计局月度产量与投资",
+  defillama_stablecoins: "DefiLlama 稳定币流动性",
+  crypto_derivatives: "加密永续 OI 与资金费率",
+  farside_etf_flows: "Farside 现货 ETF 每日净流量",
+  northbound_flow: "沪深港通资金流向",
+  ths_financial_abstract: "同花顺核心财务摘要",
+};
+
+function humanizeKey(raw: string): string {
+  const lower = raw.toLowerCase();
+  if (KEY_ZH_LABELS[lower]) return KEY_ZH_LABELS[lower];
+  return raw.replace(/_/g, " ");
+}
+
+function formatScalarValue(key: string, val: unknown): string {
+  if (val === null || val === undefined || val === "") return "—";
+  if (typeof val === "boolean") return val ? "是" : "否";
+  if (typeof val === "number") {
+    if (!Number.isFinite(val)) return "—";
+    const lk = key.toLowerCase();
+    if (lk.includes("pct") || lk.includes("percent") || lk.includes("rate") || lk.includes("yield")) {
+      return `${val.toFixed(2)}%`;
+    }
+    if (Math.abs(val) >= 1_000_000) return fmtCompact(val);
+    if (Number.isInteger(val)) return fmtNum(val, 0);
+    return Math.abs(val) < 10 ? val.toFixed(4).replace(/\.?0+$/, "") : fmtFixed(val, 2);
+  }
+  if (Array.isArray(val)) {
+    if (val.length === 0) return "—";
+    if (val.every((x) => typeof x !== "object")) return val.slice(0, 6).map(String).join(", ");
+    return `${val.length} 条记录`;
+  }
+  return String(val);
+}
+
+/* ------------------------------------------------------------------
+ * Structured Key-Value & Mini-Table Card (eliminates raw <pre> JSON)
+ * ------------------------------------------------------------------ */
+function StructuredDataCard({ title, raw }: { title: string; raw: unknown }) {
+  const obj = asObj(raw);
+  if (!obj) {
+    return (
+      <div className="card p-3.5 text-xs">
+        <div className="section-title mb-2">{title}</div>
+        <div className="font-mono text-ink-2">{formatScalarValue(title, raw)}</div>
+      </div>
+    );
+  }
+
+  const errText = typeof obj.error === "string" ? obj.error : null;
+  const scalarPairs: { key: string; label: string; value: string }[] = [];
+  const nestedObjects: { key: string; label: string; data: Dict }[] = [];
+  const arrayTables: { key: string; label: string; rows: Dict[] }[] = [];
+
+  for (const [k, v] of Object.entries(obj)) {
+    if (k === "status" && v === "ok") continue;
+    if (k === "error") continue;
+    if (Array.isArray(v)) {
+      const objRows = asArr(v);
+      if (objRows.length > 0) {
+        arrayTables.push({ key: k, label: humanizeKey(k), rows: objRows.slice(0, 8) });
+      } else if (v.length > 0) {
+        scalarPairs.push({ key: k, label: humanizeKey(k), value: formatScalarValue(k, v) });
+      }
+      continue;
+    }
+    const sub = asObj(v);
+    if (sub) {
+      /* Unwrap multi-series dictionary such as us_fred.series.{DFII10, DGS10, ...} */
+      if (k === "series") {
+        for (const [sid, sVal] of Object.entries(sub)) {
+          const sObj = asObj(sVal);
+          if (!sObj) continue;
+          const lbl = String(sObj.label || humanizeKey(sid));
+          if (sObj.status === "error" || typeof sObj.error === "string") {
+            scalarPairs.push({
+              key: `series-${sid}`,
+              label: lbl,
+              value: `源故障: ${String(sObj.error || "不可用").slice(0, 36)}`,
+            });
+          } else {
+            const numPart = formatScalarValue(sid, sObj.latest_value ?? sObj.value ?? sObj.last);
+            const unitPart = typeof sObj.unit === "string" && !numPart.endsWith("%") ? ` ${sObj.unit}` : "";
+            const dtPart = sObj.date ?? sObj.period ?? "";
+            scalarPairs.push({
+              key: `series-${sid}`,
+              label: lbl,
+              value: `${numPart}${unitPart}${dtPart ? ` (${String(dtPart)})` : ""}`,
+            });
+          }
+        }
+        continue;
+      }
+
+      /* Flatten nested module with records[] or error (e.g. china_macro.pmi / trade) */
+      const subRecords = asArr(sub.records ?? sub.items ?? sub.rows);
+      if (subRecords.length > 0) {
+        arrayTables.push({ key: k, label: humanizeKey(k), rows: subRecords.slice(0, 8) });
+        continue;
+      }
+      if (sub.status === "error" || typeof sub.error === "string") {
+        scalarPairs.push({
+          key: k,
+          label: humanizeKey(k),
+          value: `源提示: ${String(sub.error || "暂不可用").slice(0, 42)}`,
+        });
+        continue;
+      }
+
+      /* Flatten simple latest-point series objects like { latest_value, date } */
+      if ("latest_value" in sub || "value" in sub || "last" in sub) {
+        const numPart = formatScalarValue(k, sub.latest_value ?? sub.value ?? sub.last);
+        const dtPart = sub.date ?? sub.period ?? sub.end ?? "";
+        scalarPairs.push({
+          key: k,
+          label: humanizeKey(String(sub.label ?? sub.name ?? k)),
+          value: dtPart ? `${numPart} (${String(dtPart)})` : numPart,
+        });
+      } else {
+        nestedObjects.push({ key: k, label: humanizeKey(k), data: sub });
+      }
+      continue;
+    }
+    if (v !== null && v !== undefined && v !== "") {
+      scalarPairs.push({ key: k, label: humanizeKey(k), value: formatScalarValue(k, v) });
+    }
+  }
+
+  return (
+    <div className="card flex flex-col gap-2.5 p-3.5 text-xs">
+      <div className="flex items-center justify-between gap-2">
+        <span className="section-title">{title}</span>
+        {typeof obj.status === "string" && obj.status !== "ok" ? (
+          <SourceStatusBadge status={obj.status} />
+        ) : null}
+      </div>
+
+      {errText ? (
+        <div className="rounded border border-warning/35 bg-warning/10 px-2.5 py-1.5 text-ink-2">
+          数据源提示：{errText}
+        </div>
+      ) : null}
+
+      {scalarPairs.length > 0 ? (
+        <dl className="m-0 grid grid-cols-1 gap-x-4 gap-y-1.5 sm:grid-cols-2">
+          {scalarPairs.map((item) => (
+            <div
+              key={item.key}
+              className="flex items-baseline justify-between gap-2 border-b border-hairline-soft pb-1"
+            >
+              <dt className="truncate text-muted">{item.label}</dt>
+              <dd className="tnum m-0 shrink-0 font-mono font-medium text-ink">{item.value}</dd>
+            </div>
+          ))}
+        </dl>
+      ) : null}
+
+      {nestedObjects.map((sub) => {
+        const entries = Object.entries(sub.data).filter(([, sv]) => sv !== null && sv !== undefined && typeof sv !== "object");
+        if (entries.length === 0) return null;
+        return (
+          <div key={sub.key} className="pt-1">
+            <div className="mb-1 text-[11px] font-semibold text-ink-2">{sub.label}</div>
+            <dl className="m-0 grid grid-cols-1 gap-x-4 gap-y-1 sm:grid-cols-2">
+              {entries.slice(0, 8).map(([sk, sv]) => (
+                <div
+                  key={sk}
+                  className="flex items-baseline justify-between gap-2 border-b border-hairline-soft pb-1"
+                >
+                  <dt className="truncate text-muted">{humanizeKey(sk)}</dt>
+                  <dd className="tnum m-0 shrink-0 font-mono text-ink">{formatScalarValue(sk, sv)}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        );
+      })}
+
+      {arrayTables.map((tbl) => {
+        const cols = Array.from(
+          new Set(tbl.rows.flatMap((r) => Object.keys(r).filter((ck) => typeof r[ck] !== "object"))),
+        ).slice(0, 5);
+        if (cols.length === 0) return null;
+        return (
+          <div key={tbl.key} className="table-wrapper max-h-48">
+            <table className="data-table">
+              <thead>
+                <tr>
+                  {cols.map((c) => (
+                    <th key={c} scope="col">
+                      {humanizeKey(c)}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {tbl.rows.map((r, rIdx) => (
+                  <tr key={rIdx}>
+                    {cols.map((c, cIdx) =>
+                      cIdx === 0 ? (
+                        <th key={c} scope="row">
+                          {formatScalarValue(c, r[c])}
+                        </th>
+                      ) : (
+                        <td key={c} data-label={humanizeKey(c)} className={typeof r[c] === "number" ? "num" : ""}>
+                          {formatScalarValue(c, r[c])}
+                        </td>
+                      ),
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+      })}
+
+      {scalarPairs.length === 0 && nestedObjects.length === 0 && arrayTables.length === 0 && !errText ? (
+        <div className="text-muted">暂无有效结构化字段</div>
+      ) : null}
+    </div>
+  );
 }
 
 /* ------------------------------------------------------------------
@@ -49,8 +330,8 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
   const mismatchWarn = typeof raw.quote_date_mismatch_warning === "string" ? raw.quote_date_mismatch_warning : null;
 
   const W = 620;
-  const H = 210;
-  const pad = { l: 58, r: 24, t: 22, b: 34 };
+  const H = 205;
+  const pad = { l: 58, r: 24, t: 20, b: 32 };
   const plotW = W - pad.l - pad.r;
   const plotH = H - pad.t - pad.b;
 
@@ -69,17 +350,12 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
   return (
     <div className="card flex flex-col gap-3 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <div className="flex items-center gap-2">
-            <h3 className="m-0 text-sm font-semibold text-ink">期货活跃合约期限结构曲线</h3>
-            <StatusBadge
-              tone={structure.toLowerCase().includes("backwardation") ? "warning" : "info"}
-              label={structure}
-            />
-          </div>
-          <p className="m-0 mt-0.5 text-xs text-muted">
-            单纵轴合约价格结构 · 鼠标悬停查看单腿报价与成交量（大 B 结构不否决做空）
-          </p>
+        <div className="flex items-center gap-2">
+          <h3 className="m-0 text-sm font-semibold text-ink">期货活跃合约期限结构曲线</h3>
+          <StatusBadge
+            tone={structure.toLowerCase().includes("backwardation") ? "warning" : "info"}
+            label={structure}
+          />
         </div>
         <button type="button" className="chip" aria-pressed={showTable} onClick={() => setShowTable((v) => !v)}>
           <Table2 className="h-3.5 w-3.5" aria-hidden="true" />
@@ -87,28 +363,28 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
         </button>
       </div>
 
-      {/* Roll Yield KPI Tiles */}
-      <div className="tnum grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-        <div className="rounded border border-hairline bg-page/60 p-2.5">
-          <div className="text-muted">近月合约</div>
-          <div className="mt-0.5 font-semibold text-ink">
+      {/* Hairline Roll Yield Strip */}
+      <div className="metric-strip grid-cols-2 sm:grid-cols-4">
+        <div className="metric-cell">
+          <span className="metric-label">近月合约</span>
+          <span className="metric-val">
             {String(raw.front_contract ?? points[0]?.code ?? "—")} · {fmtPrice(raw.front_price ?? points[0]?.price)}
-          </div>
+          </span>
         </div>
-        <div className="rounded border border-hairline bg-page/60 p-2.5">
-          <div className="text-muted">远月合约</div>
-          <div className="mt-0.5 font-semibold text-ink">
+        <div className="metric-cell">
+          <span className="metric-label">远月合约</span>
+          <span className="metric-val">
             {String(raw.far_contract ?? raw.back_contract ?? points[points.length - 1]?.code ?? "—")} ·{" "}
             {fmtPrice(raw.far_price ?? raw.back_price ?? points[points.length - 1]?.price)}
-          </div>
+          </span>
         </div>
-        <div className="rounded border border-hairline bg-page/60 p-2.5">
-          <div className="text-muted">近月年化展期收益</div>
-          <div className="mt-0.5 font-semibold text-ink">{fmtPct(nearRoll, 2, true)}</div>
+        <div className="metric-cell">
+          <span className="metric-label">近月年化展期收益</span>
+          <span className="metric-val">{fmtPct(nearRoll, 2, true)}</span>
         </div>
-        <div className="rounded border border-hairline bg-page/60 p-2.5">
-          <div className="text-muted">全曲线年化展期收益</div>
-          <div className="mt-0.5 font-semibold text-ink">{fmtPct(curveRoll, 2, true)}</div>
+        <div className="metric-cell">
+          <span className="metric-label">全曲线年化展期收益</span>
+          <span className="metric-val">{fmtPct(curveRoll, 2, true)}</span>
         </div>
       </div>
 
@@ -160,7 +436,6 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
             aria-label="期货期限结构价格曲线图"
             onMouseLeave={() => setHoverIdx(null)}
           >
-            {/* Recessive horizontal gridlines (3 ticks) */}
             {[0, 0.5, 1].map((t) => {
               const val = yLow + t * (yHigh - yLow);
               const y = yAt(val);
@@ -173,7 +448,7 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
                     textAnchor="end"
                     fontSize="10.5"
                     fill={palette.muted}
-                    style={{ fontVariantNumeric: "tabular-nums" }}
+                    style={{ fontVariantNumeric: "tabular-nums", fontFamily: "var(--font-mono)" }}
                   >
                     {fmtPrice(val)}
                   </text>
@@ -181,10 +456,8 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
               );
             })}
 
-            {/* 2px primary curve line */}
-            <path d={pathD} fill="none" stroke={palette.slots[0]} strokeWidth={2} />
+            <path d={pathD} fill="none" stroke={palette.accent} strokeWidth={2} />
 
-            {/* Hover crosshair */}
             {hoverIdx !== null && points[hoverIdx] ? (
               <line
                 x1={xAt(hoverIdx)}
@@ -196,22 +469,21 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
               />
             ) : null}
 
-            {/* Marks (>= 8px diameter with 2px surface ring) + larger invisible hit targets */}
             {points.map((p, i) => {
               const cx = xAt(i);
               const cy = yAt(p.price);
-              const showTick = points.length <= 8 || i === 0 || i === points.length - 1 || i % Math.ceil(points.length / 6) === 0;
+              const showTick =
+                points.length <= 8 || i === 0 || i === points.length - 1 || i % Math.ceil(points.length / 6) === 0;
               return (
                 <g key={p.code}>
                   <circle
                     cx={cx}
                     cy={cy}
-                    r={hoverIdx === i ? 6 : 4.5}
-                    fill={palette.slots[0]}
+                    r={hoverIdx === i ? 6 : 4}
+                    fill={palette.accent}
                     stroke={palette.surface}
                     strokeWidth={2}
                   />
-                  {/* Selective direct labels on front and back contracts */}
                   {i === 0 || i === points.length - 1 ? (
                     <text
                       x={cx}
@@ -220,13 +492,20 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
                       fontSize="10.5"
                       fontWeight="600"
                       fill={palette.ink}
-                      style={{ fontVariantNumeric: "tabular-nums" }}
+                      style={{ fontVariantNumeric: "tabular-nums", fontFamily: "var(--font-mono)" }}
                     >
                       {fmtPrice(p.price)}
                     </text>
                   ) : null}
                   {showTick ? (
-                    <text x={cx} y={H - 10} textAnchor="middle" fontSize="10.5" fill={palette.muted}>
+                    <text
+                      x={cx}
+                      y={H - 8}
+                      textAnchor="middle"
+                      fontSize="10"
+                      fill={palette.muted}
+                      style={{ fontFamily: "var(--font-mono)" }}
+                    >
                       {p.code}
                     </text>
                   ) : null}
@@ -244,11 +523,11 @@ function FuturesCurveCard({ raw }: { raw: Dict }) {
           </svg>
 
           {activePt ? (
-            <div className="tnum mt-1 flex flex-wrap items-center gap-3 rounded border border-hairline bg-elevated px-3 py-1.5 text-xs text-ink">
+            <div className="tnum mt-1 flex flex-wrap items-center gap-3 rounded border border-hairline bg-sunken px-3 py-1 font-mono text-[11px] text-ink">
               <strong>{activePt.code}</strong>
-              <span>报价：{fmtPrice(activePt.price)}</span>
-              {activePt.volume != null ? <span>成交量：{fmtCompact(activePt.volume)}</span> : null}
-              {activePt.oi != null ? <span>持仓量：{fmtCompact(activePt.oi)}</span> : null}
+              <span>报价 {fmtPrice(activePt.price)}</span>
+              {activePt.volume != null ? <span>量 {fmtCompact(activePt.volume)}</span> : null}
+              {activePt.oi != null ? <span>OI {fmtCompact(activePt.oi)}</span> : null}
             </div>
           ) : null}
         </div>
@@ -301,12 +580,7 @@ function FxHardDataCard({ rateDiff, cot }: { rateDiff: Dict | null; cot: Dict | 
   return (
     <div className="card flex flex-col gap-3.5 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <div>
-          <h3 className="m-0 text-sm font-semibold text-ink">主权国债利差 & CFTC 金融期货持仓结构（TFF）</h3>
-          <p className="m-0 mt-0.5 text-xs text-muted">
-            零轴双向净头寸条形图（自动标注反向报价换算）· 悬停查看多空明细
-          </p>
-        </div>
+        <h3 className="m-0 text-sm font-semibold text-ink">主权国债利差 & CFTC 金融期货持仓结构（TFF）</h3>
         {buckets.length > 0 ? (
           <button type="button" className="chip" aria-pressed={showTable} onClick={() => setShowTable((v) => !v)}>
             <Table2 className="h-3.5 w-3.5" aria-hidden="true" />
@@ -315,41 +589,40 @@ function FxHardDataCard({ rateDiff, cot }: { rateDiff: Dict | null; cot: Dict | 
         ) : null}
       </div>
 
-      {/* Rate Differential KPI Strip */}
       {rateDiff ? (
-        <div className="tnum grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">10Y 利差 (Base − Quote)</div>
-            <div className="mt-0.5 font-semibold text-ink">
+        <div className="metric-strip grid-cols-2 sm:grid-cols-4">
+          <div className="metric-cell">
+            <span className="metric-label">10Y 利差 (Base − Quote)</span>
+            <span className="metric-val">
               {rateDiff.base_minus_quote_10y_bp != null
                 ? `${fmtFixed(rateDiff.base_minus_quote_10y_bp, 1)} bp`
                 : fmtPct(rateDiff.base_minus_quote_10y_pct, 2, true)}
-            </div>
+            </span>
           </div>
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">基准端收益率</div>
-            <div className="mt-0.5 font-semibold text-ink">
+          <div className="metric-cell">
+            <span className="metric-label">基准端收益率</span>
+            <span className="metric-val">
               {fmtPct(asObj(rateDiff.base)?.latest_value ?? asObj(rateDiff.us10y)?.latest_value, 2)}
-            </div>
+            </span>
           </div>
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">计价端收益率</div>
-            <div className="mt-0.5 font-semibold text-ink">
+          <div className="metric-cell">
+            <span className="metric-label">计价端收益率</span>
+            <span className="metric-val">
               {fmtPct(asObj(rateDiff.quote)?.latest_value ?? asObj(rateDiff.cn10y)?.latest_value, 2)}
-            </div>
+            </span>
           </div>
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">口径与频率提示</div>
-            <div className="mt-0.5 truncate font-medium text-ink-2">
+          <div className="metric-cell">
+            <span className="metric-label">数据来源</span>
+            <span className="metric-val font-sans text-xs text-ink-2">
               {String(rateDiff.formula || rateDiff.source || "FRED / 东财")}
-            </div>
+            </span>
           </div>
         </div>
       ) : null}
 
       {cot?.direction_note ? (
-        <div className="rounded border border-slot1/35 bg-slot1/10 px-3 py-1.5 text-xs text-ink">
-          <strong>报价方向换算说明：</strong> {String(cot.direction_note)}（报告期：{String(cot.report_date ?? "—")} · 总持仓 OI：{fmtCompact(cot.open_interest)}）
+        <div className="rounded border border-accent/30 bg-accent/8 px-3 py-1.5 text-xs text-ink">
+          <strong>报价换算说明：</strong> {String(cot.direction_note)}（报告期：{String(cot.report_date ?? "—")} · 总 OI：{fmtCompact(cot.open_interest)}）
         </div>
       ) : null}
 
@@ -395,40 +668,40 @@ function FxHardDataCard({ rateDiff, cot }: { rateDiff: Dict | null; cot: Dict | 
           </table>
         </div>
       ) : (
-        <div className="space-y-2.5">
+        <div className="space-y-2">
           {buckets.map((b) => {
             const pctWidth = Math.min(50, (Math.abs(b.net) / maxAbs) * 48);
             const positive = b.net >= 0;
-            const barColor = positive ? palette.slots[2] : palette.slots[1];
+            const barColor = positive ? palette.bull : palette.bear;
             return (
               <div
                 key={b.key}
                 onMouseEnter={() => setHoverRow(b.key)}
                 onMouseLeave={() => setHoverRow(null)}
-                className="rounded-md border border-hairline bg-page/50 p-2.5"
+                className="py-1"
               >
-                <div className="mb-1.5 flex items-center justify-between gap-2 text-xs">
+                <div className="mb-1 flex items-center justify-between gap-2 text-xs">
                   <span className="font-medium text-ink">{b.label}</span>
-                  <span className="tnum text-ink-2">
-                    净头寸 <strong className="text-ink">{fmtNum(b.net, 0)}</strong>
+                  <span className="tnum font-mono text-[11.5px] text-ink-2">
+                    净头寸 <strong className={positive ? "text-bull" : "text-bear"}>{fmtNum(b.net, 0)}</strong>
                     {b.pctOi != null ? ` (${fmtPct(b.pctOi, 1, true)} OI)` : ""}
                   </span>
                 </div>
-                <div className="relative h-4 w-full rounded bg-elevated">
+                <div className="relative h-3.5 w-full rounded bg-sunken">
                   <div className="absolute inset-y-0 left-1/2 w-px bg-muted/60" aria-hidden="true" />
                   <div
                     style={{
                       width: `${pctWidth}%`,
                       left: positive ? "50%" : `${50 - pctWidth}%`,
                       backgroundColor: barColor,
-                      borderRadius: positive ? "0 4px 4px 0" : "4px 0 0 4px",
+                      borderRadius: positive ? "0 3px 3px 0" : "3px 0 0 3px",
                     }}
                     className="absolute inset-y-0.5"
                   />
                 </div>
                 {hoverRow === b.key && (b.long != null || b.short != null) ? (
-                  <div className="tnum mt-1.5 text-[11px] text-muted">
-                    多头：{fmtNum(b.long, 0)} 手 · 空头：{fmtNum(b.short, 0)} 手
+                  <div className="tnum mt-1 font-mono text-[11px] text-muted">
+                    多头 {fmtNum(b.long, 0)} 手 · 空头 {fmtNum(b.short, 0)} 手
                   </div>
                 ) : null}
               </div>
@@ -443,94 +716,88 @@ function FxHardDataCard({ rateDiff, cot }: { rateDiff: Dict | null; cot: Dict | 
 /* ------------------------------------------------------------------
  * 3. Equity Valuation, Consensus & SEC EDGAR GAAP Card
  * ------------------------------------------------------------------ */
-function EquityHardDataCard({ sec, yf, valEm, thsForecast }: { sec: Dict | null; yf: Dict | null; valEm: Dict | null; thsForecast: Dict | null }) {
+function EquityHardDataCard({
+  sec,
+  yf,
+  valEm,
+  thsForecast,
+}: {
+  sec: Dict | null;
+  yf: Dict | null;
+  valEm: Dict | null;
+  thsForecast: Dict | null;
+}) {
   const filings = asArr(sec?.recent_filings);
   const gaap = asObj(sec?.gaap_metrics);
   const valPos = asObj(yf?.valuation_and_positioning);
   const targets = asObj(yf?.analyst_price_targets);
 
   return (
-    <div className="card flex flex-col gap-4 p-4">
-      <div>
-        <h3 className="m-0 text-sm font-semibold text-ink">股票远期预期、估值分位与官方财报核验</h3>
-        <p className="m-0 mt-0.5 text-xs text-muted">
-          严格区分 SEC GAAP 原表与卖方一致预期（Adjusted 口径需交叉核验，禁死板套用静态当期 PE）
-        </p>
-      </div>
+    <div className="card flex flex-col gap-3.5 p-4">
+      <h3 className="m-0 text-sm font-semibold text-ink">股票远期预期、估值分位与官方财报核验</h3>
 
-      {/* US Valuation & Short Interest (snake_case aligned with scripts/research_extensions.py) */}
       {valPos || targets ? (
-        <div className="tnum grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">Trailing / Forward PE (yfinance)</div>
-            <div className="mt-0.5 font-semibold text-ink">
+        <div className="metric-strip grid-cols-2 sm:grid-cols-4">
+          <div className="metric-cell">
+            <span className="metric-label">Trailing / Forward PE</span>
+            <span className="metric-val">
               {fmtFixed(valPos?.trailing_pe ?? valPos?.trailingPE, 1)}x /{" "}
               {fmtFixed(valPos?.forward_pe ?? valPos?.forwardPE, 1)}x
-            </div>
+            </span>
           </div>
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">空头占流通盘 (Short % Float)</div>
-            <div className="mt-0.5 font-semibold text-ink">
+          <div className="metric-cell">
+            <span className="metric-label">空头占比 (Short % Float)</span>
+            <span className="metric-val">
               {(() => {
                 const ratio = toNum(valPos?.short_percent_of_float ?? valPos?.shortPercentOfFloat);
                 return ratio !== null ? fmtPct(ratio * 100, 2) : "—";
               })()}
-            </div>
+            </span>
           </div>
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">一致预期目标价均值 / 中位</div>
-            <div className="mt-0.5 font-semibold text-ink">
+          <div className="metric-cell">
+            <span className="metric-label">一致预期目标价均值 / 中位</span>
+            <span className="metric-val">
               {fmtPrice(targets?.mean)} / {fmtPrice(targets?.median)}
-            </div>
+            </span>
           </div>
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">下次财报窗口</div>
-            <div className="mt-0.5 font-medium text-ink-2">
+          <div className="metric-cell">
+            <span className="metric-label">下次财报窗口</span>
+            <span className="metric-val font-sans text-xs text-ink-2">
               {String(valPos?.next_earnings_date ?? "待定")}
-            </div>
+            </span>
           </div>
         </div>
       ) : null}
 
-      {/* A-Share 5Y Valuation Percentiles (snake_case aligned with compute_ashare_valuation_percentiles) */}
       {valEm ? (
-        <div className="tnum grid grid-cols-2 gap-2 text-xs sm:grid-cols-4">
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">PE(TTM) & 5年历史分位</div>
-            <div className="mt-0.5 font-semibold text-ink">
-              {fmtFixed(valEm.pe_ttm ?? valEm.pe_ttm_latest, 1)}x · 分位{" "}
+        <div className="metric-strip grid-cols-2 sm:grid-cols-4">
+          <div className="metric-cell">
+            <span className="metric-label">PE(TTM) & 5Y 分位</span>
+            <span className="metric-val">
+              {fmtFixed(valEm.pe_ttm ?? valEm.pe_ttm_latest, 1)}x ·{" "}
               {fmtPct(valEm.pe_ttm_5y_percentile ?? valEm.pe_ttm_pct_5y ?? valEm.pe_percentile_5y, 1)}
-            </div>
-            {valEm.pe_ttm_5y_median != null ? (
-              <div className="mt-0.5 text-[10.5px] text-muted">
-                5年中位数：{fmtFixed(valEm.pe_ttm_5y_median, 1)}x
-              </div>
-            ) : null}
+            </span>
           </div>
-          <div className="rounded border border-hairline bg-page/60 p-2.5">
-            <div className="text-muted">PB & 5年历史分位</div>
-            <div className="mt-0.5 font-semibold text-ink">
-              {fmtFixed(valEm.pb ?? valEm.pb_latest, 2)}x · 分位{" "}
+          <div className="metric-cell">
+            <span className="metric-label">PE 5Y 中位数</span>
+            <span className="metric-val">{fmtFixed(valEm.pe_ttm_5y_median, 1)}x</span>
+          </div>
+          <div className="metric-cell">
+            <span className="metric-label">PB & 5Y 分位</span>
+            <span className="metric-val">
+              {fmtFixed(valEm.pb ?? valEm.pb_latest, 2)}x ·{" "}
               {fmtPct(valEm.pb_5y_percentile ?? valEm.pb_pct_5y ?? valEm.pb_percentile_5y, 1)}
-            </div>
-            {valEm.pb_5y_median != null ? (
-              <div className="mt-0.5 text-[10.5px] text-muted">
-                5年中位数：{fmtFixed(valEm.pb_5y_median, 2)}x
-              </div>
-            ) : null}
+            </span>
           </div>
-          {thsForecast ? (
-            <div className="rounded border border-hairline bg-page/60 p-2.5 sm:col-span-2">
-              <div className="text-muted">同花顺机构盈利预测</div>
-              <div className="mt-0.5 truncate font-medium text-ink-2">
-                {JSON.stringify(thsForecast).slice(0, 110)}…
-              </div>
-            </div>
-          ) : null}
+          <div className="metric-cell">
+            <span className="metric-label">PB 5Y 中位数</span>
+            <span className="metric-val">{fmtFixed(valEm.pb_5y_median, 2)}x</span>
+          </div>
         </div>
       ) : null}
 
-      {/* SEC EDGAR L1 Filings */}
+      {thsForecast ? <StructuredDataCard title="同花顺机构盈利预测 (2026~2028)" raw={thsForecast} /> : null}
+
       {filings.length > 0 ? (
         <div className="flex flex-col gap-1.5">
           <span className="section-title">SEC EDGAR 官方 L1 财报原件（{String(sec?.entity_name ?? "")}）</span>
@@ -543,17 +810,16 @@ function EquityHardDataCard({ sec, yf, valEm, thsForecast }: { sec: Dict | null;
                 rel="noreferrer"
                 className="btn btn-sm"
               >
-                <span>
+                <span className="font-mono">
                   {String(f.form ?? "10-Q")} · {String(f.filingDate ?? "")}
                 </span>
-                <ExternalLink className="h-3 w-3 text-slot1" aria-hidden="true" />
+                <ExternalLink className="h-3 w-3 text-muted" aria-hidden="true" />
               </a>
             ))}
           </div>
         </div>
       ) : null}
 
-      {/* SEC GAAP Metrics Table */}
       {gaap && Object.keys(gaap).length > 0 ? (
         <div tabIndex={0} role="region" aria-label="SEC EDGAR GAAP 核心财务指标表" className="table-wrapper">
           <table className="data-table">
@@ -577,7 +843,9 @@ function EquityHardDataCard({ sec, yf, valEm, thsForecast }: { sec: Dict | null;
                     <td data-label="最新披露值" className="num">
                       {fmtCompact(recent?.val ?? recent?.value)}
                     </td>
-                    <td data-label="报告期末">{String(recent?.end ?? recent?.period ?? "—")}</td>
+                    <td data-label="报告期末" className="font-mono text-xs">
+                      {String(recent?.end ?? recent?.period ?? "—")}
+                    </td>
                     <td data-label="表单来源" className="text-muted">
                       {String(recent?.form ?? "10-K/10-Q")}
                     </td>
@@ -612,11 +880,14 @@ export function HardDataVisuals({ symbol, data, loading, error, onRefresh }: Har
   const valEm = asObj(fs.valuation_5y_em);
   const thsForecast = asObj(fs.ths_profit_forecast);
 
-  /* Remaining structured cards rendered cleanly as key-value summary tiles */
   const extraEntries = Object.entries(fs).filter(
     ([k]) =>
       ![
         "term_structure",
+        "spot_and_basis",
+        "inventory_em",
+        "cross_market_spread",
+        "baltic_freight",
         "rate_differential",
         "cftc_fx_cot",
         "cftc_cot",
@@ -628,21 +899,21 @@ export function HardDataVisuals({ symbol, data, loading, error, onRefresh }: Har
   );
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex flex-col gap-3.5">
       {/* Header & Source Health Badges */}
       <div className="card flex flex-col gap-2.5 p-3.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <span className="text-sm font-semibold text-ink">
-              {symbol} · 按品种白名单精准路由硬数据（{data?.asset_class || "自动识别"}）
+              {formatSymbolWithCode(symbol)} · 白名单路由实时硬数据（{data?.asset_class || "自动识别"}）
             </span>
             {data?.fetched_at_utc ? (
-              <span className="ml-2 text-xs text-muted">抓取时间：{shortTime(data.fetched_at_utc)} UTC</span>
+              <span className="ml-2 font-mono text-[11px] text-muted">{shortTime(data.fetched_at_utc)} UTC</span>
             ) : null}
           </div>
           <button type="button" className="btn btn-sm" disabled={loading} onClick={onRefresh}>
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden="true" />
-            <span>{loading ? "拉取硬数据中…" : "重新抓取实时源"}</span>
+            <span>{loading ? "拉取中…" : "重新抓取实时源"}</span>
           </button>
         </div>
 
@@ -674,91 +945,43 @@ export function HardDataVisuals({ symbol, data, loading, error, onRefresh }: Har
         <div className="card p-8 text-center text-xs text-muted">正在按品种白名单并发拉取官方免费硬数据…</div>
       ) : null}
 
-      {/* Visual 1: Futures Term Structure */}
       {termStructure && termStructure.status !== "skipped" && !termStructure.error ? (
         <FuturesCurveCard raw={termStructure} />
       ) : null}
 
-      {/* Visual 2: FX Rate Diff & CFTC COT */}
       {(rateDiff && rateDiff.status !== "skipped") || (fxCot && fxCot.status !== "skipped") ? (
         <FxHardDataCard rateDiff={rateDiff} cot={fxCot} />
       ) : null}
 
-      {/* Visual 3: Equity Valuation & SEC EDGAR */}
       {secEdgar || yfConsensus || valEm ? (
         <EquityHardDataCard sec={secEdgar} yf={yfConsensus} valEm={valEm} thsForecast={thsForecast} />
       ) : null}
 
-      {/* Commodity Spot/Basis, Inventory, Cross-Market Spread & Freight Summary */}
-      {(spotBasis || inventory || crossSpread || freight) ? (
+      {spotBasis || inventory || crossSpread || freight ? (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          {spotBasis ? (
-            <div className="card p-3.5 text-xs">
-              <div className="section-title mb-2">现货与基差（生意社）</div>
-              <pre className="m-0 max-h-44 overflow-auto font-mono text-[11.5px] text-ink-2">
-                {JSON.stringify(spotBasis, null, 2)}
-              </pre>
-            </div>
-          ) : null}
-          {inventory ? (
-            <div className="card p-3.5 text-xs">
-              <div className="section-title mb-2">显性期货库存（东财）</div>
-              <pre className="m-0 max-h-44 overflow-auto font-mono text-[11.5px] text-ink-2">
-                {JSON.stringify(inventory, null, 2)}
-              </pre>
-            </div>
-          ) : null}
-          {crossSpread ? (
-            <div className="card p-3.5 text-xs">
-              <div className="section-title mb-2">内外盘跨市价差与进口比价</div>
-              <pre className="m-0 max-h-44 overflow-auto font-mono text-[11.5px] text-ink-2">
-                {JSON.stringify(crossSpread, null, 2)}
-              </pre>
-            </div>
-          ) : null}
-          {freight ? (
-            <div className="card p-3.5 text-xs">
-              <div className="section-title mb-2">波罗的海海运指数联动</div>
-              <pre className="m-0 max-h-44 overflow-auto font-mono text-[11.5px] text-ink-2">
-                {JSON.stringify(freight, null, 2)}
-              </pre>
-            </div>
-          ) : null}
+          {spotBasis ? <StructuredDataCard title="现货与基差（生意社）" raw={spotBasis} /> : null}
+          {inventory ? <StructuredDataCard title="显性期货库存（东财）" raw={inventory} /> : null}
+          {crossSpread ? <StructuredDataCard title="内外盘跨市价差与进口比价" raw={crossSpread} /> : null}
+          {freight ? <StructuredDataCard title="波罗的海海运指数联动" raw={freight} /> : null}
         </div>
       ) : null}
 
-      {/* Remaining asset-specific modules (Crypto ETF / Stablecoins / EIA / USDA) */}
       {extraEntries.length > 0 ? (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-          {extraEntries
-            .filter(([k]) => !["spot_and_basis", "inventory_em", "cross_market_spread", "baltic_freight"].includes(k))
-            .map(([k, v]) => (
-              <div key={k} className="card p-3.5 text-xs">
-                <div className="section-title mb-2">{k}</div>
-                <pre className="m-0 max-h-48 overflow-auto font-mono text-[11.5px] text-ink-2">
-                  {JSON.stringify(v, null, 2)}
-                </pre>
-              </div>
-            ))}
+          {extraEntries.map(([k, v]) => (
+            <StructuredDataCard key={k} title={MODULE_ZH_TITLES[k] || humanizeKey(k)} raw={v} />
+          ))}
         </div>
       ) : null}
 
-      {/* Macro Dual-Core Summary */}
       {Object.keys(macro).length > 0 && macro.status !== "skipped" ? (
-        <div className="card p-3.5 text-xs">
-          <div className="section-title mb-2">中美宏观双核底座（FRED 免 Key 利率通胀 + 中国 PMI/进出口）</div>
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-            {macro.us_fred ? (
-              <pre className="m-0 max-h-44 overflow-auto rounded border border-hairline bg-page/60 p-2.5 font-mono text-[11px] text-ink-2">
-                {JSON.stringify(macro.us_fred, null, 2)}
-              </pre>
-            ) : null}
-            {macro.china_macro ? (
-              <pre className="m-0 max-h-44 overflow-auto rounded border border-hairline bg-page/60 p-2.5 font-mono text-[11px] text-ink-2">
-                {JSON.stringify(macro.china_macro, null, 2)}
-              </pre>
-            ) : null}
-          </div>
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+          {macro.us_fred ? (
+            <StructuredDataCard title="美国宏观与实际利率底座（FRED）" raw={macro.us_fred} />
+          ) : null}
+          {macro.china_macro ? (
+            <StructuredDataCard title="中国信用与景气周期（PMI / 进出口）" raw={macro.china_macro} />
+          ) : null}
         </div>
       ) : null}
     </div>

@@ -42,6 +42,7 @@ export interface PreparedChanlunSeries {
   confirmedStrokes: LineData<Time>[];
   unconfirmedStroke: LineData<Time>[];
   confirmedSegments: LineData<Time>[];
+  confirmedSegmentChains: LineData<Time>[][];
   unconfirmedSegments: LineData<Time>[];
   strokeZhongshuBoxes: ZhongshuBoxDrawItem[];
   segmentZhongshuBoxes: ZhongshuBoxDrawItem[];
@@ -357,20 +358,35 @@ export function prepareChanlunSeries(
   const macdHist: HistogramData<Time>[] = [];
   const macdDif: LineData<Time>[] = [];
   const macdDea: LineData<Time>[] = [];
+  let prevHist: number | null = null;
+  const isDark = palette.mode === "dark";
   for (const b of bars) {
     if (b.hist !== null) {
+      /* 4-tone MACD divergence histogram: solid when expanding, muted translucent when converging */
+      const pos = b.hist >= 0;
+      const expanding =
+        prevHist === null || (pos ? b.hist >= prevHist : b.hist <= prevHist);
+      const color = pos
+        ? expanding
+          ? isDark
+            ? "rgba(46, 189, 133, 0.84)"
+            : "rgba(13, 148, 98, 0.82)"
+          : isDark
+            ? "rgba(46, 189, 133, 0.34)"
+            : "rgba(13, 148, 98, 0.32)"
+        : expanding
+          ? isDark
+            ? "rgba(240, 101, 101, 0.84)"
+            : "rgba(220, 38, 38, 0.82)"
+          : isDark
+            ? "rgba(240, 101, 101, 0.34)"
+            : "rgba(220, 38, 38, 0.32)";
       macdHist.push({
         time: b.time,
         value: b.hist,
-        color:
-          b.hist >= 0
-            ? palette.mode === "dark"
-              ? "rgba(25, 158, 112, 0.72)"
-              : "rgba(27, 175, 122, 0.72)"
-            : palette.mode === "dark"
-              ? "rgba(230, 103, 103, 0.72)"
-              : "rgba(227, 73, 72, 0.72)",
+        color,
       });
+      prevHist = b.hist;
     }
     if (b.dif !== null) macdDif.push({ time: b.time, value: b.dif });
     if (b.dea !== null) macdDea.push({ time: b.time, value: b.dea });
@@ -402,14 +418,22 @@ export function prepareChanlunSeries(
     }
   }
 
-  /* Segments (线段): confirmed segments are solid; uncertain trailing segment / extension to latest price is dashed */
+  /* Segments (线段): preserve ALL contiguous confirmed segment chains across gaps without false bridges */
   type SegmentChain = {
+    chains: LineData<Time>[][];
     data: LineData<Time>[];
     lastIdx: number | null;
     hadGap: boolean;
   };
-  const confirmedChain: SegmentChain = { data: [], lastIdx: null, hadGap: false };
-  const unconfirmedChain: SegmentChain = { data: [], lastIdx: null, hadGap: false };
+  const confirmedChain: SegmentChain = { chains: [], data: [], lastIdx: null, hadGap: false };
+  const unconfirmedChain: SegmentChain = { chains: [], data: [], lastIdx: null, hadGap: false };
+
+  const flushChain = (chain: SegmentChain) => {
+    if (chain.data.length >= 2) {
+      chain.chains.push([...chain.data]);
+    }
+    chain.data = [];
+  };
 
   const appendToChain = (
     chain: SegmentChain,
@@ -430,8 +454,8 @@ export function prepareChanlunSeries(
     } else if (!chain.hadGap && sb.idx === chain.lastIdx) {
       chain.data.push({ time: eb.time, value: endPrice });
     } else {
-      /* Lightweight Charts LineSeries connects all non-whitespace points continuously; restart at the latest contiguous chain across any gap */
-      chain.data.length = 0;
+      /* Preserve completed chain before starting a separate contiguous chain across the gap */
+      flushChain(chain);
       chain.data.push({ time: sb.time, value: startPrice }, { time: eb.time, value: endPrice });
     }
     chain.lastIdx = eb.idx;
@@ -507,10 +531,9 @@ export function prepareChanlunSeries(
   const latestStrokeZhongshu = strokeZsSrc.length > 0 ? (strokeZsSrc[strokeZsSrc.length - 1] ?? null) : null;
   const latestSegmentZhongshu = segmentZsSrc.length > 0 ? (segmentZsSrc[segmentZsSrc.length - 1] ?? null) : null;
 
-  /* Markers: latest fractal + recent stroke turning points + strict signal_meta buy/sell marker */
+  /* Markers: clean micro-dots for recent fractal pivots; text labels reserved strictly for 1/2/3 Buy/Sell signals */
   const rawMarkers: { idx: number; marker: SeriesMarker<Time> }[] = [];
 
-  /* Recent 8 strokes' fractal endpoints (subtle circle markers) */
   const recentStrokes = strokes.slice(-8);
   for (const st of recentStrokes) {
     const eb = resolve(st.end_date);
@@ -522,14 +545,13 @@ export function prepareChanlunSeries(
         time: eb.time,
         position: isTop ? "aboveBar" : "belowBar",
         shape: "circle",
-        color: isTop ? palette.slots[7] : palette.slots[2],
-        text: st.strength_tier ? `${isTop ? "顶" : "底"}·${st.strength_tier.slice(0, 2)}` : isTop ? "顶" : "底",
-        size: 0.7,
+        color: isTop ? palette.bear : palette.bull,
+        size: 0.42,
       },
     });
   }
 
-  /* Latest fractal highlight */
+  /* Latest fractal subtle square pivot (no cluttering text) */
   if (tf?.latest_fractal) {
     const fb = resolve(tf.latest_fractal.date);
     if (fb) {
@@ -541,8 +563,7 @@ export function prepareChanlunSeries(
           position: isTop ? "aboveBar" : "belowBar",
           shape: "square",
           color: palette.warning,
-          text: isTop ? "最新顶分" : "最新底分",
-          size: 0.9,
+          size: 0.65,
         },
       });
     }
@@ -565,9 +586,9 @@ export function prepareChanlunSeries(
             time: sigBar.time,
             position: isLong ? "belowBar" : "aboveBar",
             shape: isLong ? "arrowUp" : "arrowDown",
-            color: isLong ? palette.good : palette.critical,
+            color: isLong ? palette.bull : palette.bear,
             text: `${conciseLabel}${isConfirmed ? "·已确认" : "(待确认)"}`,
-            size: 1.4,
+            size: 1.25,
           },
         });
       }
@@ -575,6 +596,11 @@ export function prepareChanlunSeries(
   }
 
   rawMarkers.sort((a, b) => a.idx - b.idx);
+
+  const allConfirmedSegmentChains = [
+    ...confirmedChain.chains,
+    ...(confirmedChain.data.length >= 2 ? [confirmedChain.data] : []),
+  ];
 
   return {
     bars,
@@ -586,6 +612,7 @@ export function prepareChanlunSeries(
     confirmedStrokes: toSortedLine(confirmedPts),
     unconfirmedStroke: toSortedLine(unconfirmedPts),
     confirmedSegments: confirmedChain.data,
+    confirmedSegmentChains: allConfirmedSegmentChains,
     unconfirmedSegments: unconfirmedChain.data,
     strokeZhongshuBoxes,
     segmentZhongshuBoxes,

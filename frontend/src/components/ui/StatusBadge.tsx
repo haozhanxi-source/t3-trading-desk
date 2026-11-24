@@ -1,49 +1,45 @@
-import {
-  AlertOctagon,
-  AlertTriangle,
-  CheckCircle2,
-  Clock,
-  HelpCircle,
-  MinusCircle,
-  ShieldAlert,
-  TrendingDown,
-  TrendingUp,
-} from "lucide-react";
+import { AlertOctagon, ArrowDownRight, ArrowUpRight } from "lucide-react";
 import type { SentinelStatus } from "../../api/types";
 import { cn } from "../../lib/cn";
 
 export type Tone = "good" | "warning" | "serious" | "critical" | "neutral" | "info";
 
-const TONE_STYLES: Record<Tone, { border: string; bg: string; dot: string }> = {
+const TONE_STYLES: Record<Tone, { border: string; bg: string; dotBg: string; text: string }> = {
   good: {
-    border: "border-[color:color-mix(in_srgb,var(--good)_42%,transparent)]",
-    bg: "bg-[color:color-mix(in_srgb,var(--good)_13%,transparent)]",
-    dot: "text-good",
+    border: "border-[color:color-mix(in_srgb,var(--good)_28%,transparent)]",
+    bg: "bg-[color:color-mix(in_srgb,var(--good)_11%,transparent)]",
+    dotBg: "bg-good",
+    text: "text-good",
   },
   warning: {
-    border: "border-[color:color-mix(in_srgb,var(--warning)_45%,transparent)]",
-    bg: "bg-[color:color-mix(in_srgb,var(--warning)_14%,transparent)]",
-    dot: "text-warning",
+    border: "border-[color:color-mix(in_srgb,var(--warning)_30%,transparent)]",
+    bg: "bg-[color:color-mix(in_srgb,var(--warning)_11%,transparent)]",
+    dotBg: "bg-warning",
+    text: "text-warning",
   },
   serious: {
-    border: "border-[color:color-mix(in_srgb,var(--serious)_45%,transparent)]",
-    bg: "bg-[color:color-mix(in_srgb,var(--serious)_14%,transparent)]",
-    dot: "text-serious",
+    border: "border-[color:color-mix(in_srgb,var(--serious)_32%,transparent)]",
+    bg: "bg-[color:color-mix(in_srgb,var(--serious)_11%,transparent)]",
+    dotBg: "bg-serious",
+    text: "text-serious",
   },
   critical: {
-    border: "border-[color:color-mix(in_srgb,var(--critical)_48%,transparent)]",
-    bg: "bg-[color:color-mix(in_srgb,var(--critical)_15%,transparent)]",
-    dot: "text-critical",
+    border: "border-[color:color-mix(in_srgb,var(--critical)_42%,transparent)]",
+    bg: "bg-[color:color-mix(in_srgb,var(--critical)_13%,transparent)]",
+    dotBg: "bg-critical",
+    text: "text-critical",
   },
   info: {
-    border: "border-[color:color-mix(in_srgb,var(--slot1)_45%,transparent)]",
-    bg: "bg-[color:color-mix(in_srgb,var(--slot1)_13%,transparent)]",
-    dot: "text-slot1",
+    border: "border-[color:color-mix(in_srgb,var(--accent)_30%,transparent)]",
+    bg: "bg-[color:color-mix(in_srgb,var(--accent)_11%,transparent)]",
+    dotBg: "bg-accent",
+    text: "text-accent",
   },
   neutral: {
     border: "border-hairline",
-    bg: "bg-elevated",
-    dot: "text-muted",
+    bg: "bg-sunken",
+    dotBg: "bg-muted",
+    text: "text-ink-2",
   },
 };
 
@@ -57,29 +53,22 @@ export function StatusBadge({
   className?: string;
 }) {
   const s = TONE_STYLES[tone];
-  const Icon =
-    tone === "good"
-      ? CheckCircle2
-      : tone === "warning"
-        ? AlertTriangle
-        : tone === "serious"
-          ? ShieldAlert
-          : tone === "critical"
-            ? AlertOctagon
-            : tone === "info"
-              ? Clock
-              : MinusCircle;
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium text-ink whitespace-nowrap",
+        "inline-flex items-center gap-1.5 rounded border px-2 py-0.5 text-[11px] font-medium leading-snug whitespace-nowrap",
         s.border,
         s.bg,
+        s.text,
         className,
       )}
     >
-      <Icon className={cn("h-3.5 w-3.5 shrink-0", s.dot)} aria-hidden="true" />
-      <span>{label}</span>
+      {tone === "critical" ? (
+        <AlertOctagon className="h-3 w-3 shrink-0 text-critical" aria-hidden="true" />
+      ) : (
+        <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", s.dotBg)} aria-hidden="true" />
+      )}
+      <span className="text-ink">{label}</span>
     </span>
   );
 }
@@ -106,24 +95,23 @@ export function DirectionBadge({ direction }: { direction: string | null | undef
   const d = (direction || "").toLowerCase();
   if (d === "long" || d === "up" || d === "bullish" || d.includes("多")) {
     return (
-      <span className="inline-flex items-center gap-1 rounded border border-[color:color-mix(in_srgb,var(--good)_40%,transparent)] bg-[color:color-mix(in_srgb,var(--good)_12%,transparent)] px-1.5 py-0.5 text-[11px] font-medium text-ink">
-        <TrendingUp className="h-3 w-3 text-good" aria-hidden="true" />
-        <span>做多</span>
+      <span className="inline-flex items-center gap-0.5 rounded border border-[color:color-mix(in_srgb,var(--bull)_34%,transparent)] bg-[color:color-mix(in_srgb,var(--bull)_12%,transparent)] px-1.5 py-0.5 font-mono text-[11px] font-semibold text-bull whitespace-nowrap">
+        <ArrowUpRight className="h-3 w-3 shrink-0" aria-hidden="true" />
+        <span className="font-sans">做多</span>
       </span>
     );
   }
   if (d === "short" || d === "down" || d === "bearish" || d.includes("空")) {
     return (
-      <span className="inline-flex items-center gap-1 rounded border border-[color:color-mix(in_srgb,var(--serious)_42%,transparent)] bg-[color:color-mix(in_srgb,var(--serious)_12%,transparent)] px-1.5 py-0.5 text-[11px] font-medium text-ink">
-        <TrendingDown className="h-3 w-3 text-serious" aria-hidden="true" />
-        <span>做空</span>
+      <span className="inline-flex items-center gap-0.5 rounded border border-[color:color-mix(in_srgb,var(--bear)_34%,transparent)] bg-[color:color-mix(in_srgb,var(--bear)_12%,transparent)] px-1.5 py-0.5 font-mono text-[11px] font-semibold text-bear whitespace-nowrap">
+        <ArrowDownRight className="h-3 w-3 shrink-0" aria-hidden="true" />
+        <span className="font-sans">做空</span>
       </span>
     );
   }
   return (
-    <span className="inline-flex items-center gap-1 rounded border border-hairline bg-elevated px-1.5 py-0.5 text-[11px] text-muted">
-      <HelpCircle className="h-3 w-3" aria-hidden="true" />
-      <span>{direction || "中性"}</span>
+    <span className="inline-flex items-center rounded border border-hairline bg-sunken px-1.5 py-0.5 text-[11px] text-muted whitespace-nowrap">
+      {direction || "中性"}
     </span>
   );
 }
@@ -155,15 +143,25 @@ export function SourceStatusBadge({ status, name }: { status: string | undefined
 
 export function GateDecisionBadge({ decision, actionable }: { decision: string; actionable?: boolean }) {
   const d = decision.toUpperCase();
+  if (d.includes("APPROVE_LONG") || decision.includes("放行做多")) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded border border-[color:color-mix(in_srgb,var(--bull)_42%,transparent)] bg-[color:color-mix(in_srgb,var(--bull)_14%,transparent)] px-2 py-0.5 text-xs font-semibold text-bull whitespace-nowrap">
+        <ArrowUpRight className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <span>放行做多</span>
+      </span>
+    );
+  }
+  if (d.includes("APPROVE_SHORT") || decision.includes("放行做空")) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded border border-[color:color-mix(in_srgb,var(--accent)_45%,transparent)] bg-[color:color-mix(in_srgb,var(--accent)_14%,transparent)] px-2 py-0.5 text-xs font-semibold text-accent whitespace-nowrap">
+        <ArrowDownRight className="h-3.5 w-3.5 shrink-0 text-bear" aria-hidden="true" />
+        <span className="text-ink">放行做空</span>
+      </span>
+    );
+  }
   let tone: Tone = "neutral";
   let zh = decision;
-  if (d.includes("APPROVE_LONG") || decision.includes("放行做多")) {
-    tone = "good";
-    zh = "放行做多";
-  } else if (d.includes("APPROVE_SHORT") || decision.includes("放行做空")) {
-    tone = "good";
-    zh = "放行做空";
-  } else if (d.includes("PAIR") || decision.includes("配对")) {
+  if (d.includes("PAIR") || decision.includes("配对")) {
     tone = "info";
     zh = "同板块配对";
   } else if (d.includes("WATCH") || d.includes("WAIT") || decision.includes("观察")) {
@@ -173,7 +171,12 @@ export function GateDecisionBadge({ decision, actionable }: { decision: string; 
     tone = "critical";
     zh = "否决建仓";
   } else if (actionable) {
-    tone = "good";
+    tone = "info";
   }
   return <StatusBadge tone={tone} label={zh} className="text-xs font-semibold" />;
+}
+
+export function signedToneClass(val: number | null | undefined): string {
+  if (val == null || !Number.isFinite(val) || val === 0) return "text-ink-2";
+  return val > 0 ? "text-bull" : "text-bear";
 }

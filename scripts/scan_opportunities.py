@@ -225,6 +225,7 @@ def build_scan_row(market: str, sym: str, snap: dict) -> dict:
     cl = snap["chanlun"]
     daily = cl["daily"]
     summary = cl["signal_summary"]
+    meta = summary.get("signal_meta") if isinstance(summary.get("signal_meta"), dict) else {}
     zs = daily.get("latest_zhongshu")
 
     return {
@@ -236,6 +237,9 @@ def build_scan_row(market: str, sym: str, snap: dict) -> dict:
         "ret_60d_%": t["return_60d_pct"],
         "atr_%": t["atr14_pct"],
         "signal_tier": summary.get("tier"),
+        "signal_direction": meta.get("direction"),
+        "signal_type": meta.get("signal_type"),
+        "signal_confirmed": meta.get("confirmed"),
         "daily_structure": daily.get("macro_structure"),
         "daily_zs_count": daily.get("zhongshu_count"),
         "daily_zs": [zs["zd"], zs["zg"]] if zs else None,

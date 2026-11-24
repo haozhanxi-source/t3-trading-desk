@@ -2,6 +2,7 @@ import { useEffect, useState, type FormEvent } from "react";
 import { api, errorMessage } from "../../api/client";
 import type { Direction, OpenPositionBody, Position } from "../../api/types";
 import { fmtInputPrice, fmtPlanNum, fmtPrice, inferAssetCurrency, optNum, parseSymbolList } from "../../lib/format";
+import { formatSymbolWithCode } from "../../lib/symbols";
 import { ModalDialog } from "../ui/ModalDialog";
 
 /* ------------------------------------------------------------------
@@ -53,15 +54,15 @@ export function InitPortfolioDialog({
     <ModalDialog
       open={open}
       onClose={onClose}
-      title="初始化持仓账本（单一板块龙头独占制）"
-      subtitle="创建本地 portfolio/ SQLite 事务账本与风险预算上限（已加入 .gitignore，不连接自动实盘）"
+      title="初始化持仓账本"
+      subtitle="创建本地 portfolio/ SQLite 风险预算账本（单一板块龙头独占制）"
     >
       <form onSubmit={submit} className="flex flex-col gap-4 p-5">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className="field">
             <span>初始账户净值</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               min="100"
@@ -80,9 +81,9 @@ export function InitPortfolioDialog({
             </select>
           </label>
           <label className="field">
-            <span>单笔/单板块风险上限 (%)</span>
+            <span>单笔 / 单板块风险上限 (%)</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="0.1"
               min="0.1"
@@ -95,7 +96,7 @@ export function InitPortfolioDialog({
           <label className="field">
             <span>总敞口风险上限 (%)</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="0.1"
               min="0.5"
@@ -106,9 +107,9 @@ export function InitPortfolioDialog({
             />
           </label>
           <label className="field sm:col-span-2">
-            <span>单一宏大因子（如美元/通胀利率）叠加风险上限 (%)</span>
+            <span>单一宏大因子（美元/利率等）叠加风险上限 (%)</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="0.1"
               min="0.5"
@@ -265,17 +266,17 @@ export function OpenPositionDialog({
       open={open}
       onClose={onClose}
       title="录入新持仓头寸"
-      subtitle="强制执行单一板块龙头独占制（sole_leader 独占；双寡头 co_leader 共享同一板块风险额度）"
+      subtitle="单一板块仅允许 1 只真龙头（或双寡头共享单板块风险额度）"
     >
-      <form onSubmit={submit} className="flex max-h-[75dvh] flex-col gap-3.5 overflow-y-auto p-5">
+      <form onSubmit={submit} className="flex max-h-[76dvh] flex-col gap-3.5 overflow-y-auto p-5">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <label className="field">
             <span>标的代码 *</span>
             <input
-              className="input"
+              className="input font-mono"
               required
-              autoFocus
-              placeholder="如 PWR / CU0 / AUDUSD=X"
+              autoFocus={!seed?.symbol}
+              placeholder="如 PWR / CU0"
               value={symbol}
               onChange={(e) => setSymbol(e.target.value)}
             />
@@ -305,20 +306,21 @@ export function OpenPositionDialog({
         </div>
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <label className="field">
+          <label className="field sm:col-span-2">
             <span>所属板块 / 主驱动主题 *</span>
             <input
               className="input"
               required
-              placeholder="如 us_power_grid / 全球铜供需劈叉"
+              autoFocus={Boolean(seed?.symbol && !seed?.sector_theme)}
+              placeholder="如 北美电网基建 / 全球铜供需劈叉"
               value={sectorTheme}
               onChange={(e) => setSectorTheme(e.target.value)}
             />
           </label>
           <label className="field">
-            <span>建仓实际数量（股数 / 合约手数 / 单位数）*</span>
+            <span>建仓数量（股 / 手 / 单位）*</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               min="0.0001"
@@ -327,34 +329,36 @@ export function OpenPositionDialog({
               onChange={(e) => setQuantity(e.target.value)}
             />
           </label>
-          <label className="field">
-            <span>汇率折算 (fx_to_account: 1 报价币 = ? 账户币)</span>
-            <input
-              className="input"
-              type="number"
-              step="any"
-              min="0.000001"
-              placeholder={needsCrossFx ? `必填，1 ${quoteCcy} = ? ${acctCcy}` : `同币种 (${acctCcy}) 可留空`}
-              value={fxToAccount}
-              onChange={(e) => setFxToAccount(e.target.value)}
-            />
-          </label>
         </div>
 
         {needsCrossFx ? (
-          <div className="rounded border border-warning/45 bg-warning/10 px-3 py-1.5 text-xs text-ink">
-            跨币种提示：识别到标的报价币为 <strong>{quoteCcy}</strong>，当前账本本位币为 <strong>{acctCcy}</strong>
-            ，请填写精确折算汇率（<code>1 {quoteCcy} = ? {acctCcy}</code>，如 CNY→USD 约 <code>0.138</code>）。
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-ink">
+            <span>
+              跨币种必填：报价币 <strong>{quoteCcy}</strong> → 账户币 <strong>{acctCcy}</strong>
+            </span>
+            <label className="inline-flex items-center gap-1.5">
+              <span className="font-mono text-[11px] text-muted">1 {quoteCcy} =</span>
+              <input
+                className="input h-7 w-28 font-mono"
+                type="number"
+                step="any"
+                min="0.000001"
+                required
+                placeholder={`? ${acctCcy}`}
+                value={fxToAccount}
+                onChange={(e) => setFxToAccount(e.target.value)}
+              />
+            </label>
           </div>
         ) : null}
 
         {leaderRole === "co_leader" ? (
           <label className="field">
-            <span>双寡头并列理由（必填说明为何第一第二不明显）*</span>
+            <span>双寡头并列理由 *</span>
             <input
               className="input"
               required
-              placeholder="说明为何两只标的共享该板块龙头地位与风险额度"
+              placeholder="说明为何第一第二不明显需共享该板块风险额度"
               value={coLeaderReason}
               onChange={(e) => setCoLeaderReason(e.target.value)}
             />
@@ -365,7 +369,7 @@ export function OpenPositionDialog({
           <label className="field">
             <span>入场均价 *</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               required
@@ -376,7 +380,7 @@ export function OpenPositionDialog({
           <label className="field">
             <span>30min 战术止损 *</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               required
@@ -385,9 +389,9 @@ export function OpenPositionDialog({
             />
           </label>
           <label className="field">
-            <span>日线结构失效位</span>
+            <span>日线结构位</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               placeholder="可选 ZD/ZG"
@@ -398,7 +402,7 @@ export function OpenPositionDialog({
           <label className="field">
             <span>目标位</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               placeholder="可选"
@@ -408,36 +412,54 @@ export function OpenPositionDialog({
           </label>
         </div>
 
-        <label className="field">
-          <span>跨板块宏大因子标签（逗号分隔，用于监控美元/利率隐性叠仓）</span>
-          <input
-            className="input"
-            placeholder="如 USD_SHORT, AI_CAPEX, CN_REFLATION"
-            value={macroFactors}
-            onChange={(e) => setMacroFactors(e.target.value)}
-          />
-        </label>
-
-        <label className="field">
-          <span>撤离红线（每行一条）</span>
-          <textarea
-            className="input"
-            rows={2}
-            placeholder="如：30min 跌破三买中枢 ZG&#10;显性库存连续 3 周超季节性累库"
-            value={redLines}
-            onChange={(e) => setRedLines(e.target.value)}
-          />
-        </label>
-
-        <label className="field">
-          <span>交易备注</span>
-          <input
-            className="input"
-            placeholder="可选：合约月份或建仓分批说明"
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-          />
-        </label>
+        <details className="disclosure">
+          <summary>
+            <span>补充撤离红线、跨板块宏大因子与交易备注（可选）</span>
+          </summary>
+          <div className="mt-2.5 flex flex-col gap-3">
+            {!needsCrossFx ? (
+              <label className="field">
+                <span>汇率折算 (fx_to_account，同币种可留空)</span>
+                <input
+                  className="input font-mono"
+                  type="number"
+                  step="any"
+                  min="0.000001"
+                  value={fxToAccount}
+                  onChange={(e) => setFxToAccount(e.target.value)}
+                />
+              </label>
+            ) : null}
+            <label className="field">
+              <span>跨板块宏大因子标签（逗号分隔）</span>
+              <input
+                className="input"
+                placeholder="如 USD_SHORT, AI_CAPEX, CN_REFLATION"
+                value={macroFactors}
+                onChange={(e) => setMacroFactors(e.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>撤离红线（每行一条）</span>
+              <textarea
+                className="input"
+                rows={2}
+                placeholder="如：30min 跌破三买中枢 ZG&#10;显性库存连续 3 周超季节性累库"
+                value={redLines}
+                onChange={(e) => setRedLines(e.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>交易备注</span>
+              <input
+                className="input"
+                placeholder="合约月份或分批执行说明"
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+              />
+            </label>
+          </div>
+        </details>
 
         {err ? (
           <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
@@ -450,7 +472,7 @@ export function OpenPositionDialog({
             取消
           </button>
           <button type="submit" className="btn btn-primary" disabled={busy}>
-            {busy ? "正在写入账本…" : "确认录入持仓"}
+            {busy ? "正在写入…" : "确认录入持仓"}
           </button>
         </div>
       </form>
@@ -531,22 +553,22 @@ export function TrailStopDialog({
     <ModalDialog
       open={open}
       onClose={onClose}
-      title={`上移/收紧止损 · ${symbol}`}
-      subtitle="移动止损只紧不松；越过保本位后账本自动释放该板块已用风险敞口"
+      title={`上移/收紧止损 · ${formatSymbolWithCode(symbol)}`}
+      subtitle="移动止损只紧不松；越过保本位后自动释放该板块已占用风险额度"
     >
       <form onSubmit={submit} className="flex flex-col gap-3.5 p-5">
-        <div className="grid grid-cols-3 gap-2 rounded-lg border border-hairline bg-page p-3 text-xs">
-          <div>
-            <div className="text-muted">当前市价</div>
-            <div className="tnum mt-0.5 font-semibold text-ink">{fmtPrice(currentPrice)}</div>
+        <div className="metric-strip grid-cols-3">
+          <div className="metric-cell">
+            <span className="metric-label">当前市价</span>
+            <span className="metric-val">{fmtPrice(currentPrice)}</span>
           </div>
-          <div>
-            <div className="text-muted">原 30m 止损</div>
-            <div className="tnum mt-0.5 font-semibold text-ink">{fmtPrice(currentStop30m)}</div>
+          <div className="metric-cell">
+            <span className="metric-label">原 30m 止损</span>
+            <span className="metric-val">{fmtPrice(currentStop30m)}</span>
           </div>
-          <div>
-            <div className="text-muted">哨兵建议止损</div>
-            <div className="tnum mt-0.5 font-semibold text-good">{fmtPrice(suggestedStop30m)}</div>
+          <div className="metric-cell">
+            <span className="metric-label">哨兵建议止损</span>
+            <span className="metric-val text-bull">{fmtPrice(suggestedStop30m)}</span>
           </div>
         </div>
 
@@ -554,7 +576,7 @@ export function TrailStopDialog({
           <label className="field">
             <span>新 30min 战术止损价 *</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               required
@@ -564,9 +586,9 @@ export function TrailStopDialog({
             />
           </label>
           <label className="field">
-            <span>新日线结构止损位（可选）</span>
+            <span>新日线结构位（可选）</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               placeholder="不改留空"
@@ -660,7 +682,7 @@ export function TrimPositionDialog({
     <ModalDialog
       open={open}
       onClose={onClose}
-      title={`分批减仓 · ${position?.symbol ?? ""}`}
+      title={`分批减仓 · ${formatSymbolWithCode(position?.symbol)}`}
       subtitle={`当前持仓数量：${position?.quantity ?? "—"} · 入场均价：${fmtPrice(position?.entry_price)}`}
     >
       <form onSubmit={submit} className="flex flex-col gap-3.5 p-5">
@@ -668,7 +690,7 @@ export function TrimPositionDialog({
           <label className="field">
             <span>减仓成交价 *</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               required
@@ -680,7 +702,7 @@ export function TrimPositionDialog({
           <label className="field">
             <span>减仓数量 *</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               required
@@ -715,7 +737,264 @@ export function TrimPositionDialog({
 }
 
 /* ------------------------------------------------------------------
- * 5. Close Position Confirmation Dialog (safe Cancel gets autofocus)
+ * 5. Atomic Leader Rotation Dialog (/api/portfolio/positions/{id}/rotate)
+ * ------------------------------------------------------------------ */
+export function RotatePositionDialog({
+  open,
+  onClose,
+  onSuccess,
+  position,
+  lastPrice,
+  accountCurrency,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onSuccess: () => void;
+  position: Position | null;
+  lastPrice?: number | null;
+  accountCurrency?: string | null;
+}) {
+  const [exitPrice, setExitPrice] = useState("");
+  const [exitReason, setExitReason] = useState("原龙头动能弱化，原子切换至同板块新引领龙头");
+  const [newSymbol, setNewSymbol] = useState("");
+  const [newDirection, setNewDirection] = useState<Direction>("long");
+  const [sectorTheme, setSectorTheme] = useState("");
+  const [newEntry, setNewEntry] = useState("");
+  const [newStop30m, setNewStop30m] = useState("");
+  const [newStopDaily, setNewStopDaily] = useState("");
+  const [newTarget, setNewTarget] = useState("");
+  const [newQty, setNewQty] = useState("");
+  const [fxToAccount, setFxToAccount] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open || !position) return;
+    setExitPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(position.entry_price, 6));
+    setExitReason("原龙头动能弱化，原子切换至同板块新引领龙头");
+    setNewSymbol("");
+    setNewDirection(position.direction || "long");
+    setSectorTheme(position.sector_theme || "");
+    setNewEntry("");
+    setNewStop30m("");
+    setNewStopDaily("");
+    setNewTarget("");
+    setNewQty("");
+    setFxToAccount("");
+    setErr(null);
+  }, [open, position, lastPrice]);
+
+  const acctCcy = (accountCurrency || "USD").toUpperCase();
+  const quoteCcy = inferAssetCurrency(newSymbol);
+  const needsCrossFx = Boolean(quoteCcy && quoteCcy !== acctCcy);
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!position) return;
+    const epOut = optNum(exitPrice);
+    const epIn = optNum(newEntry);
+    const s30 = optNum(newStop30m);
+    const qty = optNum(newQty);
+    if (
+      epOut === undefined ||
+      !newSymbol.trim() ||
+      !sectorTheme.trim() ||
+      epIn === undefined ||
+      s30 === undefined ||
+      qty === undefined
+    ) {
+      setErr("请完整填写旧龙头平仓价以及新龙头代码、入场价、30m 止损与数量");
+      return;
+    }
+    const fxVal = optNum(fxToAccount);
+    if (fxToAccount.trim() !== "" && (fxVal === undefined || fxVal <= 0)) {
+      setErr("汇率折算必须为大于 0 的有效数值");
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.rotatePosition(position.position_id, {
+        exit_price: epOut,
+        exit_reason: exitReason.trim() || "leader_rotation",
+        exit_category: "leader_rotation",
+        new_position: {
+          symbol: newSymbol.trim().toUpperCase(),
+          direction: newDirection,
+          sector_theme: sectorTheme.trim(),
+          entry_price: epIn,
+          tactical_stop_30m: s30,
+          quantity: qty,
+          structural_stop_daily: optNum(newStopDaily),
+          target_price: optNum(newTarget),
+          fx_to_account: fxVal,
+          leader_role: "sole_leader",
+          macro_factors: position.macro_factors,
+        },
+      });
+      onSuccess();
+      onClose();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <ModalDialog
+      open={open}
+      onClose={onClose}
+      title={`原子龙头换仓 · ${formatSymbolWithCode(position?.symbol)} → 新龙头`}
+      subtitle="单事务结清旧龙头释放板块额度，并同步校验录入新龙头（严禁同板块叠加）"
+    >
+      <form onSubmit={submit} className="flex max-h-[76dvh] flex-col gap-3.5 overflow-y-auto p-5">
+        <div className="rounded-md border border-hairline bg-sunken p-3">
+          <div className="section-title mb-2">第 1 步：结清原龙头（{formatSymbolWithCode(position?.symbol)}）</div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <label className="field">
+              <span>原龙头平仓价 *</span>
+              <input
+                className="input bg-surface font-mono"
+                type="number"
+                step="any"
+                required
+                value={exitPrice}
+                onChange={(e) => setExitPrice(e.target.value)}
+              />
+            </label>
+            <label className="field sm:col-span-2">
+              <span>切换原因 *</span>
+              <input
+                className="input bg-surface"
+                required
+                value={exitReason}
+                onChange={(e) => setExitReason(e.target.value)}
+              />
+            </label>
+          </div>
+        </div>
+
+        <div className="flex flex-col gap-3">
+          <div className="section-title">第 2 步：接棒新龙头头寸</div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <label className="field">
+              <span>新龙头代码 *</span>
+              <input
+                className="input font-mono"
+                required
+                autoFocus
+                placeholder="如 GEV / HG=F"
+                value={newSymbol}
+                onChange={(e) => setNewSymbol(e.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>方向 *</span>
+              <select
+                className="input"
+                value={newDirection}
+                onChange={(e) => setNewDirection(e.target.value as Direction)}
+              >
+                <option value="long">做多 (Long)</option>
+                <option value="short">做空 (Short)</option>
+              </select>
+            </label>
+            <label className="field">
+              <span>继承/归属板块 *</span>
+              <input
+                className="input"
+                required
+                value={sectorTheme}
+                onChange={(e) => setSectorTheme(e.target.value)}
+              />
+            </label>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+            <label className="field">
+              <span>新入场价 *</span>
+              <input
+                className="input font-mono"
+                type="number"
+                step="any"
+                required
+                value={newEntry}
+                onChange={(e) => setNewEntry(e.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>30m 战术止损 *</span>
+              <input
+                className="input font-mono"
+                type="number"
+                step="any"
+                required
+                value={newStop30m}
+                onChange={(e) => setNewStop30m(e.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>建仓数量 *</span>
+              <input
+                className="input font-mono"
+                type="number"
+                step="any"
+                min="0.0001"
+                required
+                value={newQty}
+                onChange={(e) => setNewQty(e.target.value)}
+              />
+            </label>
+            <label className="field">
+              <span>目标价（可选）</span>
+              <input
+                className="input font-mono"
+                type="number"
+                step="any"
+                value={newTarget}
+                onChange={(e) => setNewTarget(e.target.value)}
+              />
+            </label>
+          </div>
+
+          {needsCrossFx ? (
+            <label className="field">
+              <span>跨币种汇率 (1 {quoteCcy} = ? {acctCcy}) *</span>
+              <input
+                className="input font-mono"
+                type="number"
+                step="any"
+                min="0.000001"
+                required
+                value={fxToAccount}
+                onChange={(e) => setFxToAccount(e.target.value)}
+              />
+            </label>
+          ) : null}
+        </div>
+
+        {err ? (
+          <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
+            {err}
+          </div>
+        ) : null}
+
+        <div className="flex justify-end gap-2 border-t border-hairline pt-3">
+          <button type="button" className="btn" onClick={onClose} disabled={busy}>
+            取消
+          </button>
+          <button type="submit" className="btn btn-primary" disabled={busy}>
+            {busy ? "正在原子换仓…" : "确认原子切换龙头"}
+          </button>
+        </div>
+      </form>
+    </ModalDialog>
+  );
+}
+
+/* ------------------------------------------------------------------
+ * 6. Close Position Confirmation Dialog
  * ------------------------------------------------------------------ */
 export function ClosePositionDialog({
   open,
@@ -775,7 +1054,7 @@ export function ClosePositionDialog({
     <ModalDialog
       open={open}
       onClose={onClose}
-      title={`清仓了结头寸 · ${position?.symbol ?? ""}`}
+      title={`清仓了结头寸 · ${formatSymbolWithCode(position?.symbol)}`}
       subtitle="逻辑或关键指标松动绝不硬扛，结算盈亏并释放板块龙头席位"
     >
       <form onSubmit={submit} className="flex flex-col gap-3.5 p-5">
@@ -783,7 +1062,7 @@ export function ClosePositionDialog({
           <label className="field">
             <span>平仓结算价 *</span>
             <input
-              className="input"
+              className="input font-mono"
               type="number"
               step="any"
               required
@@ -820,12 +1099,11 @@ export function ClosePositionDialog({
         ) : null}
 
         <div className="flex justify-end gap-2 border-t border-hairline pt-3">
-          {/* Destructive confirmation rule: safe Cancel button receives initial autofocus */}
           <button type="button" className="btn" autoFocus onClick={onClose} disabled={busy}>
-            保留持仓（取消）
+            取消
           </button>
           <button type="submit" className="btn btn-danger" disabled={busy}>
-            {busy ? "正在结算…" : "确认清仓撤离"}
+            {busy ? "正在平仓…" : "确认撤离平仓"}
           </button>
         </div>
       </form>

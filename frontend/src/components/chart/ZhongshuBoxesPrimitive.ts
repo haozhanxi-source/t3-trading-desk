@@ -102,31 +102,36 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
         ctx.stroke();
         ctx.setLineDash([]);
 
-        /* Inline Zhongshu badge (`笔中枢 Z1` / `线段中枢 S1`) wearing primary ink token */
-        if (width >= 34 && top >= -12 && top <= h - 6) {
-          const text = width >= 118 ? `${box.label} [${box.rangeText}]` : box.label;
-          ctx.font = '600 10.5px system-ui, -apple-system, "Segoe UI", sans-serif';
+        /* Watermark-style monospace tag: stroke ZS anchored top-left, segment ZS anchored bottom-left to prevent collision */
+        if (width >= 36 && bottom >= 12 && top <= h - 6) {
+          const compactLabel = box.label.replace("笔中枢 ", "Z·").replace("线段中枢 ", "S·");
+          const text = width >= 128 ? `${compactLabel} [${box.rangeText}]` : compactLabel;
+          ctx.font = '500 10px "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace';
           const textW = ctx.measureText(text).width;
-          const pillW = Math.min(width - 4, textW + 10);
-          const pillH = 16;
-          const pillX = left + 3;
-          const pillY = Math.max(2, top - pillH - 2);
+          const tagW = Math.min(width - 4, textW + 8);
+          const tagH = 14;
+          const tagX = left + 3;
+          const insideFits = height >= 18;
+          const tagY = isSeg
+            ? insideFits
+              ? Math.min(h - tagH - 2, bottom - tagH - 2)
+              : Math.min(h - tagH - 2, bottom + 2)
+            : insideFits
+              ? Math.max(2, top + 2)
+              : Math.max(2, top - tagH - 2);
 
-          ctx.fillStyle = pal.elevated;
-          ctx.strokeStyle = border;
-          ctx.lineWidth = 1;
+          ctx.fillStyle = pal.mode === "dark" ? "rgba(12, 14, 18, 0.76)" : "rgba(255, 255, 255, 0.84)";
           ctx.beginPath();
-          ctx.roundRect(pillX, pillY, pillW, pillH, 3);
+          ctx.roundRect(tagX, tagY, tagW, tagH, 2.5);
           ctx.fill();
-          ctx.stroke();
 
           ctx.save();
           ctx.beginPath();
-          ctx.rect(pillX + 2, pillY, pillW - 4, pillH);
+          ctx.rect(tagX + 2, tagY, tagW - 4, tagH);
           ctx.clip();
-          ctx.fillStyle = pal.ink;
+          ctx.fillStyle = border;
           ctx.textBaseline = "middle";
-          ctx.fillText(text, pillX + 5, pillY + pillH / 2 + 0.5);
+          ctx.fillText(text, tagX + 4, tagY + tagH / 2 + 0.5);
           ctx.restore();
         }
       }

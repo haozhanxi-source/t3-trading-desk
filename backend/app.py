@@ -16,9 +16,11 @@ import scan_opportunities as so
 import trade_planner as tp
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from . import ROOT_DIR, __version__
 from .cache import (
@@ -27,6 +29,7 @@ from .cache import (
     TTL_RESEARCH_SECONDS,
     TTL_SENTINEL_SECONDS,
 )
+from .cf_access import CloudflareAccessMiddleware
 from .serializers import SafeJSONResponse, sanitize
 from .symbols import search_symbols
 from .tasks import (
@@ -236,6 +239,13 @@ class ArchiveLogReq(_ArchiveMarketReq):
     entry: str
 
 
+class ArchiveThesisReq(_ArchiveMarketReq):
+    symbol: str = Field(..., min_length=1)
+    body_md: str = Field(..., min_length=1)
+    expected_revision: int = Field(..., ge=1)
+    note: str = ""
+
+
 class UniverseReq(_Strict):
     name: str
     description: str = ""
@@ -249,7 +259,7 @@ class ScanTaskReq(_Strict):
     sort: Literal["tier", "none"] = Field("tier", validation_alias=AliasChoices("sort_mode", "sort"))
 
 
-class ResearchRefreshTaskReq(_Strict):
+class ResearchRefreshTaskReq(_ArchiveMarketReq):
     symbol: str
     include_macro: bool = True
 
@@ -397,7 +407,15 @@ def _plan_args(req: TradePlanReq) -> tuple[Any, str]:
     args.max_margin_pct = req.max_margin_pct
     args.allow_equity_margin = req.allow_equity_margin
     args.horizon_days = req.horizon_days
-    args.has_l1_l2 = req.has_l1_l2
+    # Server-side research archive on disk is the sole source of truth for L1/L2 evidence gate
+    try:
+        arch = ra.load_archive(req.symbol, evidence_limit=0)
+        args.has_l1_l2 = any(
+            isinstance(ev, dict) and ev.get("level") in ("L1", "L2")
+            for ev in (arch.get("recent_evidence") or [])
+        )
+    except (FileNotFoundError, ValueError, OSError):
+        args.has_l1_l2 = False
     args.pending_verifications = req.pending_verifications
     args.thesis_falsified = req.thesis_falsified
     args.hedge_only = req.hedge_only
@@ -422,10 +440,52 @@ def _safe_static_path(root: str, rel: str) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Compression & static caching helpers
+# ---------------------------------------------------------------------------
+class _SafeGZipMiddleware:
+    """GZip HTTP responses while bypassing SSE endpoints so streams never buffer."""
+
+    def __init__(self, app: ASGIApp, minimum_size: int = 500, compresslevel: int = 6) -> None:
+        self.app = app
+        self.gzip = GZipMiddleware(app, minimum_size=minimum_size, compresslevel=compresslevel)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and scope.get("path", "").endswith("/events"):
+            await self.app(scope, receive, send)
+            return
+        await self.gzip(scope, receive, send)
+
+
+class _ImmutableStaticFiles(StaticFiles):
+    """Serve Vite content-hashed /assets/* with immutable long-term caching."""
+
+    async def get_response(self, path: str, scope: Scope):
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
+# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 def create_app(task_manager: TaskManager | None = None, frontend_dist: str | None = None) -> FastAPI:
     app = FastAPI(title="T3 Trading Desk API", version=__version__, default_response_class=SafeJSONResponse)
+    cf_team = os.environ.get("TRADING_DESK_CF_ACCESS_TEAM", "").strip()
+    if cf_team:
+        cf_hosts = {
+            h.strip()
+            for h in os.environ.get("TRADING_DESK_CF_ACCESS_HOSTS", "").split(",")
+            if h.strip()
+        }
+        cf_aud = os.environ.get("TRADING_DESK_CF_ACCESS_AUD", "").strip() or None
+        app.add_middleware(
+            CloudflareAccessMiddleware,
+            team_domain=cf_team,
+            protected_hosts=cf_hosts,
+            audience=cf_aud,
+        )
+    app.add_middleware(_SafeGZipMiddleware, minimum_size=500, compresslevel=6)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,
@@ -455,6 +515,28 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     @app.get("/api/symbols/search")
     def symbols_search(q: str = "", limit: int = Query(30, ge=1, le=200)):
         return ok({"items": search_symbols(q, limit)})
+
+    @app.get("/api/macro/snapshot")
+    def macro_snapshot(refresh: bool = False):
+        def fetch_bundle() -> dict[str, Any]:
+            ctx = market_snapshot.fetch_macro_context()
+            return {
+                "macro_context": ctx,
+                "fetched_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+
+        key = ("macro_context",)
+        if not refresh:
+            hit, cached = CACHE.get(key)
+            if hit:
+                return ok(cached, headers=_cache_headers(True))
+
+        bundle = fetch_bundle()
+        ctx_dict = bundle.get("macro_context")
+        has_values = isinstance(ctx_dict, dict) and len(ctx_dict) > 0
+        ttl = TTL_MARKET_SECONDS if has_values else 15.0
+        CACHE.set(key, bundle, ttl)
+        return ok(bundle, headers=_cache_headers(False))
 
     # ----------------------------------------------------------------- screen 1: portfolio & sentinel
     @app.get("/api/portfolio/summary")
@@ -546,6 +628,13 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
                     status_code=502,
                     detail={"code": "snapshot_error", "message": snap["error"], "symbol": symbol},
                 )
+            try:
+                snap["contract_spec"] = tp.get_contract_spec(
+                    snap.get("symbol") or symbol,
+                    snap.get("asset_class"),
+                )
+            except ValueError:
+                snap["contract_spec"] = None
             return snap
 
         key = ("dual", symbol.strip(), period, intraday_interval, include_macro)
@@ -637,6 +726,19 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         )
         return ok({"appended": line})
 
+    @app.put("/api/research/archive/thesis")
+    def research_archive_thesis_put(req: ArchiveThesisReq):
+        res = archive_call(
+            ra.update_thesis_body,
+            invalidate_sentinel=False,
+            raw_symbol=req.symbol,
+            body_md=req.body_md,
+            expected_revision=req.expected_revision,
+            note=req.note,
+            market_override=req.resolved_market(),
+        )
+        return ok(res)
+
     @app.get("/api/research/data")
     def research_data_get(symbol: str = Query(..., min_length=1), include_macro: bool = True, refresh: bool = False):
         def fetch() -> dict[str, Any]:
@@ -681,7 +783,12 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     async def task_research_refresh(req: ResearchRefreshTaskReq):
         if not req.symbol.strip():
             raise HTTPException(status_code=422, detail="symbol must be non-empty")
-        return ok(tasks.start("research_refresh", req.model_dump()).summary(), status_code=202)
+        params = {
+            "symbol": req.symbol.strip(),
+            "include_macro": req.include_macro,
+            "market": req.resolved_market(),
+        }
+        return ok(tasks.start("research_refresh", params).summary(), status_code=202)
 
     @app.post("/api/tasks/sentinel", status_code=202)
     async def task_sentinel(req: SentinelTaskReq):
@@ -751,12 +858,14 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     if os.path.isfile(index_path):
         assets_dir = os.path.join(dist, "assets")
         if os.path.isdir(assets_dir):
-            app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")
+            app.mount("/assets", _ImmutableStaticFiles(directory=assets_dir), name="assets")
 
         @app.get("/{full_path:path}", include_in_schema=False)
         def spa(full_path: str):
             static = _safe_static_path(dist, full_path) if full_path else None
-            return FileResponse(static or index_path)
+            if static:
+                return FileResponse(static)
+            return FileResponse(index_path, headers={"Cache-Control": "no-cache"})
 
     return app
 

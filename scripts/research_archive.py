@@ -166,6 +166,20 @@ def _atomic_write_json(path: str, obj: dict) -> None:
     _atomic_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2, allow_nan=False) + "\n")
 
 
+def _apply_wal_unlocked(folder: str) -> None:
+    """Idempotently roll forward any committed .thesis_wal.json under _archive_lock (never swallows I/O errors)."""
+    wal_path = os.path.join(folder, ".thesis_wal.json")
+    if not os.path.exists(wal_path):
+        return
+    with open(wal_path, "r", encoding="utf-8") as f:
+        wal = json.load(f)
+    if not isinstance(wal, dict) or not isinstance(wal.get("thesis_md"), str) or not isinstance(wal.get("state"), dict):
+        raise ValueError(f"Corrupted thesis WAL at {wal_path}")
+    _atomic_write_text(os.path.join(folder, "thesis.md"), wal["thesis_md"])
+    _atomic_write_json(os.path.join(folder, "state.json"), wal["state"])
+    os.unlink(wal_path)
+
+
 def _build_commodity_template(
     symbol: str,
     market: str,
@@ -532,21 +546,23 @@ def load_archive(
     if not os.path.exists(state_path):
         raise FileNotFoundError(f"Research archive not found for {raw_symbol} at {folder}")
 
-    with open(state_path, "r", encoding="utf-8") as f:
-        state = json.load(f)
+    with _archive_lock(folder):
+        _apply_wal_unlocked(folder)
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
 
-    evidence: list[dict] = []
-    if os.path.exists(evidence_path):
-        with open(evidence_path, "r", encoding="utf-8") as f:
-            for line in f:
-                s = line.strip()
-                if s:
-                    evidence.append(json.loads(s))
+        evidence: list[dict] = []
+        if os.path.exists(evidence_path):
+            with open(evidence_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    s = line.strip()
+                    if s:
+                        evidence.append(json.loads(s))
 
-    thesis_text = ""
-    if os.path.exists(thesis_path):
-        with open(thesis_path, "r", encoding="utf-8") as f:
-            thesis_text = f.read()
+        thesis_text = ""
+        if os.path.exists(thesis_path):
+            with open(thesis_path, "r", encoding="utf-8") as f:
+                thesis_text = f.read()
 
     return {
         "archive_dir": folder,
@@ -722,6 +738,7 @@ def update_state(
         raise FileNotFoundError(f"Archive not initialized at {folder}")
 
     with _archive_lock(folder):
+        _apply_wal_unlocked(folder)
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
 
@@ -767,12 +784,154 @@ def append_log(
     line = f"- `{today}`：{clean_entry}\n"
 
     with _archive_lock(folder):
+        _apply_wal_unlocked(folder)
         with open(thesis_path, "r", encoding="utf-8") as f:
             content = f.read()
         if content and not content.endswith("\n"):
             content += "\n"
         _atomic_write_text(thesis_path, content + line)
     return line.strip()
+
+
+_AUDIT_HEADING_RE = re.compile(
+    r"^##\s*(?:增量修订日志|修订与核验日志|修订日志)(?:\s*(?:（[^）]*）|\([^)]*\)))?\s*$"
+)
+_OPEN_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+_DATED_LOG_LINE_RE = re.compile(r"^-\s+`\d{4}-\d{2}-\d{2}`[：:]")
+
+
+def _update_fence_state(line: str, active: tuple[str, int] | None) -> tuple[tuple[str, int] | None, bool]:
+    """CommonMark-compliant fence tracker returning (next_state, is_fence_delimiter_line)."""
+    stripped = line.rstrip("\r\n")
+    m = _OPEN_FENCE_RE.match(stripped)
+    if not m:
+        return active, False
+    delim, rest = m.group(1), m.group(2)
+    ch = delim[0]
+    length = len(delim)
+    if active is None:
+        # Backtick fence info strings cannot contain backticks per CommonMark
+        if ch == "`" and "`" in rest:
+            return None, False
+        return (ch, length), True
+    open_ch, open_len = active
+    if ch == open_ch and length >= open_len and rest.strip() == "":
+        return None, True
+    return active, False
+
+
+def split_thesis_and_log(markdown_text: str) -> tuple[str, str]:
+    """CommonMark fence-aware split of thesis.md into (editable_body, append_only_audit_log_section)."""
+    raw = markdown_text or ""
+    lines = raw.splitlines(keepends=True)
+    fence_state: tuple[str, int] | None = None
+    split_line_idx: int | None = None
+
+    for idx, line in enumerate(lines):
+        fence_state, is_delim = _update_fence_state(line, fence_state)
+        if is_delim:
+            continue
+        if fence_state is None and _AUDIT_HEADING_RE.match(line.rstrip("\r\n")):
+            split_line_idx = idx
+
+    if split_line_idx is not None:
+        # Include an immediately preceding horizontal rule `---` (and blank lines around it) in the tail
+        cut = split_line_idx
+        probe = split_line_idx - 1
+        while probe >= 0 and lines[probe].strip() == "":
+            probe -= 1
+        if probe >= 0 and lines[probe].strip() == "---":
+            cut = probe
+        body = "".join(lines[:cut]).rstrip()
+        tail = "".join(lines[cut:]).lstrip("\r\n")
+        return body, tail
+
+    # Fallback: preserve trailing headerless dated audit log bullets ONLY when EOF is NOT inside an unclosed fence
+    if fence_state is None:
+        end_idx = len(lines)
+        while end_idx > 0 and lines[end_idx - 1].strip() == "":
+            end_idx -= 1
+        log_start = end_idx
+        while log_start > 0 and _DATED_LOG_LINE_RE.match(lines[log_start - 1].strip()):
+            log_start -= 1
+        if log_start < end_idx:
+            rescued_lines = "".join(lines[log_start:end_idx])
+            body = "".join(lines[:log_start]).rstrip()
+            tail = f"---\n\n## 增量修订日志（只追加，不重写）\n{rescued_lines}"
+            return body, tail
+
+    return raw.rstrip(), ""
+
+
+def update_thesis_body(
+    raw_symbol: str,
+    body_md: str,
+    expected_revision: int | None = None,
+    note: str = "",
+    research_root: str | None = None,
+    market_override: str | None = None,
+) -> dict[str, Any]:
+    """Atomically update thesis body + increment revision while preserving append-only audit logs."""
+    if expected_revision is None or isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision < 1:
+        raise ValueError("expected_revision (positive integer) is required when updating thesis body")
+
+    clean_body, _ = split_thesis_and_log(body_md)
+    if not clean_body.strip():
+        raise ValueError("Thesis body cannot be empty")
+
+    folder, market, norm_sym, _ = resolve_archive_dir(
+        raw_symbol, research_root=research_root, market_override=market_override
+    )
+    thesis_path = os.path.join(folder, "thesis.md")
+    state_path = os.path.join(folder, "state.json")
+    wal_path = os.path.join(folder, ".thesis_wal.json")
+    if not os.path.exists(thesis_path) or not os.path.exists(state_path):
+        raise FileNotFoundError(f"Archive not initialized at {folder}")
+
+    with _archive_lock(folder):
+        _apply_wal_unlocked(folder)
+
+        with open(state_path, "r", encoding="utf-8") as f:
+            orig_state = json.load(f)
+
+        cur_rev = int(orig_state.get("revision", 1))
+        if expected_revision != cur_rev:
+            raise ValueError(
+                f"Revision conflict for {raw_symbol}: expected revision {expected_revision}, actual {cur_rev}"
+            )
+
+        with open(thesis_path, "r", encoding="utf-8") as f:
+            existing_md = f.read()
+
+        _, preserved_log = split_thesis_and_log(existing_md)
+        next_rev = cur_rev + 1
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        clean_note = note.strip().replace("\n", " ") or f"在线修订研报主体卡片（升级至 v{next_rev}）"
+        audit_line = f"- `{today}`：{clean_note}\n"
+
+        if preserved_log:
+            if not preserved_log.endswith("\n"):
+                preserved_log += "\n"
+            if not preserved_log.startswith("---"):
+                preserved_log = "---\n\n" + preserved_log
+            merged_md = f"{clean_body.rstrip()}\n\n{preserved_log}{audit_line}"
+        else:
+            merged_md = (
+                f"{clean_body.rstrip()}\n\n---\n\n"
+                f"## 增量修订日志（只追加，不重写）\n{audit_line}"
+            )
+
+        next_state = {
+            **orig_state,
+            "revision": next_rev,
+            "updated_at_utc": utc_now_str(),
+        }
+
+        # Single atomic commit point: once .thesis_wal.json is replaced, the transaction is durable
+        _atomic_write_json(wal_path, {"thesis_md": merged_md, "state": next_state})
+        _apply_wal_unlocked(folder)
+
+        return {"market": market, "symbol": norm_sym, "revision": next_rev, "thesis_md": merged_md}
 
 
 def evaluate_triggers(state: dict, observations: dict[str, Any]) -> list[dict]:

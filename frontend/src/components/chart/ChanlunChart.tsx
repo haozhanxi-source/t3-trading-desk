@@ -15,24 +15,12 @@ import {
   type MouseEventParams,
   type Time,
 } from "lightweight-charts";
-import { Layers, Maximize2, Table2 } from "lucide-react";
+import { Crosshair, Layers, Maximize2, Table2 } from "lucide-react";
 import type { ChanlunTimeframe, SignalSummary } from "../../api/types";
-import { fmtFixed, fmtPct, fmtPrice } from "../../lib/format";
-import { useTheme, type ChartPalette } from "../../lib/theme";
+import { fmtFixed, fmtMomentumVerdict, fmtPct, fmtPosVsZs, fmtPrice } from "../../lib/format";
+import { useTheme } from "../../lib/theme";
 import { ZhongshuBoxesPrimitive } from "./ZhongshuBoxesPrimitive";
 import { prepareChanlunSeries, timeKey, type AnyBar, type IndexedBar } from "./chanlunUtils";
-
-function resolveLineHierarchy(palette: ChartPalette) {
-  const isDark = palette.mode === "dark";
-  return {
-    /* Lower-level stroke (笔): subtle & thin so it stays visually subordinate to segments */
-    strokeConfirmed: isDark ? "rgba(104, 159, 214, 0.50)" : "rgba(43, 108, 176, 0.45)",
-    strokeUnconfirmed: isDark ? "rgba(217, 119, 87, 0.62)" : "rgba(201, 100, 66, 0.56)",
-    /* Higher-level segment (线段): high-contrast primary violet */
-    segmentConfirmed: palette.slots[6],
-    segmentUnconfirmed: isDark ? "rgba(156, 142, 232, 0.82)" : "rgba(98, 80, 200, 0.78)",
-  };
-}
 
 function computeSeriesPriceFormat(bars: IndexedBar[]) {
   const closes = bars
@@ -61,27 +49,42 @@ function computeSeriesPriceFormat(bars: IndexedBar[]) {
   };
 }
 
+export interface PlanOverlayLines {
+  entry?: number | null;
+  stop30m?: number | null;
+  target?: number | null;
+}
+
 export interface ChanlunChartProps {
   title: string;
-  subtitle?: string;
   bars: AnyBar[];
   chanlun: ChanlunTimeframe | undefined;
   signalSummary?: SignalSummary;
   intraday?: boolean;
+  active?: boolean;
   height?: number;
+  planOverlay?: PlanOverlayLines | null;
+  pickHint?: string | null;
+  onPickPrice?: ((price: number, bar: IndexedBar | null) => void) | null;
+  syncDate?: string | null;
+  onHoverDate?: ((ymd: string | null) => void) | null;
 }
 
 export function ChanlunChart({
   title,
-  subtitle,
   bars,
   chanlun,
   signalSummary,
   intraday = false,
-  height = 460,
+  active = true,
+  height = 420,
+  planOverlay = null,
+  pickHint = null,
+  onPickPrice = null,
+  syncDate = null,
+  onHoverDate = null,
 }: ChanlunChartProps) {
   const { palette } = useTheme();
-  const lineColors = useMemo(() => resolveLineHierarchy(palette), [palette]);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   /* Interactive layer visibility toggles (stroke <-> 笔中枢, segment <-> 线段中枢) */
@@ -120,7 +123,7 @@ export function ChanlunChart({
   const candleRef = useRef<ISeriesApi<"Candlestick", Time> | null>(null);
   const strokeConfirmedRef = useRef<ISeriesApi<"Line", Time> | null>(null);
   const strokeUnconfirmedRef = useRef<ISeriesApi<"Line", Time> | null>(null);
-  const segmentConfirmedRef = useRef<ISeriesApi<"Line", Time> | null>(null);
+  const segmentConfirmedPoolRef = useRef<ISeriesApi<"Line", Time>[]>([]);
   const segmentUnconfirmedRef = useRef<ISeriesApi<"Line", Time> | null>(null);
   const macdHistRef = useRef<ISeriesApi<"Histogram", Time> | null>(null);
   const macdDifRef = useRef<ISeriesApi<"Line", Time> | null>(null);
@@ -132,6 +135,23 @@ export function ChanlunChart({
   const prevFirstTimeRef = useRef<string>("");
   const byTimeKeyRef = useRef(prepared.byTimeKey);
   byTimeKeyRef.current = prepared.byTimeKey;
+  const onPickPriceRef = useRef(onPickPrice);
+  onPickPriceRef.current = onPickPrice;
+  const onHoverDateRef = useRef(onHoverDate);
+  onHoverDateRef.current = onHoverDate;
+  const programmaticCrosshairRef = useRef(false);
+
+  /* Map YYYY-MM-DD -> latest bar of that date for Daily <-> Intraday crosshair linkage */
+  const barByDateMap = useMemo(() => {
+    const m = new Map<string, IndexedBar>();
+    for (const b of prepared.bars) {
+      const ymd = b.label.slice(0, 10);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(ymd)) {
+        m.set(ymd, b);
+      }
+    }
+    return m;
+  }, [prepared.bars]);
 
   /* Mount Lightweight Charts v5 instance once per canvas container */
   useEffect(() => {
@@ -144,11 +164,11 @@ export function ChanlunChart({
       layout: {
         background: { type: ColorType.Solid, color: palette.surface },
         textColor: palette.muted,
-        fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif',
-        fontSize: 11,
+        fontFamily: '"JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace',
+        fontSize: 10.5,
         panes: {
           separatorColor: palette.gridline,
-          separatorHoverColor: palette.slots[0],
+          separatorHoverColor: palette.accent,
           enableResize: true,
         },
       },
@@ -183,13 +203,12 @@ export function ChanlunChart({
       lastValueVisible: true,
     });
 
-    /* Custom ISeriesPrimitive for Zhongshu [ZD, ZG] translucent boxes */
     const zsPrimitive = new ZhongshuBoxesPrimitive(palette);
     candleSeries.attachPrimitive(zsPrimitive);
 
-    /* Confirmed strokes overlay (笔, lower level: 1px muted solid) */
+    /* Strokes (笔): neutral understated silver skeleton so Zhongshu & Segments own color hierarchy */
     const strokeConfirmed = chart.addSeries(LineSeries, {
-      color: lineColors.strokeConfirmed,
+      color: palette.strokeConfirmed,
       lineWidth: 1,
       lineStyle: LineStyle.Solid,
       priceLineVisible: false,
@@ -197,9 +216,8 @@ export function ChanlunChart({
       crosshairMarkerVisible: false,
     });
 
-    /* Active unconfirmed latest stroke (未确认笔: 1px muted dashed) */
     const strokeUnconfirmed = chart.addSeries(LineSeries, {
-      color: lineColors.strokeUnconfirmed,
+      color: palette.strokeUnconfirmed,
       lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       priceLineVisible: false,
@@ -207,19 +225,9 @@ export function ChanlunChart({
       crosshairMarkerVisible: false,
     });
 
-    /* Confirmed Chanlun segments (已确认线段, higher level: bold 3px high-contrast solid) */
-    const segmentConfirmed = chart.addSeries(LineSeries, {
-      color: lineColors.segmentConfirmed,
-      lineWidth: 3,
-      lineStyle: LineStyle.Solid,
-      priceLineVisible: false,
-      lastValueVisible: false,
-      crosshairMarkerVisible: false,
-    });
-
-    /* Uncertain/growing trailing segment & extension to latest price (未确认线段: 2px dashed) */
+    /* Segments (线段): dynamic pool of confirmed segment chains + uncertain dashed tail */
     const segmentUnconfirmed = chart.addSeries(LineSeries, {
-      color: lineColors.segmentUnconfirmed,
+      color: palette.segUnconfirmed,
       lineWidth: 2,
       lineStyle: LineStyle.Dashed,
       priceLineVisible: false,
@@ -227,13 +235,11 @@ export function ChanlunChart({
       crosshairMarkerVisible: false,
     });
 
-    /* Series markers v5 plugin */
     const markersPlugin = createSeriesMarkers(candleSeries, [], { zOrder: "aboveSeries" });
 
-    /* Synchronized MACD sub-pane (Lightweight Charts v5 native multi-pane) */
     const macdPane = chart.addPane();
-    chart.panes()[0]?.setStretchFactor(0.73);
-    macdPane.setStretchFactor(0.27);
+    chart.panes()[0]?.setStretchFactor(0.74);
+    macdPane.setStretchFactor(0.26);
 
     const macdHist = macdPane.addSeries(HistogramSeries, {
       priceLineVisible: false,
@@ -242,7 +248,7 @@ export function ChanlunChart({
     });
     const macdDif = macdPane.addSeries(LineSeries, {
       color: palette.slots[0],
-      lineWidth: 1,
+      lineWidth: 2,
       priceLineVisible: false,
       lastValueVisible: false,
       crosshairMarkerVisible: false,
@@ -256,14 +262,37 @@ export function ChanlunChart({
     });
 
     const onCrosshair = (param: MouseEventParams<Time>) => {
-      if (!param.time) {
+      if (programmaticCrosshairRef.current) return;
+      if (!param.time || !param.point) {
         setHoveredBar(null);
+        onHoverDateRef.current?.(null);
         return;
       }
       const hit = byTimeKeyRef.current.get(timeKey(param.time)) ?? null;
       setHoveredBar(hit);
+      if (hit) {
+        const ymd = hit.label.slice(0, 10);
+        onHoverDateRef.current?.(/^\d{4}-\d{2}-\d{2}$/.test(ymd) ? ymd : null);
+      } else {
+        onHoverDateRef.current?.(null);
+      }
     };
     chart.subscribeCrosshairMove(onCrosshair);
+
+    const onClick = (param: MouseEventParams<Time>) => {
+      const cb = onPickPriceRef.current;
+      if (!cb || !param.point) return;
+      const bar = param.time ? (byTimeKeyRef.current.get(timeKey(param.time)) ?? null) : null;
+      const coordPrice = candleSeries.coordinateToPrice(param.point.y);
+      const picked =
+        typeof coordPrice === "number" && Number.isFinite(coordPrice) && coordPrice > 0
+          ? coordPrice
+          : bar?.close ?? null;
+      if (picked !== null && picked > 0) {
+        cb(picked, bar);
+      }
+    };
+    chart.subscribeClick(onClick);
 
     const ro = new ResizeObserver((entries) => {
       const rect = entries[0]?.contentRect;
@@ -277,7 +306,7 @@ export function ChanlunChart({
     candleRef.current = candleSeries;
     strokeConfirmedRef.current = strokeConfirmed;
     strokeUnconfirmedRef.current = strokeUnconfirmed;
-    segmentConfirmedRef.current = segmentConfirmed;
+    segmentConfirmedPoolRef.current = [];
     segmentUnconfirmedRef.current = segmentUnconfirmed;
     macdHistRef.current = macdHist;
     macdDifRef.current = macdDif;
@@ -288,6 +317,7 @@ export function ChanlunChart({
     return () => {
       ro.disconnect();
       chart.unsubscribeCrosshairMove(onCrosshair);
+      chart.unsubscribeClick(onClick);
       markersPlugin.detach();
       candleSeries.detachPrimitive(zsPrimitive);
       chart.remove();
@@ -295,7 +325,7 @@ export function ChanlunChart({
       candleRef.current = null;
       strokeConfirmedRef.current = null;
       strokeUnconfirmedRef.current = null;
-      segmentConfirmedRef.current = null;
+      segmentConfirmedPoolRef.current = [];
       segmentUnconfirmedRef.current = null;
       macdHistRef.current = null;
       macdDifRef.current = null;
@@ -309,7 +339,17 @@ export function ChanlunChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intraday, height]);
 
-  /* Sync theme palette dynamically on Dark/Light/System toggle & OS prefers-color-scheme change */
+  /* Recalculate width cleanly when Keep-Alive screen transitions back to visible */
+  useEffect(() => {
+    if (!active) return;
+    const el = containerRef.current;
+    const chart = chartRef.current;
+    if (el && chart && el.clientWidth > 0) {
+      chart.applyOptions({ width: Math.floor(el.clientWidth) });
+    }
+  }, [active]);
+
+  /* Sync theme palette dynamically */
   useEffect(() => {
     const chart = chartRef.current;
     if (!chart) return;
@@ -319,7 +359,7 @@ export function ChanlunChart({
         textColor: palette.muted,
         panes: {
           separatorColor: palette.gridline,
-          separatorHoverColor: palette.slots[0],
+          separatorHoverColor: palette.accent,
         },
       },
       grid: {
@@ -339,25 +379,28 @@ export function ChanlunChart({
       wickUpColor: palette.candleUp,
       wickDownColor: palette.candleDown,
     });
-    strokeConfirmedRef.current?.applyOptions({ color: lineColors.strokeConfirmed });
-    strokeUnconfirmedRef.current?.applyOptions({ color: lineColors.strokeUnconfirmed });
-    segmentConfirmedRef.current?.applyOptions({ color: lineColors.segmentConfirmed });
-    segmentUnconfirmedRef.current?.applyOptions({ color: lineColors.segmentUnconfirmed });
+    strokeConfirmedRef.current?.applyOptions({ color: palette.strokeConfirmed });
+    strokeUnconfirmedRef.current?.applyOptions({ color: palette.strokeUnconfirmed });
+    for (const segSeries of segmentConfirmedPoolRef.current) {
+      segSeries.applyOptions({ color: palette.segConfirmed });
+    }
+    segmentUnconfirmedRef.current?.applyOptions({ color: palette.segUnconfirmed });
     macdDifRef.current?.applyOptions({ color: palette.slots[0] });
     macdDeaRef.current?.applyOptions({ color: palette.slots[3] });
     zsPrimitiveRef.current?.setPalette(palette);
-  }, [palette, lineColors]);
+  }, [palette]);
 
-  /* Push base candle & MACD data and fit visible window when data or chart instance changes */
+  /* Push base candle & MACD data */
   useEffect(() => {
     const candle = candleRef.current;
     if (!candle) return;
 
-    /* Apply dynamic decimal precision so FX (e.g. AUDUSD=X 0.6658) never rounds to 2dp */
     candle.applyOptions({ priceFormat: dynamicFormats.price });
     strokeConfirmedRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
     strokeUnconfirmedRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
-    segmentConfirmedRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
+    for (const segSeries of segmentConfirmedPoolRef.current) {
+      segSeries.applyOptions({ priceFormat: dynamicFormats.price });
+    }
     segmentUnconfirmedRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
     macdHistRef.current?.applyOptions({ priceFormat: dynamicFormats.macd });
     macdDifRef.current?.applyOptions({ priceFormat: dynamicFormats.macd });
@@ -368,9 +411,11 @@ export function ChanlunChart({
     macdDifRef.current?.setData(prepared.macdDif);
     macdDeaRef.current?.setData(prepared.macdDea);
 
-    /* Fit or scroll cleanly to recent structure when symbol/timeframe/chart instance changes */
     const firstKey = prepared.bars[0] ? timeKey(prepared.bars[0].time) : "";
-    if (prepared.bars.length > 0 && (firstKey !== prevFirstTimeRef.current || Math.abs(prepared.bars.length - prevBarCountRef.current) > 5)) {
+    if (
+      prepared.bars.length > 0 &&
+      (firstKey !== prevFirstTimeRef.current || Math.abs(prepared.bars.length - prevBarCountRef.current) > 5)
+    ) {
       prevFirstTimeRef.current = firstKey;
       prevBarCountRef.current = prepared.bars.length;
       const total = prepared.bars.length;
@@ -382,20 +427,60 @@ export function ChanlunChart({
     }
   }, [prepared, dynamicFormats, intraday, height]);
 
-  /* Push Chanlun structural overlays independently so toggling layers never reloads candles/MACD */
+  /* Push Chanlun structural overlays independently (multi-chain confirmed segments across gaps) */
   useEffect(() => {
-    if (!candleRef.current) return;
+    const chart = chartRef.current;
+    if (!candleRef.current || !chart) return;
     strokeConfirmedRef.current?.setData(showStrokes ? prepared.confirmedStrokes : []);
     strokeUnconfirmedRef.current?.setData(showStrokes ? prepared.unconfirmedStroke : []);
-    segmentConfirmedRef.current?.setData(showSegments ? prepared.confirmedSegments : []);
+
+    const chains = showSegments ? prepared.confirmedSegmentChains : [];
+    const pool = segmentConfirmedPoolRef.current;
+    while (pool.length < chains.length) {
+      pool.push(
+        chart.addSeries(LineSeries, {
+          color: palette.segConfirmed,
+          lineWidth: 2,
+          lineStyle: LineStyle.Solid,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+          priceFormat: dynamicFormats.price,
+        }),
+      );
+    }
+    for (let i = 0; i < pool.length; i++) {
+      pool[i]?.setData(chains[i] ?? []);
+    }
+
     segmentUnconfirmedRef.current?.setData(showSegments ? prepared.unconfirmedSegments : []);
 
     zsPrimitiveRef.current?.setBoxes(visibleZhongshuBoxes);
     zsPrimitiveRef.current?.setVisible(visibleZhongshuBoxes.length > 0);
     markersRef.current?.setMarkers(showMarkers ? prepared.markers : []);
-  }, [prepared, showStrokes, showSegments, visibleZhongshuBoxes, showMarkers, intraday, height]);
+  }, [prepared, palette.segConfirmed, dynamicFormats.price, showStrokes, showSegments, visibleZhongshuBoxes, showMarkers, intraday, height]);
 
-  /* Update stroke / segment Zhongshu ZG & ZD reference PriceLines from canonical classified latest Zhongshu */
+  /* Apply synchronized crosshair AFTER candle data is pushed; clear stale crosshair when date is absent */
+  useEffect(() => {
+    const chart = chartRef.current;
+    const candle = candleRef.current;
+    if (!chart || !candle) return;
+    programmaticCrosshairRef.current = true;
+    try {
+      const matched = syncDate ? (barByDateMap.get(syncDate) ?? null) : null;
+      if (!matched) {
+        chart.clearCrosshairPosition();
+        setHoveredBar(null);
+      } else {
+        chart.setCrosshairPosition(matched.close, matched.time, candle);
+        setHoveredBar(matched);
+      }
+    } finally {
+      programmaticCrosshairRef.current = false;
+    }
+  }, [syncDate, barByDateMap, prepared.candles]);
+
+  /* Update Zhongshu ZG/ZD reference lines + optional user-requested Trade Plan R:R ruler */
   useEffect(() => {
     const candle = candleRef.current;
     if (!candle) return;
@@ -404,7 +489,13 @@ export function ChanlunChart({
     }
     priceLinesRef.current = [];
 
-    const addLine = (price: number | null | undefined, lineTitle: string, color: string, style: LineStyle, lineWidth: 1 | 2 = 1) => {
+    const addLine = (
+      price: number | null | undefined,
+      lineTitle: string,
+      color: string,
+      style: LineStyle,
+      lineWidth: 1 | 2 = 1,
+    ) => {
       if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) return;
       priceLinesRef.current.push(
         candle.createPriceLine({
@@ -420,14 +511,20 @@ export function ChanlunChart({
 
     const latestStrokeZs = prepared.latestStrokeZhongshu;
     if (showStrokeZhongshu && latestStrokeZs) {
-      addLine(latestStrokeZs.zg, "笔中枢 ZG", palette.zsStrokeBorder, LineStyle.Dotted, 1);
-      addLine(latestStrokeZs.zd, "笔中枢 ZD", palette.zsStrokeBorder, LineStyle.Dotted, 1);
+      addLine(latestStrokeZs.zg, "Z·ZG", palette.zsStrokeBorder, LineStyle.Dotted, 1);
+      addLine(latestStrokeZs.zd, "Z·ZD", palette.zsStrokeBorder, LineStyle.Dotted, 1);
     }
 
     const latestSegmentZs = prepared.latestSegmentZhongshu;
     if (showSegmentZhongshu && latestSegmentZs) {
-      addLine(latestSegmentZs.zg, "线段中枢 ZG", palette.zsSegBorder, LineStyle.Dotted, 1);
-      addLine(latestSegmentZs.zd, "线段中枢 ZD", palette.zsSegBorder, LineStyle.Dotted, 1);
+      addLine(latestSegmentZs.zg, "S·ZG", palette.zsSegBorder, LineStyle.Dotted, 1);
+      addLine(latestSegmentZs.zd, "S·ZD", palette.zsSegBorder, LineStyle.Dotted, 1);
+    }
+
+    if (planOverlay) {
+      addLine(planOverlay.entry, "计划入场", palette.accent, LineStyle.Dashed, 1);
+      addLine(planOverlay.stop30m, "战术止损", palette.bear, LineStyle.Dashed, 1);
+      addLine(planOverlay.target, "目标位", palette.bull, LineStyle.Dashed, 1);
     }
   }, [
     prepared.latestStrokeZhongshu,
@@ -435,6 +532,7 @@ export function ChanlunChart({
     palette,
     showStrokeZhongshu,
     showSegmentZhongshu,
+    planOverlay,
     intraday,
     height,
   ]);
@@ -451,136 +549,151 @@ export function ChanlunChart({
 
   const latestZs = chanlun?.latest_zhongshu;
   const mom = chanlun?.momentum_assessment;
+  const latestStroke = chanlun?.all_strokes?.[chanlun.all_strokes.length - 1];
 
   return (
-    <section className="card flex flex-col overflow-hidden" aria-label={title}>
-      {/* Header & Interactive Toggles */}
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline px-3.5 py-2.5">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h2 className="m-0 text-sm font-semibold text-ink">{title}</h2>
-            {chanlun?.macro_structure ? (
-              <span className="rounded border border-hairline bg-elevated px-2 py-0.5 text-[11px] text-ink-2">
-                {chanlun.macro_structure}
-              </span>
-            ) : null}
-            {chanlun?.zhongshu_level_label ? (
-              <span className="rounded border border-hairline bg-page px-2 py-0.5 text-[11px] text-muted">
-                {chanlun.zhongshu_level_label}
-              </span>
-            ) : null}
-          </div>
-          {subtitle ? <p className="m-0 mt-0.5 text-[11px] text-muted">{subtitle}</p> : null}
+    <section
+      className={`card flex flex-col overflow-hidden ${pickHint ? "ring-1 ring-accent" : ""}`}
+      aria-label={title}
+    >
+      {/* Single-Row Precision Toolbar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-hairline px-3 py-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+          <h2 className="m-0 text-[13px] font-semibold tracking-tight text-ink">{title}</h2>
+          {chanlun?.macro_structure ? (
+            <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[10.5px] text-ink-2">
+              {chanlun.macro_structure}
+            </span>
+          ) : null}
+          {chanlun?.zhongshu_level_label ? (
+            <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[10.5px] text-muted">
+              {chanlun.zhongshu_level_label}
+            </span>
+          ) : null}
         </div>
 
         <div className="flex flex-wrap items-center gap-1" role="group" aria-label={`${title} 图层开关`}>
-          <button type="button" className="chip" aria-pressed={showStrokes} onClick={() => setShowStrokes((v) => !v)}>
+          <button type="button" className="chip px-2" aria-pressed={showStrokes} onClick={() => setShowStrokes((v) => !v)}>
             <span
-              className="inline-block h-1.5 w-1.5 rounded-full"
-              style={{ backgroundColor: lineColors.strokeConfirmed }}
+              className="inline-block h-1.5 w-2 rounded-xs"
+              style={{ backgroundColor: palette.strokeUnconfirmed }}
               aria-hidden="true"
             />
             <span>笔</span>
           </button>
           <button
             type="button"
-            className="chip"
+            className="chip px-2"
             aria-pressed={showStrokeZhongshu}
             onClick={() => setShowStrokeZhongshu((v) => !v)}
             title={`显示/隐藏笔中枢（当前 ${prepared.strokeZhongshuBoxes.length} 个）`}
           >
             <Layers className="h-3 w-3" style={{ color: palette.zsStrokeBorder }} aria-hidden="true" />
-            <span>笔中枢</span>
+            <span>笔枢</span>
           </button>
-          <button type="button" className="chip" aria-pressed={showSegments} onClick={() => setShowSegments((v) => !v)}>
+          <button type="button" className="chip px-2" aria-pressed={showSegments} onClick={() => setShowSegments((v) => !v)}>
             <span
-              className="inline-block h-2.5 w-2.5 rounded-full"
-              style={{ backgroundColor: lineColors.segmentConfirmed }}
+              className="inline-block h-1.5 w-2 rounded-xs"
+              style={{ backgroundColor: palette.segConfirmed }}
               aria-hidden="true"
             />
             <span>线段</span>
           </button>
           <button
             type="button"
-            className="chip"
+            className="chip px-2"
             aria-pressed={showSegmentZhongshu}
             onClick={() => setShowSegmentZhongshu((v) => !v)}
             title={`显示/隐藏线段中枢（当前 ${prepared.segmentZhongshuBoxes.length} 个）`}
           >
             <Layers className="h-3 w-3" style={{ color: palette.zsSegBorder }} aria-hidden="true" />
-            <span>线段中枢</span>
+            <span>段枢</span>
           </button>
-          <button type="button" className="chip" aria-pressed={showMarkers} onClick={() => setShowMarkers((v) => !v)}>
-            <span>买卖点/分型</span>
+          <button type="button" className="chip px-2" aria-pressed={showMarkers} onClick={() => setShowMarkers((v) => !v)}>
+            <span>信号</span>
           </button>
           <button
             type="button"
-            className="chip"
+            className="chip px-2"
             aria-pressed={showTable}
             onClick={() => setShowTable((v) => !v)}
-            title="切换缠论笔与中枢坐标无障碍表格视图"
+            title="切换缠论笔与中枢坐标无障碍对照表"
           >
             <Table2 className="h-3 w-3" aria-hidden="true" />
-            <span>坐标表</span>
           </button>
           <button
             type="button"
-            className="btn btn-ghost btn-sm"
+            className="btn btn-ghost btn-sm px-1.5"
             onClick={handleResetZoom}
             aria-label="重置视图缩放"
-            title="回到最近关键结构区间"
+            title="重置缩放至最近结构视口"
           >
             <Maximize2 className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
         </div>
       </div>
 
-      {/* Crosshair Readout & Legend Strip (text wears ink tokens; colored marks carry identity) */}
-      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1 border-b border-hairline bg-page/60 px-3.5 py-1.5 text-[11.5px]">
+      {/* Compact Monospace Readout & Structural Telemetry Strip */}
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-hairline-soft bg-sunken/70 px-3 py-1 font-mono text-[11px]">
         {displayBar ? (
-          <div className="tnum flex flex-wrap items-center gap-x-3 gap-y-0.5 text-ink-2">
-            <span className="font-mono text-muted">{displayBar.label}</span>
+          <div className="tnum flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-ink-2">
+            <span className="text-muted">{displayBar.label}</span>
             <span>
-              开 <strong className="font-medium text-ink">{fmtPrice(displayBar.open)}</strong>
-            </span>
-            <span>
-              高 <strong className="font-medium text-ink">{fmtPrice(displayBar.high)}</strong>
+              O <strong className="font-medium text-ink">{fmtPrice(displayBar.open)}</strong>
             </span>
             <span>
-              低 <strong className="font-medium text-ink">{fmtPrice(displayBar.low)}</strong>
+              H <strong className="font-medium text-ink">{fmtPrice(displayBar.high)}</strong>
             </span>
             <span>
-              收 <strong className="font-semibold text-ink">{fmtPrice(displayBar.close)}</strong>
+              L <strong className="font-medium text-ink">{fmtPrice(displayBar.low)}</strong>
             </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="inline-block h-1.5 w-1.5 rounded-full bg-slot1" aria-hidden="true" />
-              DIF {fmtFixed(displayBar.dif, dynamicFormats.macdDp)}
+            <span>
+              C <strong className="font-semibold text-ink">{fmtPrice(displayBar.close)}</strong>
             </span>
-            <span className="inline-flex items-center gap-1">
-              <span className="inline-block h-1.5 w-1.5 rounded-full bg-slot4" aria-hidden="true" />
-              DEA {fmtFixed(displayBar.dea, dynamicFormats.macdDp)}
+            <span className="text-slot1">DIF {fmtFixed(displayBar.dif, dynamicFormats.macdDp)}</span>
+            <span className="text-slot4">DEA {fmtFixed(displayBar.dea, dynamicFormats.macdDp)}</span>
+            <span
+              className={
+                displayBar.hist != null && displayBar.hist >= 0 ? "text-bull" : "text-bear"
+              }
+            >
+              HIST {fmtFixed(displayBar.hist, dynamicFormats.macdDp)}
             </span>
-            <span>MACD {fmtFixed(displayBar.hist, dynamicFormats.macdDp)}</span>
           </div>
         ) : (
-          <span className="text-muted">暂无 K 线数据</span>
+          <span className="font-sans text-muted">暂无 K 线数据</span>
         )}
 
-        <div className="tnum flex flex-wrap items-center gap-x-3 text-[11px] text-muted">
+        <div className="tnum flex flex-wrap items-center gap-x-2.5 font-sans text-[11px] text-muted">
           {latestZs ? (
             <span>
-              最新中枢 [ZD <strong className="text-ink-2">{fmtPrice(latestZs.zd)}</strong>, ZG{" "}
-              <strong className="text-ink-2">{fmtPrice(latestZs.zg)}</strong>] · {chanlun?.price_vs_zhongshu || "—"}
+              中枢{" "}
+              <span className="font-mono text-ink-2">
+                [{fmtPrice(latestZs.zd)}, {fmtPrice(latestZs.zg)}]
+              </span>{" "}
+              · {fmtPosVsZs(chanlun?.price_vs_zhongshu)}
             </span>
           ) : (
-            <span>未形成标准中枢</span>
+            <span>未成中枢</span>
           )}
-          {mom?.verdict ? <span>动力学：{mom.verdict}</span> : null}
+          {latestStroke?.strength_tier ? (
+            <span>
+              近笔：{latestStroke.direction === "up" ? "↑" : "↓"}
+              {latestStroke.strength_tier}
+            </span>
+          ) : null}
+          {mom?.verdict ? <span>{fmtMomentumVerdict(mom.verdict)}</span> : null}
         </div>
       </div>
 
       {/* Canvas Container */}
-      <div className="relative w-full">
+      <div className={`relative w-full ${onPickPrice ? "cursor-crosshair" : ""}`}>
+        {pickHint ? (
+          <div className="pointer-events-none absolute top-2 left-3 z-10 inline-flex items-center gap-1.5 rounded border border-accent/45 bg-surface/92 px-2.5 py-1 text-[11px] font-medium text-ink shadow-sm backdrop-blur-xs">
+            <Crosshair className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
+            <span>{pickHint}（点击 K 线画布取价 · Esc 取消）</span>
+          </div>
+        ) : null}
         <div ref={containerRef} className="w-full" style={{ height: `${height}px` }} />
         {prepared.bars.length === 0 ? (
           <div className="absolute inset-0 flex items-center justify-center bg-surface/90 p-6 text-center text-xs text-muted">
@@ -589,13 +702,13 @@ export function ChanlunChart({
         ) : null}
       </div>
 
-      {/* Accessible Coordinate Table View (dataviz rule: table alternative for canvas geometry) */}
+      {/* Accessible Coordinate Table View */}
       {showTable ? (
         <div className="border-t border-hairline p-3">
           <div className="mb-2 flex items-center justify-between text-xs text-muted">
-            <span>中枢与近期严格笔坐标明细（无障碍数据对照表）</span>
-            <span>
-              笔中枢 {prepared.strokeZhongshuBoxes.length} 个 · 线段中枢 {prepared.segmentZhongshuBoxes.length} 个 ·{" "}
+            <span>中枢与近期严格笔坐标明细</span>
+            <span className="font-mono text-[11px]">
+              笔中枢 {prepared.strokeZhongshuBoxes.length} · 线段中枢 {prepared.segmentZhongshuBoxes.length} ·{" "}
               {(chanlun?.all_strokes ?? []).length} 笔 · {(chanlun?.all_segments ?? []).length} 线段
             </span>
           </div>
@@ -636,7 +749,7 @@ export function ChanlunChart({
                         <td data-label="ZG 上沿" className="num">
                           {fmtPrice(z.zg)}
                         </td>
-                        <td data-label="起止时间" className="text-muted">
+                        <td data-label="起止时间" className="font-mono text-[11px] text-muted">
                           {z.startLabel ?? String(z.startTime)} → {z.endLabel ?? String(z.endTime)}
                         </td>
                       </tr>
@@ -661,23 +774,28 @@ export function ChanlunChart({
                   </tr>
                 </thead>
                 <tbody>
-                  {(chanlun?.all_strokes ?? []).slice(-8).reverse().map((s, idx) => (
-                    <tr key={`${s.start_date}-${idx}`}>
-                      <th scope="row">
-                        {s.direction === "up" ? "↑ 向上笔" : "↓ 向下笔"}
-                        {!s.is_confirmed ? " (未完)" : ""}
-                      </th>
-                      <td data-label="起点→终点" className="num">
-                        {fmtPrice(s.start_price)} → {fmtPrice(s.end_price)}
-                      </td>
-                      <td data-label="幅度" className="num">
-                        {fmtPct(s.pct_change, 2, true)}
-                      </td>
-                      <td data-label="笔强弱" className="text-muted">
-                        {s.strength_tier || `${s.raw_bars ?? "—"}K`}
-                      </td>
-                    </tr>
-                  ))}
+                  {(chanlun?.all_strokes ?? [])
+                    .slice(-8)
+                    .reverse()
+                    .map((s, idx) => (
+                      <tr key={`${s.start_date}-${idx}`}>
+                        <th scope="row">
+                          <span className={s.direction === "up" ? "text-bull" : "text-bear"}>
+                            {s.direction === "up" ? "↑ 向上笔" : "↓ 向下笔"}
+                          </span>
+                          {!s.is_confirmed ? <span className="text-muted"> (未完)</span> : null}
+                        </th>
+                        <td data-label="起点→终点" className="num">
+                          {fmtPrice(s.start_price)} → {fmtPrice(s.end_price)}
+                        </td>
+                        <td data-label="幅度" className="num">
+                          {fmtPct(s.pct_change, 2, true)}
+                        </td>
+                        <td data-label="笔强弱" className="text-muted">
+                          {s.strength_tier || `${s.raw_bars ?? "—"}K`}
+                        </td>
+                      </tr>
+                    ))}
                 </tbody>
               </table>
             </div>

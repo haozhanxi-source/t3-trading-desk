@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
+import json
+import os
+import tempfile
 import threading
+import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
@@ -20,6 +26,7 @@ from .cache import CACHE, TTL_RESEARCH_SECONDS, TTL_SENTINEL_SECONDS
 from .serializers import sanitize
 
 MAX_TASKS = 50
+MAX_PERSISTED_SCANS = 10
 TERMINAL_STATUSES = frozenset({"completed", "failed"})
 TERMINAL_EVENT_TYPES = frozenset({"done", "error"})
 TASK_KINDS = ("scan", "research_refresh", "sentinel")
@@ -58,6 +65,7 @@ class Task:
         self.created_at = utc_iso()
         self.started_at: str | None = None
         self.finished_at: str | None = None
+        self.finished_ns: int = 0
         self.progress: dict[str, Any] = {"done": 0, "total": None}
         self.events: list[dict[str, Any]] = []
         self.result: Any = None
@@ -97,11 +105,189 @@ class TaskManager:
         self.max_tasks = max_tasks
         self._lock = threading.RLock()
         self._tasks: OrderedDict[str, Task] = OrderedDict()
+        self._persisted_scans: OrderedDict[str, Task] = OrderedDict()
+        self._unflushed_scans: OrderedDict[str, Task] = OrderedDict()
         self._background: set[asyncio.Task] = set()
+        self._hydrated_path: str | None = None
+        self._hydrated_mtime_ns: int | None = None
+
+    # ------------------------------------------------------------------ scan persistence
+    @staticmethod
+    def _scan_history_path() -> str:
+        return os.path.join(portfolio_manager.DEFAULT_PORTFOLIO_DIR, "scan_history.json")
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _scan_history_file_lock(parent_dir: str):
+        os.makedirs(parent_dir, exist_ok=True)
+        lock_path = os.path.join(parent_dir, ".scan_history.lock")
+        f = open(lock_path, "a+", encoding="utf-8")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            finally:
+                f.close()
+
+    @staticmethod
+    def _record_to_task(rec: dict[str, Any]) -> Task | None:
+        tid = str(rec.get("id") or "").strip()
+        if not tid:
+            return None
+        t = Task("scan", rec.get("params") if isinstance(rec.get("params"), dict) else {})
+        t.id = tid
+        t.status = str(rec.get("status") or "completed")
+        t.created_at = str(rec.get("created_at") or utc_iso())
+        t.started_at = rec.get("started_at")
+        t.finished_at = rec.get("finished_at")
+        t.finished_ns = int(rec.get("finished_ns") or 0)
+        if isinstance(rec.get("progress"), dict):
+            t.progress = dict(rec["progress"])
+        t.result = rec.get("result")
+        t.events = rec.get("events") if isinstance(rec.get("events"), list) else []
+        return t
+
+    @staticmethod
+    def _task_to_record(t: Task) -> dict[str, Any]:
+        return {
+            "id": t.id,
+            "kind": "scan",
+            "status": t.status,
+            "params": sanitize(t.params),
+            "created_at": t.created_at,
+            "started_at": t.started_at,
+            "finished_at": t.finished_at,
+            "finished_ns": t.finished_ns,
+            "progress": dict(t.progress),
+            "result": t.result,
+            "events": t.events[-3:],
+        }
+
+    def _ensure_hydrated_unlocked(self) -> None:
+        path = self._scan_history_path()
+        if self._hydrated_path != path:
+            self._persisted_scans.clear()
+            self._unflushed_scans.clear()
+            self._hydrated_path = None
+            self._hydrated_mtime_ns = None
+
+        if not os.path.exists(path):
+            self._hydrated_path = path
+            self._hydrated_mtime_ns = None
+            return
+
+        try:
+            st = os.stat(path)
+            if self._hydrated_path == path and self._hydrated_mtime_ns == st.st_mtime_ns:
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if not isinstance(saved, list):
+                return
+            by_id: dict[str, Task] = {}
+            for rec in saved:
+                if not isinstance(rec, dict):
+                    continue
+                t = self._record_to_task(rec)
+                if t is not None:
+                    by_id[t.id] = t
+            for tid, mem_t in self._unflushed_scans.items():
+                by_id[tid] = mem_t
+            ordered_tasks = sorted(
+                by_id.values(),
+                key=lambda item: (item.finished_ns, str(item.finished_at or item.created_at or ""), item.id),
+            )[-MAX_PERSISTED_SCANS:]
+            self._persisted_scans = OrderedDict((item.id, item) for item in ordered_tasks)
+            # Evict any completed scan in _tasks that is no longer within the authoritative latest-10 persisted set
+            for stale_tid in [
+                tid
+                for tid, t in self._tasks.items()
+                if t.kind == "scan" and t.status == "completed" and tid not in self._persisted_scans
+            ]:
+                self._tasks.pop(stale_tid, None)
+            self._hydrated_path = path
+            self._hydrated_mtime_ns = st.st_mtime_ns
+        except (OSError, ValueError, TypeError):
+            # Do not mark hydrated on transient read/parse failure so future calls retry
+            return
+
+    def _record_completed_scan_unlocked(self, scan_task: Task) -> None:
+        path = self._scan_history_path()
+        parent = os.path.dirname(path)
+        if self._hydrated_path not in (None, path):
+            self._persisted_scans.clear()
+            self._unflushed_scans.clear()
+        new_rec = self._task_to_record(scan_task)
+
+        try:
+            with self._scan_history_file_lock(parent):
+                merged: dict[str, dict[str, Any]] = {}
+                if os.path.exists(path):
+                    try:
+                        with open(path, "r", encoding="utf-8") as rf:
+                            existing = json.load(rf)
+                        if isinstance(existing, list):
+                            for item in existing:
+                                if isinstance(item, dict) and item.get("id"):
+                                    merged[str(item["id"])] = item
+                    except (OSError, ValueError, TypeError):
+                        pass
+                for tid, uf in self._unflushed_scans.items():
+                    merged[tid] = self._task_to_record(uf)
+                merged[scan_task.id] = new_rec
+                ordered_records = sorted(
+                    merged.values(),
+                    key=lambda r: (
+                        int(r.get("finished_ns") or 0),
+                        str(r.get("finished_at") or r.get("created_at") or ""),
+                        str(r.get("id") or ""),
+                    ),
+                )[-MAX_PERSISTED_SCANS:]
+
+                fd, tmp = tempfile.mkstemp(prefix=".scan_hist_", suffix=".tmp", dir=parent)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as wf:
+                        json.dump(ordered_records, wf, ensure_ascii=False, allow_nan=False)
+                    os.replace(tmp, path)
+                except BaseException:
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    raise
+                self._unflushed_scans.clear()
+                self._hydrated_path = path
+                self._hydrated_mtime_ns = os.stat(path).st_mtime_ns
+                synced: OrderedDict[str, Task] = OrderedDict()
+                for rec in ordered_records:
+                    rid = str(rec["id"])
+                    # Prefer disk-merged record unless it is the live task still carrying full in-memory replay events
+                    mem_live = self._tasks.get(rid)
+                    if mem_live is not None and len(mem_live.events) > len(rec.get("events") or []):
+                        t_obj: Task | None = mem_live
+                    else:
+                        t_obj = self._record_to_task(rec)
+                    if t_obj is not None:
+                        synced[t_obj.id] = t_obj
+                self._persisted_scans = synced
+                for stale_tid in [
+                    tid
+                    for tid, t in self._tasks.items()
+                    if t.kind == "scan" and t.status == "completed" and tid not in self._persisted_scans
+                ]:
+                    self._tasks.pop(stale_tid, None)
+        except OSError:
+            self._unflushed_scans.pop(scan_task.id, None)
+            self._unflushed_scans[scan_task.id] = scan_task
+            self._persisted_scans.pop(scan_task.id, None)
+            self._persisted_scans[scan_task.id] = scan_task
+            while len(self._persisted_scans) > MAX_PERSISTED_SCANS:
+                self._persisted_scans.popitem(last=False)
 
     # ------------------------------------------------------------------ registry
     def _register(self, task: Task) -> None:
         with self._lock:
+            self._ensure_hydrated_unlocked()
             while len(self._tasks) >= self.max_tasks:
                 victim = next((tid for tid, t in self._tasks.items() if t.terminal), next(iter(self._tasks)))
                 self._tasks.pop(victim)
@@ -109,16 +295,33 @@ class TaskManager:
 
     def get(self, task_id: str) -> Task | None:
         with self._lock:
-            return self._tasks.get(task_id)
+            self._ensure_hydrated_unlocked()
+            if task_id in self._persisted_scans:
+                return self._persisted_scans[task_id]
+            t = self._tasks.get(task_id)
+            if t is not None and t.kind == "scan" and t.status == "completed":
+                return None
+            return t
 
     def detail(self, task_id: str) -> dict[str, Any] | None:
         with self._lock:
-            task = self._tasks.get(task_id)
+            self._ensure_hydrated_unlocked()
+            task = self.get(task_id)
             return task.detail() if task is not None else None
 
     def list(self) -> list[dict[str, Any]]:
         with self._lock:
-            return [t.summary() for t in reversed(self._tasks.values())]
+            self._ensure_hydrated_unlocked()
+            combined: list[Task] = list(self._persisted_scans.values())
+            for tid, t in self._tasks.items():
+                if t.kind == "scan" and t.status == "completed":
+                    continue
+                combined.append(t)
+            combined.sort(
+                key=lambda item: (item.finished_ns, str(item.finished_at or item.created_at or ""), item.id),
+                reverse=True,
+            )
+            return [t.summary() for t in combined]
 
     # ------------------------------------------------------------------ events
     def _emit(self, task: Task, etype: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -200,7 +403,10 @@ class TaskManager:
             task.status = "completed"
             task.result = sanitize(result)
             task.finished_at = utc_iso()
+            task.finished_ns = time.time_ns()
             self._emit(task, "done", {"result": result})
+            if task.kind == "scan":
+                self._record_completed_scan_unlocked(task)
 
 
 # ---------------------------------------------------------------------- runners
@@ -231,6 +437,7 @@ def run_scan(params: dict[str, Any], emit: Emit) -> dict[str, Any]:
 
 def run_research_refresh(params: dict[str, Any], emit: Emit) -> dict[str, Any]:
     symbol = params["symbol"]
+    market = params.get("market")
     include_macro = bool(params.get("include_macro", True))
     total = 3
     emit("progress", {"done": 0, "total": total})
@@ -247,11 +454,12 @@ def run_research_refresh(params: dict[str, Any], emit: Emit) -> dict[str, Any]:
 
     emit("step", {"message": "loading research archive", "stage": "archive"})
     try:
-        loaded = research_archive.load_archive(symbol, evidence_limit=0)
+        loaded = research_archive.load_archive(symbol, market_override=market, evidence_limit=0)
     except FileNotFoundError:
         emit("progress", {"done": total, "total": total})
         return {
             "symbol": symbol,
+            "market": market,
             "archive_exists": False,
             "sources_status": bundle.get("sources_status"),
             "triggers": [],
@@ -269,6 +477,7 @@ def run_research_refresh(params: dict[str, Any], emit: Emit) -> dict[str, Any]:
     emit("progress", {"done": total, "total": total})
     return {
         "symbol": loaded.get("symbol", symbol),
+        "market": loaded.get("market"),
         "archive_exists": True,
         "revision": state.get("revision"),
         "status": state.get("status"),

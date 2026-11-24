@@ -1,12 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertOctagon,
   AlertTriangle,
+  ArrowLeftRight,
   ArrowUpRight,
   BookOpen,
   CalendarClock,
-  CheckCircle2,
   Crosshair,
+  History,
   PlusCircle,
   RefreshCw,
   Scissors,
@@ -20,19 +20,43 @@ import {
   ClosePositionDialog,
   InitPortfolioDialog,
   OpenPositionDialog,
+  RotatePositionDialog,
   TrailStopDialog,
   TrimPositionDialog,
 } from "../components/portfolio/PortfolioDialogs";
-import { DirectionBadge, SentinelStatusBadge, StatusBadge } from "../components/ui/StatusBadge";
-import { fmtMoney, fmtPct, fmtPrice, shortTime } from "../lib/format";
-import { formatSymbolWithCode, getSymbolName } from "../lib/symbols";
+import {
+  DirectionBadge,
+  SentinelStatusBadge,
+  signedToneClass,
+  StatusBadge,
+} from "../components/ui/StatusBadge";
+import { SymbolLabel } from "../components/ui/SymbolLabel";
+import { fmtMoney, fmtPct, fmtPrice, shortTime, toNum } from "../lib/format";
+import { getSymbolName } from "../lib/symbols";
+
+const JOURNAL_ACTION_ZH: Record<string, string> = {
+  init_account: "初始化账本",
+  open_position: "建仓入账",
+  trail_stop: "收紧保护止损",
+  trim_position: "分批减仓",
+  close_position: "清仓了结",
+  rotate_leader: "原子龙头换仓",
+  leader_rotation: "原子龙头换仓",
+};
 
 interface SentinelViewProps {
+  workspaceRev?: number;
+  onPortfolioMutated?: () => void;
   onJumpWarRoom: (symbol: string) => void;
   onJumpArchive: (symbol: string, market?: string | null) => void;
 }
 
-export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps) {
+export function SentinelView({
+  workspaceRev = 0,
+  onPortfolioMutated,
+  onJumpWarRoom,
+  onJumpArchive,
+}: SentinelViewProps) {
   const [portfolio, setPortfolio] = useState<PortfolioSummaryResponse | null>(null);
   const [sentinel, setSentinel] = useState<SentinelResponse | null>(null);
   const [includeWatchlist, setIncludeWatchlist] = useState(false);
@@ -51,19 +75,31 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
     rationale?: string;
   } | null>(null);
   const [trimTarget, setTrimTarget] = useState<{ position: Position; lastPrice?: number | null } | null>(null);
+  const [rotateTarget, setRotateTarget] = useState<{ position: Position; lastPrice?: number | null } | null>(null);
   const [closeTarget, setCloseTarget] = useState<{
     position: Position;
     lastPrice?: number | null;
     reason?: string;
   } | null>(null);
 
+  const loadAbortRef = useRef<AbortController | null>(null);
+  const loadReqIdRef = useRef(0);
+  const forceNextRefreshRef = useRef(false);
+
   const loadAll = useCallback(
-    async (forceRefresh = false, signal?: AbortSignal) => {
+    async (forceRefresh = false) => {
+      if (loadAbortRef.current) {
+        loadAbortRef.current.abort();
+      }
+      const ctrl = new AbortController();
+      loadAbortRef.current = ctrl;
+      const reqId = ++loadReqIdRef.current;
+
       setLoading(true);
       setError(null);
       try {
         const [pf, sn] = await Promise.all([
-          api.portfolioSummary(signal),
+          api.portfolioSummary(ctrl.signal),
           api.sentinel(
             {
               include_watchlist: includeWatchlist,
@@ -71,26 +107,50 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
               event_window_days: 14,
               refresh: forceRefresh,
             },
-            signal,
+            ctrl.signal,
           ),
         ]);
+        if (ctrl.signal.aborted || reqId !== loadReqIdRef.current) return;
         setPortfolio(pf);
         setSentinel(sn);
       } catch (ex) {
-        if (ex instanceof DOMException && ex.name === "AbortError") return;
+        if (
+          ctrl.signal.aborted ||
+          (ex instanceof DOMException && ex.name === "AbortError") ||
+          reqId !== loadReqIdRef.current
+        ) {
+          return;
+        }
         setError(errorMessage(ex));
       } finally {
-        if (!signal?.aborted) setLoading(false);
+        if (reqId === loadReqIdRef.current) {
+          if (loadAbortRef.current === ctrl) {
+            loadAbortRef.current = null;
+          }
+          setLoading(false);
+        }
       }
     },
     [includeWatchlist],
   );
 
   useEffect(() => {
-    const ctrl = new AbortController();
-    void loadAll(false, ctrl.signal);
-    return () => ctrl.abort();
-  }, [loadAll]);
+    const shouldForce = forceNextRefreshRef.current;
+    forceNextRefreshRef.current = false;
+    void loadAll(shouldForce);
+    return () => {
+      loadAbortRef.current?.abort();
+    };
+  }, [loadAll, workspaceRev]);
+
+  const handleMutationSuccess = useCallback(() => {
+    if (onPortfolioMutated) {
+      forceNextRefreshRef.current = true;
+      onPortfolioMutated();
+    } else {
+      void loadAll(true);
+    }
+  }, [loadAll, onPortfolioMutated]);
 
   const summary = portfolio?.summary;
   const openPositionsById = useMemo(() => {
@@ -120,7 +180,6 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
     return openPositionsBySym.get(h.symbol.toUpperCase()) ?? null;
   };
 
-  /* Aggregate 14-day upcoming events across holdings + watchlist */
   const allUpcomingEvents = useMemo<(UpcomingEvent & { symbol: string })[]>(() => {
     const out: (UpcomingEvent & { symbol: string })[] = [];
     for (const h of sentinel?.holdings ?? []) {
@@ -140,14 +199,19 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
   const sectorEntries = Object.entries(summary?.sector_slots ?? {});
   const macroEntries = Object.entries(summary?.macro_factor_concentration ?? {});
 
+  const riskUtilPct = useMemo(() => {
+    if (!summary || !summary.max_total_open_risk_cap || summary.max_total_open_risk_cap <= 0) return 0;
+    return Math.min(100, Math.max(0, (summary.total_open_risk_amount / summary.max_total_open_risk_cap) * 100));
+  }, [summary]);
+
   return (
     <div className="flex flex-col gap-4">
-      {/* Top Action & Refresh Header */}
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      {/* Compact Precision Header */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="m-0 text-base font-semibold text-ink">今日哨兵与持仓总控台</h2>
-          <p className="m-0 text-xs text-muted">
-            每日双轨必检（30min/日线缠论防线 + 核心高频触发器 + 14 天事件/移仓窗口）· 逻辑松动果断撤离
+          <h1 className="heading-page m-0 text-lg text-ink md:text-xl">哨兵总控与持仓纪律台</h1>
+          <p className="m-0 mt-0.5 text-xs text-muted">
+            每日巡检 30min/日线防线、核心触发器与 14 天事件窗口
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -157,11 +221,11 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
             aria-pressed={includeWatchlist}
             onClick={() => setIncludeWatchlist((v) => !v)}
           >
-            <span>附加观察池轻量刷新</span>
+            <span>巡检观察池</span>
           </button>
           {portfolio?.initialized ? (
-            <button type="button" className="btn" onClick={() => setOpenPosModal(true)}>
-              <PlusCircle className="h-3.5 w-3.5 text-slot1" aria-hidden="true" />
+            <button type="button" className="btn btn-primary" onClick={() => setOpenPosModal(true)}>
+              <PlusCircle className="h-3.5 w-3.5" aria-hidden="true" />
               <span>新增持仓</span>
             </button>
           ) : null}
@@ -173,82 +237,110 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
       </div>
 
       {error ? (
-        <div role="alert" className="card border-critical/50 bg-critical/10 px-4 py-3 text-xs text-ink">
+        <div role="alert" className="card border-critical/50 bg-critical/10 px-4 py-2.5 text-xs text-ink">
           <strong>哨兵总控加载异常：</strong> {error}
         </div>
       ) : null}
 
-      {/* Top KPI Strip */}
-      <section className="grid grid-cols-2 gap-3 lg:grid-cols-4" aria-label="账户风险预算与哨兵统计指标">
-        <div className="card p-3.5">
-          <div className="section-title">账户净值 & 回撤降仓档</div>
-          <div className="kpi-value mt-1.5 text-ink">
+      {/* Unified Hairline KPI Summary Bar (replaces 4 separate boxes + pill soup) */}
+      <section
+        className="card grid grid-cols-1 divide-y divide-hairline sm:grid-cols-2 sm:divide-y-0 lg:grid-cols-4 lg:divide-x"
+        aria-label="账户风险预算与哨兵统计指标"
+      >
+        <div className="flex flex-col justify-between p-4">
+          <div className="flex items-center justify-between gap-2">
+            <span className="section-title">账户净值 & 风险缩放</span>
+            {summary ? (
+              <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.2 font-mono text-[10px] text-muted">
+                {summary.base_currency}
+              </span>
+            ) : null}
+          </div>
+          <div className="kpi-value mt-2 text-ink">
             {summary ? fmtMoney(summary.equity, summary.base_currency) : "未初始化"}
           </div>
-          <div className="tnum mt-1 text-xs text-muted">
+          <div className="tnum mt-2 text-[11.5px] text-muted">
             {summary
-              ? `回撤 ${fmtPct(summary.drawdown_pct, 2)} · 风险缩放 ${fmtPct(summary.risk_scale * 100, 0)}`
-              : "初始化后启用风险预算算仓"}
+              ? `回撤 ${fmtPct(summary.drawdown_pct, 2)} · 仓位档 ${fmtPct(summary.risk_scale * 100, 0)}`
+              : "初始化后启用风险预算"}
           </div>
         </div>
 
-        <div className="card p-3.5">
-          <div className="section-title">总敞口风险 vs 上限</div>
-          <div className="kpi-value mt-1.5 text-ink">
+        <div className="flex flex-col justify-between p-4">
+          <div className="flex items-center justify-between gap-2">
+            <span className="section-title">总敞口风险占用</span>
+            {summary ? <span className="font-mono text-[11px] text-muted">{fmtPct(riskUtilPct, 0)}</span> : null}
+          </div>
+          <div className="kpi-value mt-2 text-ink">
             {summary ? fmtPct(summary.total_open_risk_pct, 2) : "—"}
           </div>
-          <div className="tnum mt-1 text-xs text-muted">
-            {summary
-              ? `${fmtMoney(summary.total_open_risk_amount, summary.base_currency)} / 上限 ${fmtMoney(summary.max_total_open_risk_cap, summary.base_currency)}`
-              : "单笔越过保本自动释放风险额"}
+          <div className="mt-2 space-y-1.5">
+            {summary ? (
+              <div className="risk-meter" aria-hidden="true">
+                <span style={{ inlineSize: `${riskUtilPct}%` }} />
+              </div>
+            ) : null}
+            <div className="tnum text-[11.5px] text-muted">
+              {summary
+                ? `${fmtMoney(summary.total_open_risk_amount, summary.base_currency)} / 上限 ${fmtMoney(summary.max_total_open_risk_cap, summary.base_currency)}`
+                : "过保本自动释放风险额"}
+            </div>
           </div>
         </div>
 
-        <div className="card p-3.5">
+        <div className="flex flex-col justify-between p-4">
           <div className="section-title">单板块龙头风险上限</div>
-          <div className="kpi-value mt-1.5 text-ink">
+          <div className="kpi-value mt-2 text-ink">
             {summary ? fmtMoney(summary.single_sector_risk_cap, summary.base_currency) : "—"}
           </div>
-          <div className="tnum mt-1 text-xs text-muted">
+          <div className="tnum mt-2 text-[11.5px] text-muted">
             {summary
-              ? `在途 ${summary.open_positions_count} 笔 · 已占用 ${sectorEntries.length} 个主驱动板块`
-              : "单一板块只允许 1 只真龙头（或双寡头共享）"}
+              ? `在途 ${summary.open_positions_count} 笔 · 占用 ${sectorEntries.length} 个主驱动板块`
+              : "每板块限 1 只真龙头"}
           </div>
         </div>
 
-        <div className="card p-3.5">
+        <div className="flex flex-col justify-between p-4">
           <div className="section-title">今日红 / 黄 / 绿哨兵计数</div>
-          <div className="tnum mt-2 flex flex-wrap items-center gap-1.5">
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-[color:color-mix(in_srgb,var(--critical)_48%,transparent)] bg-[color:color-mix(in_srgb,var(--critical)_15%,transparent)] px-2.5 py-0.5 text-xs font-medium text-ink whitespace-nowrap">
-              <AlertOctagon className="h-3.5 w-3.5 shrink-0 text-critical" aria-hidden="true" />
-              <span>撤离 {sentinel?.summary?.red_count ?? 0}</span>
-            </span>
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-[color:color-mix(in_srgb,var(--warning)_45%,transparent)] bg-[color:color-mix(in_srgb,var(--warning)_14%,transparent)] px-2.5 py-0.5 text-xs font-medium text-ink whitespace-nowrap">
-              <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
-              <span>警戒 {sentinel?.summary?.yellow_count ?? 0}</span>
-            </span>
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-[color:color-mix(in_srgb,var(--good)_42%,transparent)] bg-[color:color-mix(in_srgb,var(--good)_13%,transparent)] px-2.5 py-0.5 text-xs font-medium text-ink whitespace-nowrap">
-              <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-good" aria-hidden="true" />
-              <span>持有 {sentinel?.summary?.green_count ?? 0}</span>
-            </span>
+          <div className="mt-2 grid grid-cols-3 gap-2">
+            <div>
+              <div className="kpi-value text-critical">{sentinel?.summary?.red_count ?? 0}</div>
+              <div className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-muted">
+                <span className="h-1.5 w-1.5 rounded-full bg-critical" aria-hidden="true" />
+                <span>撤离</span>
+              </div>
+            </div>
+            <div>
+              <div className="kpi-value text-warning">{sentinel?.summary?.yellow_count ?? 0}</div>
+              <div className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-muted">
+                <span className="h-1.5 w-1.5 rounded-full bg-warning" aria-hidden="true" />
+                <span>警戒</span>
+              </div>
+            </div>
+            <div>
+              <div className="kpi-value text-bull">{sentinel?.summary?.green_count ?? 0}</div>
+              <div className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-muted">
+                <span className="h-1.5 w-1.5 rounded-full bg-bull" aria-hidden="true" />
+                <span>持有</span>
+              </div>
+            </div>
           </div>
-          <div className="tnum mt-1.5 text-xs text-muted">
-            {sentinel?.checked_at_utc ? `最近巡检：${shortTime(sentinel.checked_at_utc)} UTC` : "等待巡检结果…"}
+          <div className="tnum mt-1.5 font-mono text-[11px] text-muted">
+            {sentinel?.checked_at_utc ? `巡检 ${shortTime(sentinel.checked_at_utc)} UTC` : "等待巡检…"}
           </div>
         </div>
       </section>
 
       {/* Uninitialized Portfolio Onboarding Card */}
       {portfolio && !portfolio.initialized ? (
-        <section className="card flex flex-wrap items-center justify-between gap-4 border-slot1/40 bg-elevated/50 p-4">
+        <section className="callout-editorial flex flex-wrap items-center justify-between gap-4 p-4">
           <div className="max-w-2xl">
             <div className="flex items-center gap-2 text-sm font-semibold text-ink">
-              <Shield className="h-4 w-4 text-slot1" aria-hidden="true" />
+              <Shield className="h-4 w-4 text-accent" aria-hidden="true" />
               <span>尚未初始化本地持仓账本（portfolio/）</span>
             </div>
-            <p className="m-0 mt-1 text-xs text-ink-2">
-              初始化后即可启用单一板块龙头独占风控、保本自动释放风险预算、移动止损只紧不松与跨板块宏大因子叠加预警。下方仍会正常巡检研究档案中标记为{" "}
-              <code>holding</code> 的持仓标的。
+            <p className="m-0 mt-1 text-xs leading-relaxed text-ink-2">
+              初始化后即可启用单一板块龙头独占风控、原子换仓、保本自动释放风险预算与宏大因子叠加监控。
             </p>
           </div>
           <button type="button" className="btn btn-primary" onClick={() => setInitOpen(true)}>
@@ -261,7 +353,7 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
       <section className="flex flex-col gap-2.5" aria-label="红黄绿持仓哨兵矩阵">
         <div className="flex items-center justify-between">
           <span className="section-title">
-            持仓每日必检矩阵（共 {sentinel?.holdings?.length ?? 0} 笔在途监控）
+            在途持仓每日必检矩阵（{sentinel?.holdings?.length ?? 0} 笔）
           </span>
           {sentinel?.discovery_errors && sentinel.discovery_errors.length > 0 ? (
             <span className="text-xs text-warning">发现提示：{sentinel.discovery_errors.join("；")}</span>
@@ -270,7 +362,7 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
 
         {(sentinel?.holdings?.length ?? 0) === 0 ? (
           <div className="card p-6 text-center text-xs text-muted">
-            当前暂无 <code>holding</code> 状态的持仓标的。可在「双周期战情室」完成四象限算仓后录入持仓，或在上方点击「新增持仓」。
+            暂无 <code>holding</code> 持仓标的。可在「缠论战情室」完成四象限算仓后录入持仓，或点击右上角「新增持仓」。
           </div>
         ) : (
           <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
@@ -278,23 +370,25 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
               const pos = findPosition(h);
               const sug = h.suggested_trail_stop;
               const canTrail = Boolean(pos && sug?.suggested_stop != null);
+              const edgeCls =
+                h.status === "RED_EXIT"
+                  ? "border-l-[3px] border-l-critical"
+                  : h.status === "YELLOW_LOOSENING"
+                    ? "border-l-[3px] border-l-warning"
+                    : "border-l-[3px] border-l-bull";
+
               return (
-                <article key={`${h.symbol}-${h.position_id ?? "arch"}`} className="card flex flex-col gap-3 p-4">
+                <article
+                  key={`${h.symbol}-${h.position_id ?? "arch"}`}
+                  className={`card flex flex-col gap-3 p-4 ${edgeCls}`}
+                >
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
-                        {(() => {
-                          const zh = h.name || getSymbolName(h.symbol);
-                          return (
-                            <>
-                              <span className="text-base font-semibold text-ink">{zh || h.symbol}</span>
-                              {zh ? <span className="font-mono text-xs text-muted">{h.symbol}</span> : null}
-                            </>
-                          );
-                        })()}
+                        <SymbolLabel symbol={h.symbol} name={h.name} />
                         <DirectionBadge direction={h.direction} />
                         {h.sector_theme ? (
-                          <span className="rounded border border-hairline bg-elevated px-2 py-0.5 text-[11px] text-ink-2">
+                          <span className="rounded border border-hairline-soft bg-sunken px-2 py-0.5 text-[11px] text-ink-2">
                             {h.sector_theme}
                           </span>
                         ) : null}
@@ -306,27 +400,29 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
                     <SentinelStatusBadge status={h.status} labelZh={h.status_zh} />
                   </div>
 
-                  {/* Price vs Defense Stops Strip */}
-                  <div className="tnum grid grid-cols-2 gap-2 rounded-lg border border-hairline bg-page/60 p-2.5 text-xs sm:grid-cols-5">
-                    <div>
-                      <div className="text-muted">最新价</div>
-                      <div className="mt-0.5 font-semibold text-ink">{fmtPrice(h.last_price)}</div>
+                  {/* Clean Hairline Metric Strip (replaces nested box) */}
+                  <div className="metric-strip grid-cols-2 sm:grid-cols-5">
+                    <div className="metric-cell">
+                      <span className="metric-label">最新价</span>
+                      <span className="metric-val">{fmtPrice(h.last_price)}</span>
                     </div>
-                    <div>
-                      <div className="text-muted">入场均价</div>
-                      <div className="mt-0.5 font-medium text-ink-2">{fmtPrice(h.entry_price)}</div>
+                    <div className="metric-cell">
+                      <span className="metric-label">入场均价</span>
+                      <span className="metric-val text-ink-2">{fmtPrice(h.entry_price)}</span>
                     </div>
-                    <div>
-                      <div className="text-muted">浮动盈亏</div>
-                      <div className="mt-0.5 font-semibold text-ink">{fmtPct(h.unrealized_pnl_pct, 2, true)}</div>
+                    <div className="metric-cell">
+                      <span className="metric-label">浮动盈亏</span>
+                      <span className={`metric-val ${signedToneClass(h.unrealized_pnl_pct)}`}>
+                        {fmtPct(h.unrealized_pnl_pct, 2, true)}
+                      </span>
                     </div>
-                    <div>
-                      <div className="text-muted">30m 战术止损</div>
-                      <div className="mt-0.5 font-semibold text-critical">{fmtPrice(h.tactical_stop_30m)}</div>
+                    <div className="metric-cell">
+                      <span className="metric-label">30m 战术止损</span>
+                      <span className="metric-val text-bear">{fmtPrice(h.tactical_stop_30m)}</span>
                     </div>
-                    <div>
-                      <div className="text-muted">日线结构防线</div>
-                      <div className="mt-0.5 font-medium text-serious">{fmtPrice(h.structural_stop_daily)}</div>
+                    <div className="metric-cell">
+                      <span className="metric-label">日线结构位</span>
+                      <span className="metric-val text-ink-2">{fmtPrice(h.structural_stop_daily)}</span>
                     </div>
                   </div>
 
@@ -345,14 +441,14 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
                       {h.yellow_alerts.map((a, i) => (
                         <div
                           key={`y-${i}`}
-                          className="flex items-start gap-1.5 rounded border border-warning/45 bg-warning/10 px-2.5 py-1.5 text-ink"
+                          className="flex items-start gap-1.5 rounded border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-ink"
                         >
                           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
                           <span>{a.message || a.detail || a.code}</span>
                         </div>
                       ))}
                       {h.info_notes.slice(0, 2).map((n, i) => (
-                        <div key={`i-${i}`} className="text-[11.5px] text-muted">
+                        <div key={`i-${i}`} className="text-[11px] text-muted">
                           • {n}
                         </div>
                       ))}
@@ -361,10 +457,10 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
 
                   {/* Suggested Trailing Stop Banner */}
                   {sug?.suggested_stop != null ? (
-                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-good/40 bg-good/10 px-3 py-2 text-xs text-ink">
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-bull/35 bg-bull/10 px-3 py-2 text-xs text-ink">
                       <span>
                         <strong>浮盈推保护建议：</strong>将 30m 止损收紧至{" "}
-                        <strong className="tnum">{fmtPrice(sug.suggested_stop)}</strong>
+                        <strong className="font-mono">{fmtPrice(sug.suggested_stop)}</strong>
                         {sug.rationale ? `（${sug.rationale}）` : ""}
                       </span>
                       {canTrail && pos ? (
@@ -390,14 +486,14 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
                   ) : null}
 
                   {/* Actions Footer */}
-                  <div className="mt-auto flex flex-wrap items-center justify-between gap-2 border-t border-hairline pt-2.5">
+                  <div className="mt-auto flex flex-wrap items-center justify-between gap-2 pt-1">
                     <div className="flex flex-wrap items-center gap-1.5">
                       <button type="button" className="btn btn-sm" onClick={() => onJumpWarRoom(h.symbol)}>
-                        <Crosshair className="h-3.5 w-3.5 text-slot1" aria-hidden="true" />
-                        <span>双周期战情室</span>
+                        <Crosshair className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
+                        <span>战情室</span>
                       </button>
                       <button type="button" className="btn btn-sm" onClick={() => onJumpArchive(h.symbol, h.market)}>
-                        <BookOpen className="h-3.5 w-3.5 text-slot3" aria-hidden="true" />
+                        <BookOpen className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
                         <span>研究档案</span>
                       </button>
                     </div>
@@ -424,8 +520,17 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
                           className="btn btn-sm"
                           onClick={() => setTrimTarget({ position: pos, lastPrice: h.last_price })}
                         >
-                          <Scissors className="h-3 w-3" aria-hidden="true" />
+                          <Scissors className="h-3 w-3 text-muted" aria-hidden="true" />
                           <span>减仓</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          title="原龙头掉队时原子切换至同板块新龙头"
+                          onClick={() => setRotateTarget({ position: pos, lastPrice: h.last_price })}
+                        >
+                          <ArrowLeftRight className="h-3 w-3 text-muted" aria-hidden="true" />
+                          <span>换龙头</span>
                         </button>
                         <button
                           type="button"
@@ -496,17 +601,21 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
                         <th scope="row">{theme}</th>
                         <td data-label="在途龙头标的">
                           <div className="flex flex-wrap gap-1">
-                            {slot.symbols.map((sym) => (
-                              <button
-                                key={sym}
-                                type="button"
-                                className="chip"
-                                onClick={() => onJumpWarRoom(sym)}
-                              >
-                                <span>{sym}</span>
-                                <ArrowUpRight className="h-3 w-3" aria-hidden="true" />
-                              </button>
-                            ))}
+                            {slot.symbols.map((sym) => {
+                              const zh = getSymbolName(sym);
+                              return (
+                                <button
+                                  key={sym}
+                                  type="button"
+                                  className="chip"
+                                  onClick={() => onJumpWarRoom(sym)}
+                                >
+                                  <span>{zh || sym}</span>
+                                  {zh ? <span className="font-mono text-[10.5px] text-muted">{sym}</span> : null}
+                                  <ArrowUpRight className="h-3 w-3 text-muted" aria-hidden="true" />
+                                </button>
+                              );
+                            })}
                           </div>
                         </td>
                         <td data-label="席位角色">
@@ -546,7 +655,7 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
         {/* 14-Day Events & Rollover Timeline */}
         <section className="flex flex-col gap-2.5 xl:col-span-5" aria-label="未来 14 天事件与移仓窗口">
           <span className="section-title inline-flex items-center gap-1.5">
-            <CalendarClock className="h-3.5 w-3.5 text-slot4" aria-hidden="true" />
+            <CalendarClock className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
             未来 14 天财报 / 议息 / 主力移仓展期窗口
           </span>
           <div className="card divide-y divide-hairline">
@@ -558,18 +667,18 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
               allUpcomingEvents.map((ev, idx) => (
                 <div key={`${ev.symbol}-${ev.date}-${idx}`} className="flex items-center justify-between gap-3 px-3.5 py-2.5 text-xs">
                   <div className="min-w-0">
-                    <div className="flex items-center gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
-                        className="font-semibold text-slot1 hover:underline"
+                        className="cursor-pointer border-0 bg-transparent p-0 text-left hover:underline"
                         onClick={() => onJumpWarRoom(ev.symbol)}
                       >
-                        {formatSymbolWithCode(ev.symbol)}
+                        <SymbolLabel symbol={ev.symbol} size="sm" />
                       </button>
                       <span className="truncate text-ink">{ev.title}</span>
                     </div>
-                    <div className="tnum mt-0.5 text-[11px] text-muted">
-                      日期：{ev.date} {ev.source ? `· 来源：${ev.source}` : ""}
+                    <div className="tnum mt-0.5 font-mono text-[11px] text-muted">
+                      {ev.date} {ev.source ? `· ${ev.source}` : ""}
                     </div>
                   </div>
                   <StatusBadge
@@ -581,27 +690,21 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
             )}
           </div>
 
-          {/* Watchlist Light Refresh Section when enabled */}
           {includeWatchlist && (sentinel?.watchlist?.length ?? 0) > 0 ? (
             <div className="card p-3.5">
               <div className="mb-2 text-xs font-semibold text-ink">
                 观察池轻量刷新（共 {sentinel?.watchlist.length} 只 · 触发 {sentinel?.summary.watchlist_fired_count ?? 0} 只）
               </div>
-              <div className="space-y-1.5">
+              <div className="divide-y divide-hairline-soft">
                 {sentinel?.watchlist.map((w) => (
-                  <div key={w.symbol} className="flex items-center justify-between gap-2 text-xs">
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        className="font-semibold text-slot1 hover:underline"
-                        onClick={() => onJumpWarRoom(w.symbol)}
-                      >
-                        {w.name || getSymbolName(w.symbol) || w.symbol}
-                      </button>
-                      <span className="font-mono text-[11px] text-muted">
-                        {w.name || getSymbolName(w.symbol) ? w.symbol : w.market}
-                      </span>
-                    </div>
+                  <div key={w.symbol} className="flex items-center justify-between gap-2 py-1.5 text-xs first:pt-0 last:pb-0">
+                    <button
+                      type="button"
+                      className="cursor-pointer border-0 bg-transparent p-0 text-left hover:underline"
+                      onClick={() => onJumpWarRoom(w.symbol)}
+                    >
+                      <SymbolLabel symbol={w.symbol} name={w.name} size="sm" />
+                    </button>
                     <StatusBadge
                       tone={(w.fired_triggers?.length ?? 0) > 0 ? "warning" : "neutral"}
                       label={
@@ -618,18 +721,153 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
         </section>
       </div>
 
+      {/* Recent Ledger Audit & Closed Trade Post-Mortem Journal */}
+      {portfolio?.initialized ? (
+        <section className="flex flex-col gap-2.5" aria-label="交易审计与平仓复盘流水">
+          {(() => {
+            const totalJournal = (portfolio.journal ?? []).length;
+            const visibleJournal = [...(portfolio.journal ?? [])].reverse().slice(0, 20);
+            return (
+              <>
+                <div className="flex items-center justify-between">
+                  <span className="section-title inline-flex items-center gap-1.5">
+                    <History className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
+                    交易审计与平仓复盘流水（显示 {visibleJournal.length} / {totalJournal} 条）
+                  </span>
+                  {summary ? (
+                    <span className="font-mono text-[11px] text-muted">
+                      累计了结 {summary.closed_positions_count} 笔
+                    </span>
+                  ) : null}
+                </div>
+
+                <div tabIndex={0} role="region" aria-label="持仓账本历史事务与复盘记录表" className="table-wrapper max-h-64">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">时间 (UTC)</th>
+                        <th scope="col">事务动作</th>
+                        <th scope="col">标的</th>
+                        <th scope="col" className="num">
+                          成交价 / 止损位
+                        </th>
+                        <th scope="col" className="num">
+                          结算盈亏
+                        </th>
+                        <th scope="col">复盘归因与依据</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {visibleJournal.length === 0 ? (
+                        <tr>
+                          <th scope="row">—</th>
+                          <td data-label="事务动作">尚无交易流水</td>
+                          <td data-label="标的">—</td>
+                          <td data-label="成交价 / 止损位" className="num">
+                            —
+                          </td>
+                          <td data-label="结算盈亏" className="num">
+                            —
+                          </td>
+                          <td data-label="复盘归因与依据">建仓、推保护止损、换龙头与平仓归因将自动按序沉淀于此</td>
+                        </tr>
+                      ) : (
+                        visibleJournal.map((j, idx) => {
+                          const rawAct = String(j.action || j.event || "record");
+                          const leg = typeof j.leg === "string" ? j.leg : "";
+                          const legSuffix =
+                            leg === "close_old_leader"
+                              ? " · 平原龙头"
+                              : leg === "open_new_leader"
+                                ? " · 开新龙头"
+                                : "";
+                          const sym =
+                            typeof j.symbol === "string"
+                              ? j.symbol
+                              : typeof j.old_symbol === "string"
+                                ? `${j.old_symbol}→${String(j.new_symbol || "")}`
+                                : "";
+                          const px = toNum(
+                            j.price ?? j.exit_price ?? j.trim_price ?? j.entry_price ?? j.new_stop_30m ?? j.stop_30m,
+                          );
+                          const stop30 = toNum(j.stop_30m ?? j.new_stop_30m);
+                          const pnl = toNum(j.realized_pnl_account ?? j.realized_pnl);
+                          const noteText = String(
+                            j.exit_reason ??
+                              j.reason ??
+                              j.notes ??
+                              (rawAct === "init_account"
+                                ? `初始净值 ${fmtMoney(j.equity, String(j.base_currency || summary?.base_currency || ""))}`
+                                : "—"),
+                          );
+                          return (
+                            <tr key={`${j.timestamp_utc || idx}-${idx}`}>
+                              <th scope="row" className="font-mono text-xs font-normal text-muted">
+                                {shortTime(String(j.timestamp_utc || j.ts_utc || j.at_utc || ""))}
+                              </th>
+                              <td data-label="事务动作">
+                                <StatusBadge
+                                  tone={
+                                    rawAct.includes("close") || leg === "close_old_leader"
+                                      ? "serious"
+                                      : rawAct.includes("open") || rawAct.includes("rotate")
+                                        ? "info"
+                                        : rawAct.includes("trail")
+                                          ? "good"
+                                          : "neutral"
+                                  }
+                                  label={`${JOURNAL_ACTION_ZH[rawAct] || rawAct}${legSuffix}`}
+                                />
+                              </td>
+                              <td data-label="标的">
+                                {sym && !sym.includes("→") ? (
+                                  <SymbolLabel symbol={sym} size="sm" />
+                                ) : (
+                                  <span className="font-mono text-xs">{sym || "—"}</span>
+                                )}
+                              </td>
+                              <td data-label="成交价 / 止损位" className="num">
+                                {px !== null ? fmtPrice(px) : "—"}
+                                {stop30 !== null && px !== null && stop30 !== px ? (
+                                  <span className="ml-1 text-bear">/ 止 {fmtPrice(stop30)}</span>
+                                ) : null}
+                              </td>
+                              <td
+                                data-label="结算盈亏"
+                                className={`num font-semibold ${pnl !== null ? signedToneClass(pnl) : "text-muted"}`}
+                              >
+                                {pnl !== null
+                                  ? `${pnl > 0 ? "+" : ""}${fmtMoney(pnl, summary?.base_currency)}`
+                                  : "—"}
+                              </td>
+                              <td data-label="复盘归因与依据" className="text-ink-2">
+                                {noteText}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            );
+          })()}
+        </section>
+      ) : null}
+
       {/* Native <dialog> Modals */}
-      <InitPortfolioDialog open={initOpen} onClose={() => setInitOpen(false)} onSuccess={() => void loadAll(true)} />
+      <InitPortfolioDialog open={initOpen} onClose={() => setInitOpen(false)} onSuccess={handleMutationSuccess} />
       <OpenPositionDialog
         open={openPosModal}
         onClose={() => setOpenPosModal(false)}
-        onSuccess={() => void loadAll(true)}
+        onSuccess={handleMutationSuccess}
         accountCurrency={summary?.base_currency}
       />
       <TrailStopDialog
         open={trailTarget !== null}
         onClose={() => setTrailTarget(null)}
-        onSuccess={() => void loadAll(true)}
+        onSuccess={handleMutationSuccess}
         positionId={trailTarget?.positionId ?? ""}
         symbol={trailTarget?.symbol ?? ""}
         currentStop30m={trailTarget?.currentStop}
@@ -640,14 +878,22 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
       <TrimPositionDialog
         open={trimTarget !== null}
         onClose={() => setTrimTarget(null)}
-        onSuccess={() => void loadAll(true)}
+        onSuccess={handleMutationSuccess}
         position={trimTarget?.position ?? null}
         lastPrice={trimTarget?.lastPrice}
+      />
+      <RotatePositionDialog
+        open={rotateTarget !== null}
+        onClose={() => setRotateTarget(null)}
+        onSuccess={handleMutationSuccess}
+        position={rotateTarget?.position ?? null}
+        lastPrice={rotateTarget?.lastPrice}
+        accountCurrency={summary?.base_currency}
       />
       <ClosePositionDialog
         open={closeTarget !== null}
         onClose={() => setCloseTarget(null)}
-        onSuccess={() => void loadAll(true)}
+        onSuccess={handleMutationSuccess}
         position={closeTarget?.position ?? null}
         lastPrice={closeTarget?.lastPrice}
         defaultReason={closeTarget?.reason}

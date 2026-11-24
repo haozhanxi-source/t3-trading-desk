@@ -159,6 +159,33 @@ export interface CloseBody {
   exit_category?: string;
 }
 
+export interface RotateNewPositionBody {
+  symbol: string;
+  direction: Direction;
+  sector_theme: string;
+  entry_price: number;
+  tactical_stop_30m: number;
+  quantity: number;
+  structural_stop_daily?: number;
+  target_price?: number;
+  leader_role?: string;
+  co_leader_reason?: string;
+  macro_factors?: string[];
+  exit_red_lines?: string[];
+  fx_to_account?: number;
+  notes?: string;
+  reason?: string;
+  allow_equity_margin?: boolean;
+}
+
+export interface RotatePositionBody {
+  exit_price: number;
+  exit_reason: string;
+  new_position: RotateNewPositionBody;
+  exit_category?: string;
+  enforce_macro_cap?: boolean;
+}
+
 /* ---------------- Sentinel ---------------- */
 export type SentinelStatus = "RED_EXIT" | "YELLOW_LOOSENING" | "GREEN_HOLD";
 
@@ -413,9 +440,26 @@ export interface MacroQuote {
   chg_1d_pct?: number | null;
 }
 
+export interface ContractSpec {
+  symbol?: string;
+  asset_class?: string;
+  multiplier?: number | null;
+  min_order_qty?: number;
+  lot_step?: number;
+  lot_size?: number;
+  currency?: string | null;
+  quote_currency?: string | null;
+  margin_rate?: number | null;
+  fractional?: boolean;
+  known_spec?: boolean;
+  unit_note?: string;
+  warning?: string;
+}
+
 export interface MarketDualResponse {
   symbol: string;
   asset_class: string;
+  contract_spec?: ContractSpec | null;
   data_source?: string;
   intraday_data_source?: string;
   intraday_interval?: string;
@@ -673,6 +717,9 @@ export interface ScanRow {
   "ret_60d_%"?: number | null;
   "atr_%"?: number | null;
   signal_tier?: string | null;
+  signal_direction?: string | null;
+  signal_type?: string | null;
+  signal_confirmed?: boolean | null;
   daily_structure?: string | null;
   daily_zs_count?: number | null;
   daily_zs?: [number, number] | null;

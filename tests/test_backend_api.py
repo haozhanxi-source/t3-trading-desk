@@ -166,6 +166,31 @@ def test_health_and_symbol_search(client: TestClient):
     assert len(sr_all.json()["items"]) == 5
 
 
+def test_macro_snapshot_cached(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    calls = {"n": 0}
+
+    def fake_macro():
+        calls["n"] += 1
+        return {
+            "VIX": {"last": 16.42, "chg_1d_pct": -2.1},
+            "US10Y_Yield": {"last": 4.28},
+            "DXY_USD_Index": {"last": 103.85},
+        }
+
+    monkeypatch.setattr(market_snapshot, "fetch_macro_context", fake_macro)
+
+    r1 = client.get("/api/macro/snapshot")
+    assert r1.status_code == 200
+    assert r1.headers.get("X-Cache") == "MISS"
+    assert r1.json()["macro_context"]["VIX"]["last"] == 16.42
+    assert calls["n"] == 1
+
+    r2 = client.get("/api/macro/snapshot")
+    assert r2.status_code == 200
+    assert r2.headers.get("X-Cache") == "HIT"
+    assert calls["n"] == 1
+
+
 # ---------------------------------------------------------------------------
 # 2. Portfolio Lifecycle & Sentinel Caching / Invalidation
 # ---------------------------------------------------------------------------
@@ -446,6 +471,12 @@ def test_trade_plan_manual_b_structure_live_and_validation(client: TestClient, m
         "/api/portfolio/init",
         json={"equity": 250_000.0, "base_currency": "USD", "default_risk_per_trade_pct": 1.0},
     )
+    for seeded_sym in ("SPY", "CU0"):
+        ra.init_archive(seeded_sym)
+        ra.append_evidence(
+            seeded_sym,
+            [{"level": "L1", "kind": "fact", "metric": "verified_kpi", "value": "1"}],
+        )
 
     # 1) Manual mode using frontend canonical field names + auto-read equity
     r1 = client.post(
@@ -908,6 +939,258 @@ def test_task_manager_ring_buffer_eviction(isolated_env, monkeypatch: pytest.Mon
         assert tc.get(f"/api/tasks/{ids[0]}").status_code == 404
         # Sanity: time import used if needed
         assert time.monotonic() > 0
+
+
+def test_update_thesis_preserves_append_only_log(client: TestClient):
+    r_init = client.post("/api/research/archive/init", json={"symbol": "PWR", "name": "Quanta Services"})
+    assert r_init.status_code == 200
+    client.post("/api/research/archive/log", json={"symbol": "PWR", "entry": "历史核验记录不可篡改"})
+
+    # Attempt to overwrite body AND inject/strip audit log -> backend must preserve original log line
+    r_put = client.put(
+        "/api/research/archive/thesis",
+        json={
+            "symbol": "PWR",
+            "body_md": "## 第三层研究更新\n- Backlog 创新高\n\n## 增量修订日志（只追加，不重写）\n- 试图伪造删除旧日志",
+            "expected_revision": 1,
+            "note": "补充 Q3 Backlog 硬合同核验",
+        },
+    )
+    assert r_put.status_code == 200
+    data = r_put.json()
+    assert data["revision"] == 2
+    assert "Backlog 创新高" in data["thesis_md"]
+    assert "历史核验记录不可篡改" in data["thesis_md"]
+    assert "试图伪造删除旧日志" not in data["thesis_md"]
+    assert "补充 Q3 Backlog 硬合同核验" in data["thesis_md"]
+
+    # Optimistic concurrency conflict -> 409/400
+    r_conflict = client.put(
+        "/api/research/archive/thesis",
+        json={"symbol": "PWR", "body_md": "stale", "expected_revision": 1},
+    )
+    assert r_conflict.status_code in (400, 409)
+
+    # Missing expected_revision is strictly rejected (422)
+    r_missing_rev = client.put(
+        "/api/research/archive/thesis",
+        json={"symbol": "PWR", "body_md": "missing rev"},
+    )
+    assert r_missing_rev.status_code == 422
+
+    # Fenced code blocks (including 4-backtick outer fence containing 3-backtick inner line + `## 修订日志`, AND unclosed EOF fence with dated bullet) must NOT truncate body
+    fenced_body = (
+        "## 论点\n````markdown\n```\n## 增量修订日志\n- 四反引号内示例\n````\n\n### 关键结论\n必须完整保留段尾\n```markdown\n- `2026-11-24`：未闭合代码块内示例行"
+    )
+    r_fence = client.put(
+        "/api/research/archive/thesis",
+        json={"symbol": "PWR", "body_md": fenced_body, "expected_revision": 2},
+    )
+    assert r_fence.status_code == 200
+    assert "必须完整保留段尾" in r_fence.json()["thesis_md"]
+    assert "未闭合代码块内示例行" in r_fence.json()["thesis_md"]
+    assert "历史核验记录不可篡改" in r_fence.json()["thesis_md"]
+
+
+def test_update_thesis_wal_consistency_and_headerless_log_rescue(
+    isolated_env, monkeypatch: pytest.MonkeyPatch
+):
+    ra.init_archive("CU0", name="沪铜")
+    folder, _, _, _ = ra.resolve_archive_dir("CU0")
+    thesis_path = os.path.join(folder, "thesis.md")
+    with open(thesis_path, "w", encoding="utf-8") as f:
+        f.write("# 沪铜旧档\n初始正文\n\n- `2026-11-20`：旧版无标题日志行\n")
+
+    real_write_json = ra._atomic_write_json
+
+    # Case 1: Failure BEFORE WAL commit point -> untouched v1
+    def fail_on_wal(path: str, obj: dict):
+        if path.endswith(".thesis_wal.json"):
+            raise OSError("simulated wal write error")
+        return real_write_json(path, obj)
+
+    monkeypatch.setattr(ra, "_atomic_write_json", fail_on_wal)
+    with pytest.raises(OSError, match="simulated wal write error"):
+        ra.update_thesis_body("CU0", "## 未达提交点", expected_revision=1)
+    monkeypatch.setattr(ra, "_atomic_write_json", real_write_json)
+    untouched = ra.load_archive("CU0")
+    assert untouched["state"]["revision"] == 1
+    assert "未达提交点" not in untouched["thesis_md"]
+
+    # Case 2: Failure AFTER WAL commit (during state.json write) -> next load/write rolls forward atomically to v2 (never torn!)
+    def fail_on_state_json(path: str, obj: dict):
+        if path.endswith("state.json"):
+            raise OSError("simulated state.json disk full")
+        return real_write_json(path, obj)
+
+    monkeypatch.setattr(ra, "_atomic_write_json", fail_on_state_json)
+    with pytest.raises(OSError, match="simulated state.json disk full"):
+        ra.update_thesis_body("CU0", "## WAL已提交正文", expected_revision=1, note="完成迁移")
+
+    # Restore writer -> load_archive replays WAL cleanly so revision == 2 and stale expected_revision=1 is rejected!
+    monkeypatch.setattr(ra, "_atomic_write_json", real_write_json)
+    replayed = ra.load_archive("CU0")
+    assert replayed["state"]["revision"] == 2
+    assert "WAL已提交正文" in replayed["thesis_md"]
+    assert "旧版无标题日志行" in replayed["thesis_md"]
+    assert "完成迁移" in replayed["thesis_md"]
+    with pytest.raises(ValueError, match="Revision conflict"):
+        ra.update_thesis_body("CU0", "## 陈旧覆盖", expected_revision=1)
+
+
+def test_scan_persistence_survives_eviction_and_merges_multi_instance(
+    isolated_env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        market_snapshot,
+        "get_snapshot",
+        lambda sym, **kw: {
+            "symbol": sym,
+            "asset_class": "us_equity",
+            "technicals": {
+                "last_close": 210.0,
+                "return_5d_pct": -1.2,
+                "return_20d_pct": -4.5,
+                "return_60d_pct": -8.0,
+                "atr14_pct": 2.1,
+            },
+            "chanlun": {
+                "signal_summary": {
+                    "tier": "买卖点信号",
+                    "summary": "日线三卖确认",
+                    "action_bias": "空头方向，严禁当一买盲目抄底",
+                    "signal_meta": {"direction": "short", "signal_type": "third_sell", "confirmed": True},
+                },
+                "daily": {"macro_structure": "下跌趋势", "zhongshu_count": 1},
+            },
+        },
+    )
+    monkeypatch.setattr(
+        daily_sentinel,
+        "run_daily_sentinel",
+        lambda **kw: {"summary": {"holdings_total": 0}, "holdings": [], "watchlist": []},
+    )
+
+    tm_a = TaskManager(max_tasks=2)
+    tm_b = TaskManager(max_tasks=2)
+    app_a = create_app(task_manager=tm_a, frontend_dist=str(isolated_env["tmp_path"] / "no_dist"))
+    app_b = create_app(task_manager=tm_b, frontend_dist=str(isolated_env["tmp_path"] / "no_dist"))
+
+    with TestClient(app_a) as tca, TestClient(app_b) as tcb:
+        r_a = tca.post("/api/tasks/scan", json={"symbols": ["SPY"], "sort": "tier"})
+        tid_a = r_a.json()["id"]
+        with tca.stream("GET", f"/api/tasks/{tid_a}/events") as s:
+            _ = "".join(s.iter_text())
+
+        # Second instance runs another scan -> must merge with tid_a, NOT overwrite it
+        r_b = tcb.post("/api/tasks/scan", json={"symbols": ["NVDA"], "sort": "tier"})
+        tid_b = r_b.json()["id"]
+        with tcb.stream("GET", f"/api/tasks/{tid_b}/events") as s:
+            _ = "".join(s.iter_text())
+
+        # Flood tm_b's small 2-slot ring buffer with 4 sentinel tasks -> persisted scans still survive!
+        for _ in range(4):
+            rs = tcb.post("/api/tasks/sentinel", json={})
+            with tcb.stream("GET", f"/api/tasks/{rs.json()['id']}/events") as s:
+                _ = "".join(s.iter_text())
+
+        det_a = tcb.get(f"/api/tasks/{tid_a}").json()
+        det_b = tcb.get(f"/api/tasks/{tid_b}").json()
+        assert det_a["status"] == "completed"
+        assert det_b["status"] == "completed"
+        assert det_a["result"]["rows"][0]["signal_direction"] == "short"
+        assert det_a["result"]["rows"][0]["signal_type"] == "third_sell"
+
+        # Instance A (holding old cache) reads after Instance B writes 10 newer scans -> must see B's 10 newest, never hide them!
+        newest_ids = []
+        for idx in range(10):
+            time.sleep(0.002)
+            rb = tcb.post("/api/tasks/scan", json={"symbols": ["SPY"], "sort": "tier"})
+            nid = rb.json()["id"]
+            newest_ids.append(nid)
+            with tcb.stream("GET", f"/api/tasks/{nid}/events") as s:
+                _ = "".join(s.iter_text())
+        # Force mtime bump in case coarse filesystem mtime granularity
+        hist_path = tm_b._scan_history_path()
+        st = os.stat(hist_path)
+        os.utime(hist_path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+        seen_on_a = [t["id"] for t in tca.get("/api/tasks").json()["tasks"] if t["kind"] == "scan"]
+        assert seen_on_a == list(reversed(newest_ids))
+        assert tid_a not in seen_on_a
+        assert tca.get(f"/api/tasks/{tid_a}").status_code == 404
+
+
+def test_trade_plan_unconditionally_blocks_spoofed_client_l1_l2_flag(client: TestClient):
+    # Even if client sends has_l1_l2=True directly to API, server checks research/ archive on disk -> NOT actionable
+    r_unarchived = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "PWR",
+            "direction": "long",
+            "live": False,
+            "entry_price": 300.0,
+            "tactical_stop_30m": 290.0,
+            "target_price": 340.0,
+            "account_equity": 100000.0,
+            "account_currency": "USD",
+            "has_l1_l2": True,
+            "alignment_status": "aligned_trigger",
+        },
+    )
+    assert r_unarchived.status_code == 200
+    assert r_unarchived.json()["four_quadrant_gate"]["actionable"] is False
+
+
+def test_market_dual_exposes_contract_spec(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    def fake_snapshot(symbol, **kwargs):
+        return {
+            "symbol": "CU0",
+            "asset_class": "cn_future",
+            "ohlcv_daily": [],
+            "ohlcv_intraday": [],
+            "chanlun": {},
+        }
+
+    monkeypatch.setattr(market_snapshot, "get_snapshot", fake_snapshot)
+    r = client.get("/api/market/dual", params={"symbol": "CU0", "include_macro": False})
+    assert r.status_code == 200
+    body = r.json()
+    spec = body.get("contract_spec")
+    assert isinstance(spec, dict)
+    assert spec["known_spec"] is True
+    assert spec["multiplier"] == 5
+    assert spec["lot_step"] == 1
+    assert spec["quote_currency"] == "CNY"
+
+
+def test_scan_task_persists_across_task_manager_restarts(isolated_env, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        market_snapshot,
+        "get_snapshot",
+        lambda sym, **kw: {
+            "symbol": sym,
+            "asset_class": "us_equity",
+            "technicals": {"last_close": 210.0, "ret_20d_pct": 3.2},
+            "chanlun": {"signal_summary": {"tier": "A", "summary": "三买"}, "daily": {"macro_structure": "上涨"}},
+        },
+    )
+
+    app1 = create_app(task_manager=TaskManager(max_tasks=10), frontend_dist=str(isolated_env["tmp_path"] / "no_dist"))
+    with TestClient(app1) as tc1:
+        r = tc1.post("/api/tasks/scan", json={"symbols": ["PWR"], "sort": "tier"})
+        assert r.status_code == 202
+        tid = r.json()["id"]
+        with tc1.stream("GET", f"/api/tasks/{tid}/events") as sse:
+            _ = "".join(sse.iter_text())
+
+    # Brand new TaskManager instance simulating service restart -> persisted scan history restores cleanly
+    app2 = create_app(task_manager=TaskManager(max_tasks=10), frontend_dist=str(isolated_env["tmp_path"] / "no_dist"))
+    with TestClient(app2) as tc2:
+        listed = tc2.get("/api/tasks").json()["tasks"]
+        assert any(t["id"] == tid and t["status"] == "completed" for t in listed)
+        det = tc2.get(f"/api/tasks/{tid}").json()
+        assert det["result"]["count"] == 1
+        assert det["result"]["rows"][0]["symbol"] == "PWR"
 
 
 # ---------------------------------------------------------------------------
@@ -1386,6 +1669,8 @@ def test_same_currency_rejects_non_unit_fx_in_planner_and_ledger(client: TestCli
 
 def test_pair_leg_verified_requires_distinct_opposite_symbol(client: TestClient):
     """Codex Round-2 HIGH #1: pair_leg_verified=True MUST require non-empty pair_leg_symbol != primary symbol."""
+    ra.init_archive("SPY")
+    ra.append_evidence("SPY", [{"level": "L1", "metric": "macro_anchor", "value": "ok"}])
     base_payload = {
         "symbol": "SPY",
         "direction": "short",

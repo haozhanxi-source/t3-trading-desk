@@ -11,6 +11,7 @@ import type {
   PortfolioInitBody,
   PortfolioSummaryResponse,
   ResearchDataResponse,
+  RotatePositionBody,
   SentinelResponse,
   SymbolSearchItem,
   TaskEventEnvelope,
@@ -74,7 +75,7 @@ function extractMessage(status: number, body: unknown): string {
 }
 
 async function request<T>(
-  method: "GET" | "POST" | "PATCH" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
   path: string,
   opts: { query?: Query; body?: unknown; signal?: AbortSignal } = {},
 ): Promise<T> {
@@ -110,6 +111,8 @@ export function normalizeTask(raw: TaskRecord): TaskRecord {
 
 export const api = {
   health: (signal?: AbortSignal) => get<HealthResponse>("/health", undefined, signal),
+  macroSnapshot: (refresh = false, signal?: AbortSignal) =>
+    get<{ macro_context: Record<string, unknown>; fetched_at_utc?: string }>("/macro/snapshot", { refresh }, signal),
   searchSymbols: (q: string, limit = 30, signal?: AbortSignal) =>
     get<{ items: SymbolSearchItem[] }>("/symbols/search", { q, limit }, signal),
 
@@ -123,6 +126,8 @@ export const api = {
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/trim`, body),
   closePosition: (id: string, body: CloseBody) =>
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/close`, body),
+  rotatePosition: (id: string, body: RotatePositionBody) =>
+    post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/rotate`, body),
   sentinel: (
     q: { include_watchlist: boolean; skip_research?: boolean; event_window_days?: number; refresh?: boolean },
     signal?: AbortSignal,
@@ -170,6 +175,22 @@ export const api = {
     }),
   archiveLog: (symbol: string, entry: string, market?: string | null) =>
     post<unknown>("/research/archive/log", { symbol, entry, ...(market ? { market } : {}) }),
+  archiveUpdateThesis: (
+    symbol: string,
+    body_md: string,
+    expected_revision: number,
+    note?: string,
+    market?: string | null,
+  ) =>
+    request<{ revision: number; thesis_md: string }>("PUT", "/research/archive/thesis", {
+      body: {
+        symbol,
+        body_md,
+        expected_revision,
+        ...(note ? { note } : {}),
+        ...(market ? { market } : {}),
+      },
+    }),
   researchData: (q: { symbol: string; include_macro?: boolean; refresh?: boolean }, signal?: AbortSignal) =>
     get<ResearchDataResponse>(
       "/research/data",
@@ -189,8 +210,14 @@ export const api = {
         period: body.period ?? "3y",
       }),
     ),
-  startResearchRefresh: async (body: { symbol: string; include_macro: boolean }) =>
-    normalizeTask(await post<TaskRecord>("/tasks/research-refresh", body)),
+  startResearchRefresh: async (body: { symbol: string; include_macro: boolean; market?: string | null }) =>
+    normalizeTask(
+      await post<TaskRecord>("/tasks/research-refresh", {
+        symbol: body.symbol,
+        include_macro: body.include_macro,
+        ...(body.market ? { market: body.market } : {}),
+      }),
+    ),
   startSentinelTask: async (body: { include_watchlist: boolean; skip_research: boolean; event_window_days: number }) =>
     normalizeTask(await post<TaskRecord>("/tasks/sentinel", body)),
   tasks: async (signal?: AbortSignal) => {

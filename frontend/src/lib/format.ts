@@ -88,10 +88,65 @@ export function shortTime(s: string | null | undefined): string {
     .trim()
     .replace(/(\d{4}-\d{2}-\d{2})T/, "$1 ")
     .replace(/\s*UTC$/i, "")
-    .replace(/:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})?$/, "")
     .replace(/(Z|[+-]\d{2}:?\d{2})$/i, "")
+    .replace(/^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}):\d{2}(\.\d+)?$/, "$1")
     .trim();
   return cleaned || "—";
+}
+
+const ALIGNMENT_ZH: Record<string, string> = {
+  aligned_trigger: "区间套同向共振",
+  daily_opposes_direction: "日线反向·禁逆势",
+  daily_ok_wait_30m: "日线顺向·等小级别触发",
+  neutral_wait: "中枢震荡·观望",
+};
+
+export function fmtAlignmentStatus(raw: string | null | undefined): string {
+  if (!raw) return "";
+  return ALIGNMENT_ZH[raw.trim()] ?? raw;
+}
+
+export function fmtPosVsZs(raw: string | null | undefined): string {
+  if (!raw) return "—";
+  const s = raw.trim();
+  if (s === "no_zhongshu") return "未成中枢";
+  const above = /^above_zg\(([^)]+)\)$/i.exec(s);
+  if (above) return `中枢上方 (${above[1]})`;
+  const below = /^below_zd\(([^)]+)\)$/i.exec(s);
+  if (below) return `中枢下方 (${below[1]})`;
+  const inside = /^inside_zs\(([^)]+)\)$/i.exec(s);
+  if (inside) return `中枢内部 (${inside[1]})`;
+  return s;
+}
+
+const MOMENTUM_VERDICT_ZH: Record<string, string> = {
+  capital_consensus_up: "多头资金一致",
+  capital_consensus_down: "空头资金一致",
+  divergence_candidate_up: "上涨背驰观察",
+  divergence_candidate_down: "下跌背驰观察",
+  non_divergence_up: "急拉非背驰",
+  non_divergence_down: "急跌非背驰",
+  higher_low_pullback: "次低点回踩",
+  lower_high_rebound: "次高点反抽",
+  neutral_extension_up: "向上延伸",
+  neutral_extension_down: "向下延伸",
+};
+
+export function fmtMomentumVerdict(raw: string | null | undefined): string {
+  if (!raw) return "";
+  const s = raw.trim();
+  return MOMENTUM_VERDICT_ZH[s] ?? s;
+}
+
+export function fmtFractalText(raw: string | null | undefined): string {
+  if (!raw) return "—";
+  return raw
+    .replace(/\/strong\b/gi, "·强")
+    .replace(/\/standard\b/gi, "·标准")
+    .replace(/\/weak\b/gi, "·弱")
+    .replace(/\bstrong\b/gi, "强")
+    .replace(/\bstandard\b/gi, "标准")
+    .replace(/\bweak\b/gi, "弱");
 }
 
 /** Clean input string for prefilled chart/snapshot prices (no 16-digit IEEE-754 float tails). */

@@ -4,22 +4,33 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="color-scheme" content="light dark" />
-    <meta name="description" content="T3 Trading Desk · 中低频投研工作台（日线定方向 + 30min 缠论落地）" />
+    <meta name="description" content="T3 Trading Desk · 机构级中长线投研与缠论决策工作台" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <title>T3 Trading Desk · 中低频投研工作台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+    />
+    <title>T3 Trading Desk · 中长线投研工作台</title>
     <script>
       (function () {
+        var meta = document.querySelector('meta[name="color-scheme"]');
         try {
           var t = localStorage.getItem("t3desk.theme");
           if (t === "light" || t === "dark") {
             document.documentElement.dataset.theme = t;
+            if (meta) meta.content = t;
           } else if (t === "system") {
             delete document.documentElement.dataset.theme;
+            if (meta) meta.content = "light dark";
           } else {
             document.documentElement.dataset.theme = "dark";
+            if (meta) meta.content = "dark";
           }
         } catch (e) {
           document.documentElement.dataset.theme = "dark";
+          if (meta) meta.content = "dark";
         }
       })();
     </script>

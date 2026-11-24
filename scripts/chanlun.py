@@ -12,6 +12,7 @@ Aligned with the 19-lesson practical Chanlun system + MACD confirmation:
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Optional
@@ -892,6 +893,64 @@ def build_segments(strokes: list[Stroke]) -> list[Segment]:
     return segments
 
 
+def _scan_zhongshu_extension(
+    units: Sequence[Stroke | Segment],
+    after_core_idx: int,
+    zd: float,
+    zg: float,
+    dd: float,
+    gg: float,
+) -> tuple[int, str, int, Optional[str], Optional[float], Optional[float]]:
+    """Scan confirmed units after the founding 3-unit core [ZD, ZG] for genuine Zhongshu extension.
+
+    Chanlun distinction between Zhongshu extension (中枢延伸) and leaving unit (离开段):
+    - Collect contiguous confirmed units overlapping [ZD, ZG] until the first disjoint confirmed unit
+      (3rd buy: low > ZG -> broken_up; 3rd sell: high < ZD -> broken_down) or an unconfirmed/end unit.
+    - When broken_up / broken_down is confirmed at u[k], u[k-1] (if after core) is the confirmed
+      leaving unit (离开段) and also serves as the entering unit for the next Zhongshu at u[k];
+      it must NOT be swallowed into extension count or stretch oscillation_end_date.
+    - When still active (no confirmed 3B/3S yet), if the last confirmed overlapping unit ended
+      strictly outside [ZD, ZG] (end_price > ZG or end_price < ZD), it is a live candidate leaving
+      unit awaiting pullback confirmation and is excluded from confirmed extension until a subsequent
+      confirmed unit pulls back into [ZD, ZG].
+    """
+    n = len(units)
+    j = after_core_idx
+    status = "active"
+    overlapping: list[Stroke | Segment] = []
+
+    while j < n:
+        uj = units[j]
+        if not uj.is_confirmed:
+            break
+        if uj.low <= zg and uj.high >= zd:
+            overlapping.append(uj)
+            j += 1
+        else:
+            if uj.low > zg:
+                status = "broken_up"
+            elif uj.high < zd:
+                status = "broken_down"
+            break
+
+    if overlapping:
+        if status in ("broken_up", "broken_down"):
+            overlapping.pop()
+        else:
+            last_u = overlapping[-1]
+            if last_u.end_price > zg or last_u.end_price < zd:
+                overlapping.pop()
+
+    osc_count = len(overlapping)
+    if osc_count == 0:
+        return j, status, 0, None, None, None
+
+    osc_end_date = overlapping[-1].end_date
+    osc_dd = min(dd, *(u.low for u in overlapping))
+    osc_gg = max(gg, *(u.high for u in overlapping))
+    return j, status, osc_count, osc_end_date, round(osc_dd, 4), round(osc_gg, 4)
+
+
 def detect_zhongshus(strokes: list[Stroke], last_close: float) -> list[Zhongshu]:
     """Lesson 10 strict stroke-based Zhongshu (严格笔中枢):
 
@@ -899,8 +958,8 @@ def detect_zhongshus(strokes: list[Stroke], last_close: float) -> list[Zhongshu]
        (最简单的三笔上涨/下跌) is NOT falsely boxed as a Zhongshu.
     2. Core Zhongshu geometry [ZD, ZG], [DD, GG], and [start_date, end_date] are
        strictly defined by ONLY the founding 3 strokes (只画前三笔的重叠区域).
-    3. Subsequent overlapping strokes are recorded as extension/oscillation metadata
-       without stretching the core box indefinitely across months.
+    3. Only genuine pull-back oscillations (excluding leaving strokes) are recorded
+       as extension metadata without stretching the box across a breakout leg.
     """
     zhongshus: list[Zhongshu] = []
     n = len(strokes)
@@ -927,30 +986,9 @@ def detect_zhongshus(strokes: list[Stroke], last_close: float) -> list[Zhongshu]
         start_date = b1.start_date
         end_date = b3.end_date
 
-        osc_count = 0
-        osc_end_date: Optional[str] = None
-        osc_dd = dd
-        osc_gg = gg
-        status = "active"
-
-        j = i + 3
-        while j < n:
-            bj = strokes[j]
-            if not bj.is_confirmed:
-                break
-            overlaps = (bj.low <= zg) and (bj.high >= zd)
-            if overlaps:
-                osc_count += 1
-                osc_end_date = bj.end_date
-                osc_dd = min(osc_dd, bj.low)
-                osc_gg = max(osc_gg, bj.high)
-                j += 1
-            else:
-                if bj.low > zg:
-                    status = "broken_up"
-                elif bj.high < zd:
-                    status = "broken_down"
-                break
+        j, status, osc_count, osc_end_date, osc_dd, osc_gg = _scan_zhongshu_extension(
+            strokes, i + 3, zd, zg, dd, gg
+        )
 
         # Track consecutive trend index (首中枢=1; flips reset to 1)
         trend_idx = 1
@@ -983,8 +1021,8 @@ def detect_zhongshus(strokes: list[Stroke], last_close: float) -> list[Zhongshu]
                 status=status,
                 oscillation_strokes=osc_count,
                 oscillation_end_date=osc_end_date,
-                oscillation_dd=round(osc_dd, 4) if osc_count > 0 else None,
-                oscillation_gg=round(osc_gg, 4) if osc_count > 0 else None,
+                oscillation_dd=osc_dd,
+                oscillation_gg=osc_gg,
                 is_nine_upgrade=(3 + osc_count) >= 9,
                 trend_zs_index=trend_idx,
             )
@@ -999,8 +1037,7 @@ def detect_segment_zhongshus(segments: list[Segment]) -> list[Zhongshu]:
     """Detect Daily Segment-level Zhongshus (日线一级线段中枢 / 段中枢).
 
     Built strictly from 3 consecutive overlapping Segments after an entering segment (i >= 1).
-    Used when wide multi-month oscillations upgrade a Stroke Zhongshu (9+ strokes / distant box)
-    into a higher-level Segment Zhongshu that governs current price action.
+    Only genuine pull-back oscillations (excluding leaving segments) are recorded as extension.
     """
     seg_zss: list[Zhongshu] = []
     n = len(segments)
@@ -1027,30 +1064,9 @@ def detect_segment_zhongshus(segments: list[Segment]) -> list[Zhongshu]:
         start_date = b1.start_date
         end_date = b3.end_date
 
-        osc_count = 0
-        osc_end_date: Optional[str] = None
-        osc_dd = dd
-        osc_gg = gg
-        status = "active"
-
-        j = i + 3
-        while j < n:
-            bj = segments[j]
-            if not bj.is_confirmed:
-                break
-            overlaps = (bj.low <= zg) and (bj.high >= zd)
-            if overlaps:
-                osc_count += 1
-                osc_end_date = bj.end_date
-                osc_dd = min(osc_dd, bj.low)
-                osc_gg = max(osc_gg, bj.high)
-                j += 1
-            else:
-                if bj.low > zg:
-                    status = "broken_up"
-                elif bj.high < zd:
-                    status = "broken_down"
-                break
+        j, status, osc_count, osc_end_date, osc_dd, osc_gg = _scan_zhongshu_extension(
+            segments, i + 3, zd, zg, dd, gg
+        )
 
         trend_idx = 1
         if seg_zss:
@@ -1082,8 +1098,8 @@ def detect_segment_zhongshus(segments: list[Segment]) -> list[Zhongshu]:
                 status=status,
                 oscillation_strokes=osc_count,
                 oscillation_end_date=osc_end_date,
-                oscillation_dd=round(osc_dd, 4) if osc_count > 0 else None,
-                oscillation_gg=round(osc_gg, 4) if osc_count > 0 else None,
+                oscillation_dd=osc_dd,
+                oscillation_gg=osc_gg,
                 is_nine_upgrade=(3 + osc_count) >= 9,
                 trend_zs_index=trend_idx,
             )
@@ -1372,13 +1388,23 @@ def classify_chanlun_signals(
         zhongshu_level_label = f"{timeframe_label}笔中枢"
     signals: list[str] = []
 
-    # 1. Macro structure from Zhongshu sequence
+    # 1. Macro structure from Zhongshu sequence (distinguish standard trend vs 中枢扩张 vs 中枢扩展)
     if len(zhongshus) >= 2:
         z_prev, z_curr = zhongshus[-2], zhongshus[-1]
+        prev_gg = z_prev.oscillation_gg if z_prev.oscillation_gg is not None else z_prev.gg
+        prev_dd = z_prev.oscillation_dd if z_prev.oscillation_dd is not None else z_prev.dd
+        curr_gg = z_curr.oscillation_gg if z_curr.oscillation_gg is not None else z_curr.gg
+        curr_dd = z_curr.oscillation_dd if z_curr.oscillation_dd is not None else z_curr.dd
         if z_curr.zd > z_prev.zg:
-            macro_structure = "双中枢上涨趋势"
+            if curr_dd > prev_gg:
+                macro_structure = "双中枢上涨趋势"
+            else:
+                macro_structure = "上涨中枢扩张(震荡升级)"
         elif z_curr.zg < z_prev.zd:
-            macro_structure = "双中枢下跌趋势"
+            if curr_gg < prev_dd:
+                macro_structure = "双中枢下跌趋势"
+            else:
+                macro_structure = "下跌中枢扩张(震荡升级)"
         else:
             macro_structure = "中枢扩展/宽幅震荡"
     elif len(zhongshus) == 1:

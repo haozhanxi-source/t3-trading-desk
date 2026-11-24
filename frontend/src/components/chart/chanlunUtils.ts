@@ -239,7 +239,7 @@ function mapZhongshus(
     if (!startBar || !endBar) continue;
     const [b1, b2] = startBar.idx <= endBar.idx ? [startBar, endBar] : [endBar, startBar];
     const prefix = kind === "segment" ? `线段中枢 S${zs.zs_id}` : `笔中枢 Z${zs.zs_id}`;
-    const suffix = zs.is_nine_upgrade ? "·九段" : zs.is_extended ? "·扩展" : "";
+    const suffix = zs.is_nine_upgrade ? "·九段" : zs.is_extended ? "·延伸" : "";
     const truncTag = clampedLeft ? "·左截断" : clampedRight ? "·右截断" : "";
     out.push({
       key: `${kind}-${zs.zs_id}-${b1.idx}`,

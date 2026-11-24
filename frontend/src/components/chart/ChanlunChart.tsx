@@ -18,9 +18,21 @@ import {
 import { Layers, Maximize2, Table2 } from "lucide-react";
 import type { ChanlunTimeframe, SignalSummary } from "../../api/types";
 import { fmtFixed, fmtPct, fmtPrice } from "../../lib/format";
-import { useTheme } from "../../lib/theme";
+import { useTheme, type ChartPalette } from "../../lib/theme";
 import { ZhongshuBoxesPrimitive } from "./ZhongshuBoxesPrimitive";
 import { prepareChanlunSeries, timeKey, type AnyBar, type IndexedBar } from "./chanlunUtils";
+
+function resolveLineHierarchy(palette: ChartPalette) {
+  const isDark = palette.mode === "dark";
+  return {
+    /* Lower-level stroke (笔): subtle & thin so it stays visually subordinate to segments */
+    strokeConfirmed: isDark ? "rgba(104, 159, 214, 0.50)" : "rgba(43, 108, 176, 0.45)",
+    strokeUnconfirmed: isDark ? "rgba(217, 119, 87, 0.62)" : "rgba(201, 100, 66, 0.56)",
+    /* Higher-level segment (线段): high-contrast primary violet */
+    segmentConfirmed: palette.slots[6],
+    segmentUnconfirmed: isDark ? "rgba(156, 142, 232, 0.82)" : "rgba(98, 80, 200, 0.78)",
+  };
+}
 
 function computeSeriesPriceFormat(bars: IndexedBar[]) {
   const closes = bars
@@ -69,6 +81,7 @@ export function ChanlunChart({
   height = 460,
 }: ChanlunChartProps) {
   const { palette } = useTheme();
+  const lineColors = useMemo(() => resolveLineHierarchy(palette), [palette]);
   const containerRef = useRef<HTMLDivElement | null>(null);
 
   /* Interactive layer visibility toggles (stroke <-> 笔中枢, segment <-> 线段中枢) */
@@ -107,7 +120,8 @@ export function ChanlunChart({
   const candleRef = useRef<ISeriesApi<"Candlestick", Time> | null>(null);
   const strokeConfirmedRef = useRef<ISeriesApi<"Line", Time> | null>(null);
   const strokeUnconfirmedRef = useRef<ISeriesApi<"Line", Time> | null>(null);
-  const segmentRef = useRef<ISeriesApi<"Line", Time> | null>(null);
+  const segmentConfirmedRef = useRef<ISeriesApi<"Line", Time> | null>(null);
+  const segmentUnconfirmedRef = useRef<ISeriesApi<"Line", Time> | null>(null);
   const macdHistRef = useRef<ISeriesApi<"Histogram", Time> | null>(null);
   const macdDifRef = useRef<ISeriesApi<"Line", Time> | null>(null);
   const macdDeaRef = useRef<ISeriesApi<"Line", Time> | null>(null);
@@ -173,31 +187,41 @@ export function ChanlunChart({
     const zsPrimitive = new ZhongshuBoxesPrimitive(palette);
     candleSeries.attachPrimitive(zsPrimitive);
 
-    /* Confirmed strokes overlay (slot1 blue, crisp 2px solid) */
+    /* Confirmed strokes overlay (笔, lower level: 1px muted solid) */
     const strokeConfirmed = chart.addSeries(LineSeries, {
-      color: palette.slots[0],
-      lineWidth: 2,
+      color: lineColors.strokeConfirmed,
+      lineWidth: 1,
       lineStyle: LineStyle.Solid,
       priceLineVisible: false,
       lastValueVisible: false,
       crosshairMarkerVisible: false,
     });
 
-    /* Active unconfirmed latest stroke (slot2 orange, 2px dashed) */
+    /* Active unconfirmed latest stroke (未确认笔: 1px muted dashed) */
     const strokeUnconfirmed = chart.addSeries(LineSeries, {
-      color: palette.slots[1],
-      lineWidth: 2,
+      color: lineColors.strokeUnconfirmed,
+      lineWidth: 1,
       lineStyle: LineStyle.Dashed,
       priceLineVisible: false,
       lastValueVisible: false,
       crosshairMarkerVisible: false,
     });
 
-    /* Optional Chanlun segments (线段, slot7 violet) */
-    const segmentSeries = chart.addSeries(LineSeries, {
-      color: palette.slots[6],
+    /* Confirmed Chanlun segments (已确认线段, higher level: bold 3px high-contrast solid) */
+    const segmentConfirmed = chart.addSeries(LineSeries, {
+      color: lineColors.segmentConfirmed,
+      lineWidth: 3,
+      lineStyle: LineStyle.Solid,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+
+    /* Uncertain/growing trailing segment & extension to latest price (未确认线段: 2px dashed) */
+    const segmentUnconfirmed = chart.addSeries(LineSeries, {
+      color: lineColors.segmentUnconfirmed,
       lineWidth: 2,
-      lineStyle: LineStyle.LargeDashed,
+      lineStyle: LineStyle.Dashed,
       priceLineVisible: false,
       lastValueVisible: false,
       crosshairMarkerVisible: false,
@@ -253,7 +277,8 @@ export function ChanlunChart({
     candleRef.current = candleSeries;
     strokeConfirmedRef.current = strokeConfirmed;
     strokeUnconfirmedRef.current = strokeUnconfirmed;
-    segmentRef.current = segmentSeries;
+    segmentConfirmedRef.current = segmentConfirmed;
+    segmentUnconfirmedRef.current = segmentUnconfirmed;
     macdHistRef.current = macdHist;
     macdDifRef.current = macdDif;
     macdDeaRef.current = macdDea;
@@ -270,7 +295,8 @@ export function ChanlunChart({
       candleRef.current = null;
       strokeConfirmedRef.current = null;
       strokeUnconfirmedRef.current = null;
-      segmentRef.current = null;
+      segmentConfirmedRef.current = null;
+      segmentUnconfirmedRef.current = null;
       macdHistRef.current = null;
       macdDifRef.current = null;
       macdDeaRef.current = null;
@@ -313,13 +339,14 @@ export function ChanlunChart({
       wickUpColor: palette.candleUp,
       wickDownColor: palette.candleDown,
     });
-    strokeConfirmedRef.current?.applyOptions({ color: palette.slots[0] });
-    strokeUnconfirmedRef.current?.applyOptions({ color: palette.slots[1] });
-    segmentRef.current?.applyOptions({ color: palette.slots[6] });
+    strokeConfirmedRef.current?.applyOptions({ color: lineColors.strokeConfirmed });
+    strokeUnconfirmedRef.current?.applyOptions({ color: lineColors.strokeUnconfirmed });
+    segmentConfirmedRef.current?.applyOptions({ color: lineColors.segmentConfirmed });
+    segmentUnconfirmedRef.current?.applyOptions({ color: lineColors.segmentUnconfirmed });
     macdDifRef.current?.applyOptions({ color: palette.slots[0] });
     macdDeaRef.current?.applyOptions({ color: palette.slots[3] });
     zsPrimitiveRef.current?.setPalette(palette);
-  }, [palette]);
+  }, [palette, lineColors]);
 
   /* Push base candle & MACD data and fit visible window when data or chart instance changes */
   useEffect(() => {
@@ -330,7 +357,8 @@ export function ChanlunChart({
     candle.applyOptions({ priceFormat: dynamicFormats.price });
     strokeConfirmedRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
     strokeUnconfirmedRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
-    segmentRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
+    segmentConfirmedRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
+    segmentUnconfirmedRef.current?.applyOptions({ priceFormat: dynamicFormats.price });
     macdHistRef.current?.applyOptions({ priceFormat: dynamicFormats.macd });
     macdDifRef.current?.applyOptions({ priceFormat: dynamicFormats.macd });
     macdDeaRef.current?.applyOptions({ priceFormat: dynamicFormats.macd });
@@ -359,7 +387,8 @@ export function ChanlunChart({
     if (!candleRef.current) return;
     strokeConfirmedRef.current?.setData(showStrokes ? prepared.confirmedStrokes : []);
     strokeUnconfirmedRef.current?.setData(showStrokes ? prepared.unconfirmedStroke : []);
-    segmentRef.current?.setData(showSegments ? prepared.segments : []);
+    segmentConfirmedRef.current?.setData(showSegments ? prepared.confirmedSegments : []);
+    segmentUnconfirmedRef.current?.setData(showSegments ? prepared.unconfirmedSegments : []);
 
     zsPrimitiveRef.current?.setBoxes(visibleZhongshuBoxes);
     zsPrimitiveRef.current?.setVisible(visibleZhongshuBoxes.length > 0);
@@ -446,7 +475,11 @@ export function ChanlunChart({
 
         <div className="flex flex-wrap items-center gap-1" role="group" aria-label={`${title} 图层开关`}>
           <button type="button" className="chip" aria-pressed={showStrokes} onClick={() => setShowStrokes((v) => !v)}>
-            <span className="inline-block h-2 w-2 rounded-full bg-slot1" aria-hidden="true" />
+            <span
+              className="inline-block h-1.5 w-1.5 rounded-full"
+              style={{ backgroundColor: lineColors.strokeConfirmed }}
+              aria-hidden="true"
+            />
             <span>笔</span>
           </button>
           <button
@@ -460,7 +493,11 @@ export function ChanlunChart({
             <span>笔中枢</span>
           </button>
           <button type="button" className="chip" aria-pressed={showSegments} onClick={() => setShowSegments((v) => !v)}>
-            <span className="inline-block h-2 w-2 rounded-full bg-slot7" aria-hidden="true" />
+            <span
+              className="inline-block h-2.5 w-2.5 rounded-full"
+              style={{ backgroundColor: lineColors.segmentConfirmed }}
+              aria-hidden="true"
+            />
             <span>线段</span>
           </button>
           <button

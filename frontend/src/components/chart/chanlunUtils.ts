@@ -41,7 +41,8 @@ export interface PreparedChanlunSeries {
   macdDea: LineData<Time>[];
   confirmedStrokes: LineData<Time>[];
   unconfirmedStroke: LineData<Time>[];
-  segments: LineData<Time>[];
+  confirmedSegments: LineData<Time>[];
+  unconfirmedSegments: LineData<Time>[];
   strokeZhongshuBoxes: ZhongshuBoxDrawItem[];
   segmentZhongshuBoxes: ZhongshuBoxDrawItem[];
   latestStrokeZhongshu: Zhongshu | null;
@@ -401,14 +402,79 @@ export function prepareChanlunSeries(
     }
   }
 
-  /* Segments (线段) */
-  const segPts: { idx: number; time: Time; value: number }[] = [];
-  for (const seg of tf?.all_segments ?? []) {
+  /* Segments (线段): confirmed segments are solid; uncertain trailing segment / extension to latest price is dashed */
+  type SegmentChain = {
+    data: LineData<Time>[];
+    lastIdx: number | null;
+    hadGap: boolean;
+  };
+  const confirmedChain: SegmentChain = { data: [], lastIdx: null, hadGap: false };
+  const unconfirmedChain: SegmentChain = { data: [], lastIdx: null, hadGap: false };
+
+  const appendToChain = (
+    chain: SegmentChain,
+    sb: IndexedBar,
+    startPrice: number,
+    eb: IndexedBar,
+    endPrice: number,
+  ): boolean => {
+    if (!Number.isFinite(startPrice) || !Number.isFinite(endPrice) || sb.idx >= eb.idx) {
+      chain.hadGap = true;
+      return false;
+    }
+    if (chain.lastIdx === null) {
+      chain.data.push({ time: sb.time, value: startPrice }, { time: eb.time, value: endPrice });
+    } else if (sb.idx < chain.lastIdx) {
+      chain.hadGap = true;
+      return false;
+    } else if (!chain.hadGap && sb.idx === chain.lastIdx) {
+      chain.data.push({ time: eb.time, value: endPrice });
+    } else {
+      /* Lightweight Charts LineSeries connects all non-whitespace points continuously; restart at the latest contiguous chain across any gap */
+      chain.data.length = 0;
+      chain.data.push({ time: sb.time, value: startPrice }, { time: eb.time, value: endPrice });
+    }
+    chain.lastIdx = eb.idx;
+    chain.hadGap = false;
+    return true;
+  };
+
+  const allSegments = tf?.all_segments ?? [];
+  let hasAnyUnconfirmedSeg = false;
+  let lastSegResolvedAndConfirmed = false;
+  let lastSegEnd: { idx: number; time: Time; value: number } | null = null;
+
+  for (let i = 0; i < allSegments.length; i++) {
+    const seg = allSegments[i];
+    if (!seg) continue;
+    const isLast = i === allSegments.length - 1;
+    if (!seg.is_confirmed) hasAnyUnconfirmedSeg = true;
     const sb = resolve(seg.start_date);
     const eb = resolve(seg.end_date);
-    if (!sb || !eb) continue;
-    segPts.push({ idx: sb.idx, time: sb.time, value: seg.start_price });
-    segPts.push({ idx: eb.idx, time: eb.time, value: seg.end_price });
+    if (!sb || !eb) {
+      if (seg.is_confirmed) confirmedChain.hadGap = true;
+      else unconfirmedChain.hadGap = true;
+      continue;
+    }
+    const ok = seg.is_confirmed
+      ? appendToChain(confirmedChain, sb, seg.start_price, eb, seg.end_price)
+      : appendToChain(unconfirmedChain, sb, seg.start_price, eb, seg.end_price);
+    if (ok && isLast) {
+      lastSegResolvedAndConfirmed = seg.is_confirmed;
+      lastSegEnd = { idx: eb.idx, time: eb.time, value: seg.end_price };
+    }
+  }
+
+  /* Extend uncertain dashed tail to latest bar close ONLY when the true last segment resolved cleanly */
+  if (lastBar && lastSegEnd && lastSegEnd.idx < lastBar.idx) {
+    if (!hasAnyUnconfirmedSeg && lastSegResolvedAndConfirmed) {
+      unconfirmedChain.data.push(
+        { time: lastSegEnd.time, value: lastSegEnd.value },
+        { time: lastBar.time, value: lastBar.close },
+      );
+    } else if (hasAnyUnconfirmedSeg && !unconfirmedChain.hadGap && unconfirmedChain.lastIdx === lastSegEnd.idx) {
+      unconfirmedChain.data.push({ time: lastBar.time, value: lastBar.close });
+    }
   }
 
   /* Zhongshu boxes: strictly separate stroke zhongshus (笔中枢) and segment zhongshus (线段中枢) */
@@ -519,7 +585,8 @@ export function prepareChanlunSeries(
     macdDea,
     confirmedStrokes: toSortedLine(confirmedPts),
     unconfirmedStroke: toSortedLine(unconfirmedPts),
-    segments: toSortedLine(segPts),
+    confirmedSegments: confirmedChain.data,
+    unconfirmedSegments: unconfirmedChain.data,
     strokeZhongshuBoxes,
     segmentZhongshuBoxes,
     latestStrokeZhongshu,

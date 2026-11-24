@@ -80,9 +80,9 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
         ctx.fillStyle = fill;
         ctx.fillRect(left, top, width, height);
 
-        /* Crisp ZG (top) and ZD (bottom) horizontal boundaries */
+        /* Crisp ZG (top) and ZD (bottom) horizontal boundaries (segment > stroke visual hierarchy) */
         ctx.strokeStyle = border;
-        ctx.lineWidth = isSeg || box.isNineUpgrade ? 1.75 : 1.35;
+        ctx.lineWidth = isSeg ? 2.0 : box.isNineUpgrade ? 1.5 : 1.1;
         ctx.setLineDash([]);
         ctx.beginPath();
         ctx.moveTo(left, top);

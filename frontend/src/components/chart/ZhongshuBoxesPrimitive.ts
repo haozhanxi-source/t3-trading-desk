@@ -16,6 +16,8 @@ export interface ZhongshuBoxDrawItem {
   label: string;
   startTime: Time;
   endTime: Time;
+  startLabel?: string;
+  endLabel?: string;
   zd: number;
   zg: number;
   dd?: number;
@@ -70,7 +72,7 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
         if (bottom < 0 || top > h) continue;
         const height = Math.max(2, bottom - top);
 
-        const isSeg = box.kind === "segment" || box.isNineUpgrade;
+        const isSeg = box.kind === "segment";
         const fill = isSeg ? pal.zsSegFill : pal.zsStrokeFill;
         const border = isSeg ? pal.zsSegBorder : pal.zsStrokeBorder;
 
@@ -80,7 +82,7 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
 
         /* Crisp ZG (top) and ZD (bottom) horizontal boundaries */
         ctx.strokeStyle = border;
-        ctx.lineWidth = isSeg ? 1.75 : 1.35;
+        ctx.lineWidth = isSeg || box.isNineUpgrade ? 1.75 : 1.35;
         ctx.setLineDash([]);
         ctx.beginPath();
         ctx.moveTo(left, top);

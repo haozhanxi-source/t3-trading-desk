@@ -22,13 +22,6 @@ import { useTheme } from "../../lib/theme";
 import { ZhongshuBoxesPrimitive } from "./ZhongshuBoxesPrimitive";
 import { prepareChanlunSeries, timeKey, type AnyBar, type IndexedBar } from "./chanlunUtils";
 
-export interface PriceDefenseLines {
-  tacticalStop30m?: number | null;
-  tacticalStopLabel?: string;
-  structuralStopDaily?: number | null;
-  reverseKWatch?: number | null;
-}
-
 function computeSeriesPriceFormat(bars: IndexedBar[]) {
   const closes = bars
     .map((b) => b.close)
@@ -63,7 +56,6 @@ export interface ChanlunChartProps {
   chanlun: ChanlunTimeframe | undefined;
   signalSummary?: SignalSummary;
   intraday?: boolean;
-  defenseLines?: PriceDefenseLines;
   height?: number;
 }
 
@@ -74,23 +66,36 @@ export function ChanlunChart({
   chanlun,
   signalSummary,
   intraday = false,
-  defenseLines,
   height = 460,
 }: ChanlunChartProps) {
   const { palette } = useTheme();
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  /* Interactive layer visibility toggles */
+  /* Interactive layer visibility toggles (stroke <-> 笔中枢, segment <-> 段中枢) */
   const [showStrokes, setShowStrokes] = useState(true);
+  const [showStrokeZhongshu, setShowStrokeZhongshu] = useState(true);
   const [showSegments, setShowSegments] = useState(false);
-  const [showZhongshu, setShowZhongshu] = useState(true);
+  const [showSegmentZhongshu, setShowSegmentZhongshu] = useState(false);
   const [showMarkers, setShowMarkers] = useState(true);
-  const [showStops, setShowStops] = useState(true);
   const [showTable, setShowTable] = useState(false);
 
   const prepared = useMemo(
     () => prepareChanlunSeries(bars, chanlun, signalSummary, palette, intraday),
     [bars, chanlun, signalSummary, palette, intraday],
+  );
+  const visibleZhongshuBoxes = useMemo(
+    () => [
+      ...(showStrokeZhongshu ? prepared.strokeZhongshuBoxes : []),
+      ...(showSegmentZhongshu ? prepared.segmentZhongshuBoxes : []),
+    ],
+    [prepared.strokeZhongshuBoxes, prepared.segmentZhongshuBoxes, showStrokeZhongshu, showSegmentZhongshu],
+  );
+  const tableZhongshuBoxes = useMemo(
+    () => [
+      ...prepared.strokeZhongshuBoxes.slice(-6),
+      ...prepared.segmentZhongshuBoxes.slice(-6),
+    ],
+    [prepared.strokeZhongshuBoxes, prepared.segmentZhongshuBoxes],
   );
   const dynamicFormats = useMemo(() => computeSeriesPriceFormat(prepared.bars), [prepared.bars]);
 
@@ -109,6 +114,8 @@ export function ChanlunChart({
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const zsPrimitiveRef = useRef<ZhongshuBoxesPrimitive | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
+  const prevBarCountRef = useRef<number>(0);
+  const prevFirstTimeRef = useRef<string>("");
   const byTimeKeyRef = useRef(prepared.byTimeKey);
   byTimeKeyRef.current = prepared.byTimeKey;
 
@@ -270,6 +277,8 @@ export function ChanlunChart({
       markersRef.current = null;
       zsPrimitiveRef.current = null;
       priceLinesRef.current = [];
+      prevBarCountRef.current = 0;
+      prevFirstTimeRef.current = "";
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [intraday, height]);
@@ -312,10 +321,7 @@ export function ChanlunChart({
     zsPrimitiveRef.current?.setPalette(palette);
   }, [palette]);
 
-  /* Push candle, MACD, stroke, segment, Zhongshu box & marker data */
-  const prevBarCountRef = useRef<number>(0);
-  const prevFirstTimeRef = useRef<string>("");
-
+  /* Push base candle & MACD data and fit visible window when data or chart instance changes */
   useEffect(() => {
     const candle = candleRef.current;
     if (!candle) return;
@@ -334,15 +340,7 @@ export function ChanlunChart({
     macdDifRef.current?.setData(prepared.macdDif);
     macdDeaRef.current?.setData(prepared.macdDea);
 
-    strokeConfirmedRef.current?.setData(showStrokes ? prepared.confirmedStrokes : []);
-    strokeUnconfirmedRef.current?.setData(showStrokes ? prepared.unconfirmedStroke : []);
-    segmentRef.current?.setData(showSegments ? prepared.segments : []);
-
-    zsPrimitiveRef.current?.setBoxes(prepared.zhongshuBoxes);
-    zsPrimitiveRef.current?.setVisible(showZhongshu);
-    markersRef.current?.setMarkers(showMarkers ? prepared.markers : []);
-
-    /* Fit or scroll cleanly to recent structure when symbol/timeframe changes */
+    /* Fit or scroll cleanly to recent structure when symbol/timeframe/chart instance changes */
     const firstKey = prepared.bars[0] ? timeKey(prepared.bars[0].time) : "";
     if (prepared.bars.length > 0 && (firstKey !== prevFirstTimeRef.current || Math.abs(prepared.bars.length - prevBarCountRef.current) > 5)) {
       prevFirstTimeRef.current = firstKey;
@@ -354,9 +352,21 @@ export function ChanlunChart({
         to: total + 4,
       });
     }
-  }, [prepared, showStrokes, showSegments, showZhongshu, showMarkers, intraday]);
+  }, [prepared, dynamicFormats, intraday, height]);
 
-  /* Update ZG/ZD & Stop Defense PriceLines */
+  /* Push Chanlun structural overlays independently so toggling layers never reloads candles/MACD */
+  useEffect(() => {
+    if (!candleRef.current) return;
+    strokeConfirmedRef.current?.setData(showStrokes ? prepared.confirmedStrokes : []);
+    strokeUnconfirmedRef.current?.setData(showStrokes ? prepared.unconfirmedStroke : []);
+    segmentRef.current?.setData(showSegments ? prepared.segments : []);
+
+    zsPrimitiveRef.current?.setBoxes(visibleZhongshuBoxes);
+    zsPrimitiveRef.current?.setVisible(visibleZhongshuBoxes.length > 0);
+    markersRef.current?.setMarkers(showMarkers ? prepared.markers : []);
+  }, [prepared, showStrokes, showSegments, visibleZhongshuBoxes, showMarkers, intraday, height]);
+
+  /* Update stroke / segment Zhongshu ZG & ZD reference PriceLines from canonical classified latest Zhongshu */
   useEffect(() => {
     const candle = candleRef.current;
     if (!candle) return;
@@ -379,30 +389,26 @@ export function ChanlunChart({
       );
     };
 
-    const latestZs = chanlun?.latest_zhongshu;
-    if (showZhongshu && latestZs) {
-      addLine(latestZs.zg, "ZG 上沿", palette.slots[0], LineStyle.Dotted, 1);
-      addLine(latestZs.zd, "ZD 下沿", palette.slots[0], LineStyle.Dotted, 1);
+    const latestStrokeZs = prepared.latestStrokeZhongshu;
+    if (showStrokeZhongshu && latestStrokeZs) {
+      addLine(latestStrokeZs.zg, "笔中枢 ZG", palette.zsStrokeBorder, LineStyle.Dotted, 1);
+      addLine(latestStrokeZs.zd, "笔中枢 ZD", palette.zsStrokeBorder, LineStyle.Dotted, 1);
     }
 
-    if (showStops && defenseLines) {
-      addLine(
-        defenseLines.tacticalStop30m,
-        defenseLines.tacticalStopLabel || "30m 战术止损",
-        palette.critical,
-        LineStyle.Solid,
-        2,
-      );
-      addLine(defenseLines.structuralStopDaily, "日线结构防线", palette.serious, LineStyle.Dashed, 1);
-      addLine(
-        defenseLines.reverseKWatch ?? chanlun?.stroke_end_trigger?.level,
-        "第11课反向K观察",
-        palette.warning,
-        LineStyle.SparseDotted,
-        1,
-      );
+    const latestSegmentZs = prepared.latestSegmentZhongshu;
+    if (showSegmentZhongshu && latestSegmentZs) {
+      addLine(latestSegmentZs.zg, "段中枢 ZG", palette.zsSegBorder, LineStyle.Dotted, 1);
+      addLine(latestSegmentZs.zd, "段中枢 ZD", palette.zsSegBorder, LineStyle.Dotted, 1);
     }
-  }, [chanlun, defenseLines, palette, showStops, showZhongshu]);
+  }, [
+    prepared.latestStrokeZhongshu,
+    prepared.latestSegmentZhongshu,
+    palette,
+    showStrokeZhongshu,
+    showSegmentZhongshu,
+    intraday,
+    height,
+  ]);
 
   const handleResetZoom = () => {
     const total = prepared.bars.length;
@@ -443,19 +449,32 @@ export function ChanlunChart({
             <span className="inline-block h-2 w-2 rounded-full bg-slot1" aria-hidden="true" />
             <span>笔</span>
           </button>
+          <button
+            type="button"
+            className="chip"
+            aria-pressed={showStrokeZhongshu}
+            onClick={() => setShowStrokeZhongshu((v) => !v)}
+            title={`显示/隐藏笔中枢（当前 ${prepared.strokeZhongshuBoxes.length} 个）`}
+          >
+            <Layers className="h-3 w-3" style={{ color: palette.zsStrokeBorder }} aria-hidden="true" />
+            <span>笔中枢</span>
+          </button>
           <button type="button" className="chip" aria-pressed={showSegments} onClick={() => setShowSegments((v) => !v)}>
             <span className="inline-block h-2 w-2 rounded-full bg-slot7" aria-hidden="true" />
             <span>线段</span>
           </button>
-          <button type="button" className="chip" aria-pressed={showZhongshu} onClick={() => setShowZhongshu((v) => !v)}>
-            <Layers className="h-3 w-3 text-slot1" aria-hidden="true" />
-            <span>中枢箱体</span>
+          <button
+            type="button"
+            className="chip"
+            aria-pressed={showSegmentZhongshu}
+            onClick={() => setShowSegmentZhongshu((v) => !v)}
+            title={`显示/隐藏段中枢（当前 ${prepared.segmentZhongshuBoxes.length} 个）`}
+          >
+            <Layers className="h-3 w-3" style={{ color: palette.zsSegBorder }} aria-hidden="true" />
+            <span>段中枢</span>
           </button>
           <button type="button" className="chip" aria-pressed={showMarkers} onClick={() => setShowMarkers((v) => !v)}>
             <span>买卖点/分型</span>
-          </button>
-          <button type="button" className="chip" aria-pressed={showStops} onClick={() => setShowStops((v) => !v)}>
-            <span>止损防线</span>
           </button>
           <button
             type="button"
@@ -539,7 +558,8 @@ export function ChanlunChart({
           <div className="mb-2 flex items-center justify-between text-xs text-muted">
             <span>中枢与近期严格笔坐标明细（无障碍数据对照表）</span>
             <span>
-              共 {prepared.zhongshuBoxes.length} 个中枢 · {(chanlun?.all_strokes ?? []).length} 笔
+              笔中枢 {prepared.strokeZhongshuBoxes.length} 个 · 段中枢 {prepared.segmentZhongshuBoxes.length} 个 ·{" "}
+              {(chanlun?.all_strokes ?? []).length} 笔 · {(chanlun?.all_segments ?? []).length} 线段
             </span>
           </div>
           <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
@@ -558,7 +578,7 @@ export function ChanlunChart({
                   </tr>
                 </thead>
                 <tbody>
-                  {prepared.zhongshuBoxes.length === 0 ? (
+                  {tableZhongshuBoxes.length === 0 ? (
                     <tr>
                       <th scope="row">无</th>
                       <td data-label="ZD 下沿" className="num">
@@ -570,7 +590,7 @@ export function ChanlunChart({
                       <td data-label="起止时间">尚未形成中枢</td>
                     </tr>
                   ) : (
-                    prepared.zhongshuBoxes.slice(-6).map((z) => (
+                    tableZhongshuBoxes.map((z) => (
                       <tr key={z.key}>
                         <th scope="row">{z.label}</th>
                         <td data-label="ZD 下沿" className="num">
@@ -580,7 +600,7 @@ export function ChanlunChart({
                           {fmtPrice(z.zg)}
                         </td>
                         <td data-label="起止时间" className="text-muted">
-                          {String(z.startTime)} → {String(z.endTime)}
+                          {z.startLabel ?? String(z.startTime)} → {z.endLabel ?? String(z.endTime)}
                         </td>
                       </tr>
                     ))

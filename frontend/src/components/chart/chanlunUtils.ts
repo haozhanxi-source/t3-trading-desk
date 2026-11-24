@@ -42,7 +42,10 @@ export interface PreparedChanlunSeries {
   confirmedStrokes: LineData<Time>[];
   unconfirmedStroke: LineData<Time>[];
   segments: LineData<Time>[];
-  zhongshuBoxes: ZhongshuBoxDrawItem[];
+  strokeZhongshuBoxes: ZhongshuBoxDrawItem[];
+  segmentZhongshuBoxes: ZhongshuBoxDrawItem[];
+  latestStrokeZhongshu: Zhongshu | null;
+  latestSegmentZhongshu: Zhongshu | null;
   markers: SeriesMarker<Time>[];
 }
 
@@ -234,7 +237,7 @@ function mapZhongshus(
 
     if (!startBar || !endBar) continue;
     const [b1, b2] = startBar.idx <= endBar.idx ? [startBar, endBar] : [endBar, startBar];
-    const prefix = kind === "segment" || zs.is_nine_upgrade ? `段中枢 S${zs.zs_id}` : `笔中枢 Z${zs.zs_id}`;
+    const prefix = kind === "segment" ? `段中枢 S${zs.zs_id}` : `笔中枢 Z${zs.zs_id}`;
     const suffix = zs.is_nine_upgrade ? "·九段" : zs.is_extended ? "·扩展" : "";
     const truncTag = clampedLeft ? "·左截断" : clampedRight ? "·右截断" : "";
     out.push({
@@ -243,6 +246,8 @@ function mapZhongshus(
       label: `${prefix}${suffix}${truncTag}`,
       startTime: b1.time,
       endTime: b2.time,
+      startLabel: b1.label,
+      endLabel: b2.label,
       zd: zs.zd,
       zg: zs.zg,
       dd: zs.dd,
@@ -406,19 +411,35 @@ export function prepareChanlunSeries(
     segPts.push({ idx: eb.idx, time: eb.time, value: seg.end_price });
   }
 
-  /* Zhongshu boxes: stroke zhongshus + segment zhongshus */
+  /* Zhongshu boxes: strictly separate stroke zhongshus (笔中枢) and segment zhongshus (段中枢) */
   const strokeZsSrc =
-    tf?.all_stroke_zhongshus && tf.all_stroke_zhongshus.length > 0
+    tf?.all_stroke_zhongshus !== undefined
       ? tf.all_stroke_zhongshus
-      : tf?.recent_zhongshus && tf.recent_zhongshus.length > 0
-        ? tf.recent_zhongshus
-        : tf?.latest_zhongshu
-          ? [tf.latest_zhongshu]
+      : tf?.stroke_zhongshus !== undefined
+        ? tf.stroke_zhongshus
+        : tf?.zhongshu_level !== "segment"
+          ? tf?.recent_zhongshus && tf.recent_zhongshus.length > 0
+            ? tf.recent_zhongshus
+            : tf?.latest_zhongshu
+              ? [tf.latest_zhongshu]
+              : []
           : [];
-  const zhongshuBoxes = [
-    ...mapZhongshus(strokeZsSrc, "stroke", resolve, firstBar, lastBar, intraday),
-    ...mapZhongshus(tf?.all_segment_zhongshus, "segment", resolve, firstBar, lastBar, intraday),
-  ];
+  const segmentZsSrc =
+    tf?.all_segment_zhongshus !== undefined
+      ? tf.all_segment_zhongshus
+      : tf?.segment_zhongshus !== undefined
+        ? tf.segment_zhongshus
+        : tf?.zhongshu_level === "segment"
+          ? tf?.recent_zhongshus && tf.recent_zhongshus.length > 0
+            ? tf.recent_zhongshus
+            : tf?.latest_zhongshu
+              ? [tf.latest_zhongshu]
+              : []
+          : [];
+  const strokeZhongshuBoxes = mapZhongshus(strokeZsSrc, "stroke", resolve, firstBar, lastBar, intraday);
+  const segmentZhongshuBoxes = mapZhongshus(segmentZsSrc, "segment", resolve, firstBar, lastBar, intraday);
+  const latestStrokeZhongshu = strokeZsSrc.length > 0 ? (strokeZsSrc[strokeZsSrc.length - 1] ?? null) : null;
+  const latestSegmentZhongshu = segmentZsSrc.length > 0 ? (segmentZsSrc[segmentZsSrc.length - 1] ?? null) : null;
 
   /* Markers: latest fractal + recent stroke turning points + strict signal_meta buy/sell marker */
   const rawMarkers: { idx: number; marker: SeriesMarker<Time> }[] = [];
@@ -499,7 +520,10 @@ export function prepareChanlunSeries(
     confirmedStrokes: toSortedLine(confirmedPts),
     unconfirmedStroke: toSortedLine(unconfirmedPts),
     segments: toSortedLine(segPts),
-    zhongshuBoxes,
+    strokeZhongshuBoxes,
+    segmentZhongshuBoxes,
+    latestStrokeZhongshu,
+    latestSegmentZhongshu,
     markers: rawMarkers.map((x) => x.marker),
   };
 }

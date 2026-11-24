@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState, type KeyboardEvent } from "react";
 import { ArrowRight, BookOpen, Crosshair, Radar, Search, ShieldCheck } from "lucide-react";
 import { api } from "../../api/client";
 import type { ScreenId, SymbolSearchItem } from "../../api/types";
+import { getSymbolName } from "../../lib/symbols";
+import { getUniverseLabel } from "../../lib/universes";
 import { ModalDialog } from "../ui/ModalDialog";
 
 interface CommandPaletteProps {
@@ -104,13 +106,14 @@ export function CommandPalette({ open, onClose, onNavigateScreen, onJumpSymbol }
     }
 
     for (const it of items) {
+      const zhName = (it.label && it.label.toUpperCase() !== it.symbol.toUpperCase() ? it.label : null) ?? getSymbolName(it.symbol);
       out.push({
         key: `sym-${it.symbol}-${targetMode}`,
         kind: targetMode,
-        title: `${it.symbol}${it.label && it.label !== it.symbol ? ` · ${it.label}` : ""}`,
+        title: zhName ? `${zhName} · ${it.symbol}` : it.symbol,
         subtitle: [
           it.asset_class,
-          it.pool ? `池:${it.pool}` : null,
+          it.pool ? `板块:${getUniverseLabel(it.pool)}` : null,
           it.status ? `状态:${it.status}` : null,
           targetMode === "warroom" ? "回车打开双周期战情室" : "回车打开研究档案室",
         ]

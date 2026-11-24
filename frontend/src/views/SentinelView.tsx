@@ -25,6 +25,7 @@ import {
 } from "../components/portfolio/PortfolioDialogs";
 import { DirectionBadge, SentinelStatusBadge, StatusBadge } from "../components/ui/StatusBadge";
 import { fmtMoney, fmtPct, fmtPrice, shortTime } from "../lib/format";
+import { formatSymbolWithCode, getSymbolName } from "../lib/symbols";
 
 interface SentinelViewProps {
   onJumpWarRoom: (symbol: string) => void;
@@ -282,8 +283,15 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div>
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-base font-semibold text-ink">{h.symbol}</span>
-                        {h.name ? <span className="text-xs text-muted">{h.name}</span> : null}
+                        {(() => {
+                          const zh = h.name || getSymbolName(h.symbol);
+                          return (
+                            <>
+                              <span className="text-base font-semibold text-ink">{zh || h.symbol}</span>
+                              {zh ? <span className="font-mono text-xs text-muted">{h.symbol}</span> : null}
+                            </>
+                          );
+                        })()}
                         <DirectionBadge direction={h.direction} />
                         {h.sector_theme ? (
                           <span className="rounded border border-hairline bg-elevated px-2 py-0.5 text-[11px] text-ink-2">
@@ -556,7 +564,7 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
                         className="font-semibold text-slot1 hover:underline"
                         onClick={() => onJumpWarRoom(ev.symbol)}
                       >
-                        {ev.symbol}
+                        {formatSymbolWithCode(ev.symbol)}
                       </button>
                       <span className="truncate text-ink">{ev.title}</span>
                     </div>
@@ -588,9 +596,11 @@ export function SentinelView({ onJumpWarRoom, onJumpArchive }: SentinelViewProps
                         className="font-semibold text-slot1 hover:underline"
                         onClick={() => onJumpWarRoom(w.symbol)}
                       >
-                        {w.symbol}
+                        {w.name || getSymbolName(w.symbol) || w.symbol}
                       </button>
-                      <span className="text-muted">{w.name || w.market}</span>
+                      <span className="font-mono text-[11px] text-muted">
+                        {w.name || getSymbolName(w.symbol) ? w.symbol : w.market}
+                      </span>
                     </div>
                     <StatusBadge
                       tone={(w.fired_triggers?.length ?? 0) > 0 ? "warning" : "neutral"}

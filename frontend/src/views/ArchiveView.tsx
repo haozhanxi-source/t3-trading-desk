@@ -18,6 +18,7 @@ import { HardDataVisuals } from "../components/archive/HardDataVisuals";
 import { ModalDialog } from "../components/ui/ModalDialog";
 import { DirectionBadge, StatusBadge } from "../components/ui/StatusBadge";
 import { shortTime } from "../lib/format";
+import { getSymbolName } from "../lib/symbols";
 
 type ArchiveTab = "thesis" | "evidence" | "harddata" | "triggers";
 
@@ -370,7 +371,10 @@ export function ArchiveView({ symbol, market = null, onSelectSymbol, onJumpWarRo
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-semibold text-ink">
-                        {a.symbol} {a.name ? `· ${a.name}` : ""}
+                        {a.name || getSymbolName(a.symbol) || a.symbol}
+                        {a.name || getSymbolName(a.symbol) ? (
+                          <span className="font-mono text-[11px] font-normal text-muted"> · {a.symbol}</span>
+                        ) : null}
                       </span>
                       <StatusBadge tone={statusTone} label={a.status} />
                     </div>

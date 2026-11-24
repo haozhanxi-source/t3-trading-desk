@@ -1,0 +1,622 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------
+ * T3 Trading Desk · Validated OKLab CVD-safe palette & Modern Web CSS
+ * Dark is the default workbench identity (`data-theme="dark"`), while
+ * `:root` supports `color-scheme: light dark`, `@media (prefers-color-scheme: dark)`
+ * fallback, and `light-dark()` for System mode and `data-theme="light"`.
+ * ------------------------------------------------------------------ */
+
+:root {
+  color-scheme: light dark;
+
+  /* Raw light / dark token pairs */
+  --page-light: #f9f9f7;
+  --page-dark: #0d0d0d;
+  --surface-light: #fcfcfb;
+  --surface-dark: #1a1a19;
+  --elevated-light: #f3f2ee;
+  --elevated-dark: #222220;
+  --hairline-light: rgba(11, 11, 11, 0.1);
+  --hairline-dark: rgba(255, 255, 255, 0.1);
+  --gridline-light: #e1e0d9;
+  --gridline-dark: #2c2c2a;
+  --ink-light: #0b0b0b;
+  --ink-dark: #f0efec;
+  --ink-2-light: #52514e;
+  --ink-2-dark: #c3c2b7;
+
+  /* Base fallback (light) before @media (prefers-color-scheme: dark) & light-dark() */
+  --page: var(--page-light);
+  --surface: var(--surface-light);
+  --elevated: var(--elevated-light);
+  --hairline: var(--hairline-light);
+  --gridline: var(--gridline-light);
+  --ink: var(--ink-light);
+  --ink-2: var(--ink-2-light);
+  --muted: #898781;
+
+  --slot1: #2a78d6;
+  --slot2: #eb6834;
+  --slot3: #1baf7a;
+  --slot4: #eda100;
+  --slot5: #e87ba4;
+  --slot6: #008300;
+  --slot7: #6250d6;
+  --slot8: #e34948;
+
+  /* Status colors (fixed, always paired with icon + text label, never color alone) */
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* Fallback for browsers without light-dark() support */
+  @media (prefers-color-scheme: dark) {
+    --page: var(--page-dark);
+    --surface: var(--surface-dark);
+    --elevated: var(--elevated-dark);
+    --hairline: var(--hairline-dark);
+    --gridline: var(--gridline-dark);
+    --ink: var(--ink-dark);
+    --ink-2: var(--ink-2-dark);
+    --slot1: #3987e5;
+    --slot2: #d95926;
+    --slot3: #199e70;
+    --slot4: #c98500;
+    --slot5: #d55181;
+    --slot6: #0ca30c;
+    --slot7: #9085e9;
+    --slot8: #e66767;
+  }
+
+  /* Modern engines resolve per active color-scheme on :root */
+  @supports (color: light-dark(white, black)) {
+    --page: light-dark(var(--page-light), var(--page-dark));
+    --surface: light-dark(var(--surface-light), var(--surface-dark));
+    --elevated: light-dark(var(--elevated-light), var(--elevated-dark));
+    --hairline: light-dark(var(--hairline-light), var(--hairline-dark));
+    --gridline: light-dark(var(--gridline-light), var(--gridline-dark));
+    --ink: light-dark(var(--ink-light), var(--ink-dark));
+    --ink-2: light-dark(var(--ink-2-light), var(--ink-2-dark));
+    --slot1: light-dark(#2a78d6, #3987e5);
+    --slot2: light-dark(#eb6834, #d95926);
+    --slot3: light-dark(#1baf7a, #199e70);
+    --slot4: light-dark(#eda100, #c98500);
+    --slot5: light-dark(#e87ba4, #d55181);
+    --slot6: light-dark(#008300, #0ca30c);
+    --slot7: light-dark(#6250d6, #9085e9);
+    --slot8: light-dark(#e34948, #e66767);
+  }
+}
+
+/* Explicit user theme choice on :root (html), NOT body */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface: #1a1a19;
+  --elevated: #222220;
+  --hairline: rgba(255, 255, 255, 0.1);
+  --gridline: #2c2c2a;
+  --ink: #f0efec;
+  --ink-2: #c3c2b7;
+  --slot1: #3987e5;
+  --slot2: #d95926;
+  --slot3: #199e70;
+  --slot4: #c98500;
+  --slot5: #d55181;
+  --slot6: #0ca30c;
+  --slot7: #9085e9;
+  --slot8: #e66767;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface: #fcfcfb;
+  --elevated: #f3f2ee;
+  --hairline: rgba(11, 11, 11, 0.1);
+  --gridline: #e1e0d9;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --slot1: #2a78d6;
+  --slot2: #eb6834;
+  --slot3: #1baf7a;
+  --slot4: #eda100;
+  --slot5: #e87ba4;
+  --slot6: #008300;
+  --slot7: #6250d6;
+  --slot8: #e34948;
+}
+
+@theme inline {
+  --color-page: var(--page);
+  --color-surface: var(--surface);
+  --color-elevated: var(--elevated);
+  --color-hairline: var(--hairline);
+  --color-gridline: var(--gridline);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-muted: var(--muted);
+  --color-good: var(--good);
+  --color-warning: var(--warning);
+  --color-serious: var(--serious);
+  --color-critical: var(--critical);
+  --color-slot1: var(--slot1);
+  --color-slot2: var(--slot2);
+  --color-slot3: var(--slot3);
+  --color-slot4: var(--slot4);
+  --color-slot5: var(--slot5);
+  --color-slot6: var(--slot6);
+  --color-slot7: var(--slot7);
+  --color-slot8: var(--slot8);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+/* ------------------------------------------------------------------
+ * Base & Scrollbars (never transition scrollbar-color)
+ * ------------------------------------------------------------------ */
+html {
+  background: var(--page);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  accent-color: var(--slot1);
+  scrollbar-color: var(--muted) transparent;
+  scrollbar-width: thin;
+}
+
+body {
+  margin: 0;
+  min-height: 100dvh;
+  background: var(--page);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  scrollbar-color: var(--muted) transparent;
+}
+
+@supports not (scrollbar-color: auto) {
+  html,
+  * {
+    /* Reset scrollbar-width: thin so ::-webkit-scrollbar is not suppressed */
+    scrollbar-width: auto;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--muted);
+    border-radius: 6px;
+    border: 2px solid var(--page);
+  }
+}
+
+.tnum,
+td.num,
+th.num {
+  font-variant-numeric: tabular-nums;
+}
+
+:focus-visible {
+  outline: 2px solid var(--slot1);
+  outline-offset: 2px;
+}
+
+/* ------------------------------------------------------------------
+ * Native <dialog> (scope display to dialog[open] ONLY)
+ * Explicit margin: auto prevents Tailwind Preflight's margin: 0 from
+ * pinning top-layer modals to the viewport's top-left corner.
+ * ------------------------------------------------------------------ */
+dialog,
+dialog.modal-dialog {
+  inset: 0;
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  max-width: min(640px, calc(100vw - 32px));
+  width: 100%;
+  max-height: calc(100dvh - 64px);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.45);
+}
+
+dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.58);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+dialog.palette,
+dialog.modal-dialog.palette {
+  margin: 10vh auto auto;
+  max-width: min(680px, calc(100vw - 32px));
+}
+
+/* ------------------------------------------------------------------
+ * Responsive semantic tables (@container stacked transformation)
+ * ------------------------------------------------------------------ */
+.table-wrapper {
+  overflow: auto;
+  container-type: inline-size;
+  max-inline-size: 100%;
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.table-wrapper:focus-visible {
+  outline-offset: -2px;
+}
+
+.data-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.data-table thead {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+}
+
+.data-table thead th {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 1;
+  background: var(--elevated);
+  color: var(--muted);
+  font-weight: 500;
+  text-align: start;
+  white-space: nowrap;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.data-table tbody th {
+  position: sticky;
+  inset-inline-start: 0;
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 600;
+  text-align: start;
+  white-space: nowrap;
+}
+
+.data-table td,
+.data-table tbody th {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: middle;
+}
+
+.data-table tbody tr:last-child td,
+.data-table tbody tr:last-child th {
+  border-bottom: 0;
+}
+
+.data-table td.num,
+.data-table th.num {
+  text-align: end;
+  white-space: nowrap;
+}
+
+.data-table tbody tr.clickable {
+  cursor: pointer;
+}
+
+.data-table tbody tr.clickable:hover td,
+.data-table tbody tr.clickable:hover th {
+  background: var(--elevated);
+}
+
+@container (width < 600px) {
+  .data-table,
+  .data-table tbody,
+  .data-table tr,
+  .data-table td,
+  .data-table tbody th {
+    display: block;
+    width: 100%;
+  }
+
+  .data-table thead {
+    /* MANDATORY: Hide column header from layout and screen readers in stacked mode */
+    display: none;
+  }
+
+  .data-table tbody tr {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  .data-table tbody th {
+    position: sticky;
+    inset-block-start: 0;
+    z-index: 2;
+    padding: 4px 6px;
+    margin-bottom: 4px;
+    border-radius: 4px;
+    border: 0;
+    background: var(--elevated);
+  }
+
+  .data-table td {
+    display: grid;
+    grid-template-columns: minmax(104px, 40%) 1fr;
+    gap: 8px;
+    padding: 3px 2px;
+    border: 0;
+    text-align: start;
+  }
+
+  .data-table td.num {
+    text-align: start;
+  }
+
+  .data-table td::before {
+    content: attr(data-label) ": ";
+    color: var(--muted);
+    font-weight: 500;
+  }
+}
+
+/* ------------------------------------------------------------------
+ * Markdown (thesis.md) — rendered safely via react-markdown + remark-gfm
+ * ------------------------------------------------------------------ */
+.prose-desk {
+  font-size: 13.5px;
+  line-height: 1.72;
+  color: var(--ink);
+  max-width: 90ch;
+}
+.prose-desk h1,
+.prose-desk h2,
+.prose-desk h3,
+.prose-desk h4 {
+  font-weight: 650;
+  line-height: 1.35;
+  margin: 1.35em 0 0.5em;
+}
+.prose-desk h1 {
+  font-size: 1.3rem;
+}
+.prose-desk h2 {
+  font-size: 1.1rem;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--hairline);
+}
+.prose-desk h3 {
+  font-size: 0.98rem;
+}
+.prose-desk p,
+.prose-desk ul,
+.prose-desk ol,
+.prose-desk blockquote,
+.prose-desk pre {
+  margin: 0.6em 0;
+}
+.prose-desk ul {
+  list-style: disc;
+  padding-inline-start: 1.4em;
+}
+.prose-desk ol {
+  list-style: decimal;
+  padding-inline-start: 1.4em;
+}
+.prose-desk a {
+  color: var(--slot1);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.prose-desk code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: var(--elevated);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.prose-desk pre {
+  background: var(--elevated);
+  padding: 10px 12px;
+  border-radius: 6px;
+  overflow: auto;
+}
+.prose-desk pre code {
+  background: transparent;
+  padding: 0;
+}
+.prose-desk blockquote {
+  border-inline-start: 3px solid var(--gridline);
+  padding-inline-start: 12px;
+  color: var(--ink-2);
+}
+.prose-desk table {
+  border-collapse: collapse;
+  font-size: 12.5px;
+  display: block;
+  overflow-x: auto;
+  font-variant-numeric: tabular-nums;
+}
+.prose-desk th,
+.prose-desk td {
+  border: 1px solid var(--hairline);
+  padding: 5px 9px;
+  text-align: start;
+}
+.prose-desk th {
+  background: var(--elevated);
+  font-weight: 600;
+}
+.prose-desk hr {
+  border: 0;
+  border-top: 1px solid var(--hairline);
+  margin: 1.3em 0;
+}
+
+/* ------------------------------------------------------------------
+ * Clean workbench primitives (no flashing animations)
+ * ------------------------------------------------------------------ */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.input {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--hairline);
+  background: var(--page);
+  color: var(--ink);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+
+textarea.input {
+  height: auto;
+  padding: 8px 10px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+select.input {
+  padding-inline-end: 6px;
+}
+
+.input:focus-visible {
+  outline: 2px solid var(--slot1);
+  outline-offset: 0;
+  border-color: transparent;
+}
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid var(--hairline);
+  background: var(--elevated);
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.btn:hover:not(:disabled) {
+  border-color: var(--muted);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.btn-primary {
+  background: var(--slot1);
+  border-color: var(--slot1);
+  color: #ffffff;
+}
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+  border-color: var(--slot1);
+}
+.btn-danger {
+  background: transparent;
+  border-color: var(--critical);
+  color: var(--critical);
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+}
+.btn-ghost:hover:not(:disabled) {
+  background: var(--elevated);
+  border-color: var(--hairline);
+}
+.btn-sm {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 25px;
+  padding: 0 9px;
+  border-radius: 999px;
+  border: 1px solid var(--hairline);
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chip:hover:not(:disabled) {
+  border-color: var(--muted);
+  color: var(--ink);
+}
+.chip[aria-pressed="true"] {
+  background: var(--elevated);
+  color: var(--ink);
+  border-color: var(--slot1);
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+}
+
+.section-title {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--muted);
+}
+
+.kpi-value {
+  font-size: 21px;
+  font-weight: 650;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+  line-height: 1.15;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .progress-bar > span {
+    transition: inline-size 220ms ease-out;
+  }
+}

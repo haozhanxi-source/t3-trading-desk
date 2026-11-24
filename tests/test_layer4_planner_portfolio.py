@@ -946,7 +946,12 @@ class TestPositionPlanner(unittest.TestCase):
                         "bar_is_closed": True,
                     }
                 },
-                "chanlun": {"daily_30m_alignment": {"alignment_status": "daily_ok_wait_30m"}},
+                "chanlun": {
+                    "daily_30m_alignment": {
+                        "alignment_status": "daily_ok_wait_30m",
+                        "intraday_tactical_stop": 96200.0,
+                    }
+                },
             },
             "research": {
                 "fundamentals_and_supply": {
@@ -967,7 +972,6 @@ class TestPositionPlanner(unittest.TestCase):
             rc_live = planner_main([
                 "--symbol", "CU0",
                 "--direction", "short",
-                "--stop", "96200",
                 "--target", "89000",
                 "--equity", "1000000",
                 "--account-currency", "CNY",
@@ -980,7 +984,21 @@ class TestPositionPlanner(unittest.TestCase):
         self.assertEqual(live_payload["four_quadrant_gate"]["decision"], "watchlist_wait_30m")
         self.assertEqual(live_payload["expression_and_carry"]["annualized_carry_pct"], -15.0)
         self.assertEqual(live_payload["position_plan"]["entry_price"], 95000.0)
+        self.assertEqual(live_payload["position_plan"]["tactical_stop_30m"], 96200.0)
+        self.assertEqual(live_payload["stop_source"], "live_30m_chanlun")
+        self.assertEqual(live_payload["stop_timeframe"], "30m")
         self.assertIsNotNone(live_payload["position_plan"]["stop_vs_atr30m"])
+
+        # --live with manual --stop or --daily-stop MUST be rejected by CLI argparse (exit 2)
+        for bad_flag, bad_val in (("--stop", "96200"), ("--daily-stop", "99000")):
+            err_stop = io.StringIO()
+            with redirect_stderr(err_stop), self.assertRaises(SystemExit) as cm_stop:
+                planner_main([
+                    "--symbol", "CU0", "--direction", "short", "--live",
+                    bad_flag, bad_val,
+                ])
+            self.assertEqual(cm_stop.exception.code, 2)
+            self.assertIn("live mode strictly enforces live 30m Chanlun stops", err_stop.getvalue())
 
         # Real Worker-1 dual snapshot shape: intraday_technicals + chanlun.dual_alignment + auto-filled --stop
         w1_live_ctx = {

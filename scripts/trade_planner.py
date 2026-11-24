@@ -612,10 +612,16 @@ def resolve_fx_to_account(
     if not acct_ccy:
         raise ValueError("account_currency must be a non-empty string")
     quote_ccy = str(spec.get("quote_currency") or spec.get("currency") or "").strip().upper()
+    if quote_ccy and quote_ccy == acct_ccy:
+        if fx_to_account is not None:
+            rate = _require_finite_float(fx_to_account, "fx_to_account", positive=True)
+            if abs(rate - 1.0) > 1e-9:
+                raise ValueError(
+                    f"Same-currency trade ({quote_ccy} == {acct_ccy}) must use fx_to_account=1.0 (got {rate})"
+                )
+        return 1.0
     if fx_to_account is not None:
         return _require_finite_float(fx_to_account, "fx_to_account", positive=True)
-    if quote_ccy and quote_ccy == acct_ccy:
-        return 1.0
     raise ValueError(
         f"Cross-currency trade ({quote_ccy or 'UNKNOWN'} -> {acct_ccy}) requires explicit fx_to_account"
     )
@@ -2496,15 +2502,19 @@ def _parse_tranches_arg(raw: str) -> tuple[float, ...]:
     return tuple(float(p) for p in parts)
 
 
-def main(argv: list[str] | None = None) -> int:
+class PlanInputError(ValueError):
+    """Missing/contradictory planner inputs (CLI maps this to argparse usage errors)."""
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Layer-4 trade expression, carry evaluation, four-quadrant gate, and position sizer"
     )
     parser.add_argument("--symbol", required=True, help="Ticker or CN future (e.g. CU0, CL=F, NVDA, 600519, USDJPY)")
     parser.add_argument("--direction", required=True, choices=["long", "short"], help="Trade direction")
     parser.add_argument("--entry", type=float, default=None, help="Planned entry price (auto-filled in --live mode)")
-    parser.add_argument("--stop", "--tactical-stop-30m", dest="stop", type=float, default=None, help="30min tactical stop (auto-filled in --live mode if valid)")
-    parser.add_argument("--daily-stop", "--structural-stop-daily", dest="daily_stop", type=float, default=None, help="Daily structural invalidation stop")
+    parser.add_argument("--stop", "--tactical-stop-30m", dest="stop", type=float, default=None, help="30min tactical stop (manual scenario mode only; forbidden with --live)")
+    parser.add_argument("--daily-stop", "--structural-stop-daily", dest="daily_stop", type=float, default=None, help="Daily structural invalidation stop (manual scenario mode only; forbidden with --live)")
     parser.add_argument("--target", type=float, default=None, help="Target price")
     parser.add_argument("--equity", type=float, default=1_000_000.0, help="Account equity in account currency")
     parser.add_argument("--account-currency", default="USD", help="Account base currency (default: USD)")
@@ -2548,11 +2558,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--min-rr", type=float, default=2.5, help="Minimum R:R gate threshold (default: 2.5)")
     parser.add_argument("--alignment-status", default=None, help="Manual daily/30m alignment_status (offline mode only; forbidden with --live)")
     parser.add_argument("--live", action="store_true", help="Fetch live market snapshot & Layer-3 curve/rate/funding data")
+    return parser
 
-    args = parser.parse_args(argv)
+
+def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
+    """Compose live context, position sizing, carry expression and four-quadrant gate.
+
+    Raises ``PlanInputError`` for missing entry/stop inputs and ``ValueError`` for domain validation errors.
+    """
 
     if args.live and args.alignment_status is not None:
-        parser.error("--alignment-status cannot override live dual alignment in --live mode")
+        raise PlanInputError("--alignment-status cannot override live dual alignment in --live mode")
+    if args.live and (args.stop is not None or args.daily_stop is not None):
+        raise PlanInputError(
+            "--stop and --daily-stop cannot override live 30m/daily Chanlun stops in --live mode; "
+            "live mode strictly enforces live 30m Chanlun stops — run manual stop scenarios with --live disabled (live=False)"
+        )
 
     live_ctx: dict[str, Any] | None = None
     upstream_errors: list[str] = []
@@ -2695,9 +2716,14 @@ def main(argv: list[str] | None = None) -> int:
                 rate_diff = {"status": "stale", "warning": "sources_status reported rate_differential stale/error"}
 
     if entry_price is None:
-        parser.error("--entry is required (or use --live when snapshot last_close is available)")
+        raise PlanInputError("--entry is required (or use --live when snapshot last_close is available)")
     if stop_price is None:
-        parser.error("--stop is required (or use --live when a valid 30min tactical stop is available)")
+        if args.live:
+            raise PlanInputError(
+                "Live mode strictly enforces live 30min Chanlun stops, but no valid intraday_tactical_stop is available "
+                "(run manual stop scenarios with --live disabled / live=False)"
+            )
+        raise PlanInputError("--stop is required (or use --live when a valid 30min tactical stop is available)")
 
     if args.curve_structure is not None or args.roll_yield is not None or args.near_roll_yield is not None:
         term_structure = dict(term_structure or {})
@@ -2723,72 +2749,88 @@ def main(argv: list[str] | None = None) -> int:
             daily_alignment["daily_bias"] = args.direction
             daily_alignment["intraday_action"] = f"entry_{args.direction}"
 
-    try:
-        tranche_weights = _parse_tranches_arg(args.tranches)
-        plan = calculate_position_plan(
-            symbol=args.symbol,
-            direction=args.direction,
-            entry_price=entry_price,
-            tactical_stop_30m=stop_price,
-            structural_stop_daily=daily_stop,
-            target_price=args.target,
-            account_equity=args.equity,
-            account_currency=args.account_currency,
-            risk_budget_pct=args.risk_pct,
-            slot_risk_share=args.slot_risk_share,
-            tranche_weights=tranche_weights,
-            atr14_30m=atr30m,
-            atr14_daily=atr_daily,
-            multiplier=args.multiplier,
-            margin_rate=args.margin_rate,
-            fx_to_account=args.fx_to_account,
-            asset_class=args.asset_class,
-            max_margin_pct=args.max_margin_pct,
-            max_leverage=args.max_leverage,
-            allow_equity_margin=args.allow_equity_margin,
-        )
-        expression = evaluate_expression_and_carry(
-            direction=args.direction,
-            asset_class=plan["asset_class"],
-            term_structure=term_structure,
-            rate_diff=rate_diff,
-            crypto_funding=crypto_funding,
-            holding_horizon_days=args.horizon_days,
-            expected_move_pct=plan.get("expected_move_pct"),
-            stop_distance_pct=plan.get("stop_distance_30m_pct"),
-        )
-        if expression.get("carry_adjusted_rr_ratio") is not None:
-            plan["carry_adjusted_rr_ratio"] = expression["carry_adjusted_rr_ratio"]
-        gate = evaluate_four_quadrant_gate(
-            direction=args.direction,
-            asset_class=plan["asset_class"],
-            has_l1_l2_evidence=args.has_l1_l2,
-            pending_verifications_count=args.pending_verifications,
-            thesis_falsified=args.thesis_falsified,
-            daily_alignment=daily_alignment,
-            rr_ratio=plan.get("rr_ratio"),
-            min_rr=args.min_rr,
-            hedge_only=args.hedge_only,
-            is_pair_trade=args.pair_trade,
-            total_quantity=plan.get("total_quantity"),
-            within_capital_limits=plan.get("within_capital_limits", True),
-            upstream_errors=upstream_errors,
-            pair_leg_verified=args.pair_leg_verified,
-            carry_adjusted_rr_ratio=expression.get("carry_adjusted_rr_ratio"),
-            curve_stale_or_error=bool(expression.get("curve_data_warning")),
-        )
-    except ValueError as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
-        return 2
+    tranche_weights = _parse_tranches_arg(args.tranches)
+    plan = calculate_position_plan(
+        symbol=args.symbol,
+        direction=args.direction,
+        entry_price=entry_price,
+        tactical_stop_30m=stop_price,
+        structural_stop_daily=daily_stop,
+        target_price=args.target,
+        account_equity=args.equity,
+        account_currency=args.account_currency,
+        risk_budget_pct=args.risk_pct,
+        slot_risk_share=args.slot_risk_share,
+        tranche_weights=tranche_weights,
+        atr14_30m=atr30m,
+        atr14_daily=atr_daily,
+        multiplier=args.multiplier,
+        margin_rate=args.margin_rate,
+        fx_to_account=args.fx_to_account,
+        asset_class=args.asset_class,
+        max_margin_pct=args.max_margin_pct,
+        max_leverage=args.max_leverage,
+        allow_equity_margin=args.allow_equity_margin,
+    )
+    expression = evaluate_expression_and_carry(
+        direction=args.direction,
+        asset_class=plan["asset_class"],
+        term_structure=term_structure,
+        rate_diff=rate_diff,
+        crypto_funding=crypto_funding,
+        holding_horizon_days=args.horizon_days,
+        expected_move_pct=plan.get("expected_move_pct"),
+        stop_distance_pct=plan.get("stop_distance_30m_pct"),
+    )
+    if expression.get("carry_adjusted_rr_ratio") is not None:
+        plan["carry_adjusted_rr_ratio"] = expression["carry_adjusted_rr_ratio"]
+    gate = evaluate_four_quadrant_gate(
+        direction=args.direction,
+        asset_class=plan["asset_class"],
+        has_l1_l2_evidence=args.has_l1_l2,
+        pending_verifications_count=args.pending_verifications,
+        thesis_falsified=args.thesis_falsified,
+        daily_alignment=daily_alignment,
+        rr_ratio=plan.get("rr_ratio"),
+        min_rr=args.min_rr,
+        hedge_only=args.hedge_only,
+        is_pair_trade=args.pair_trade,
+        total_quantity=plan.get("total_quantity"),
+        within_capital_limits=plan.get("within_capital_limits", True),
+        upstream_errors=upstream_errors,
+        pair_leg_verified=args.pair_leg_verified,
+        carry_adjusted_rr_ratio=expression.get("carry_adjusted_rr_ratio"),
+        curve_stale_or_error=bool(expression.get("curve_data_warning")),
+    )
+
+    stop_source = "live_30m_chanlun" if args.live else "manual_scenario"
+    stop_timeframe = "30m" if args.live else "manual"
+    plan["stop_source"] = stop_source
+    plan["stop_timeframe"] = stop_timeframe
 
     output: dict[str, Any] = {
         "four_quadrant_gate": gate,
         "expression_and_carry": expression,
         "position_plan": plan,
+        "stop_source": stop_source,
+        "stop_timeframe": stop_timeframe,
     }
     dedup_warnings = list(dict.fromkeys(upstream_errors))
     if dedup_warnings:
         output["live_warnings"] = dedup_warnings
+    return output
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        output = build_trade_plan(args)
+    except PlanInputError as exc:
+        parser.error(str(exc))
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}, ensure_ascii=False, indent=2), file=sys.stderr)
+        return 2
 
     print(json.dumps(output, ensure_ascii=False, indent=2, allow_nan=False))
     return 0

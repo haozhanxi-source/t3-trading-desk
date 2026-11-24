@@ -237,7 +237,7 @@ function mapZhongshus(
 
     if (!startBar || !endBar) continue;
     const [b1, b2] = startBar.idx <= endBar.idx ? [startBar, endBar] : [endBar, startBar];
-    const prefix = kind === "segment" ? `段中枢 S${zs.zs_id}` : `笔中枢 Z${zs.zs_id}`;
+    const prefix = kind === "segment" ? `线段中枢 S${zs.zs_id}` : `笔中枢 Z${zs.zs_id}`;
     const suffix = zs.is_nine_upgrade ? "·九段" : zs.is_extended ? "·扩展" : "";
     const truncTag = clampedLeft ? "·左截断" : clampedRight ? "·右截断" : "";
     out.push({
@@ -411,7 +411,7 @@ export function prepareChanlunSeries(
     segPts.push({ idx: eb.idx, time: eb.time, value: seg.end_price });
   }
 
-  /* Zhongshu boxes: strictly separate stroke zhongshus (笔中枢) and segment zhongshus (段中枢) */
+  /* Zhongshu boxes: strictly separate stroke zhongshus (笔中枢) and segment zhongshus (线段中枢) */
   const strokeZsSrc =
     tf?.all_stroke_zhongshus !== undefined
       ? tf.all_stroke_zhongshus

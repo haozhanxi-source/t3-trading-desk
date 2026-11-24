@@ -102,7 +102,7 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
         ctx.stroke();
         ctx.setLineDash([]);
 
-        /* Inline Zhongshu badge (`笔中枢 Z1` / `段中枢 S1`) wearing primary ink token */
+        /* Inline Zhongshu badge (`笔中枢 Z1` / `线段中枢 S1`) wearing primary ink token */
         if (width >= 34 && top >= -12 && top <= h - 6) {
           const text = width >= 118 ? `${box.label} [${box.rangeText}]` : box.label;
           ctx.font = '600 10.5px system-ui, -apple-system, "Segoe UI", sans-serif';

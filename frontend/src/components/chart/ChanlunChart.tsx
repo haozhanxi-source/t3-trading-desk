@@ -71,7 +71,7 @@ export function ChanlunChart({
   const { palette } = useTheme();
   const containerRef = useRef<HTMLDivElement | null>(null);
 
-  /* Interactive layer visibility toggles (stroke <-> 笔中枢, segment <-> 段中枢) */
+  /* Interactive layer visibility toggles (stroke <-> 笔中枢, segment <-> 线段中枢) */
   const [showStrokes, setShowStrokes] = useState(true);
   const [showStrokeZhongshu, setShowStrokeZhongshu] = useState(true);
   const [showSegments, setShowSegments] = useState(false);
@@ -397,8 +397,8 @@ export function ChanlunChart({
 
     const latestSegmentZs = prepared.latestSegmentZhongshu;
     if (showSegmentZhongshu && latestSegmentZs) {
-      addLine(latestSegmentZs.zg, "段中枢 ZG", palette.zsSegBorder, LineStyle.Dotted, 1);
-      addLine(latestSegmentZs.zd, "段中枢 ZD", palette.zsSegBorder, LineStyle.Dotted, 1);
+      addLine(latestSegmentZs.zg, "线段中枢 ZG", palette.zsSegBorder, LineStyle.Dotted, 1);
+      addLine(latestSegmentZs.zd, "线段中枢 ZD", palette.zsSegBorder, LineStyle.Dotted, 1);
     }
   }, [
     prepared.latestStrokeZhongshu,
@@ -468,10 +468,10 @@ export function ChanlunChart({
             className="chip"
             aria-pressed={showSegmentZhongshu}
             onClick={() => setShowSegmentZhongshu((v) => !v)}
-            title={`显示/隐藏段中枢（当前 ${prepared.segmentZhongshuBoxes.length} 个）`}
+            title={`显示/隐藏线段中枢（当前 ${prepared.segmentZhongshuBoxes.length} 个）`}
           >
             <Layers className="h-3 w-3" style={{ color: palette.zsSegBorder }} aria-hidden="true" />
-            <span>段中枢</span>
+            <span>线段中枢</span>
           </button>
           <button type="button" className="chip" aria-pressed={showMarkers} onClick={() => setShowMarkers((v) => !v)}>
             <span>买卖点/分型</span>
@@ -558,7 +558,7 @@ export function ChanlunChart({
           <div className="mb-2 flex items-center justify-between text-xs text-muted">
             <span>中枢与近期严格笔坐标明细（无障碍数据对照表）</span>
             <span>
-              笔中枢 {prepared.strokeZhongshuBoxes.length} 个 · 段中枢 {prepared.segmentZhongshuBoxes.length} 个 ·{" "}
+              笔中枢 {prepared.strokeZhongshuBoxes.length} 个 · 线段中枢 {prepared.segmentZhongshuBoxes.length} 个 ·{" "}
               {(chanlun?.all_strokes ?? []).length} 笔 · {(chanlun?.all_segments ?? []).length} 线段
             </span>
           </div>

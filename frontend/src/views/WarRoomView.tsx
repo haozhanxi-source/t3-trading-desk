@@ -291,7 +291,7 @@ export function WarRoomView({
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
         <ChanlunChart
           title={`3年日线缠论图 · ${data?.symbol || symbol}`}
-          subtitle="定主方向、笔/段中枢 [ZD, ZG] 空间与 MACD 动力学对比"
+          subtitle="定主方向、笔中枢/线段中枢 [ZD, ZG] 空间与 MACD 动力学对比"
           bars={data?.ohlcv_daily ?? []}
           chanlun={daily}
           signalSummary={data?.chanlun?.signal_summary}
@@ -300,7 +300,7 @@ export function WarRoomView({
 
         <ChanlunChart
           title={`${loadedInterval} 缠论执行图 · ${data?.symbol || symbol}`}
-          subtitle="诞生精确 1/2/3 买卖点与小级别笔/段中枢结构"
+          subtitle="诞生精确 1/2/3 买卖点与小级别笔中枢/线段中枢结构"
           bars={data?.ohlcv_intraday ?? []}
           chanlun={intraday}
           signalSummary={data?.chanlun?.intraday_signal_summary}

@@ -501,6 +501,12 @@ export function ArchiveView({
           const msg = parsed?.data?.message || parsed?.message || "后台核验流连接中断或任务异常";
           finish({ kind: "error", message: String(msg) });
         });
+        es.addEventListener("cancelled", (ev) => {
+          const rawData = typeof (ev as MessageEvent).data === "string" ? (ev as MessageEvent).data : "";
+          const parsed = rawData ? parseTaskEvent(rawData, "cancelled") : null;
+          const msg = parsed?.data?.message || parsed?.message || "任务已终止";
+          finish({ kind: "error", message: String(msg) });
+        });
       });
 
       if (outcome.kind === "timeout") {

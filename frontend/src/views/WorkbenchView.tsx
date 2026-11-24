@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
+  AlertTriangle,
   BookmarkPlus,
   BookOpen,
   Check,
@@ -8,13 +9,15 @@ import {
   ChevronRight,
   Clock,
   Crosshair,
+  Database,
   FolderPlus,
   Play,
   RefreshCw,
+  Square,
   XCircle,
 } from "lucide-react";
 import { api, errorMessage, parseTaskEvent } from "../api/client";
-import type { ScanRow, TaskEventEnvelope, TaskRecord, UniversePool } from "../api/types";
+import type { PersistedScanRun, ScanRow, TaskEventEnvelope, TaskRecord, UniversePool, WarehouseSummary } from "../api/types";
 import { ModalDialog } from "../components/ui/ModalDialog";
 import { signedToneClass, StatusBadge } from "../components/ui/StatusBadge";
 import { SymbolLabel } from "../components/ui/SymbolLabel";
@@ -70,14 +73,16 @@ function classifyScanRow(row: ScanRow): "long" | "short" | "watch" {
   const sigType = (row.signal_type || "").trim().toLowerCase();
   const tierTxt = (row.signal_tier || "").trim();
 
-  /* Exclude unconfirmed candidates, weak-momentum warnings, exhaustion alerts, and watch tiers */
+  /* Exclude degraded quality feeds, unconfirmed candidates, weak-momentum warnings, exhaustion alerts, and watch tiers */
   if (
+    row.quality_grade === "degraded" ||
+    sigType === "data_quality_degraded" ||
     row.signal_confirmed === false ||
     sigType.includes("candidate") ||
     sigType.includes("weak_momentum") ||
     sigType.includes("divergence_watch") ||
     sigType.includes("exhaustion") ||
-    /(?:观察|待确认|勿追|警告)/.test(tierTxt)
+    /(?:观察|待确认|勿追|警告|数据质量降级)/.test(tierTxt)
   ) {
     return "watch";
   }
@@ -136,9 +141,11 @@ export function WorkbenchView({
   const [pickerExpanded, setPickerExpanded] = useState(true);
   const [customSymbolsText, setCustomSymbolsText] = useState("");
   const [sortMode, setSortMode] = useState<"tier" | "none">("tier");
+  const [forceRefresh, setForceRefresh] = useState(false);
 
-  /* Tasks & SSE stream */
+  /* Tasks, SQLite history & SSE stream */
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
+  const [warehouse, setWarehouse] = useState<WarehouseSummary | null>(null);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(null);
   const [activeTask, setActiveTask] = useState<TaskRecord | null>(null);
   const [liveEvents, setLiveEvents] = useState<TaskEventEnvelope[]>([]);
@@ -146,6 +153,7 @@ export function WorkbenchView({
   const [rowFilter, setRowFilter] = useState<RowFilter>("all");
   const [progress, setProgress] = useState<{ done: number; total: number | null }>({ done: 0, total: null });
   const [launching, setLaunching] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   /* Quick add-to-watchlist (archiveInit) tracking */
@@ -175,19 +183,46 @@ export function WorkbenchView({
     }
   }, []);
 
+  const loadWarehouse = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const w = await api.warehouse(signal);
+      setWarehouse(w);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const loadTasks = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await api.tasks(signal);
-      const list = (res.tasks ?? []).filter((t) => t.kind === "scan");
+      const [res, histRes] = await Promise.all([
+        api.tasks(signal),
+        api.scanHistory(30, signal).catch(() => ({ runs: [] as PersistedScanRun[] })),
+      ]);
+      const liveScans = (res.tasks ?? []).filter((t) => t.kind === "scan");
+      const seenIds = new Set(liveScans.map((t) => t.id));
+      const archivedAsTasks: TaskRecord[] = (histRes.runs ?? [])
+        .filter((r) => !seenIds.has(r.run_id))
+        .map((r) => ({
+          id: r.run_id,
+          task_id: r.run_id,
+          kind: "scan",
+          status: r.status || "completed",
+          params: { universes: r.universes, symbols: r.symbols, period: r.period },
+          created_at: r.created_at_utc,
+          finished_at: r.finished_at_utc,
+          progress: { done: r.total_count, total: r.total_count },
+        }));
+      const list = [...liveScans, ...archivedAsTasks];
       setTasks((prev) => {
         const prevById = new Map(prev.map((t) => [t.id, t]));
         return list.map((item) => mergeMonotonicTask(prevById.get(item.id) ?? null, item));
       });
+      void loadWarehouse(signal);
       return list;
     } catch {
       return [];
     }
-  }, []);
+  }, [loadWarehouse]);
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -285,16 +320,17 @@ export function WorkbenchView({
                 : item,
             ),
           );
-        } else if (t === "error") {
+        } else if (t === "error" || t === "cancelled") {
           sawTerminal = true;
-          const errMsg = d.message || ev.message || "任务执行失败";
+          const nextStatus = t === "cancelled" ? "cancelled" : "failed";
+          const errMsg = d.message || ev.message || (t === "cancelled" ? "已终止扫描任务" : "任务执行失败");
           setActiveTask((prev) =>
             prev
-              ? { ...prev, status: "failed", error: errMsg }
-              : { id: activeTaskId, task_id: activeTaskId, kind: "scan", status: "failed", error: errMsg },
+              ? { ...prev, status: nextStatus, error: errMsg }
+              : { id: activeTaskId, task_id: activeTaskId, kind: "scan", status: nextStatus, error: errMsg },
           );
           setTasks((prev) =>
-            prev.map((item) => (item.id === activeTaskId ? { ...item, status: "failed", error: errMsg } : item)),
+            prev.map((item) => (item.id === activeTaskId ? { ...item, status: nextStatus, error: errMsg } : item)),
           );
         }
       }
@@ -338,7 +374,32 @@ export function WorkbenchView({
           es.close();
         }
       })
-      .catch(() => undefined);
+      .catch(async () => {
+        /* Fallback to long-term SQLite scan_runs archive when task_id was evicted from 10-slot active ring */
+        es.close();
+        try {
+          const archived = await api.scanHistoryDetail(activeTaskId, detailCtrl.signal);
+          if (cancelled || detailCtrl.signal.aborted) return;
+          setActiveTask({
+            id: archived.run_id,
+            task_id: archived.run_id,
+            kind: "scan",
+            status: archived.status || "completed",
+            params: { universes: archived.universes, symbols: archived.symbols, period: archived.period },
+            created_at: archived.created_at_utc,
+            finished_at: archived.finished_at_utc,
+            progress: { done: archived.total_count, total: archived.total_count },
+            result: { rows: archived.rows ?? [], count: archived.total_count, errors: archived.error_count },
+          });
+          setProgress({ done: archived.total_count, total: archived.total_count });
+          if (archived.rows && archived.rows.length > 0) {
+            setScanRows(archived.rows);
+            setPickerExpanded(false);
+          }
+        } catch {
+          /* ignore */
+        }
+      });
 
     const handleEnvelope = (evType: string) => (msg: MessageEvent) => {
       if (cancelled || typeof msg.data !== "string") return;
@@ -349,7 +410,7 @@ export function WorkbenchView({
       applyBusinessEvents(added);
     };
 
-    for (const evtName of ["step", "progress", "row", "done", "error", "message"]) {
+    for (const evtName of ["step", "progress", "row", "done", "error", "cancelled", "message"]) {
       es.addEventListener(evtName, handleEnvelope(evtName) as EventListener);
     }
 
@@ -380,6 +441,7 @@ export function WorkbenchView({
         symbols: customSyms,
         sort: sortMode,
         period: "3y",
+        refresh: forceRefresh,
       });
       setActiveTask(created);
       setActiveTaskId(created.id);
@@ -389,6 +451,20 @@ export function WorkbenchView({
       setErr(errorMessage(ex));
     } finally {
       setLaunching(false);
+    }
+  };
+
+  const handleCancelActiveTask = async () => {
+    if (!activeTaskId || cancelling) return;
+    setCancelling(true);
+    try {
+      const updated = await api.cancelTask(activeTaskId);
+      setActiveTask((prev) => mergeMonotonicTask(prev, updated));
+      void loadTasks();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setCancelling(false);
     }
   };
 
@@ -476,15 +552,33 @@ export function WorkbenchView({
             自上而下锁定共振板块龙头 → 日线缠论定方向过筛 → 一键收入观察池或下钻 30min 战情室算仓
           </p>
         </div>
-        <button
-          type="button"
-          className="btn"
-          onClick={() => setSavePoolOpen(true)}
-          title="将自上而下推演出的新板块核心龙头沉淀至 universes.json"
-        >
-          <BookmarkPlus className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
-          <span>沉淀新主题池</span>
-        </button>
+        <div className="flex flex-wrap items-center gap-2">
+          {warehouse ? (
+            <span
+              className="inline-flex items-center gap-1.5 rounded-md border border-hairline bg-surface px-2.5 py-1 font-mono text-[11px] text-muted"
+              title={`本地 SQLite 仓库：${warehouse.db_path}（已落盘 ${warehouse.series_count} 条行情序列 / ${warehouse.total_ohlcv_bars} 根 K 线，历史扫描留存 ${warehouse.scan_runs_count} 批）`}
+            >
+              <Database className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
+              <span>
+                本地仓 {warehouse.series_count} 序列 · {warehouse.scan_runs_count} 批留存
+              </span>
+              {(warehouse.quality_counts?.degraded ?? 0) > 0 ? (
+                <span className="text-warning">
+                  · {warehouse.quality_counts.degraded} 项降级
+                </span>
+              ) : null}
+            </span>
+          ) : null}
+          <button
+            type="button"
+            className="btn"
+            onClick={() => setSavePoolOpen(true)}
+            title="将自上而下推演出的新板块核心龙头沉淀至 universes.json"
+          >
+            <BookmarkPlus className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
+            <span>沉淀新主题池</span>
+          </button>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-12">
@@ -602,7 +696,7 @@ export function WorkbenchView({
                 </div>
 
                 <div className="grid grid-cols-1 items-end gap-2.5 border-t border-hairline-soft pt-2.5 md:grid-cols-12">
-                  <label className="field md:col-span-7">
+                  <label className="field md:col-span-5">
                     <span>临时切入新细分板块真龙头（空格或逗号分隔）</span>
                     <input
                       className="input"
@@ -621,6 +715,17 @@ export function WorkbenchView({
                       <option value="tier">按买卖点信号优先级</option>
                       <option value="none">保持原池顺序</option>
                     </select>
+                  </label>
+                  <label
+                    className="flex cursor-pointer items-center gap-1.5 pb-2 text-xs text-ink-2 md:col-span-2"
+                    title="默认 15 分钟内优先复用本地 SQLite 增量行情库，勾选后强制逐标的重连上游"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={forceRefresh}
+                      onChange={(e) => setForceRefresh(e.target.checked)}
+                    />
+                    <span>强制重拉上游</span>
                   </label>
                   <div className="md:col-span-2">
                     <button type="submit" className="btn btn-primary w-full" disabled={launching}>
@@ -653,7 +758,9 @@ export function WorkbenchView({
                         ? "good"
                         : activeTask.status === "failed"
                           ? "critical"
-                          : "info"
+                          : activeTask.status === "cancelled"
+                            ? "warning"
+                            : "info"
                     }
                     label={formatTaskStatus(activeTask.status)}
                   />
@@ -662,6 +769,18 @@ export function WorkbenchView({
                   <span className="tnum font-mono text-[11px] text-muted">
                     {progress.done}/{progress.total} ({progressPct}%)
                   </span>
+                ) : null}
+                {activeTask && !isTerminalTaskStatus(activeTask.status) ? (
+                  <button
+                    type="button"
+                    className="btn btn-sm text-critical"
+                    disabled={cancelling}
+                    onClick={() => void handleCancelActiveTask()}
+                    title="立即终止当前扫描流，已完成的行情仍保留在本地库"
+                  >
+                    <Square className="h-3 w-3" aria-hidden="true" />
+                    <span>{cancelling ? "终止中…" : "终止"}</span>
+                  </button>
                 ) : null}
               </div>
 
@@ -765,7 +884,14 @@ export function WorkbenchView({
                           ) : (
                             <>
                               <td data-label="最新收盘" className="num">
-                                {fmtPrice(row.close)}
+                                <div>{fmtPrice(row.close)}</div>
+                                {row.as_of_bar ? (
+                                  <div className="font-mono text-[10.5px] font-normal text-muted">
+                                    {row.as_of_bar}
+                                    {row.bar_is_closed === false ? " · 盘中" : ""}
+                                    {row.cache_status === "hit" ? " · 本地" : ""}
+                                  </div>
+                                ) : null}
                               </td>
                               <td
                                 data-label="20D 涨跌"
@@ -776,8 +902,9 @@ export function WorkbenchView({
                               <td data-label="日线结构 & 中枢数">
                                 <div>{row.daily_structure || "—"}</div>
                                 <div className="text-[11px] text-muted">
-                                  {row.daily_zs_count ?? 0} 中枢 · {fmtPosVsZs(row.pos_vs_zs)} ·{" "}
-                                  {fmtFractalText(row.daily_fractal)}
+                                  {row.daily_zs_count ?? 0}{" "}
+                                  {row.daily_zs_level === "segment" ? "线段中枢" : "笔中枢"} ·{" "}
+                                  {fmtPosVsZs(row.pos_vs_zs)} · {fmtFractalText(row.daily_fractal)}
                                   {row.daily_momentum ? ` · ${fmtMomentumVerdict(row.daily_momentum)}` : ""}
                                 </div>
                               </td>
@@ -789,16 +916,32 @@ export function WorkbenchView({
                                   {row.signal_tier ? (
                                     <StatusBadge
                                       tone={
-                                        rowClass === "long"
-                                          ? "good"
-                                          : rowClass === "short"
-                                            ? "critical"
-                                            : "neutral"
+                                        row.quality_grade === "degraded" || row.signal_tier === "数据质量降级"
+                                          ? "warning"
+                                          : rowClass === "long"
+                                            ? "good"
+                                            : rowClass === "short"
+                                              ? "critical"
+                                              : "neutral"
                                       }
                                       label={row.signal_tier}
                                     />
                                   ) : null}
-                                  <span className="text-xs text-ink-2">{row.action_bias || ""}</span>
+                                  {row.quality_grade === "caution" ? (
+                                    <span
+                                      className="inline-flex items-center gap-0.5 rounded bg-warning/15 px-1.5 py-0.5 text-[10.5px] text-warning"
+                                      title={(row.quality_notes ?? []).join("；") || "数据源存在轻微平K或包络修正"}
+                                    >
+                                      <AlertTriangle className="h-2.5 w-2.5" aria-hidden="true" />
+                                      <span>质量提示</span>
+                                    </span>
+                                  ) : null}
+                                  <span
+                                    className="text-xs text-ink-2"
+                                    title={(row.quality_notes ?? []).join("；") || undefined}
+                                  >
+                                    {row.action_bias || ""}
+                                  </span>
                                 </div>
                               </td>
                               <td
@@ -909,13 +1052,21 @@ export function WorkbenchView({
               tasks.map((t) => {
                 const selected = t.id === activeTaskId;
                 const Icon =
-                  t.status === "completed" ? CheckCircle2 : t.status === "failed" ? XCircle : Clock;
+                  t.status === "completed"
+                    ? CheckCircle2
+                    : t.status === "failed"
+                      ? XCircle
+                      : t.status === "cancelled"
+                        ? Square
+                        : Clock;
                 const iconCls =
                   t.status === "completed"
                     ? "text-bull"
                     : t.status === "failed"
                       ? "text-critical"
-                      : "text-accent";
+                      : t.status === "cancelled"
+                        ? "text-warning"
+                        : "text-accent";
                 return (
                   <li key={t.id}>
                     <button

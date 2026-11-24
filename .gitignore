@@ -12,3 +12,10 @@ portfolio/positions.json
 portfolio/journal.jsonl
 portfolio/scan_history.json
 portfolio/.portfolio.lock
+data/desk.db
+data/desk.db-wal
+data/desk.db-shm
+data/.desk.lock
+portfolio/.scan_history.lock
+research/**/.archive.lock
+research/**/.thesis_wal.json

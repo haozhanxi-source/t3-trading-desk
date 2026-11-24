@@ -456,6 +456,28 @@ export interface ContractSpec {
   warning?: string;
 }
 
+export interface DataQualityReport {
+  quality_grade?: "good" | "caution" | "degraded" | string;
+  actionable_allowed?: boolean;
+  bars_total?: number;
+  raw_flat_bars_60?: number;
+  raw_flat_ratio_60?: number;
+  repaired_ohlc_bars_total?: number;
+  repaired_ohlc_bars_60?: number;
+  dropped_corrupt_bars?: number;
+  as_of_bar?: string | null;
+  latest_bar_closed?: boolean | null;
+  warnings?: string[];
+  notes?: string[];
+}
+
+export interface SyncMeta {
+  cache_status?: "hit" | "miss" | "bypass" | string;
+  sync_mode?: string;
+  generation?: number;
+  last_synced_at_utc?: string;
+}
+
 export interface MarketDualResponse {
   symbol: string;
   asset_class: string;
@@ -464,6 +486,10 @@ export interface MarketDualResponse {
   intraday_data_source?: string;
   intraday_interval?: string;
   fetched_at_utc?: string;
+  data_quality?: DataQualityReport | null;
+  intraday_data_quality?: DataQualityReport | null;
+  sync_meta?: SyncMeta | null;
+  intraday_sync_meta?: SyncMeta | null;
   technicals?: Dict;
   intraday_technicals?: Dict;
   macro_context?: Record<string, MacroQuote | unknown>;
@@ -711,6 +737,9 @@ export interface UniversePool {
 export interface ScanRow {
   market: string;
   symbol: string;
+  asset_class?: string | null;
+  as_of_bar?: string | null;
+  bar_is_closed?: boolean | null;
   close?: number | null;
   "ret_5d_%"?: number | null;
   "ret_20d_%"?: number | null;
@@ -721,18 +750,25 @@ export interface ScanRow {
   signal_type?: string | null;
   signal_confirmed?: boolean | null;
   daily_structure?: string | null;
+  daily_zs_level?: string | null;
+  daily_zs_level_label?: string | null;
   daily_zs_count?: number | null;
   daily_zs?: [number, number] | null;
   pos_vs_zs?: string | null;
   daily_fractal?: string | null;
   daily_momentum?: string | null;
+  momentum_reliable?: boolean | null;
+  quality_grade?: "good" | "caution" | "degraded" | string | null;
+  quality_warnings?: string[];
+  quality_notes?: string[];
+  cache_status?: string | null;
   action_bias?: string | null;
   signals?: string[];
   error?: string;
 }
 
 export type TaskKind = "scan" | "research_refresh" | "research-refresh" | "sentinel" | string;
-export type TaskStatus = "queued" | "running" | "completed" | "failed" | string;
+export type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | string;
 
 export interface TaskProgress {
   done: number;
@@ -778,4 +814,42 @@ export interface TaskRecord {
   error?: string | null;
   result?: unknown;
   events?: TaskEventEnvelope[];
+}
+
+export interface WarehouseSummary {
+  db_path: string;
+  db_size_bytes: number;
+  series_count: number;
+  total_ohlcv_bars: number;
+  scan_runs_count: number;
+  sentinel_runs_count: number;
+  research_snapshots_count: number;
+  quality_counts: Record<string, number>;
+  flagged_series: {
+    series_id: string;
+    symbol: string;
+    asset_class: string;
+    interval: string;
+    quality_grade: string;
+    as_of_bar?: string | null;
+    last_synced_at_utc?: string;
+    warnings?: string[];
+    notes?: string[];
+  }[];
+}
+
+export interface PersistedScanRun {
+  run_id: string;
+  task_id?: string | null;
+  created_at_utc: string;
+  finished_at_utc: string;
+  status: string;
+  universes: string[];
+  symbols: string[];
+  period: string;
+  total_count: number;
+  error_count: number;
+  degraded_count: number;
+  actionable_count: number;
+  rows?: ScanRow[];
 }

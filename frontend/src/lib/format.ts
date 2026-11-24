@@ -99,6 +99,7 @@ const ALIGNMENT_ZH: Record<string, string> = {
   daily_opposes_direction: "日线反向·禁逆势",
   daily_ok_wait_30m: "日线顺向·等小级别触发",
   neutral_wait: "中枢震荡·观望",
+  data_quality_degraded: "数据质量降级·禁自动放行",
 };
 
 export function fmtAlignmentStatus(raw: string | null | undefined): string {

@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextlib
 import fcntl
+import inspect
 import json
 import os
 import tempfile
@@ -16,6 +18,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import daily_sentinel
+import data_store
 import market_snapshot
 import portfolio_manager
 import research_archive
@@ -27,11 +30,15 @@ from .serializers import sanitize
 
 MAX_TASKS = 50
 MAX_PERSISTED_SCANS = 10
-TERMINAL_STATUSES = frozenset({"completed", "failed"})
-TERMINAL_EVENT_TYPES = frozenset({"done", "error"})
+TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
+TERMINAL_EVENT_TYPES = frozenset({"done", "error", "cancelled"})
 TASK_KINDS = ("scan", "research_refresh", "sentinel")
 
 Emit = Callable[[str, dict[str, Any]], None]
+
+
+class TaskCancelledError(RuntimeError):
+    """Raised internally when a running task observes user cancellation."""
 
 
 def utc_iso() -> str:
@@ -46,14 +53,51 @@ def sentinel_cache_key(include_watchlist: bool, skip_research: bool, event_windo
     return ("sentinel", bool(include_watchlist), bool(skip_research), int(event_window_days))
 
 
-def run_sentinel_sync(include_watchlist: bool, skip_research: bool, event_window_days: int) -> dict[str, Any]:
-    return daily_sentinel.run_daily_sentinel(
+def compute_current_sentinel_fingerprint(
+    include_watchlist: bool,
+    skip_research: bool,
+    event_window_days: int,
+) -> str:
+    return data_store.DeskDataStore.compute_sentinel_fingerprint(
         portfolio_dir=portfolio_manager.DEFAULT_PORTFOLIO_DIR,
         research_root=research_archive.DEFAULT_RESEARCH_DIR,
         include_watchlist=include_watchlist,
         skip_research=skip_research,
         event_window_days=event_window_days,
     )
+
+
+def run_sentinel_sync(
+    include_watchlist: bool,
+    skip_research: bool,
+    event_window_days: int,
+    *,
+    task_id: str | None = None,
+) -> dict[str, Any]:
+    fp_before = compute_current_sentinel_fingerprint(include_watchlist, skip_research, event_window_days)
+    result = daily_sentinel.run_daily_sentinel(
+        portfolio_dir=portfolio_manager.DEFAULT_PORTFOLIO_DIR,
+        research_root=research_archive.DEFAULT_RESEARCH_DIR,
+        include_watchlist=include_watchlist,
+        skip_research=skip_research,
+        event_window_days=event_window_days,
+    )
+    if data_store.is_store_enabled():
+        fp_after = compute_current_sentinel_fingerprint(include_watchlist, skip_research, event_window_days)
+        # Only tag with current fingerprint if inputs did not mutate mid-flight; otherwise store as audit-only
+        stored_fp = fp_before if fp_after == fp_before else f"mutated:{fp_before}"
+        try:
+            data_store.get_store().record_sentinel_run(
+                sanitize(result),
+                input_fingerprint=stored_fp,
+                include_watchlist=include_watchlist,
+                skip_research=skip_research,
+                event_window_days=event_window_days,
+                task_id=task_id,
+            )
+        except Exception:
+            pass
+    return result
 
 
 class Task:
@@ -70,6 +114,7 @@ class Task:
         self.events: list[dict[str, Any]] = []
         self.result: Any = None
         self.error: str | None = None
+        self.cancel_event = threading.Event()
         self.subscribers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
 
     @property
@@ -342,12 +387,12 @@ class TaskManager:
             if etype == "progress" and isinstance(clean_data, dict):
                 task.progress = {k: clean_data.get(k, task.progress.get(k)) for k in ("done", "total")}
             task.events.append(event)
-            subs = list(task.subscribers)
-        for loop, queue in subs:
-            try:
-                loop.call_soon_threadsafe(queue.put_nowait, event)
-            except RuntimeError:  # subscriber loop already closed
-                pass
+            # Enqueue inside the lock so concurrent emitters strictly preserve [1, 2, ...] seq order!
+            for loop, queue in list(task.subscribers):
+                try:
+                    loop.call_soon_threadsafe(queue.put_nowait, event)
+                except RuntimeError:  # subscriber loop already closed
+                    pass
         return event
 
     def subscribe(self, task: Task) -> tuple[asyncio.Queue | None, list[dict[str, Any]]]:
@@ -366,6 +411,23 @@ class TaskManager:
         with self._lock:
             task.subscribers = [(lp, q) for lp, q in task.subscribers if q is not queue]
 
+    def cancel(self, task_id: str) -> dict[str, Any] | None:
+        """Atomically request cancellation and transition a non-terminal task to ``cancelled``."""
+        with self._lock:
+            self._ensure_hydrated_unlocked()
+            task = self.get(task_id)
+            if task is None:
+                return None
+            if task.terminal:
+                return task.summary()
+            task.cancel_event.set()
+            task.status = "cancelled"
+            task.error = "用户已终止该任务"
+            task.finished_at = utc_iso()
+            task.finished_ns = time.time_ns()
+            self._emit(task, "cancelled", {"message": "用户已终止该任务"})
+            return task.summary()
+
     # ------------------------------------------------------------------ execution
     def start(self, kind: str, params: dict[str, Any]) -> Task:
         """Create the task and schedule it on the running loop. Must be called from async context."""
@@ -381,25 +443,54 @@ class TaskManager:
     async def _run(self, task: Task) -> None:
         runner = RUNNERS[task.kind]
         with self._lock:
+            if task.terminal:
+                return
             task.status = "running"
             task.started_at = utc_iso()
         self._emit(task, "step", {"message": f"{task.kind} started", "stage": "start"})
 
         def emit(etype: str, data: dict[str, Any]) -> None:
-            self._emit(task, etype, data)
+            with self._lock:
+                if task.terminal:
+                    return
+                self._emit(task, etype, data)
+
+        runner_kwargs: dict[str, Any] = {}
+        try:
+            sig = inspect.signature(runner)
+            if "cancel_event" in sig.parameters:
+                runner_kwargs["cancel_event"] = task.cancel_event
+            if "task_id" in sig.parameters:
+                runner_kwargs["task_id"] = task.id
+        except (TypeError, ValueError):
+            pass
 
         try:
-            result = await asyncio.to_thread(runner, task.params, emit)
+            result = await asyncio.to_thread(runner, task.params, emit, **runner_kwargs)
+        except TaskCancelledError:
+            with self._lock:
+                if not task.terminal:
+                    task.status = "cancelled"
+                    task.error = "用户已终止该任务"
+                    task.finished_at = utc_iso()
+                    task.finished_ns = time.time_ns()
+                    self._emit(task, "cancelled", {"message": "用户已终止该任务"})
+            return
         except Exception as exc:  # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
             # Status flip and terminal event are one atomic step so late subscribers never miss it.
             with self._lock:
+                if task.terminal:
+                    return
                 task.status = "failed"
                 task.error = message
                 task.finished_at = utc_iso()
+                task.finished_ns = time.time_ns()
                 self._emit(task, "error", {"message": message})
             return
         with self._lock:
+            if task.terminal:
+                return
             task.status = "completed"
             task.result = sanitize(result)
             task.finished_at = utc_iso()
@@ -407,43 +498,136 @@ class TaskManager:
             self._emit(task, "done", {"result": result})
             if task.kind == "scan":
                 self._record_completed_scan_unlocked(task)
+                if data_store.is_store_enabled():
+                    try:
+                        data_store.get_store().record_scan_run(
+                            run_id=task.id,
+                            task_id=task.id,
+                            created_at_utc=task.created_at,
+                            finished_at_utc=task.finished_at,
+                            status="completed",
+                            universes=task.params.get("universes") or [],
+                            symbols=task.params.get("symbols") or [],
+                            period=str(task.params.get("period") or "3y"),
+                            rows=task.result.get("rows") if isinstance(task.result, dict) else [],
+                        )
+                    except Exception:
+                        pass
 
 
 # ---------------------------------------------------------------------- runners
-def run_scan(params: dict[str, Any], emit: Emit) -> dict[str, Any]:
+def _call_snapshot_for_scan(sym: str, period: str, refresh: bool) -> dict[str, Any]:
+    sig = inspect.signature(market_snapshot.get_snapshot)
+    kw: dict[str, Any] = {
+        "period": period,
+        "include_macro": False,
+        "include_fundamentals": False,
+    }
+    if refresh and "refresh" in sig.parameters:
+        kw["refresh"] = True
+    return market_snapshot.get_snapshot(sym, **kw)
+
+
+def run_scan(
+    params: dict[str, Any],
+    emit: Emit,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
     targets = [tuple(t) for t in params["targets"]]
     period = params.get("period", "3y")
     sort_mode = params.get("sort", "tier")
+    refresh = bool(params.get("refresh", False))
     total = len(targets)
     emit("step", {"message": f"resolved {total} targets", "stage": "resolve", "total": total})
     emit("progress", {"done": 0, "total": total})
 
-    rows: list[dict[str, Any]] = []
-    for idx, (market, sym) in enumerate(targets, start=1):
+    # Partition targets by upstream rate-limit profile:
+    # - Sina/AkShare (cn_future / a_share intraday): strictly serialized (1 worker) to prevent throttling
+    # - yfinance / crypto: bounded 3-worker pool for fast parallel fetching
+    sina_lock = threading.Lock()
+    done_lock = threading.Lock()
+    done_count = 0
+    rows_by_idx: dict[int, dict[str, Any]] = {}
+
+    def _scan_one(idx: int, market: str, sym: str) -> None:
+        nonlocal done_count
+        if cancel_event is not None and cancel_event.is_set():
+            raise TaskCancelledError("scan cancelled")
+        try:
+            _, ac = market_snapshot.normalize_symbol(sym)
+        except Exception:
+            ac = "unknown"
+
         emit("step", {"message": f"scanning {sym}", "stage": "scan", "symbol": sym, "market": market, "index": idx})
         try:
-            snap = market_snapshot.get_snapshot(sym, period=period, include_macro=False, include_fundamentals=False)
+            if ac == "cn_future":
+                with sina_lock:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise TaskCancelledError("scan cancelled")
+                    snap = _call_snapshot_for_scan(sym, period=period, refresh=refresh)
+            else:
+                snap = _call_snapshot_for_scan(sym, period=period, refresh=refresh)
             row = scan_opportunities.build_scan_row(market, sym, snap)
+        except TaskCancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001
             row = scan_opportunities.build_scan_row(market, sym, {"error": str(exc)})
-        rows.append(row)
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise TaskCancelledError("scan cancelled")
+
+        with done_lock:
+            rows_by_idx[idx] = row
+            done_count += 1
+            cur_done = done_count
         emit("row", {"row": row, "index": idx})
-        emit("progress", {"done": idx, "total": total, "symbol": sym})
+        emit("progress", {"done": cur_done, "total": total, "symbol": sym})
 
-    sorted_rows = scan_opportunities.sort_scan_rows(rows, sort_mode=sort_mode)
-    errors = sum(1 for r in rows if "error" in r)
-    return {"rows": sorted_rows, "count": len(rows), "errors": errors}
+    if total <= 1:
+        for idx, (market, sym) in enumerate(targets, start=1):
+            _scan_one(idx, market, sym)
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, total)) as pool:
+            futures = [
+                pool.submit(_scan_one, idx, market, sym)
+                for idx, (market, sym) in enumerate(targets, start=1)
+            ]
+            for fut in concurrent.futures.as_completed(futures):
+                fut.result()
+
+    ordered_rows = [rows_by_idx[i] for i in range(1, total + 1) if i in rows_by_idx]
+    sorted_rows = scan_opportunities.sort_scan_rows(ordered_rows, sort_mode=sort_mode)
+    errors = sum(1 for r in ordered_rows if "error" in r)
+    degraded = sum(1 for r in ordered_rows if r.get("quality_grade") == "degraded")
+    return {"rows": sorted_rows, "count": len(ordered_rows), "errors": errors, "degraded": degraded}
 
 
-def run_research_refresh(params: dict[str, Any], emit: Emit) -> dict[str, Any]:
+def run_research_refresh(
+    params: dict[str, Any],
+    emit: Emit,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
     symbol = params["symbol"]
     market = params.get("market")
     include_macro = bool(params.get("include_macro", True))
     total = 3
+    if cancel_event is not None and cancel_event.is_set():
+        raise TaskCancelledError("research_refresh cancelled")
     emit("progress", {"done": 0, "total": total})
     emit("step", {"message": f"collecting research data for {symbol}", "stage": "collect"})
     captured_epoch = CACHE.get_epoch("research")
-    bundle = research_data.collect_research_data(symbol, include_macro=include_macro)
+
+    rd_sig = inspect.signature(research_data.collect_research_data)
+    rd_kw: dict[str, Any] = {"include_macro": include_macro}
+    if "refresh" in rd_sig.parameters:
+        rd_kw["refresh"] = True
+    bundle = research_data.collect_research_data(symbol, **rd_kw)
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise TaskCancelledError("research_refresh cancelled")
+
     CACHE.set(
         research_cache_key(symbol, include_macro),
         bundle,
@@ -488,19 +672,36 @@ def run_research_refresh(params: dict[str, Any], emit: Emit) -> dict[str, Any]:
     }
 
 
-def run_sentinel(params: dict[str, Any], emit: Emit) -> dict[str, Any]:
+def run_sentinel(
+    params: dict[str, Any],
+    emit: Emit,
+    *,
+    cancel_event: threading.Event | None = None,
+    task_id: str | None = None,
+) -> dict[str, Any]:
     include_watchlist = bool(params.get("include_watchlist", False))
     skip_research = bool(params.get("skip_research", False))
     window = int(params.get("event_window_days", 14))
+    if cancel_event is not None and cancel_event.is_set():
+        raise TaskCancelledError("sentinel cancelled")
     emit("progress", {"done": 0, "total": 1})
     emit("step", {"message": "running holding daily sentinel", "stage": "sentinel"})
     captured_epoch = CACHE.get_epoch("sentinel")
-    result = run_sentinel_sync(include_watchlist, skip_research, window)
+    result = run_sentinel_sync(include_watchlist, skip_research, window, task_id=task_id)
+    if cancel_event is not None and cancel_event.is_set():
+        raise TaskCancelledError("sentinel cancelled")
+    base_key = sentinel_cache_key(include_watchlist, skip_research, window)
+    cache_key = (
+        (*base_key, compute_current_sentinel_fingerprint(include_watchlist, skip_research, window))
+        if data_store.is_store_enabled()
+        else base_key
+    )
     CACHE.set(
-        sentinel_cache_key(include_watchlist, skip_research, window),
+        cache_key,
         result,
         TTL_SENTINEL_SECONDS,
         expected_epoch=captured_epoch,
+        namespace="sentinel",
     )
     emit("progress", {"done": 1, "total": 1})
     return result

@@ -10,6 +10,7 @@ import type {
   OpenPositionBody,
   PortfolioInitBody,
   PortfolioSummaryResponse,
+  PersistedScanRun,
   ResearchDataResponse,
   RotatePositionBody,
   SentinelResponse,
@@ -21,6 +22,7 @@ import type {
   TrailStopBody,
   TrimBody,
   UniversePool,
+  WarehouseSummary,
 } from "./types";
 
 export class ApiError extends Error {
@@ -201,13 +203,20 @@ export const api = {
   /* Screen 4: Universes & SSE Tasks */
   universes: (signal?: AbortSignal) => get<{ universes: Record<string, UniversePool> }>("/universes", undefined, signal),
   saveUniverse: (body: { name: string; description: string; symbols: string[] }) => post<unknown>("/universes", body),
-  startScan: async (body: { universes?: string[]; symbols?: string[]; sort?: "tier" | "none"; period?: string }) =>
+  startScan: async (body: {
+    universes?: string[];
+    symbols?: string[];
+    sort?: "tier" | "none";
+    period?: string;
+    refresh?: boolean;
+  }) =>
     normalizeTask(
       await post<TaskRecord>("/tasks/scan", {
         universes: body.universes ?? [],
         symbols: body.symbols ?? [],
         sort: body.sort ?? "tier",
         period: body.period ?? "3y",
+        refresh: body.refresh ?? false,
       }),
     ),
   startResearchRefresh: async (body: { symbol: string; include_macro: boolean; market?: string | null }) =>
@@ -226,7 +235,16 @@ export const api = {
   },
   task: async (id: string, signal?: AbortSignal) =>
     normalizeTask(await get<TaskRecord>(`/tasks/${encodeURIComponent(id)}`, undefined, signal)),
+  cancelTask: async (id: string) =>
+    normalizeTask(await post<TaskRecord>(`/tasks/${encodeURIComponent(id)}/cancel`, {})),
   taskEventsUrl: (id: string) => buildUrl(`/tasks/${encodeURIComponent(id)}/events`),
+
+  /* Local SQLite Data Warehouse & Persisted History */
+  warehouse: (signal?: AbortSignal) => get<WarehouseSummary>("/data/warehouse", undefined, signal),
+  scanHistory: (limit = 30, signal?: AbortSignal) =>
+    get<{ runs: PersistedScanRun[] }>("/history/scans", { limit }, signal),
+  scanHistoryDetail: (runId: string, signal?: AbortSignal) =>
+    get<PersistedScanRun>(`/history/scans/${encodeURIComponent(runId)}`, undefined, signal),
 };
 
 export function parseTaskEvent(raw: string, fallbackType?: string): TaskEventEnvelope | null {

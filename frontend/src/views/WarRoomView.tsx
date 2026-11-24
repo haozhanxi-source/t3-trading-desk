@@ -559,9 +559,29 @@ export function WarRoomView({
                 日线防线 <strong className="text-ink-2">{fmtPrice(dual.daily_structural_stop)}</strong>
               </span>
             ) : null}
+              {currentData?.sync_meta?.cache_status === "hit" ? (
+                <span className="text-accent" title="日线已直接命中本地 SQLite 仓库，零重复拉取">
+                  本地库命中
+                </span>
+              ) : null}
               {currentData?.fetched_at_utc ? <span>{shortTime(currentData.fetched_at_utc)} UTC</span> : null}
           </div>
         </div>
+
+        {currentData?.data_quality?.quality_grade === "degraded" ||
+        currentData?.intraday_data_quality?.quality_grade === "degraded" ? (
+          <div
+            role="alert"
+            className="rounded-md border border-warning/50 bg-warning/10 px-3 py-2 text-xs text-ink"
+          >
+            <strong className="text-warning">数据质量降级守门已激活：</strong>{" "}
+            {[
+              ...(currentData?.data_quality?.notes ?? []),
+              ...(currentData?.intraday_data_quality?.notes ?? []),
+            ].join("；") ||
+              "当前品种存在高比例无波幅平K或异常坏点，算仓器已自动阻断实盘联立放行，建议切换同板块高流动性主力合约验证。"}
+          </div>
+        ) : null}
 
         {/* Concise Hairline Dual Summary */}
         <div className="grid grid-cols-1 gap-2 border-t border-hairline-soft pt-2 text-xs text-ink-2 md:grid-cols-2">

@@ -1474,45 +1474,65 @@ def classify_chanlun_signals(
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag}三买确认(回踩不破ZG={latest_zs.zg}·底分型上攻)")
 
     # 4. Capital Consensus vs True Divergence vs Non-Divergence Power (Lesson 9 & 14)
+    def _mom_ratio_tag(m_obj: dict, *, with_peak: bool = False, with_slope: bool = False) -> str:
+        rel = m_obj.get("momentum_reliable")
+        ar_v = m_obj.get("area_ratio_vs_prev")
+        pr_v = m_obj.get("peak_ratio_vs_prev")
+        sr_v = m_obj.get("slope_ratio_vs_prev")
+        if rel is False:
+            cp = m_obj.get("curr_pct_change")
+            pp = m_obj.get("prev_pct_change")
+            if isinstance(cp, (int, float)) and isinstance(pp, (int, float)):
+                base = f"幅度{cp:+.2f}%vs前笔{pp:+.2f}%·短笔/零面积"
+            else:
+                base = "短笔/零面积(MACD比失真)"
+            if with_slope and sr_v is not None:
+                return f"斜率{sr_v}x,{base}"
+            return base
+        parts: list[str] = []
+        if with_slope and sr_v is not None:
+            parts.append(f"斜率{sr_v}x")
+        if ar_v is not None:
+            parts.append(f"area={ar_v}x")
+        if with_peak and pr_v is not None:
+            parts.append(f"peak={pr_v}x")
+        return ",".join(parts) if parts else "力度待核"
+
     verdict = momentum.get("verdict")
     if verdict == "capital_consensus_down":
-        ar = momentum.get("area_ratio_vs_prev")
-        pr = momentum.get("peak_ratio_vs_prev")
+        m_tag = _mom_ratio_tag(momentum, with_peak=True)
         if latest_zs and last_close < latest_zs.zd:
-            signals.append(f"{timeframe_label}向下离开段·资金方向一致(area={ar}x,peak={pr}x·{curr.strength_class}类笔未背驰)")
+            signals.append(f"{timeframe_label}向下离开段·资金方向一致({m_tag}·{curr.strength_class}类笔未背驰)")
         else:
-            signals.append(f"{timeframe_label}空头资金方向一致推进(area={ar}x,peak={pr}x·{curr.strength_class}类笔)")
+            signals.append(f"{timeframe_label}空头资金方向一致推进({m_tag}·{curr.strength_class}类笔)")
     elif verdict == "capital_consensus_up":
-        ar = momentum.get("area_ratio_vs_prev")
-        pr = momentum.get("peak_ratio_vs_prev")
+        m_tag = _mom_ratio_tag(momentum, with_peak=True)
         if latest_zs and last_close > latest_zs.zg:
-            signals.append(f"{timeframe_label}向上离开段·资金方向一致(area={ar}x,peak={pr}x·{curr.strength_class}类笔趋势延续)")
+            signals.append(f"{timeframe_label}向上离开段·资金方向一致({m_tag}·{curr.strength_class}类笔趋势延续)")
         else:
-            signals.append(f"{timeframe_label}多头资金方向一致推进(area={ar}x,peak={pr}x·{curr.strength_class}类笔)")
+            signals.append(f"{timeframe_label}多头资金方向一致推进({m_tag}·{curr.strength_class}类笔)")
     elif verdict == "non_divergence_down":
-        ar = momentum.get("area_ratio_vs_prev")
-        sr = momentum.get("slope_ratio_vs_prev")
-        signals.append(f"{timeframe_label}非背驰背离(急跌{curr.strength_class}类笔·斜率{sr}x,area={ar}x·仍有空头力量勿猜1买)")
+        m_tag = _mom_ratio_tag(momentum, with_slope=True)
+        signals.append(f"{timeframe_label}非背驰背离(急跌{curr.strength_class}类笔·{m_tag}·仍有空头力量勿猜1买)")
     elif verdict == "non_divergence_up":
-        ar = momentum.get("area_ratio_vs_prev")
-        sr = momentum.get("slope_ratio_vs_prev")
-        signals.append(f"{timeframe_label}非背驰背离(急拉{curr.strength_class}类笔·斜率{sr}x,area={ar}x·仍有多头力量勿猜1卖)")
+        m_tag = _mom_ratio_tag(momentum, with_slope=True)
+        signals.append(f"{timeframe_label}非背驰背离(急拉{curr.strength_class}类笔·{m_tag}·仍有多头力量勿猜1卖)")
     elif verdict == "divergence_candidate_down":
-        ar = momentum.get("area_ratio_vs_prev")
+        m_tag = _mom_ratio_tag(momentum)
         kind_label = "趋势背驰" if macro_structure == "双中枢下跌趋势" else "盘整背驰"
         if frac_just_confirmed and latest_frac and latest_frac.kind == "bottom":
-            signals.append(f"{timeframe_label}{kind_label}+底分型确认(一买候选·{curr.strength_class}类弱笔·area={ar}x)")
+            signals.append(f"{timeframe_label}{kind_label}+底分型确认(一买候选·{curr.strength_class}类弱笔·{m_tag})")
         elif pivots and pivots[-1].kind == "bottom" and (len(merged) - 1 - pivots[-1].confirmed_by_idx) <= 3:
-            signals.append(f"{timeframe_label}{kind_label}+底分型结构(一买候选·{curr.strength_class}类笔·area={ar}x)")
+            signals.append(f"{timeframe_label}{kind_label}+底分型结构(一买候选·{curr.strength_class}类笔·{m_tag})")
         else:
-            signals.append(f"{timeframe_label}下跌力度衰减(疑似{kind_label}·{curr.strength_class}类笔·area={ar}x·待底分型)")
+            signals.append(f"{timeframe_label}下跌力度衰减(疑似{kind_label}·{curr.strength_class}类笔·{m_tag}·待底分型)")
     elif verdict == "divergence_candidate_up":
-        ar = momentum.get("area_ratio_vs_prev")
+        m_tag = _mom_ratio_tag(momentum)
         kind_label = "趋势背驰" if macro_structure == "双中枢上涨趋势" else "盘整背驰"
         if frac_just_confirmed and latest_frac and latest_frac.kind == "top":
-            signals.append(f"{timeframe_label}{kind_label}+顶分型确认(一卖候选·{curr.strength_class}类弱笔·area={ar}x)")
+            signals.append(f"{timeframe_label}{kind_label}+顶分型确认(一卖候选·{curr.strength_class}类弱笔·{m_tag})")
         else:
-            signals.append(f"{timeframe_label}上涨力度衰减(疑似{kind_label}·{curr.strength_class}类笔·area={ar}x·观察顶分型)")
+            signals.append(f"{timeframe_label}上涨力度衰减(疑似{kind_label}·{curr.strength_class}类笔·{m_tag}·观察顶分型)")
 
     # 5. Lesson 8/13/15: 恃强凌弱 (找大哥) + 3出 / 4出 / 2+3 + 2买/2卖
     if len(strokes) >= 3 and curr:
@@ -1555,17 +1575,17 @@ def classify_chanlun_signals(
         prev_mom = assess_momentum(strokes[:-1])
         if curr.direction == "up" and last_opp.direction == "down" and prev_opp.direction == "down":
             if prev_mom.get("is_divergence_candidate") and prev_mom.get("active_direction") == "down":
-                ar = prev_mom.get("area_ratio_vs_prev")
+                pm_tag = _mom_ratio_tag(prev_mom)
                 kind_label = "趋势背驰" if macro_structure == "双中枢下跌趋势" else "盘整背驰"
-                signals.append(f"{timeframe_label}{kind_label}+底分型启动(一买/盘背·{last_opp.strength_class}类笔·area={ar}x)")
+                signals.append(f"{timeframe_label}{kind_label}+底分型启动(一买/盘背·{last_opp.strength_class}类笔·{pm_tag})")
             elif last_opp.end_price > prev_opp.end_price and (frac_just_confirmed and latest_frac and latest_frac.kind == "bottom"):
                 if not any("3出" in s or "4出" in s or "二买" in s for s in signals):
                     signals.append(f"{timeframe_label}3出(D3)/二买启动(不破前低{prev_opp.end_price}+底分型)")
         elif curr.direction == "down" and last_opp.direction == "up" and prev_opp.direction == "up":
             if prev_mom.get("is_divergence_candidate") and prev_mom.get("active_direction") == "up":
-                ar = prev_mom.get("area_ratio_vs_prev")
+                pm_tag = _mom_ratio_tag(prev_mom)
                 kind_label = "趋势背驰" if macro_structure == "双中枢上涨趋势" else "盘整背驰"
-                signals.append(f"{timeframe_label}{kind_label}+顶分型启动(一卖/盘背·{last_opp.strength_class}类笔·area={ar}x)")
+                signals.append(f"{timeframe_label}{kind_label}+顶分型启动(一卖/盘背·{last_opp.strength_class}类笔·{pm_tag})")
             elif last_opp.end_price < prev_opp.end_price and (frac_just_confirmed and latest_frac and latest_frac.kind == "top"):
                 if not any("3出" in s or "4出" in s or "二卖" in s for s in signals):
                     signals.append(f"{timeframe_label}3出(D3)/二卖启动(不过前高{prev_opp.end_price}+顶分型)")
@@ -2018,6 +2038,18 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
         confirmed = False
         momentum_confirmed = False
 
+    dq = chanlun_result.get("data_quality") if isinstance(chanlun_result.get("data_quality"), dict) else None
+    quality_degraded = bool(dq and dq.get("quality_grade") == "degraded")
+    if quality_degraded:
+        dq_notes = dq.get("notes") if isinstance(dq, dict) and isinstance(dq.get("notes"), list) else []
+        dq_hint = dq_notes[0] if dq_notes else "数据源存在高比例结算平K/陈旧/坏点"
+        tier = "数据质量降级"
+        summary = f"{tf}数据质量降级({summary})"
+        action_bias = f"{dq_hint}；禁止凭该序列直接触发买卖，请改用同板块高流动性主力锚核验"
+        signal_type = "data_quality_degraded"
+        confirmed = False
+        momentum_confirmed = False
+
     return {
         "tier": tier,
         "summary": summary,
@@ -2028,6 +2060,7 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
             "confirmed": confirmed,
             "momentum_confirmed": momentum_confirmed,
             "is_exhaustion": is_exhaustion,
+            "quality_degraded": quality_degraded,
             "signal_timestamp": sig_ts,
         },
     }
@@ -2471,6 +2504,22 @@ def assess_dual_timeframe_alignment(
             aligned = False
             alignment_status = "neutral_wait"
 
+    daily_dq_bad = (
+        isinstance(daily_cl, dict)
+        and isinstance(daily_cl.get("data_quality"), dict)
+        and daily_cl["data_quality"].get("quality_grade") == "degraded"
+    ) or daily_sig.get("tier") == "数据质量降级"
+    intraday_dq_bad = (
+        isinstance(intraday_cl, dict)
+        and isinstance(intraday_cl.get("data_quality"), dict)
+        and intraday_cl["data_quality"].get("quality_grade") == "degraded"
+    ) or intraday_sig.get("tier") == "数据质量降级"
+
+    if daily_dq_bad or intraday_dq_bad:
+        aligned = False
+        alignment_status = "data_quality_degraded"
+        intraday_action = "wait_data_quality"
+
     noise_reduction_pct: Optional[float] = None
     if ref_price is not None and daily_tactical_stop is not None and intraday_tactical_stop is not None:
         both_below = daily_tactical_stop < ref_price and intraday_tactical_stop < ref_price
@@ -2483,7 +2532,14 @@ def assess_dual_timeframe_alignment(
                 noise_reduction_pct = round(min(100.0, raw_pct), 2)
 
     notes: list[str] = []
-    if alignment_status == "aligned_trigger":
+    if alignment_status == "data_quality_degraded":
+        bad_parts = []
+        if daily_dq_bad:
+            bad_parts.append("日线")
+        if intraday_dq_bad:
+            bad_parts.append(intraday_tf)
+        notes.append(f"{'/'.join(bad_parts)}行情数据质量降级（高比例结算平K或坏点），阻断自动联立放行，请切换高流动性主力合约验证")
+    elif alignment_status == "aligned_trigger":
         notes.append(f"大小级别共振：日线定方向({daily_bias}) + {intraday_tf}诞生交易({intraday_action})")
     elif alignment_status == "daily_opposes_direction":
         notes.append(f"日线方向({daily_bias})与目标方向({norm_dir})相悖，严禁逆日线建仓")

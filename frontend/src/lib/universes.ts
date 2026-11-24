@@ -123,6 +123,8 @@ export function formatTaskStatus(status: string | null | undefined): string {
       return "排队中";
     case "failed":
       return "执行失败";
+    case "cancelled":
+      return "已终止";
     default:
       return status || "未知";
   }

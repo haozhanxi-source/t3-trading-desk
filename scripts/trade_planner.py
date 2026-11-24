@@ -89,6 +89,16 @@ CN_FUTURE_SPECS: dict[str, dict[str, Any]] = {
         "fractional": False,
         "unit_note": "CNY/mt * 1 mt/hand (SHFE 沪锡)",
     },
+    "PB": {
+        "root": "PB",
+        "asset_class": "cn_future",
+        "multiplier": 5.0,
+        "lot_size": 1,
+        "currency": "CNY",
+        "margin_rate": 0.12,
+        "fractional": False,
+        "unit_note": "CNY/mt * 5 mt/hand (SHFE 沪铅)",
+    },
     "AU": {
         "root": "AU",
         "asset_class": "cn_future",
@@ -159,6 +169,26 @@ CN_FUTURE_SPECS: dict[str, dict[str, Any]] = {
         "margin_rate": 0.15,
         "fractional": False,
         "unit_note": "CNY/mt * 60 mt/hand (DCE 焦煤)",
+    },
+    "SF": {
+        "root": "SF",
+        "asset_class": "cn_future",
+        "multiplier": 5.0,
+        "lot_size": 1,
+        "currency": "CNY",
+        "margin_rate": 0.12,
+        "fractional": False,
+        "unit_note": "CNY/mt * 5 mt/hand (CZCE 硅铁)",
+    },
+    "SM": {
+        "root": "SM",
+        "asset_class": "cn_future",
+        "multiplier": 5.0,
+        "lot_size": 1,
+        "currency": "CNY",
+        "margin_rate": 0.12,
+        "fractional": False,
+        "unit_note": "CNY/mt * 5 mt/hand (CZCE 锰硅)",
     },
     # New Energy Metals (GFEX)
     "LC": {
@@ -262,6 +292,26 @@ CN_FUTURE_SPECS: dict[str, dict[str, Any]] = {
         "fractional": False,
         "unit_note": "CNY/mt * 10 mt/hand (SHFE 天然橡胶)",
     },
+    "FU": {
+        "root": "FU",
+        "asset_class": "cn_future",
+        "multiplier": 10.0,
+        "lot_size": 1,
+        "currency": "CNY",
+        "margin_rate": 0.12,
+        "fractional": False,
+        "unit_note": "CNY/mt * 10 mt/hand (SHFE 燃料油)",
+    },
+    "PG": {
+        "root": "PG",
+        "asset_class": "cn_future",
+        "multiplier": 20.0,
+        "lot_size": 1,
+        "currency": "CNY",
+        "margin_rate": 0.12,
+        "fractional": False,
+        "unit_note": "CNY/mt * 20 mt/hand (DCE 液化石油气)",
+    },
     # Livestock & Agriculture (DCE / CZCE)
     "LH": {
         "root": "LH",
@@ -332,6 +382,16 @@ CN_FUTURE_SPECS: dict[str, dict[str, Any]] = {
         "margin_rate": 0.10,
         "fractional": False,
         "unit_note": "CNY/mt * 5 mt/hand (CZCE 棉花)",
+    },
+    "C": {
+        "root": "C",
+        "asset_class": "cn_future",
+        "multiplier": 10.0,
+        "lot_size": 1,
+        "currency": "CNY",
+        "margin_rate": 0.10,
+        "fractional": False,
+        "unit_note": "CNY/mt * 10 mt/hand (DCE 玉米)",
     },
     # Shipping (INE)
     "EC": {
@@ -1686,6 +1746,18 @@ def evaluate_four_quadrant_gate(
             "checks": checks,
         }
 
+    if alignment_status == "data_quality_degraded":
+        msg = "行情数据质量降级（高比例无波幅结算平K或异常坏点），严禁自动放行开仓，请切换同板块高流动性主力合约验证"
+        return {
+            "decision": "watchlist_data_quality_degraded",
+            "actionable": False,
+            "direction": norm_dir,
+            "asset_class": norm_ac,
+            "reason": msg,
+            "reasons": [msg],
+            "checks": checks,
+        }
+
     if alignment_status != "aligned_trigger":
         msg = f"未识别或未确认的日线/30min 对齐状态 {alignment_status!r}（仅 'aligned_trigger' 可放行），默认转入待核验观察池"
         return {
@@ -2216,6 +2288,8 @@ def _fetch_live_context(symbol: str) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"include_macro": False, "include_fundamentals": False}
         if "include_intraday" in sig.parameters:
             kwargs["include_intraday"] = True
+        if "refresh" in sig.parameters:
+            kwargs["refresh"] = True
         out["snapshot"] = get_snapshot(symbol, **kwargs)
     except Exception as exc:  # noqa: BLE001
         out["errors"].append(f"market_snapshot_error: {exc}")
@@ -2223,7 +2297,11 @@ def _fetch_live_context(symbol: str) -> dict[str, Any]:
     try:
         from research_data import collect_research_data
 
-        out["research"] = collect_research_data(symbol, include_macro=False)
+        rd_sig = inspect.signature(collect_research_data)
+        rd_kwargs: dict[str, Any] = {"include_macro": False}
+        if "max_age_seconds" in rd_sig.parameters:
+            rd_kwargs["max_age_seconds"] = 120.0
+        out["research"] = collect_research_data(symbol, **rd_kwargs)
     except Exception as exc:  # noqa: BLE001
         out["errors"].append(f"research_data_error: {exc}")
     return out
@@ -2455,6 +2533,25 @@ def _check_live_upstream_health(
 
     if stale_flagged:
         errors.append("stale_market_snapshot")
+
+    # 3b. OHLCV intrinsic data-quality gate (blocks flat settlement-only feeds like ALI=F from live execution)
+    daily_dq = snap.get("data_quality") if isinstance(snap, dict) and isinstance(snap.get("data_quality"), dict) else None
+    if daily_dq is None and isinstance(snap, dict) and isinstance(snap.get("chanlun"), dict):
+        d_cl = snap["chanlun"].get("daily")
+        if isinstance(d_cl, dict) and isinstance(d_cl.get("data_quality"), dict):
+            daily_dq = d_cl["data_quality"]
+    if isinstance(daily_dq, dict) and daily_dq.get("quality_grade") == "degraded":
+        errors.append("daily_data_quality_degraded")
+
+    intra_dq = (
+        snap.get("intraday_data_quality")
+        if isinstance(snap, dict) and isinstance(snap.get("intraday_data_quality"), dict)
+        else None
+    )
+    if intra_dq is None and isinstance(intraday_30m, dict) and isinstance(intraday_30m.get("data_quality"), dict):
+        intra_dq = intraday_30m["data_quality"]
+    if isinstance(intra_dq, dict) and intra_dq.get("quality_grade") == "degraded":
+        errors.append("intraday_data_quality_degraded")
 
     # 4. Research sources_status inspection
     res_dict = res if isinstance(res, dict) else {}

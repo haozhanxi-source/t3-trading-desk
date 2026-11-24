@@ -3,6 +3,7 @@
 Supports US stocks, A-shares, Commodities, Crypto (with perpetual funding rates), and Macro indices.
 """
 import argparse
+import inspect
 import json
 import os
 import re
@@ -28,14 +29,22 @@ from chanlun import (
     evaluate_daily_signal_tier,
     evaluate_signal_tier,
 )
+from data_store import (
+    SeriesKey,
+    get_store,
+    is_store_enabled,
+    period_to_days,
+    sanitize_and_grade_ohlcv,
+    scoped_http_timeout,
+)
 
 CN_FUTURE_RE = re.compile(r"^[A-Z]{1,2}0$")
 CN_FUTURE_ROOTS = frozenset({
-    "CU", "AL", "ZN", "NI", "SN", "AU", "AG",
+    "CU", "AL", "ZN", "NI", "SN", "PB", "AU", "AG",
     "RB", "HC", "I", "J", "JM", "SF", "SM",
     "LC", "SI", "PS", "LH",
-    "M", "Y", "P", "OI", "SR", "CF",
-    "TA", "MA", "V", "SA", "FG", "RU",
+    "M", "Y", "P", "OI", "SR", "CF", "C",
+    "TA", "MA", "V", "SA", "FG", "RU", "FU", "PG",
     "EC", "SC",
 })
 CN_FUTURE_CONTRACT_RE = re.compile(
@@ -110,10 +119,13 @@ COMMODITY_ALIASES = {
     "沪锌": "ZN0",
     "沪镍": "NI0",
     "沪锡": "SN0",
+    "沪铅": "PB0",
     "沪金": "AU0",
     "沪银": "AG0",
     "集运欧线": "EC0",
     "上海原油": "SC0",
+    "燃料油": "FU0",
+    "液化石油气": "PG0",
 }
 
 CRYPTO_BASE = {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "TON", "SUI", "ARB", "OP"}
@@ -209,7 +221,7 @@ def period_to_start_date(period: str, today: date | datetime | str | None = None
     if p == "ytd":
         return f"{anchor.year}0101"
 
-    m = re.fullmatch(r"(\d+)\s*(d|w|mo|y)", p)
+    m = re.fullmatch(r"(\d+)\s*(d|w|wk|mo|y)", p)
     if not m:
         raise ValueError(f"Unsupported period format: {period!r}")
 
@@ -217,7 +229,7 @@ def period_to_start_date(period: str, today: date | datetime | str | None = None
     unit = m.group(2)
     if unit == "d":
         start = anchor - pd.Timedelta(days=qty)
-    elif unit == "w":
+    elif unit in ("w", "wk"):
         start = anchor - pd.Timedelta(weeks=qty)
     elif unit == "mo":
         start = anchor - pd.DateOffset(months=qty)
@@ -338,26 +350,29 @@ def fetch_cn_future_daily(symbol: str, period: str = "3y") -> pd.DataFrame:
 
     is_continuous = bool(CN_FUTURE_RE.fullmatch(symbol.strip().upper()))
     last_err: Exception | None = None
-    if is_continuous:
+    with scoped_http_timeout((5.0, 12.0)):
+        if is_continuous:
+            try:
+                raw = ak.futures_main_sina(symbol=symbol, start_date=start_date, end_date=end_date)
+                df = normalize_cn_future_frame(raw)
+                if not df.empty:
+                    df = df[(df.index >= start_ts) & (df.index <= end_ts)]
+                if not df.empty:
+                    df.attrs["provider_source"] = "akshare_sina_main"
+                    return df
+            except Exception as exc:
+                last_err = exc
+
         try:
-            raw = ak.futures_main_sina(symbol=symbol, start_date=start_date, end_date=end_date)
-            df = normalize_cn_future_frame(raw)
-            if not df.empty:
-                df = df[(df.index >= start_ts) & (df.index <= end_ts)]
-            if not df.empty:
-                return df
+            raw_fb = ak.futures_zh_daily_sina(symbol=symbol)
+            df_fb = normalize_cn_future_frame(raw_fb)
+            if not df_fb.empty:
+                df_fb = df_fb[(df_fb.index >= start_ts) & (df_fb.index <= end_ts)]
+            if not df_fb.empty:
+                df_fb.attrs["provider_source"] = "akshare_sina_daily_fb"
+                return df_fb
         except Exception as exc:
             last_err = exc
-
-    try:
-        raw_fb = ak.futures_zh_daily_sina(symbol=symbol)
-        df_fb = normalize_cn_future_frame(raw_fb)
-        if not df_fb.empty:
-            df_fb = df_fb[(df_fb.index >= start_ts) & (df_fb.index <= end_ts)]
-        if not df_fb.empty:
-            return df_fb
-    except Exception as exc:
-        last_err = exc
 
     if last_err is not None:
         raise last_err
@@ -418,9 +433,12 @@ def fetch_cn_future_intraday(symbol: str, interval: str = "30m") -> pd.DataFrame
     _, period_min, _ = _validate_intraday_interval(interval)
     if ak is None:
         raise RuntimeError("akshare is not installed; required for domestic futures intraday (cn_future)")
-    raw = ak.futures_zh_minute_sina(symbol=symbol, period=period_min)
+    with scoped_http_timeout((5.0, 12.0)):
+        raw = ak.futures_zh_minute_sina(symbol=symbol, period=period_min)
     df = normalize_cn_future_frame(raw)
-    return _localize_df_index(df, "Asia/Shanghai")
+    out = _localize_df_index(df, "Asia/Shanghai")
+    out.attrs["provider_source"] = "akshare_sina_min"
+    return out
 
 
 def fetch_a_share_intraday(norm_sym: str, interval: str = "30m") -> pd.DataFrame:
@@ -452,21 +470,26 @@ def fetch_a_share_intraday(norm_sym: str, interval: str = "30m") -> pd.DataFrame
         sina_sym = upper.lower()
 
     last_err: Exception | None = None
-    try:
-        raw_sina = ak.stock_zh_a_minute(symbol=sina_sym, period=period_min, adjust="qfq")
-        df_sina = normalize_cn_future_frame(raw_sina)
-        if not df_sina.empty:
-            return _localize_df_index(df_sina, "Asia/Shanghai")
-    except Exception as exc:
-        last_err = exc
+    with scoped_http_timeout((5.0, 12.0)):
+        try:
+            raw_sina = ak.stock_zh_a_minute(symbol=sina_sym, period=period_min, adjust="qfq")
+            df_sina = normalize_cn_future_frame(raw_sina)
+            if not df_sina.empty:
+                out_sina = _localize_df_index(df_sina, "Asia/Shanghai")
+                out_sina.attrs["provider_source"] = "akshare_sina_min"
+                return out_sina
+        except Exception as exc:
+            last_err = exc
 
-    try:
-        raw_em = ak.stock_zh_a_hist_min_em(symbol=code6, period=period_min, adjust="qfq")
-        df_em = normalize_cn_future_frame(raw_em)
-        if not df_em.empty:
-            return _localize_df_index(df_em, "Asia/Shanghai")
-    except Exception as exc:
-        last_err = exc
+        try:
+            raw_em = ak.stock_zh_a_hist_min_em(symbol=code6, period=period_min, adjust="qfq")
+            df_em = normalize_cn_future_frame(raw_em)
+            if not df_em.empty:
+                out_em = _localize_df_index(df_em, "Asia/Shanghai")
+                out_em.attrs["provider_source"] = "akshare_em_min"
+                return out_em
+        except Exception as exc:
+            last_err = exc
 
     if last_err is not None:
         raise last_err
@@ -534,7 +557,9 @@ def fetch_crypto_intraday(norm_sym: str, interval: str = "30m", limit: int = 500
             df = df.sort_index(ascending=True, kind="mergesort")
             if len(df) > limit:
                 df = df.iloc[-limit:]
-            return df[cols]
+            out_crypto = df[cols]
+            out_crypto.attrs["provider_source"] = f"ccxt:{eid}"
+            return out_crypto
         except Exception as exc:
             last_err = exc
 
@@ -650,7 +675,9 @@ def compute_indicators(
         ts_last_utc = ts_last.tz_convert("UTC")
         as_of_bar_utc = ts_last_utc.isoformat(timespec="seconds")
         bar_duration = _parse_bar_duration(norm_interval)
-        if is_intraday and bar_duration is not None:
+        if "_is_closed" in df.columns and now_utc is None:
+            bar_is_closed = bool(df["_is_closed"].iloc[-1])
+        elif is_intraday and bar_duration is not None:
             ref_now = (
                 now_utc.astimezone(timezone.utc)
                 if (now_utc is not None and now_utc.tzinfo is not None)
@@ -659,6 +686,8 @@ def compute_indicators(
             bar_ts_py = ts_last_utc.to_pydatetime()
             bar_end_utc = bar_ts_py if norm_anchor == "end" else (bar_ts_py + bar_duration)
             bar_is_closed = ref_now >= bar_end_utc
+    elif "_is_closed" in df.columns and now_utc is None:
+        bar_is_closed = bool(df["_is_closed"].iloc[-1])
 
     max_recent_bars = 64 if is_intraday else 10
     tail_n = min(max_recent_bars, len(df))
@@ -675,8 +704,13 @@ def compute_indicators(
     tail_high = high.iloc[-tail_n:].values
     tail_low = low.iloc[-tail_n:].values
     tail_close = close.iloc[-tail_n:].values
-    recent_bars_ohlc = [
-        {
+    has_raw_hl = "_raw_high" in df.columns and "_raw_low" in df.columns
+    tail_raw_high = df["_raw_high"].astype(float).iloc[-tail_n:].values if has_raw_hl else None
+    tail_raw_low = df["_raw_low"].astype(float).iloc[-tail_n:].values if has_raw_hl else None
+    tail_repaired = df["_envelope_repaired"].astype(bool).iloc[-tail_n:].values if "_envelope_repaired" in df.columns else None
+    recent_bars_ohlc = []
+    for i in range(tail_n):
+        bar_entry: dict = {
             "bar": tail_ts[i],
             "bar_utc": tail_utc[i],
             "open": round(float(tail_open[i]), 4),
@@ -684,8 +718,11 @@ def compute_indicators(
             "low": round(float(tail_low[i]), 4),
             "close": round(float(tail_close[i]), 4),
         }
-        for i in range(tail_n)
-    ]
+        if tail_raw_high is not None and tail_raw_low is not None:
+            bar_entry["raw_high"] = round(float(tail_raw_high[i]), 4)
+            bar_entry["raw_low"] = round(float(tail_raw_low[i]), 4)
+            bar_entry["envelope_repaired"] = bool(tail_repaired[i]) if tail_repaired is not None else False
+        recent_bars_ohlc.append(bar_entry)
 
     common_head = {
         "as_of_bar": as_of_bar,
@@ -763,18 +800,19 @@ def fetch_crypto_funding(base: str) -> dict:
 
 def fetch_macro_context() -> dict:
     ctx = {}
-    for sym, label in [("^VIX", "VIX"), ("^TNX", "US10Y_Yield"), ("DX-Y.NYB", "DXY_USD_Index")]:
-        try:
-            df = yf.Ticker(sym).history(period="10d").dropna(subset=["Close"])
-            if len(df) >= 2:
-                last = float(df["Close"].iloc[-1])
-                prev = float(df["Close"].iloc[-2])
-                ctx[label] = {
-                    "last": round(last, 2),
-                    "chg_1d_pct": round((last / prev - 1) * 100, 2),
-                }
-        except Exception:
-            pass
+    with scoped_http_timeout((5.0, 10.0)):
+        for sym, label in [("^VIX", "VIX"), ("^TNX", "US10Y_Yield"), ("DX-Y.NYB", "DXY_USD_Index")]:
+            try:
+                df = yf.Ticker(sym).history(period="10d").dropna(subset=["Close"])
+                if len(df) >= 2:
+                    last = float(df["Close"].iloc[-1])
+                    prev = float(df["Close"].iloc[-2])
+                    ctx[label] = {
+                        "last": round(last, 2),
+                        "chg_1d_pct": round((last / prev - 1) * 100, 2),
+                    }
+            except Exception:
+                pass
     return ctx
 
 
@@ -830,40 +868,129 @@ def serialize_ohlcv_bars(df: pd.DataFrame, intraday: bool) -> list[dict]:
     return [by_time[k] for k in sorted(by_time)]
 
 
+def _ticker_supports_start(history_fn) -> bool:
+    try:
+        sig = inspect.signature(history_fn)
+    except (TypeError, ValueError):
+        return False
+    params = sig.parameters
+    return "start" in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def get_intraday_snapshot(
     raw_symbol: str,
     interval: str = "30m",
     full_chanlun: bool = False,
     include_ohlcv: bool = False,
+    *,
+    refresh: bool = False,
+    use_store: bool | None = None,
+    db_path: str | None = None,
+    ttl_seconds: float | None = None,
 ) -> dict:
     """Fetch intraday OHLCV (15m/30m/60m) and run Chanlun analysis across all 6 asset classes."""
     try:
         iv, _, tf_label = _validate_intraday_interval(interval)
         norm_sym, asset_class = normalize_symbol(raw_symbol)
+        store_on = is_store_enabled(use_store, db_path)
 
         if asset_class == "cn_future":
             data_source = "akshare/sina 分钟"
+            primary_src_id = "akshare_sina_min"
+            adjust_kind = "raw_continuous" if CN_FUTURE_RE.fullmatch(norm_sym) else "raw_contract"
             timestamp_anchor = "end"
-            df = fetch_cn_future_intraday(norm_sym, interval=iv)
+            max_bars: int | None = 1000
+
+            def fetch_fn() -> pd.DataFrame:
+                return fetch_cn_future_intraday(norm_sym, interval=iv)
         elif asset_class == "a_share":
             data_source = "akshare 分钟(qfq)"
+            primary_src_id = "akshare_sina_min"
+            adjust_kind = "qfq"
             timestamp_anchor = "end"
-            df = fetch_a_share_intraday(norm_sym, interval=iv)
+            max_bars = 1000
+
+            def fetch_fn() -> pd.DataFrame:
+                return fetch_a_share_intraday(norm_sym, interval=iv)
         elif asset_class == "crypto":
             data_source = "ccxt 分钟"
+            primary_src_id = "ccxt:okx"
+            adjust_kind = "spot_usdt"
             timestamp_anchor = "start"
-            df = fetch_crypto_intraday(norm_sym, interval=iv)
+            max_bars = 500
+
+            def fetch_fn() -> pd.DataFrame:
+                return fetch_crypto_intraday(norm_sym, interval=iv)
         else:
             data_source = "yfinance 分钟"
+            primary_src_id = "yfinance_intraday"
+            adjust_kind = "auto_adjust" if asset_class == "us_stock_or_etf" else "raw_quote"
             timestamp_anchor = "start"
-            raw_df = yf.Ticker(norm_sym).history(period="60d", interval=iv)
-            df = _normalize_yfinance_frame(raw_df)
+            max_bars = None
+
+            def fetch_fn() -> pd.DataFrame:
+                with scoped_http_timeout((5.0, 12.0)):
+                    raw_df = yf.Ticker(norm_sym).history(period="60d", interval=iv)
+                out = _normalize_yfinance_frame(raw_df)
+                out.attrs["provider_source"] = "yfinance_intraday"
+                return out
+
+        sync_meta: dict = {"cache_status": "bypass"}
+        if store_on:
+            store = get_store(db_path)
+            primary_key = SeriesKey(asset_class, norm_sym, iv, primary_src_id, adjust_kind)
+            # Fast path: check primary series cache hit without hitting network
+            if not refresh:
+                df_cached, qual_cached, meta_cached = store.get_or_sync_ohlcv(
+                    primary_key,
+                    period="60d",
+                    timestamp_anchor=timestamp_anchor,
+                    ttl_seconds=ttl_seconds,
+                    refresh=False,
+                    max_bars=max_bars,
+                    supports_incremental=False,
+                    fetch_full=lambda: pd.DataFrame(),
+                )
+                if meta_cached.get("cache_status") == "hit" and not df_cached.empty:
+                    df, intra_quality, sync_meta = df_cached, qual_cached, meta_cached
+                else:
+                    df_cached = pd.DataFrame()
+            else:
+                df_cached = pd.DataFrame()
+
+            if df_cached.empty:
+                raw_fetched = fetch_fn()
+                actual_src_id = str(raw_fetched.attrs.get("provider_source") or primary_src_id)
+                actual_key = SeriesKey(asset_class, norm_sym, iv, actual_src_id, adjust_kind)
+                df, intra_quality, sync_meta = store.get_or_sync_ohlcv(
+                    actual_key,
+                    period="60d",
+                    timestamp_anchor=timestamp_anchor,
+                    ttl_seconds=ttl_seconds,
+                    refresh=True,
+                    max_bars=max_bars,
+                    supports_incremental=False,
+                    fetch_full=lambda: raw_fetched,
+                )
+        else:
+            raw_fetched = fetch_fn()
+            df, intra_quality = sanitize_and_grade_ohlcv(
+                raw_fetched,
+                asset_class=asset_class,
+                interval=iv,
+                timestamp_anchor=timestamp_anchor,
+                check_staleness=False,
+            )
 
         if df is None or df.empty:
             return {"error": f"No {iv} OHLCV data returned for {raw_symbol} (normalized: {norm_sym})"}
 
         indicators = compute_indicators(df, interval=iv, timestamp_anchor=timestamp_anchor)
+        if intra_quality.get("dropped_bar_keys"):
+            indicators["dropped_bar_keys"] = intra_quality["dropped_bar_keys"]
         intraday_cl = analyze_chanlun(df, timeframe_label=tf_label, full_export=full_chanlun)
+        if isinstance(intraday_cl, dict) and "error" not in intraday_cl:
+            intraday_cl["data_quality"] = intra_quality
         signal_summary = evaluate_signal_tier(intraday_cl, timeframe_label=tf_label)
 
         intraday_result = {
@@ -874,6 +1001,8 @@ def get_intraday_snapshot(
             "timeframe_label": tf_label,
             "data_source": data_source,
             "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "data_quality": intra_quality,
+            "sync_meta": sync_meta,
             "technicals": indicators,
             "chanlun": {
                 "signal_summary": signal_summary,
@@ -896,19 +1025,115 @@ def get_snapshot(
     include_intraday: bool = False,
     intraday_interval: str = "30m",
     include_ohlcv: bool = False,
+    *,
+    refresh: bool = False,
+    use_store: bool | None = None,
+    db_path: str | None = None,
+    ttl_seconds: float | None = None,
 ) -> dict:
     try:
         norm_sym, asset_class = normalize_symbol(raw_symbol)
         fundamentals = {}
         ticker = None
+        store_on = is_store_enabled(use_store, db_path)
+        sync_meta: dict = {"cache_status": "bypass"}
 
         if asset_class == "cn_future":
-            data_source = "akshare/sina 主力连续" if CN_FUTURE_RE.fullmatch(norm_sym) else "akshare/sina 期货合约"
-            df = fetch_cn_future_daily(norm_sym, period=period)
+            is_cont = bool(CN_FUTURE_RE.fullmatch(norm_sym))
+            data_source = "akshare/sina 主力连续" if is_cont else "akshare/sina 期货合约"
+            primary_src_id = "akshare_sina_main" if is_cont else "akshare_sina_daily_fb"
+            adjust_kind = "raw_continuous" if is_cont else "raw_contract"
+
+            if store_on:
+                store = get_store(db_path)
+                primary_key = SeriesKey(asset_class, norm_sym, "1d", primary_src_id, adjust_kind)
+                df_cached = pd.DataFrame()
+                if not refresh:
+                    df_cached, daily_quality, sync_meta = store.get_or_sync_ohlcv(
+                        primary_key,
+                        period=period,
+                        timestamp_anchor="end",
+                        ttl_seconds=ttl_seconds,
+                        refresh=False,
+                        supports_incremental=False,
+                        fetch_full=lambda: pd.DataFrame(),
+                    )
+                if df_cached.empty or sync_meta.get("cache_status") != "hit":
+                    # Sina downloads full history anyway; always sync at least 3y into SQLite so short queries never truncate 3y coverage
+                    fetch_period = "3y" if period_to_days(period) < 1095 else period
+                    raw_cn = fetch_cn_future_daily(norm_sym, period=fetch_period)
+                    actual_src_id = str(raw_cn.attrs.get("provider_source") or primary_src_id)
+                    actual_key = SeriesKey(asset_class, norm_sym, "1d", actual_src_id, adjust_kind)
+                    _, _, sync_meta = store.get_or_sync_ohlcv(
+                        actual_key,
+                        period=fetch_period,
+                        timestamp_anchor="end",
+                        ttl_seconds=ttl_seconds,
+                        refresh=True,
+                        supports_incremental=False,
+                        fetch_full=lambda: raw_cn,
+                    )
+                    df, daily_quality, _ = store.get_or_sync_ohlcv(
+                        actual_key,
+                        period=period,
+                        timestamp_anchor="end",
+                        ttl_seconds=ttl_seconds,
+                        refresh=False,
+                        supports_incremental=False,
+                        fetch_full=lambda: raw_cn,
+                    )
+                else:
+                    df = df_cached
+            else:
+                raw_cn = fetch_cn_future_daily(norm_sym, period=period)
+                df, daily_quality = sanitize_and_grade_ohlcv(
+                    raw_cn,
+                    asset_class=asset_class,
+                    interval="1d",
+                    timestamp_anchor="end",
+                    check_staleness=False,
+                )
         else:
             data_source = "yfinance"
             ticker = yf.Ticker(norm_sym)
-            df = ticker.history(period=period, interval="1d")
+            adjust_kind = (
+                "auto_adjust"
+                if asset_class in ("us_stock_or_etf", "a_share")
+                else ("spot_usd" if asset_class == "crypto" else "raw_quote")
+            )
+
+            def _fetch_yf_full() -> pd.DataFrame:
+                with scoped_http_timeout((5.0, 12.0)):
+                    return ticker.history(period=period, interval="1d")
+
+            def _fetch_yf_tail(overlap_start: str) -> pd.DataFrame:
+                with scoped_http_timeout((5.0, 12.0)):
+                    if _ticker_supports_start(ticker.history):
+                        return ticker.history(start=overlap_start, interval="1d")
+                    return ticker.history(period=period, interval="1d")
+
+            if store_on:
+                store = get_store(db_path)
+                yf_key = SeriesKey(asset_class, norm_sym, "1d", "yfinance", adjust_kind)
+                df, daily_quality, sync_meta = store.get_or_sync_ohlcv(
+                    yf_key,
+                    period=period,
+                    timestamp_anchor="start",
+                    ttl_seconds=ttl_seconds,
+                    refresh=refresh,
+                    supports_incremental=True,
+                    fetch_full=_fetch_yf_full,
+                    fetch_tail=_fetch_yf_tail,
+                )
+            else:
+                raw_yf = _fetch_yf_full()
+                df, daily_quality = sanitize_and_grade_ohlcv(
+                    raw_yf,
+                    asset_class=asset_class,
+                    interval="1d",
+                    timestamp_anchor="start",
+                    check_staleness=False,
+                )
 
         if df is not None and not df.empty:
             df = df.dropna(subset=["Open", "High", "Low", "Close"])
@@ -916,12 +1141,17 @@ def get_snapshot(
             return {"error": f"No OHLCV data returned for {raw_symbol} (normalized: {norm_sym})"}
 
         indicators = compute_indicators(df, interval="1d")
+        if daily_quality.get("dropped_bar_keys"):
+            indicators["dropped_bar_keys"] = daily_quality["dropped_bar_keys"]
         daily_cl = analyze_chanlun(df, timeframe_label="日线", full_export=full_chanlun)
+        if isinstance(daily_cl, dict) and "error" not in daily_cl:
+            daily_cl["data_quality"] = daily_quality
         signal_summary = evaluate_daily_signal_tier(daily_cl)
 
         if include_fundamentals and asset_class not in ("cn_future", "fx") and ticker is not None:
             try:
-                info = ticker.info or {}
+                with scoped_http_timeout((5.0, 8.0)):
+                    info = ticker.info or {}
                 fields = [
                     "shortName", "sector", "industry", "currency", "marketCap",
                     "trailingPE", "forwardPE", "priceToBook", "dividendYield",
@@ -939,6 +1169,8 @@ def get_snapshot(
             "asset_class": asset_class,
             "data_source": data_source,
             "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+            "data_quality": daily_quality,
+            "sync_meta": sync_meta,
             "technicals": indicators,
             "chanlun": {
                 "signal_summary": signal_summary,
@@ -952,7 +1184,14 @@ def get_snapshot(
 
         if include_intraday:
             try:
-                intraday_kwargs = {"include_ohlcv": True} if include_ohlcv else {}
+                intraday_kwargs: dict = {
+                    "refresh": refresh,
+                    "use_store": use_store,
+                    "db_path": db_path,
+                    "ttl_seconds": ttl_seconds,
+                }
+                if include_ohlcv:
+                    intraday_kwargs["include_ohlcv"] = True
                 intra_snap = get_intraday_snapshot(
                     raw_symbol,
                     interval=intraday_interval,
@@ -970,6 +1209,8 @@ def get_snapshot(
                 intraday_cl = intra_snap["chanlun"]["intraday"]
                 result["intraday_interval"] = intra_snap["interval"]
                 result["intraday_data_source"] = intra_snap["data_source"]
+                result["intraday_data_quality"] = intra_snap.get("data_quality")
+                result["intraday_sync_meta"] = intra_snap.get("sync_meta")
                 result["intraday_technicals"] = intra_snap["technicals"]
                 result["chanlun"]["intraday"] = intraday_cl
                 result["chanlun"]["intraday_signal_summary"] = intra_snap["chanlun"]["signal_summary"]
@@ -1010,7 +1251,14 @@ def main():
         action="store_true",
         help="Include full strokes, segments, and Zhongshu lists in Chanlun output",
     )
+    parser.add_argument("--refresh", action="store_true", help="Force upstream refresh bypassing local freshness window")
+    parser.add_argument("--no-cache", action="store_true", help="Bypass local SQLite store completely")
     args = parser.parse_args()
+    extra_cli_kw: dict = {}
+    if args.refresh:
+        extra_cli_kw["refresh"] = True
+    if args.no_cache:
+        extra_cli_kw["use_store"] = False
     if args.dual:
         intraday_iv = "30m" if args.interval == "1d" else args.interval
         data = get_snapshot(
@@ -1020,12 +1268,14 @@ def main():
             full_chanlun=args.full_chanlun,
             include_intraday=True,
             intraday_interval=intraday_iv,
+            **extra_cli_kw,
         )
     elif args.interval != "1d":
         data = get_intraday_snapshot(
             args.symbol,
             interval=args.interval,
             full_chanlun=args.full_chanlun,
+            **extra_cli_kw,
         )
     else:
         data = get_snapshot(
@@ -1033,6 +1283,7 @@ def main():
             period=args.period,
             include_macro=not args.no_macro,
             full_chanlun=args.full_chanlun,
+            **extra_cli_kw,
         )
     print(json.dumps(data, ensure_ascii=False, indent=2))
     if isinstance(data, dict) and ("error" in data or (args.dual and "intraday_error" in data)):

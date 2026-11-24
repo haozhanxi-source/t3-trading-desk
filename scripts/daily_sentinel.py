@@ -1957,9 +1957,23 @@ def _collect_eligible_ohlc_extrema(
         def _bar_end_utc(bar_dt: datetime) -> datetime:
             return bar_dt if anchor_mode == "end" else (bar_dt + bar_dur)
 
-        # 1a. Latest bar low/high (exclude corrupted future-timestamp bars)
-        last_low = _to_float(intra_tech.get("last_bar_low"))
-        last_high = _to_float(intra_tech.get("last_bar_high"))
+        # 1a. Latest bar low/high (exclude corrupted future-timestamp bars; prefer raw un-repaired extrema)
+        recent_intra = intra_tech.get("recent_bars_ohlc")
+        last_raw_override = (
+            recent_intra[-1]
+            if isinstance(recent_intra, list) and recent_intra and isinstance(recent_intra[-1], dict)
+            else None
+        )
+        last_low = (
+            _to_float(last_raw_override.get("raw_low"))
+            if last_raw_override is not None and last_raw_override.get("raw_low") is not None
+            else _to_float(intra_tech.get("last_bar_low"))
+        )
+        last_high = (
+            _to_float(last_raw_override.get("raw_high"))
+            if last_raw_override is not None and last_raw_override.get("raw_high") is not None
+            else _to_float(intra_tech.get("last_bar_high"))
+        )
         if (last_low is not None or last_high is not None) and not _is_future_dt(tech_dt_utc):
             if eff_dt_utc is not None and tech_dt_utc is not None:
                 t_start = _bar_start_utc(tech_dt_utc)
@@ -1972,7 +1986,6 @@ def _collect_eligible_ohlc_extrema(
                 _consider(last_low, last_high, tech_label or "latest_bar", "intraday_30m")
 
         # 1b. recent_bars_ohlc (up to 64 bars; exclude corrupted future-timestamp bars)
-        recent_intra = intra_tech.get("recent_bars_ohlc")
         parsed_intra: list[tuple[int, dict[str, Any], datetime | None, date | None, str]] = []
         if isinstance(recent_intra, list):
             for idx, item in enumerate(recent_intra):
@@ -2009,8 +2022,8 @@ def _collect_eligible_ohlc_extrema(
 
         eligible_bar_starts: list[datetime] = []
         for pos_idx, (_, item, b_dt_utc, b_local_d, lbl) in enumerate(parsed_intra):
-            b_low = _to_float(item.get("low"))
-            b_high = _to_float(item.get("high"))
+            b_low = _to_float(item.get("raw_low")) if item.get("raw_low") is not None else _to_float(item.get("low"))
+            b_high = _to_float(item.get("raw_high")) if item.get("raw_high") is not None else _to_float(item.get("high"))
             if eff_dt_utc is not None:
                 if b_dt_utc is None:
                     continue
@@ -2079,15 +2092,37 @@ def _collect_eligible_ohlc_extrema(
                 )
                 break
 
+        # 1e. Explicit dropped corrupt intraday bar gap markers
+        dropped_intra = intra_tech.get("dropped_bar_keys")
+        if isinstance(dropped_intra, list) and dropped_intra:
+            eff_iso_cut = eff_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ") if eff_dt_utc is not None else ""
+            post_eff_dropped = [str(k) for k in dropped_intra if str(k) >= eff_iso_cut]
+            if post_eff_dropped:
+                gap_details.append(f"intraday_internal_bar_gap: quarantined_corrupt_bars={','.join(post_eff_dropped[:5])}")
+
     # --- 2. Daily OHLC ---
     daily_tech = snapshot.get("technicals")
     if isinstance(daily_tech, dict):
         d_dt_utc, d_local_d, _, _, d_label = _extract_tech_timestamp(daily_tech, asset_class=eff_ac)
         d_bar_date = d_local_d or (d_dt_utc.astimezone(ex_tz).date() if d_dt_utc is not None else None)
 
-        # 2a. Latest daily bar low/high
-        last_low = _to_float(daily_tech.get("last_bar_low"))
-        last_high = _to_float(daily_tech.get("last_bar_high"))
+        # 2a. Latest daily bar low/high (prefer raw un-repaired extrema so settlement O/C never fakes a wick stop)
+        recent_daily = daily_tech.get("recent_bars_ohlc")
+        last_daily_override = (
+            recent_daily[-1]
+            if isinstance(recent_daily, list) and recent_daily and isinstance(recent_daily[-1], dict)
+            else None
+        )
+        last_low = (
+            _to_float(last_daily_override.get("raw_low"))
+            if last_daily_override is not None and last_daily_override.get("raw_low") is not None
+            else _to_float(daily_tech.get("last_bar_low"))
+        )
+        last_high = (
+            _to_float(last_daily_override.get("raw_high"))
+            if last_daily_override is not None and last_daily_override.get("raw_high") is not None
+            else _to_float(daily_tech.get("last_bar_high"))
+        )
         if last_low is not None or last_high is not None:
             if eff_dt_utc is not None:
                 eligible_daily_last = (
@@ -2101,7 +2136,6 @@ def _collect_eligible_ohlc_extrema(
                 _consider(last_low, last_high, d_label or "latest_daily_bar", "daily")
 
         # 2b. Daily recent_bars_ohlc
-        recent_daily = daily_tech.get("recent_bars_ohlc")
         if isinstance(recent_daily, list) and recent_daily:
             daily_session_date: date | None = d_bar_date
             if daily_session_date is None:
@@ -2115,8 +2149,8 @@ def _collect_eligible_ohlc_extrema(
             for idx, item in enumerate(recent_daily):
                 if not isinstance(item, dict):
                     continue
-                b_low = _to_float(item.get("low"))
-                b_high = _to_float(item.get("high"))
+                b_low = _to_float(item.get("raw_low")) if item.get("raw_low") is not None else _to_float(item.get("low"))
+                b_high = _to_float(item.get("raw_high")) if item.get("raw_high") is not None else _to_float(item.get("high"))
                 if b_low is None and b_high is None:
                     continue
                 raw_bar = item.get("bar") or item.get("bar_utc")
@@ -2134,6 +2168,13 @@ def _collect_eligible_ohlc_extrema(
                     elif idx != len(recent_daily) - 1:
                         continue
                 _consider(b_low, b_high, str(raw_bar or f"daily_bar_{idx}"), "daily")
+
+        dropped_daily = daily_tech.get("dropped_bar_keys")
+        if isinstance(dropped_daily, list) and dropped_daily:
+            eff_d_cut = eff_exchange_date.isoformat() if eff_exchange_date is not None else ""
+            post_d_dropped = [str(k) for k in dropped_daily if str(k) > eff_d_cut]
+            if post_d_dropped:
+                gap_details.append(f"daily_quarantined_corrupt_bars:{','.join(post_d_dropped[:5])}")
 
     gap_detail = "；".join(dict.fromkeys(gap_details)) if gap_details else None
     return min_low, min_low_meta, max_high, max_high_meta, gap_detail, straddle_bars
@@ -3628,6 +3669,8 @@ def _default_snapshot_fetcher(symbol: str) -> dict[str, Any]:
             kwargs["include_intraday"] = True
         if "intraday_interval" in sig.parameters:
             kwargs["intraday_interval"] = "30m"
+        if "refresh" in sig.parameters:
+            kwargs["refresh"] = True
         return ms_mod.get_snapshot(symbol, **kwargs)
     except Exception as exc:  # noqa: BLE001
         return {"error": f"Snapshot fetch failed for {symbol}: {exc}"}
@@ -3635,12 +3678,16 @@ def _default_snapshot_fetcher(symbol: str) -> dict[str, Any]:
 
 def _default_research_fetcher(symbol: str) -> dict[str, Any]:
     try:
-        return rd_mod.collect_research_data(
-            raw_symbol=symbol,
-            period="3y",
-            include_macro=False,
-            full_chanlun=False,
-        )
+        rd_sig = inspect.signature(rd_mod.collect_research_data)
+        rd_kwargs: dict[str, Any] = {
+            "raw_symbol": symbol,
+            "period": "3y",
+            "include_macro": False,
+            "full_chanlun": False,
+        }
+        if "max_age_seconds" in rd_sig.parameters:
+            rd_kwargs["max_age_seconds"] = 120.0
+        return rd_mod.collect_research_data(**rd_kwargs)
     except Exception as exc:  # noqa: BLE001
         return {
             "symbol": symbol,

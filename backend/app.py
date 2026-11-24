@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+import data_health_check
+import data_store
 import market_snapshot
 import portfolio_manager as pm
 import research_archive as ra
@@ -35,6 +38,7 @@ from .symbols import search_symbols
 from .tasks import (
     TERMINAL_EVENT_TYPES,
     TaskManager,
+    compute_current_sentinel_fingerprint,
     research_cache_key,
     run_sentinel_sync,
     sentinel_cache_key,
@@ -257,6 +261,13 @@ class ScanTaskReq(_Strict):
     symbols: list[str] = Field(default_factory=list)
     period: str = Field("3y", pattern=PERIOD_PATTERN)
     sort: Literal["tier", "none"] = Field("tier", validation_alias=AliasChoices("sort_mode", "sort"))
+    refresh: bool = False
+
+
+class DataHealthCheckReq(_Strict):
+    universes: list[str] = Field(default_factory=list)
+    symbols: list[str] = Field(default_factory=list)
+    refresh: bool = False
 
 
 class ResearchRefreshTaskReq(_ArchiveMarketReq):
@@ -589,13 +600,46 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         event_window_days: int = Query(14, ge=1, le=90),
         refresh: bool = False,
     ):
-        key = sentinel_cache_key(include_watchlist, skip_research, event_window_days)
+        store_on = data_store.is_store_enabled()
+        fp = (
+            compute_current_sentinel_fingerprint(include_watchlist, skip_research, event_window_days)
+            if store_on
+            else None
+        )
+        base_key = sentinel_cache_key(include_watchlist, skip_research, event_window_days)
+        key = (*base_key, fp) if fp is not None else base_key
+
+        if not refresh:
+            mem_hit, mem_val = CACHE.get(key)
+            if mem_hit:
+                return ok(mem_val, headers=_cache_headers(True))
+            if store_on and fp is not None:
+                captured_epoch = CACHE.get_epoch("sentinel")
+                persisted = data_store.get_store().get_fresh_sentinel_run(
+                    input_fingerprint=fp,
+                    max_age_seconds=TTL_SENTINEL_SECONDS,
+                )
+                if persisted is not None:
+                    fp_after = compute_current_sentinel_fingerprint(
+                        include_watchlist, skip_research, event_window_days
+                    )
+                    if fp_after == fp:
+                        CACHE.set(
+                            key,
+                            persisted,
+                            TTL_SENTINEL_SECONDS,
+                            expected_epoch=captured_epoch,
+                            namespace="sentinel",
+                        )
+                        return ok(persisted, headers=_cache_headers(True))
+
         try:
             result, hit = CACHE.get_or_compute(
                 key,
                 TTL_SENTINEL_SECONDS,
                 lambda: run_sentinel_sync(include_watchlist, skip_research, event_window_days),
                 refresh=refresh,
+                namespace="sentinel",
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -613,16 +657,18 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         refresh: bool = False,
     ):
         def fetch() -> dict[str, Any]:
-            snap = market_snapshot.get_snapshot(
-                symbol,
-                period=period,
-                include_macro=include_macro,
-                include_fundamentals=True,
-                full_chanlun=True,
-                include_intraday=True,
-                intraday_interval=intraday_interval,
-                include_ohlcv=True,
-            )
+            snap_kw: dict[str, Any] = {
+                "period": period,
+                "include_macro": include_macro,
+                "include_fundamentals": True,
+                "full_chanlun": True,
+                "include_intraday": True,
+                "intraday_interval": intraday_interval,
+                "include_ohlcv": True,
+            }
+            if refresh and "refresh" in inspect.signature(market_snapshot.get_snapshot).parameters:
+                snap_kw["refresh"] = True
+            snap = market_snapshot.get_snapshot(symbol, **snap_kw)
             if "error" in snap:
                 raise HTTPException(
                     status_code=502,
@@ -742,7 +788,10 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     @app.get("/api/research/data")
     def research_data_get(symbol: str = Query(..., min_length=1), include_macro: bool = True, refresh: bool = False):
         def fetch() -> dict[str, Any]:
-            return research_data.collect_research_data(symbol, include_macro=include_macro)
+            rd_kw: dict[str, Any] = {"include_macro": include_macro}
+            if refresh and "refresh" in inspect.signature(research_data.collect_research_data).parameters:
+                rd_kw["refresh"] = True
+            return research_data.collect_research_data(symbol, **rd_kw)
 
         try:
             bundle, hit = CACHE.get_or_compute(
@@ -804,6 +853,53 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         if detail is None:
             raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
         return ok(detail)
+
+    @app.post("/api/tasks/{task_id}/cancel")
+    def task_cancel(task_id: str):
+        cancelled = tasks.cancel(task_id)
+        if cancelled is None:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
+        return ok(cancelled)
+
+    # ----------------------------------------------------------------- local SQLite warehouse & history
+    @app.get("/api/data/warehouse")
+    def data_warehouse():
+        return ok(data_store.get_store().warehouse_summary())
+
+    @app.post("/api/data/health-check")
+    async def data_health_check_post(req: DataHealthCheckReq):
+        try:
+            report = await asyncio.to_thread(
+                data_health_check.run_data_health_check,
+                universes=req.universes or None,
+                symbols=req.symbols or None,
+                refresh=req.refresh,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return ok(report)
+
+    @app.get("/api/history/scans")
+    def history_scans_list(limit: int = Query(30, ge=1, le=200)):
+        return ok({"runs": data_store.get_store().list_scan_runs(limit=limit)})
+
+    @app.get("/api/history/scans/{run_id}")
+    def history_scan_detail(run_id: str):
+        rec = data_store.get_store().get_scan_run(run_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Scan run not found: {run_id}")
+        return ok(rec)
+
+    @app.get("/api/history/sentinel")
+    def history_sentinel_list(limit: int = Query(20, ge=1, le=100)):
+        return ok({"runs": data_store.get_store().list_sentinel_runs(limit=limit)})
+
+    @app.get("/api/history/sentinel/{run_id}")
+    def history_sentinel_detail(run_id: str):
+        rec = data_store.get_store().get_sentinel_run(run_id)
+        if rec is None:
+            raise HTTPException(status_code=404, detail=f"Sentinel run not found: {run_id}")
+        return ok(rec)
 
     @app.get("/api/tasks/{task_id}/events")
     async def task_events(task_id: str, request: Request):

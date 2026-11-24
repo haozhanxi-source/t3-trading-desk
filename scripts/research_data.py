@@ -1654,15 +1654,30 @@ def fetch_china_macro_core() -> dict[str, Any]:
 # Aggregator Orchestration
 # ---------------------------------------------------------------------------
 
-def _call_get_snapshot(raw_symbol: str, period: str, full_chanlun: bool) -> dict[str, Any]:
+def _call_get_snapshot(
+    raw_symbol: str,
+    period: str,
+    full_chanlun: bool,
+    *,
+    refresh: bool = False,
+    use_store: bool | None = None,
+    db_path: str | None = None,
+) -> dict[str, Any]:
     sig = inspect.signature(get_snapshot)
+    has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     kwargs: dict[str, Any] = {
         "period": period,
         "include_macro": False,
         "include_fundamentals": True,
     }
-    if "full_chanlun" in sig.parameters:
+    if has_var_kw or "full_chanlun" in sig.parameters:
         kwargs["full_chanlun"] = full_chanlun
+    if refresh and (has_var_kw or "refresh" in sig.parameters):
+        kwargs["refresh"] = True
+    if use_store is not None and (has_var_kw or "use_store" in sig.parameters):
+        kwargs["use_store"] = use_store
+    if db_path is not None and (has_var_kw or "db_path" in sig.parameters):
+        kwargs["db_path"] = db_path
     return get_snapshot(raw_symbol, **kwargs)
 
 
@@ -1671,18 +1686,46 @@ def collect_research_data(
     period: str = "3y",
     include_macro: bool = True,
     full_chanlun: bool = False,
+    *,
+    refresh: bool = False,
+    use_store: bool | None = None,
+    db_path: str | None = None,
+    max_age_seconds: float | None = None,
 ) -> dict[str, Any]:
+    from data_store import TTL_RESEARCH_FRESH_SECONDS, get_store, is_store_enabled, scoped_http_timeout
+
     norm_sym, asset_class = normalize_symbol(raw_symbol)
+    store_on = is_store_enabled(use_store, db_path)
+    eff_max_age = max_age_seconds if max_age_seconds is not None else TTL_RESEARCH_FRESH_SECONDS
+
+    if store_on and not refresh and not full_chanlun and period == "3y":
+        cached_bundle = get_store(db_path).get_fresh_research_snapshot(
+            asset_class=asset_class,
+            symbol=norm_sym,
+            include_macro=include_macro,
+            max_age_seconds=eff_max_age,
+        )
+        if cached_bundle is not None:
+            return cached_bundle
+
     sources_status: dict[str, Any] = {}
 
-    snapshot = _run_source(
-        "market_snapshot",
-        lambda: _run_with_timeout(
-            lambda: _call_get_snapshot(raw_symbol, period=period, full_chanlun=full_chanlun),
-            timeout_s=30.0,
-        ),
-        sources_status,
-    )
+    with scoped_http_timeout((5.0, 15.0)):
+        snapshot = _run_source(
+            "market_snapshot",
+            lambda: _run_with_timeout(
+                lambda: _call_get_snapshot(
+                    raw_symbol,
+                    period=period,
+                    full_chanlun=full_chanlun,
+                    refresh=refresh,
+                    use_store=use_store,
+                    db_path=db_path,
+                ),
+                timeout_s=30.0,
+            ),
+            sources_status,
+        )
     if snapshot.get("error"):
         snapshot["status"] = "error"
         sources_status["market_snapshot"] = {"status": "error", "error": snapshot["error"]}
@@ -1845,7 +1888,7 @@ def collect_research_data(
         sources_status["us_fred"] = {"status": "skipped", "reason": "include_macro=False"}
         sources_status["china_macro"] = {"status": "skipped", "reason": "include_macro=False"}
 
-    return {
+    bundle_out = {
         "query": raw_symbol,
         "symbol": norm_sym,
         "asset_class": asset_class,
@@ -1855,6 +1898,17 @@ def collect_research_data(
         "macro_dual_core": macro_dual_core,
         "sources_status": sources_status,
     }
+    if store_on and not full_chanlun and period == "3y":
+        try:
+            get_store(db_path).record_research_snapshot(
+                asset_class=asset_class,
+                symbol=norm_sym,
+                include_macro=include_macro,
+                bundle=_sanitize_for_json(bundle_out),
+            )
+        except Exception:
+            pass
+    return bundle_out
 
 
 def build_parser() -> argparse.ArgumentParser:

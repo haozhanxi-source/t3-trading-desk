@@ -778,10 +778,63 @@ def fetch_macro_context() -> dict:
     return ctx
 
 
+def _finite_or_none(val) -> float | None:
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if np.isfinite(f) else None
+
+
+def serialize_ohlcv_bars(df: pd.DataFrame, intraday: bool) -> list[dict]:
+    """Serialize OHLCV + MACD bars for charting (strictly ascending ``time``, deduplicated keep-last).
+
+    ``time`` is ``YYYY-MM-DD`` for daily bars and integer UTC unix seconds for intraday bars;
+    ``label`` matches the ``chanlun.py`` bar timestamp strings exactly.
+    """
+    if df is None or df.empty:
+        return []
+    close = df["Close"].astype(float)
+    open_s = df["Open"].astype(float) if "Open" in df else close
+    high = df["High"].astype(float)
+    low = df["Low"].astype(float)
+    vol = df["Volume"].astype(float) if "Volume" in df else pd.Series(0.0, index=df.index)
+    dif, dea, hist = compute_macd(close)
+    labels = _format_bar_timestamps(df.index, force_intraday=intraday)
+
+    by_time: dict = {}
+    for i, raw_idx in enumerate(df.index):
+        ts = _as_timestamp(raw_idx)
+        if ts is None:
+            continue
+        if intraday:
+            ts_utc = ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+            t_key = int(ts_utc.timestamp())
+        else:
+            t_key = ts.strftime("%Y-%m-%d")
+        o, h, l_, c = (_finite_or_none(x) for x in (open_s.iloc[i], high.iloc[i], low.iloc[i], close.iloc[i]))
+        if None in (o, h, l_, c):
+            continue
+        by_time[t_key] = {
+            "time": t_key,
+            "label": labels[i],
+            "open": o,
+            "high": h,
+            "low": l_,
+            "close": c,
+            "volume": _finite_or_none(vol.iloc[i]) or 0.0,
+            "dif": _finite_or_none(dif.iloc[i]),
+            "dea": _finite_or_none(dea.iloc[i]),
+            "hist": _finite_or_none(hist.iloc[i]),
+        }
+    return [by_time[k] for k in sorted(by_time)]
+
+
 def get_intraday_snapshot(
     raw_symbol: str,
     interval: str = "30m",
     full_chanlun: bool = False,
+    include_ohlcv: bool = False,
 ) -> dict:
     """Fetch intraday OHLCV (15m/30m/60m) and run Chanlun analysis across all 6 asset classes."""
     try:
@@ -813,7 +866,7 @@ def get_intraday_snapshot(
         intraday_cl = analyze_chanlun(df, timeframe_label=tf_label, full_export=full_chanlun)
         signal_summary = evaluate_signal_tier(intraday_cl, timeframe_label=tf_label)
 
-        return {
+        intraday_result = {
             "query": raw_symbol,
             "symbol": norm_sym,
             "asset_class": asset_class,
@@ -827,6 +880,9 @@ def get_intraday_snapshot(
                 "intraday": intraday_cl,
             },
         }
+        if include_ohlcv:
+            intraday_result["ohlcv_intraday"] = serialize_ohlcv_bars(df, intraday=True)
+        return intraday_result
     except Exception as exc:
         return {"error": f"Failed to fetch intraday ({interval}) snapshot for {raw_symbol}: {exc}"}
 
@@ -839,6 +895,7 @@ def get_snapshot(
     full_chanlun: bool = False,
     include_intraday: bool = False,
     intraday_interval: str = "30m",
+    include_ohlcv: bool = False,
 ) -> dict:
     try:
         norm_sym, asset_class = normalize_symbol(raw_symbol)
@@ -890,18 +947,25 @@ def get_snapshot(
             "fundamentals": fundamentals,
         }
 
+        if include_ohlcv:
+            result["ohlcv_daily"] = serialize_ohlcv_bars(df, intraday=False)
+
         if include_intraday:
             try:
+                intraday_kwargs = {"include_ohlcv": True} if include_ohlcv else {}
                 intra_snap = get_intraday_snapshot(
                     raw_symbol,
                     interval=intraday_interval,
                     full_chanlun=full_chanlun,
+                    **intraday_kwargs,
                 )
             except Exception as intra_exc:
                 intra_snap = {"error": f"Failed to fetch intraday ({intraday_interval}) snapshot: {intra_exc}"}
 
             if "error" in intra_snap:
                 result["intraday_error"] = intra_snap["error"]
+                if include_ohlcv:
+                    result["ohlcv_intraday"] = []
             else:
                 intraday_cl = intra_snap["chanlun"]["intraday"]
                 result["intraday_interval"] = intra_snap["interval"]
@@ -910,6 +974,8 @@ def get_snapshot(
                 result["chanlun"]["intraday"] = intraday_cl
                 result["chanlun"]["intraday_signal_summary"] = intra_snap["chanlun"]["signal_summary"]
                 result["chanlun"]["dual_alignment"] = assess_dual_timeframe_alignment(daily_cl, intraday_cl)
+                if include_ohlcv:
+                    result["ohlcv_intraday"] = intra_snap.get("ohlcv_intraday", [])
 
         if asset_class == "crypto":
             base = norm_sym.replace("-USD", "")

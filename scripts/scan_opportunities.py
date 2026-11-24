@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Scan watchlist or custom universes/symbols across US stocks, A-shares, Commodities, CN Futures, and Crypto using Daily Chanlun structure & momentum."""
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import sys
+import tempfile
+import threading
 
 sys.path.insert(0, os.path.dirname(__file__))
 from market_snapshot import get_snapshot, normalize_symbol
@@ -76,6 +80,51 @@ def collect_signals(snap: dict) -> list[str]:
     return signals or ["常规日线结构运行"]
 
 
+_UNIVERSES_LOCKS_GUARD = threading.Lock()
+_UNIVERSES_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _get_inproc_lock(key: str) -> threading.RLock:
+    with _UNIVERSES_LOCKS_GUARD:
+        lock = _UNIVERSES_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _UNIVERSES_LOCKS[key] = lock
+        return lock
+
+
+@contextlib.contextmanager
+def _universes_lock(universes_path: str):
+    """Serialize both multi-threaded and multi-process read-modify-write updates to universes.json."""
+    parent = os.path.dirname(os.path.abspath(universes_path))
+    os.makedirs(parent, exist_ok=True)
+    lock_path = os.path.join(os.path.realpath(parent), ".universes.lock")
+    tlock = _get_inproc_lock(lock_path)
+    with tlock, open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: str, obj: dict) -> None:
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    data = (json.dumps(obj, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".universes_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
 def load_universes(universes_path: str | None = None) -> dict:
     path = universes_path or DEFAULT_UNIVERSES_PATH
     with open(path, "r", encoding="utf-8") as f:
@@ -88,7 +137,7 @@ def save_universe(
     description: str = "",
     universes_path: str | None = None,
 ) -> dict:
-    """Persist or update a top-down discovered sector universe in universes.json."""
+    """Persist or update a top-down discovered sector universe in universes.json atomically."""
     pool_name = (name or "").strip()
     if not pool_name:
         raise ValueError("Universe name cannot be empty")
@@ -106,18 +155,17 @@ def save_universe(
     if not cleaned:
         raise ValueError(f"Cannot save empty symbol list for universe {pool_name!r}")
 
-    path = universes_path or DEFAULT_UNIVERSES_PATH
-    universes = load_universes(path) if os.path.exists(path) else {}
-    existing_desc = universes.get(pool_name, {}).get("description", "")
-    final_desc = description.strip() or existing_desc or f"自上而下投研沉淀标的池 ({pool_name})"
-    universes[pool_name] = {
-        "description": final_desc,
-        "symbols": cleaned,
-    }
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(universes, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    return universes[pool_name]
+    path = os.path.abspath(universes_path or DEFAULT_UNIVERSES_PATH)
+    with _universes_lock(path):
+        universes = load_universes(path) if os.path.exists(path) else {}
+        existing_desc = universes.get(pool_name, {}).get("description", "")
+        final_desc = description.strip() or existing_desc or f"自上而下投研沉淀标的池 ({pool_name})"
+        universes[pool_name] = {
+            "description": final_desc,
+            "symbols": cleaned,
+        }
+        _atomic_write_json(path, universes)
+        return dict(universes[pool_name])
 
 
 def resolve_targets(

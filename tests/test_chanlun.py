@@ -1001,6 +1001,205 @@ class TestChanlunEngine(unittest.TestCase):
         ev_err = evaluate_signal_tier({"error": "Insufficient bars"})
         self.assertFalse(ev_err["signal_meta"]["momentum_confirmed"])
 
+    def test_zhongshu_extension_excludes_leaving_unit_and_detects_expansion(self):
+        from chanlun import (
+            Segment,
+            Stroke,
+            Zhongshu,
+            classify_chanlun_signals,
+            detect_segment_zhongshus,
+        )
+
+        def mk_seg(seg_id: int, direction: str, sp: float, ep: float, sd: str, ed: str, conf: bool = True) -> Segment:
+            return Segment(
+                seg_id=seg_id,
+                direction=direction,
+                start_date=sd,
+                end_date=ed,
+                start_price=sp,
+                end_price=ep,
+                high=max(sp, ep),
+                low=min(sp, ep),
+                stroke_count=3,
+                is_confirmed=conf,
+            )
+
+        def mk_stroke(idx: int, direction: str, sp: float, ep: float, sd: str, ed: str, conf: bool = True) -> Stroke:
+            return Stroke(
+                direction=direction,
+                start_date=sd,
+                end_date=ed,
+                start_price=sp,
+                end_price=ep,
+                high=max(sp, ep),
+                low=min(sp, ep),
+                start_merged_idx=idx * 4,
+                end_merged_idx=idx * 4 + 4,
+                start_raw_idx=idx * 4,
+                end_raw_idx=idx * 4 + 4,
+                raw_bars=5,
+                pct_change=round((ep / sp - 1.0) * 100.0, 2),
+                macd_area=10.0,
+                macd_peak=2.0,
+                dif_extreme=1.0 if direction == "up" else -1.0,
+                efficiency=1.0,
+                avg_vol_ratio=1.0,
+                is_confirmed=conf,
+            )
+
+        # 1) SPY-like segment trend: S1 & S2 break out directly with 3rd buy; leaving segs must NOT be swallowed
+        segs = [
+            mk_seg(1, "up", 437.0, 595.0, "2023-11-30", "2024-12-06"),
+            mk_seg(2, "down", 595.0, 564.0, "2024-12-06", "2025-01-13"),
+            mk_seg(3, "up", 564.0, 601.0, "2025-01-13", "2025-02-19"),
+            mk_seg(4, "down", 601.0, 474.0, "2025-02-19", "2025-04-07"),  # S1 core ends here [564, 595]
+            mk_seg(5, "up", 474.0, 682.0, "2025-04-07", "2025-10-29"),    # Leaving seg of S1 & entering seg of S2
+            mk_seg(6, "down", 682.0, 644.0, "2025-10-29", "2025-11-21"),  # 3B above 595 -> broken_up
+            mk_seg(7, "up", 644.0, 692.0, "2025-11-21", "2026-01-28"),
+            mk_seg(8, "down", 692.0, 626.0, "2026-01-28", "2026-03-30"),  # S2 core ends here [644, 682]
+            mk_seg(9, "up", 626.0, 777.0, "2026-03-30", "2026-08-13"),    # Leaving seg of S2
+            mk_seg(10, "down", 777.0, 748.0, "2026-08-13", "2026-09-16"), # 3B above 682 -> broken_up
+        ]
+        seg_zss = detect_segment_zhongshus(segs)
+        self.assertEqual(len(seg_zss), 2)
+        s1, s2 = seg_zss
+        self.assertFalse(s1.is_extended)
+        self.assertEqual(s1.oscillation_strokes, 0)
+        self.assertIsNone(s1.oscillation_end_date)
+        self.assertEqual(s1.end_date, "2025-04-07")
+        self.assertEqual(s1.status, "broken_up")
+        self.assertFalse(s2.is_extended)
+        self.assertEqual(s2.oscillation_strokes, 0)
+        self.assertIsNone(s2.oscillation_end_date)
+        self.assertEqual(s2.end_date, "2026-03-30")
+        self.assertEqual(s2.status, "broken_up")
+
+        # S2.dd (626) > S1.gg (601) -> strict standard uptrend
+        macro_std, _, _ = classify_chanlun_signals(
+            last_close=760.0,
+            timeframe_label="日线",
+            merged=[],
+            fractals=[],
+            pivots=[],
+            strokes=[],
+            zhongshus=seg_zss,
+            momentum={},
+            segments=segs,
+            zhongshu_level="segment",
+        )
+        self.assertEqual(macro_std, "双中枢上涨趋势")
+
+        # 2) Failed breakout pulled back into [ZD, ZG] counts as true extension; final leaving stroke excluded
+        strokes_pullback = [
+            mk_stroke(0, "up", 90.0, 112.0, "2026-01-01", "2026-01-05"),
+            mk_stroke(1, "down", 112.0, 100.0, "2026-01-05", "2026-01-10"),
+            mk_stroke(2, "up", 100.0, 110.0, "2026-01-10", "2026-01-15"),
+            mk_stroke(3, "down", 110.0, 102.0, "2026-01-15", "2026-01-20"),  # core [102, 110]
+            mk_stroke(4, "up", 102.0, 118.0, "2026-01-20", "2026-01-25"),    # breakout attempt 1 (fails)
+            mk_stroke(5, "down", 118.0, 105.0, "2026-01-25", "2026-01-30"),  # pulls back inside [102, 110]
+            mk_stroke(6, "up", 105.0, 128.0, "2026-01-30", "2026-02-05"),    # genuine leaving stroke
+            mk_stroke(7, "down", 128.0, 115.0, "2026-02-05", "2026-02-10"),  # 3B above 110 -> broken_up
+        ]
+        st_zss = detect_zhongshus(strokes_pullback, last_close=116.0)
+        self.assertEqual(len(st_zss), 1)
+        z1 = st_zss[0]
+        self.assertTrue(z1.is_extended)
+        self.assertEqual(z1.oscillation_strokes, 2)
+        self.assertEqual(z1.oscillation_end_date, "2026-01-30")
+        self.assertEqual(z1.oscillation_gg, 118.0)
+        self.assertEqual(z1.status, "broken_up")
+
+        # 3) Live right-edge breakdown stroke (ends below ZD, no confirmed pullback) must NOT trigger false 9-stroke upgrade
+        strokes_right_edge = [
+            mk_stroke(0, "up", 720.0, 777.0, "2026-07-29", "2026-08-13"),
+            mk_stroke(1, "down", 777.0, 760.0, "2026-08-13", "2026-08-20"),
+            mk_stroke(2, "up", 760.0, 773.0, "2026-08-20", "2026-08-28"),
+            mk_stroke(3, "down", 773.0, 748.0, "2026-08-28", "2026-09-16"),  # core [760, 773]
+            mk_stroke(4, "up", 748.0, 775.0, "2026-09-16", "2026-09-22"),    # osc 1
+            mk_stroke(5, "down", 775.0, 759.0, "2026-09-22", "2026-10-01"),  # osc 2
+            mk_stroke(6, "up", 759.0, 782.0, "2026-10-01", "2026-10-06"),    # osc 3
+            mk_stroke(7, "down", 782.0, 750.0, "2026-10-06", "2026-10-30"),  # osc 4
+            mk_stroke(8, "up", 750.0, 776.0, "2026-10-30", "2026-11-04"),    # osc 5
+            mk_stroke(9, "down", 776.0, 687.0, "2026-11-04", "2026-11-20"),  # live candidate leaving breakdown
+            mk_stroke(10, "up", 687.0, 728.0, "2026-11-20", "2026-11-23", conf=False),
+        ]
+        re_zss = detect_zhongshus(strokes_right_edge, last_close=722.0)
+        self.assertEqual(len(re_zss), 1)
+        z_live = re_zss[0]
+        self.assertEqual(z_live.status, "active")
+        self.assertTrue(z_live.is_extended)
+        self.assertEqual(z_live.oscillation_strokes, 5)
+        self.assertFalse(z_live.is_nine_upgrade)
+        self.assertEqual(z_live.oscillation_end_date, "2026-11-04")
+        self.assertEqual(z_live.oscillation_dd, 748.0)
+
+        # 4) True Zhongshu Expansion ([ZD, ZG] disjoint, [DD, GG] overlapping) -> 扩张 + 盘整背驰 (not 趋势背驰)
+        z_up_1 = Zhongshu(
+            zs_id=1, direction="up", zd=719.0, zg=753.0, dd=715.0, gg=757.0,
+            start_date="2026-06-02", end_date="2026-06-26", stroke_count=3,
+            is_extended=False, status="broken_up",
+        )
+        z_up_2_exp = Zhongshu(
+            zs_id=2, direction="up", zd=760.0, zg=773.0, dd=748.0, gg=782.0,
+            start_date="2026-08-13", end_date="2026-09-16", stroke_count=3,
+            is_extended=False, status="active",
+        )
+        macro_up_exp, _, sigs_up_exp = classify_chanlun_signals(
+            last_close=780.0,
+            timeframe_label="日线",
+            merged=[],
+            fractals=[],
+            pivots=[],
+            strokes=[mk_stroke(1, "up", 750.0, 780.0, "2026-09-16", "2026-09-25")],
+            zhongshus=[z_up_1, z_up_2_exp],
+            momentum={"verdict": "divergence_candidate_up", "area_ratio_vs_prev": 0.55},
+        )
+        self.assertEqual(macro_up_exp, "上涨中枢扩张(震荡升级)")
+        self.assertTrue(any("盘整背驰" in s for s in sigs_up_exp))
+        self.assertFalse(any("趋势背驰" in s for s in sigs_up_exp))
+
+        z_dn_1 = Zhongshu(
+            zs_id=1, direction="down", zd=200.0, zg=220.0, dd=190.0, gg=225.0,
+            start_date="2026-01-01", end_date="2026-01-20", stroke_count=3,
+            is_extended=False, status="broken_down",
+        )
+        z_dn_2_exp = Zhongshu(
+            zs_id=2, direction="down", zd=170.0, zg=185.0, dd=165.0, gg=195.0,
+            start_date="2026-02-01", end_date="2026-02-20", stroke_count=3,
+            is_extended=False, status="active",
+        )
+        macro_dn_exp, _, sigs_dn_exp = classify_chanlun_signals(
+            last_close=166.0,
+            timeframe_label="日线",
+            merged=[],
+            fractals=[],
+            pivots=[],
+            strokes=[mk_stroke(2, "down", 185.0, 166.0, "2026-02-20", "2026-03-01")],
+            zhongshus=[z_dn_1, z_dn_2_exp],
+            momentum={"verdict": "divergence_candidate_down", "area_ratio_vs_prev": 0.45},
+        )
+        self.assertEqual(macro_dn_exp, "下跌中枢扩张(震荡升级)")
+        self.assertTrue(any("盘整背驰" in s for s in sigs_dn_exp))
+        self.assertFalse(any("趋势背驰" in s for s in sigs_dn_exp))
+
+        z_dn_2_trend = Zhongshu(
+            zs_id=2, direction="down", zd=150.0, zg=170.0, dd=145.0, gg=180.0,
+            start_date="2026-02-01", end_date="2026-02-20", stroke_count=3,
+            is_extended=False, status="active",
+        )
+        macro_dn_trend, _, sigs_dn_trend = classify_chanlun_signals(
+            last_close=146.0,
+            timeframe_label="日线",
+            merged=[],
+            fractals=[],
+            pivots=[],
+            strokes=[mk_stroke(2, "down", 170.0, 146.0, "2026-02-20", "2026-03-01")],
+            zhongshus=[z_dn_1, z_dn_2_trend],
+            momentum={"verdict": "divergence_candidate_down", "area_ratio_vs_prev": 0.45},
+        )
+        self.assertEqual(macro_dn_trend, "双中枢下跌趋势")
+        self.assertTrue(any("趋势背驰" in s for s in sigs_dn_trend))
+
 
 if __name__ == "__main__":
     unittest.main()

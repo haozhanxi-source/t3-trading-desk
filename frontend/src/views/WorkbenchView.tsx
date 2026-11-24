@@ -17,6 +17,8 @@ import type { ScanRow, TaskEventEnvelope, TaskRecord, UniversePool } from "../ap
 import { ModalDialog } from "../components/ui/ModalDialog";
 import { StatusBadge } from "../components/ui/StatusBadge";
 import { fmtPct, fmtPrice, parseSymbolList, shortTime } from "../lib/format";
+import { formatSymbolWithCode, getSymbolName } from "../lib/symbols";
+import { formatTaskKind, formatTaskStatus, getUniverseLabel, groupUniverses } from "../lib/universes";
 
 type LauncherMode = "scan" | "refresh" | "sentinel";
 
@@ -349,7 +351,24 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
     return scanRows.filter((r) => !r.error).map((r) => r.symbol);
   }, [customSymbolsText, scanRows]);
 
-  const poolEntries = Object.entries(universes);
+  const groupedPools = useMemo(() => groupUniverses(universes), [universes]);
+
+  const selectedPoolDetails = useMemo(
+    () =>
+      selectedPools
+        .map((key) => {
+          const meta = universes[key];
+          if (!meta) return null;
+          return {
+            key,
+            label: getUniverseLabel(key, meta.description),
+            description: meta.description || "",
+            symbols: meta.symbols ?? [],
+          };
+        })
+        .filter((x): x is { key: string; label: string; description: string; symbols: string[] } => x !== null),
+    [selectedPools, universes],
+  );
 
   return (
     <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
@@ -404,25 +423,91 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
           <form onSubmit={handleLaunch} className="flex flex-col gap-3">
             {mode === "scan" ? (
               <>
-                <div>
-                  <div className="mb-1.5 text-xs text-muted">
-                    1) 选择已沉淀主题/品种池（严禁每天盲扫全市场，只对第一层共振板块验真）：
-                  </div>
-                  <div className="flex max-h-36 flex-wrap gap-1.5 overflow-y-auto py-0.5">
-                    {poolEntries.map(([name, meta]) => (
+                <div className="flex flex-col gap-2.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+                    <span>1) 选择已沉淀主题/品种池（严禁每天盲扫全市场，只对第一层共振板块验真）：</span>
+                    {selectedPools.length > 0 ? (
                       <button
-                        key={name}
                         type="button"
-                        className="chip"
-                        aria-pressed={selectedPools.includes(name)}
-                        onClick={() => togglePool(name)}
-                        title={meta.description || name}
+                        className="text-[11.5px] text-slot1 underline-offset-2 hover:underline"
+                        onClick={() => setSelectedPools([])}
                       >
-                        <span>{name}</span>
-                        <span className="text-[10.5px] text-muted">({meta.symbols?.length ?? 0})</span>
+                        清空已选 ({selectedPools.length})
                       </button>
+                    ) : null}
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    {groupedPools.map((section) => (
+                      <div key={section.groupKey} className="flex flex-col gap-1.5 sm:flex-row sm:items-start sm:gap-2.5">
+                        <span className="w-28 shrink-0 pt-1 text-[11px] font-medium text-muted">
+                          {section.title}
+                        </span>
+                        <div className="flex flex-1 flex-wrap gap-1.5">
+                          {section.items.map((item) => (
+                            <button
+                              key={item.key}
+                              type="button"
+                              className="chip"
+                              aria-pressed={selectedPools.includes(item.key)}
+                              onClick={() => togglePool(item.key)}
+                              title={
+                                [
+                                  item.description || item.label,
+                                  item.symbols.length > 0
+                                    ? `包含：${item.symbols.map((s) => formatSymbolWithCode(s)).join("、")}`
+                                    : "",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")
+                              }
+                            >
+                              <span>{item.label}</span>
+                              <span className="text-[10.5px] text-muted">({item.symbols.length})</span>
+                            </button>
+                          ))}
+                        </div>
+                      </div>
                     ))}
                   </div>
+
+                  {selectedPoolDetails.length > 0 ? (
+                    <div className="rounded-lg border border-hairline bg-page/70 px-3 py-2 text-xs">
+                      <div className="flex flex-col gap-2">
+                        {selectedPoolDetails.map((pool) => (
+                          <div key={pool.key} className="flex flex-col gap-1">
+                            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 leading-relaxed">
+                              <span className="font-semibold text-ink">{pool.label}</span>
+                              {pool.description ? (
+                                <span className="text-ink-2">{pool.description}</span>
+                              ) : null}
+                            </div>
+                            {pool.symbols.length > 0 ? (
+                              <div className="flex flex-wrap gap-1">
+                                {pool.symbols.map((sym) => {
+                                  const zh = getSymbolName(sym);
+                                  return (
+                                    <span
+                                      key={sym}
+                                      className="inline-flex items-baseline gap-1 rounded border border-hairline bg-surface/80 px-1.5 py-0.5 text-[11px]"
+                                    >
+                                      {zh ? (
+                                        <>
+                                          <span className="text-ink-2">{zh}</span>
+                                          <span className="font-mono text-[10px] text-muted">{sym}</span>
+                                        </>
+                                      ) : (
+                                        <span className="font-mono text-ink-2">{sym}</span>
+                                      )}
+                                    </span>
+                                  );
+                                })}
+                              </div>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
@@ -430,7 +515,7 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
                     <span>2) 或现场切入新细分板块真龙头（空格或逗号分隔）</span>
                     <input
                       className="input"
-                      placeholder="如 PWR, ETN, GEV, CU0, AUDUSD=X"
+                      placeholder="如 NVDA、PWR、CU0（沪铜）、AUDUSD=X（澳元）"
                       value={customSymbolsText}
                       onChange={(e) => setCustomSymbolsText(e.target.value)}
                     />
@@ -442,8 +527,8 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
                       value={sortMode}
                       onChange={(e) => setSortMode(e.target.value as "tier" | "none")}
                     >
-                      <option value="tier">按买卖点信号优先级 (tier)</option>
-                      <option value="none">保持原池顺序 (none)</option>
+                      <option value="tier">按买卖点信号优先级</option>
+                      <option value="none">保持原池顺序</option>
                     </select>
                   </label>
                   <div className="flex items-end md:col-span-2">
@@ -533,7 +618,7 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
             <div className="flex items-center gap-2">
               <Terminal className="h-4 w-4 text-slot1" aria-hidden="true" />
               <span className="text-sm font-semibold text-ink">
-                实时执行流 {activeTask ? `· #${activeTask.id} (${activeTask.kind})` : ""}
+                实时执行流 {activeTask ? `· ${formatTaskKind(activeTask.kind)} #${activeTask.id.slice(0, 6)}` : ""}
               </span>
               {activeTask ? (
                 <StatusBadge
@@ -544,7 +629,7 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
                         ? "critical"
                         : "info"
                   }
-                  label={activeTask.status}
+                  label={formatTaskStatus(activeTask.status)}
                 />
               ) : null}
             </div>
@@ -595,10 +680,25 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
                         onClick={() => onJumpWarRoom(row.symbol)}
                       >
                         <th scope="row">
-                          <div className="flex items-center gap-1.5">
-                            <span className="font-semibold text-slot1">{row.symbol}</span>
-                            <span className="text-[11px] font-normal text-muted">{row.market}</span>
-                          </div>
+                          {(() => {
+                            const zh = getSymbolName(row.symbol);
+                            const marketLabel = row.market
+                              ? getUniverseLabel(row.market, universes[row.market]?.description)
+                              : null;
+                            return (
+                              <div className="flex flex-col gap-0.5">
+                                <div className="flex items-baseline gap-1.5">
+                                  <span className="font-semibold text-slot1">{zh || row.symbol}</span>
+                                  {zh ? (
+                                    <span className="font-mono text-[11px] font-normal text-muted">{row.symbol}</span>
+                                  ) : null}
+                                </div>
+                                {marketLabel ? (
+                                  <span className="text-[11px] font-normal text-muted">{marketLabel}</span>
+                                ) : null}
+                              </div>
+                            );
+                          })()}
                         </th>
                         {row.error ? (
                           <td colSpan={6} data-label="异常" className="text-critical">
@@ -672,7 +772,7 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
 
           {/* Live Step Log */}
           <div>
-            <div className="mb-1 text-xs text-muted">SSE 事件流日志（{liveEvents.length} 条）</div>
+            <div className="mb-1 text-xs text-muted">实时执行日志（{liveEvents.length} 条）</div>
             <div className="max-h-44 overflow-y-auto rounded-lg border border-hairline bg-page px-3 py-2 font-mono text-[11.5px] text-ink-2">
               {liveEvents.length === 0 ? (
                 <div className="py-3 text-center font-sans text-xs text-muted">
@@ -685,9 +785,9 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
                     d.message ||
                     ev.message ||
                     (ev.type === "row" && d.row
-                      ? `✓ ${d.row.symbol} → ${d.row.signal_tier || d.row.error || "完成"}`
+                      ? `✓ ${formatSymbolWithCode(d.row.symbol)} → ${d.row.signal_tier || d.row.error || "完成"}`
                       : ev.type === "progress"
-                        ? `进度 ${d.done ?? 0}/${d.total ?? "?"} ${d.symbol ? `(${d.symbol})` : ""}`
+                        ? `进度 ${d.done ?? 0}/${d.total ?? "?"} ${d.symbol ? `(${formatSymbolWithCode(d.symbol)})` : ""}`
                         : ev.type === "done"
                           ? "任务执行完毕"
                           : JSON.stringify(d));
@@ -737,11 +837,11 @@ export function WorkbenchView({ defaultSymbol, onJumpWarRoom, onJumpArchive }: W
                   >
                     <div className="flex items-center justify-between gap-2">
                       <span className="font-semibold text-ink">
-                        {t.kind} · #{t.id.slice(0, 6)}
+                        {formatTaskKind(t.kind)} · #{t.id.slice(0, 6)}
                       </span>
                       <span className="inline-flex items-center gap-1 text-[11px]">
                         <Icon className={`h-3.5 w-3.5 ${iconCls}`} aria-hidden="true" />
-                        <span>{t.status}</span>
+                        <span>{formatTaskStatus(t.status)}</span>
                       </span>
                     </div>
                     <div className="tnum text-[11px] text-muted">{shortTime(t.created_at)} UTC</div>

@@ -7,6 +7,7 @@ import { OpenPositionDialog, type OpenPositionSeed } from "../components/portfol
 import { DirectionBadge, StatusBadge } from "../components/ui/StatusBadge";
 import { TradePlannerCard } from "../components/warroom/TradePlannerCard";
 import { fmtPct, fmtPrice, shortTime } from "../lib/format";
+import { formatSymbolWithCode } from "../lib/symbols";
 
 const BENCHMARK_CHIPS = [
   { symbol: "SPY", label: "SPY 标普" },
@@ -207,7 +208,7 @@ export function WarRoomView({
           <div className="flex flex-wrap items-center gap-2">
             <Compass className="h-4 w-4 text-slot1" aria-hidden="true" />
             <span className="text-sm font-semibold text-ink">
-              {data?.symbol || symbol} · 日线定方向 × {loadedInterval} 区间套联立
+              {formatSymbolWithCode(data?.symbol || symbol)} · 日线定方向 × {loadedInterval} 区间套联立
             </span>
             {switchingInterval ? (
               <StatusBadge tone="info" label={`正在切换至 ${interval}…`} />

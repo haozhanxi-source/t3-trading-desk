@@ -862,7 +862,13 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             return snap
 
         key = ("dual", symbol.strip(), period, intraday_interval, include_macro)
-        snap, hit = CACHE.get_or_compute(key, TTL_MARKET_SECONDS, fetch, refresh=refresh)
+        snap, hit = CACHE.get_or_compute(
+            key,
+            TTL_MARKET_SECONDS,
+            fetch,
+            refresh=refresh,
+            ttl_for_value=lambda v: 0.0 if isinstance(v, dict) and v.get("intraday_error") else TTL_MARKET_SECONDS,
+        )
         return ok(snap, headers=_cache_headers(hit))
 
     @app.post("/api/trade/plan")

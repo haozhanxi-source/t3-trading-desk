@@ -93,6 +93,7 @@ class TTLCache:
         refresh: bool = False,
         *,
         namespace: Hashable | None = None,
+        ttl_for_value: Callable[[Any], float] | None = None,
     ) -> tuple[Any, bool]:
         """Return ``(value, cache_hit)`` without caching stale pre-invalidation values."""
         if not refresh:
@@ -113,14 +114,28 @@ class TTLCache:
                         return value, True
                 captured_epoch = self._epoch_unlocked(ns)
             value = factory()
-            self.set(key, value, ttl, expected_epoch=captured_epoch, namespace=ns)
+            eff_ttl = ttl_for_value(value) if ttl_for_value is not None else ttl
+            if eff_ttl > 0:
+                self.set(key, value, eff_ttl, expected_epoch=captured_epoch, namespace=ns)
+            else:
+                self.invalidate(key, expected_epoch=captured_epoch, namespace=ns)
             return value, False
 
     get_or_set = get_or_compute
 
-    def invalidate(self, key: Hashable) -> None:
+    def invalidate(
+        self,
+        key: Hashable,
+        *,
+        expected_epoch: int | None = None,
+        namespace: Hashable | None = None,
+    ) -> bool:
+        ns = self._namespace_for(key, namespace)
         with self._lock:
+            if expected_epoch is not None and self._epoch_unlocked(ns) != expected_epoch:
+                return False
             self._data.pop(key, None)
+            return True
 
     def invalidate_prefix(self, prefix: Any) -> int:
         """Atomically bump namespace epoch and drop every cached entry whose tuple key starts with ``prefix``."""

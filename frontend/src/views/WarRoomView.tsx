@@ -13,6 +13,7 @@ import {
   type PickPriceField,
 } from "../components/warroom/TradePlannerCard";
 import { fmtAlignmentStatus, fmtPct, fmtPrice, shortTime } from "../lib/format";
+import { isSnapshotIntradayUntrusted, selectTrustedLastQuote } from "../lib/snapshotPrice";
 import { getSymbolName } from "../lib/symbols";
 
 const FALLBACK_ANCHORS = ["SPY", "GC=F", "CU0", "AUDUSD=X", "BTC", "LC0"];
@@ -63,6 +64,7 @@ export function WarRoomView({
   const [snapBundle, setSnapBundle] = useState<{
     reqKey: string;
     data: MarketDualResponse;
+    staleAfterError?: boolean;
   } | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -263,7 +265,40 @@ export function WarRoomView({
           ctrl.signal,
         );
         if (ctrl.signal.aborted || reqId !== snapReqIdRef.current) return;
-        setSnapBundle({ reqKey, data: res });
+        setSnapBundle((prev) => {
+          const incomingEmptyIntraday = Boolean(res.intraday_error) && (!res.ohlcv_intraday || res.ohlcv_intraday.length === 0);
+          const canPreservePrevIntraday =
+            incomingEmptyIntraday &&
+            prev !== null &&
+            prev.reqKey === reqKey &&
+            prev.data.intraday_interval === targetInterval &&
+            Array.isArray(prev.data.ohlcv_intraday) &&
+            prev.data.ohlcv_intraday.length > 0;
+          if (!canPreservePrevIntraday) {
+            return { reqKey, data: res, staleAfterError: false };
+          }
+          return {
+            reqKey,
+            staleAfterError: false,
+            data: {
+              ...res,
+              intraday_stale_fallback: true,
+              intraday_interval: prev.data.intraday_interval,
+              intraday_data_source: prev.data.intraday_data_source,
+              intraday_data_quality: prev.data.intraday_data_quality,
+              intraday_sync_meta: prev.data.intraday_sync_meta,
+              intraday_technicals: prev.data.intraday_technicals,
+              ohlcv_intraday: prev.data.ohlcv_intraday,
+              chanlun: {
+                ...res.chanlun,
+                intraday: prev.data.chanlun?.intraday,
+                intraday_signal_summary: prev.data.chanlun?.intraday_signal_summary,
+                // Never copy stale dual_alignment onto a newly refreshed daily snapshot
+                dual_alignment: undefined,
+              },
+            },
+          };
+        });
         if (res.macro_context && onMacroContext) {
           onMacroContext(res.macro_context);
         }
@@ -271,7 +306,11 @@ export function WarRoomView({
         if (ctrl.signal.aborted || (ex instanceof DOMException && ex.name === "AbortError") || reqId !== snapReqIdRef.current) {
           return;
         }
-        setSnapBundle(null);
+        // Keep previously loaded charts visible for reference on same-symbol refresh failure,
+        // but persistently mark the bundle stale until a subsequent fetch succeeds.
+        setSnapBundle((prev) =>
+          prev && prev.reqKey === reqKey ? { ...prev, staleAfterError: true } : null,
+        );
         setError(errorMessage(ex));
       } finally {
         if (reqId === snapReqIdRef.current) {
@@ -334,15 +373,18 @@ export function WarRoomView({
     return out;
   }, [openPositions, archives]);
 
-  const dual = currentData?.chanlun?.dual_alignment;
+  const staleAfterError = Boolean(
+    snapBundle && snapBundle.reqKey === currentReqKey && snapBundle.staleAfterError,
+  );
+  const snapshotDegraded = isSnapshotIntradayUntrusted(currentData, error, staleAfterError);
+  const dual = snapshotDegraded ? undefined : currentData?.chanlun?.dual_alignment;
   const daily = currentData?.chanlun?.daily;
   const intraday = currentData?.chanlun?.intraday;
   const dailyMom = daily?.momentum_assessment;
   const intraMom = intraday?.momentum_assessment;
-  const lastPrice =
-    currentData?.ohlcv_intraday?.[currentData.ohlcv_intraday.length - 1]?.close ??
-    currentData?.ohlcv_daily?.[currentData.ohlcv_daily.length - 1]?.close ??
-    null;
+  const trustedQuote = selectTrustedLastQuote(currentData, error, staleAfterError);
+  const lastPrice = trustedQuote.price;
+  const lastPriceTs = trustedQuote.timestamp;
 
   const rawLoadedIv = currentData?.intraday_interval || dual?.intraday_timeframe || null;
   const loadedInterval: "15m" | "30m" | "60m" =
@@ -387,8 +429,16 @@ export function WarRoomView({
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <SymbolLabel symbol={resolvedSym} size="lg" />
             {lastPrice != null ? (
-              <span className="tnum font-mono text-base font-semibold text-ink">
-                {fmtPrice(lastPrice)}
+              <span className="tnum inline-flex items-baseline gap-1.5 font-mono">
+                <span className="text-base font-semibold text-ink">{fmtPrice(lastPrice)}</span>
+                {lastPriceTs ? (
+                  <span
+                    className="text-[10.5px] font-normal text-muted"
+                    title={trustedQuote.source === "daily" ? "当前展示日线最新收盘价时间" : "当前展示日内最新K线时间"}
+                  >
+                    {shortTime(lastPriceTs)}
+                  </span>
+                ) : null}
               </span>
             ) : null}
             <DirectionBadge direction={dual?.daily_bias} />
@@ -594,17 +644,26 @@ export function WarRoomView({
           <div className="truncate">
             <span className="text-muted">{loadedInterval} 触发：</span>
             <strong className="font-medium text-ink">
-              {currentData?.intraday_error
+              {currentData?.intraday_error && !currentData?.intraday_stale_fallback
                 ? currentData.intraday_error
-                : currentData?.chanlun?.intraday_signal_summary?.summary || dual?.intraday_summary || (error ? "加载失败" : "加载中…")}
+                : currentData?.chanlun?.intraday_signal_summary?.summary ||
+                  dual?.intraday_summary ||
+                  (currentData?.intraday_error ? currentData.intraday_error : error ? "加载失败" : "加载中…")}
             </strong>
+            {currentData?.intraday_stale_fallback ? (
+              <span className="ml-1.5 text-[10.5px] text-warning">(缓存)</span>
+            ) : null}
           </div>
         </div>
 
         {currentData?.intraday_error ? (
           <div className="flex items-center gap-2 rounded border border-warning/40 bg-warning/10 px-2.5 py-1 text-xs text-ink">
             <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
-            <span>日内源提示：{currentData.intraday_error}（日线缠论结构仍正常可用）</span>
+            <span>
+              {currentData.intraday_stale_fallback
+                ? `日内实时刷新失败，当前保留展示本地缓存（${currentData.ohlcv_intraday?.[currentData.ohlcv_intraday.length - 1]?.label || "上次成功数据"}）：${currentData.intraday_error}`
+                : `日内源提示：${currentData.intraday_error}（日线缠论结构仍正常可用）`}
+            </span>
           </div>
         ) : null}
       </section>
@@ -651,6 +710,7 @@ export function WarRoomView({
         symbol={resolvedSym}
         dualData={currentData}
         snapshotLoading={loading}
+        snapshotError={error || (staleAfterError ? "上次刷新失败，当前保留旧图供参考" : null)}
         intradayInterval={loadedInterval}
         portfolioInitialized={ledgerInit}
         accountEquity={accountEquity}

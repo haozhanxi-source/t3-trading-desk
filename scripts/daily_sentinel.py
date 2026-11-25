@@ -446,8 +446,11 @@ def _is_intraday_older_than_daily(
     daily_tech: dict[str, Any] | None,
     intra_tech: dict[str, Any] | None,
     asset_class: str | None = None,
+    *,
+    now_utc: datetime | None = None,
+    symbol: str | None = None,
 ) -> bool:
-    """Compare full UTC timestamps (never date-truncated) to detect intraday lagging daily."""
+    """Compare full UTC timestamps (and same-day official close for closed CN bars) to detect intraday lagging daily."""
     d_dt, d_local, d_has_time, _, _ = _extract_tech_timestamp(daily_tech, asset_class=asset_class)
     i_dt, i_local, i_has_time, _, _ = _extract_tech_timestamp(intra_tech, asset_class=asset_class)
     if d_dt is None or i_dt is None:
@@ -457,7 +460,32 @@ def _is_intraday_older_than_daily(
     if not d_has_time:
         # Daily is a calendar date without time; intraday lags if its local trading date is earlier.
         if i_local is not None and d_local is not None:
-            return i_local < d_local
+            if i_local < d_local:
+                return True
+            if (
+                i_local == d_local
+                and i_has_time
+                and isinstance(daily_tech, dict)
+                and daily_tech.get("bar_is_closed") is True
+            ):
+                ac = (asset_class or "").strip().lower()
+                if ac in {"cn_future", "a_share"}:
+                    sh_tz = ZoneInfo("Asia/Shanghai")
+                    is_bond = bool(re.match(r"^(T|TF|TS|TL)\d+", (symbol or "").strip().upper()))
+                    close_hh, close_mm = (15, 15) if (ac == "cn_future" and is_bond) else (15, 0)
+                    close_dt_utc = datetime(
+                        d_local.year, d_local.month, d_local.day, close_hh, close_mm, tzinfo=sh_tz
+                    ).astimezone(timezone.utc)
+                    # Only enforce same-day post-close lag once wall-clock time has actually reached official close
+                    if now_utc is None or now_utc.astimezone(timezone.utc) >= close_dt_utc:
+                        anchor = str((intra_tech or {}).get("bar_timestamp_anchor") or "end").strip().lower()
+                        iv_raw = str((intra_tech or {}).get("bar_interval") or "30m").strip().lower()
+                        iv_m = re.fullmatch(r"(\d+)\s*(m|min|h)", iv_raw)
+                        iv_mins = int(iv_m.group(1)) * (60 if iv_m.group(2) == "h" else 1) if iv_m else 30
+                        i_end_utc = i_dt + timedelta(minutes=iv_mins) if anchor == "start" else i_dt
+                        if i_end_utc < close_dt_utc:
+                            return True
+            return False
         return i_dt.date() < d_dt.date()
     # Daily has time, intraday is date-only
     if d_local is not None and i_local is not None:
@@ -487,12 +515,16 @@ def _bar_age_days(
 def _select_latest_price(
     snapshot: dict[str, Any] | None,
     asset_class: str | None = None,
+    *,
+    now_utc: datetime | None = None,
+    symbol: str | None = None,
 ) -> tuple[float | None, str | None, str | None]:
     """Return ``(price, source_label, freshness_warning)`` preferring fresher 30m price over daily."""
     if not isinstance(snapshot, dict) or snapshot.get("error"):
         return None, None, None
 
     eff_ac = asset_class or snapshot.get("asset_class")
+    eff_sym = symbol or snapshot.get("symbol")
     daily_tech = snapshot.get("technicals") if isinstance(snapshot.get("technicals"), dict) else {}
     intra_tech = snapshot.get("intraday_technicals") if isinstance(snapshot.get("intraday_technicals"), dict) else {}
 
@@ -500,7 +532,13 @@ def _select_latest_price(
     intra_px = _to_float(intra_tech.get("last_close"))
 
     if intra_px is not None and daily_px is not None:
-        if _is_intraday_older_than_daily(daily_tech, intra_tech, asset_class=eff_ac):
+        if _is_intraday_older_than_daily(
+            daily_tech,
+            intra_tech,
+            asset_class=eff_ac,
+            now_utc=now_utc,
+            symbol=eff_sym,
+        ):
             warn = (
                 f"intraday_30m: 30min 行情时间戳({intra_tech.get('as_of_bar') or intra_tech.get('as_of_bar_utc')})滞后于日线"
                 f"({daily_tech.get('as_of_bar') or daily_tech.get('as_of_bar_utc')})，现价已回退使用日线收盘价"
@@ -756,6 +794,7 @@ def extract_sentinel_observations(
     *,
     include_price_metrics: bool = True,
     asset_class: str | None = None,
+    now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Flatten live ``research_data.py`` + ``market_snapshot.py`` payloads for trigger evaluation.
 
@@ -792,7 +831,12 @@ def extract_sentinel_observations(
         )
         eff_ac = asset_class or effective_snap.get("asset_class")
         if include_price_metrics:
-            px, _, px_warn = _select_latest_price(effective_snap, asset_class=eff_ac)
+            px, _, px_warn = _select_latest_price(
+                effective_snap,
+                asset_class=eff_ac,
+                now_utc=now_utc,
+                symbol=effective_snap.get("symbol"),
+            )
             if px_warn and px_warn not in warnings:
                 warnings.append(px_warn)
             if px is not None:
@@ -2363,6 +2407,7 @@ def evaluate_holding_health(
         ref_date=anchor,
         include_price_metrics=not contract_quote_mismatch,
         asset_class=asset_class,
+        now_utc=eff_now_utc,
     )
     data_warnings: list[str] = list(raw_obs.get("data_health_warnings") or [])
     observations = {k: v for k, v in raw_obs.items() if k != "data_health_warnings"}
@@ -2378,7 +2423,12 @@ def evaluate_holding_health(
             if cw not in data_warnings:
                 data_warnings.append(cw)
 
-    last_price, price_source, px_warn = _select_latest_price(price_snap, asset_class=asset_class)
+    last_price, price_source, px_warn = _select_latest_price(
+        price_snap,
+        asset_class=asset_class,
+        now_utc=eff_now_utc,
+        symbol=(price_snap.get("symbol") if isinstance(price_snap, dict) else None) or symbol,
+    )
     if px_warn and px_warn not in data_warnings:
         data_warnings.append(px_warn)
 
@@ -2391,6 +2441,7 @@ def evaluate_holding_health(
             ref_date=anchor,
             include_price_metrics=True,
             asset_class=asset_class,
+            now_utc=eff_now_utc,
         )
         for pk in _CONTRACT_PRICE_OBS_KEYS:
             if pk in price_only_obs:
@@ -2563,7 +2614,13 @@ def evaluate_holding_health(
                     })
                     data_warnings.append(f"intraday_30m: latest 30m bar unclosed (as_of={i_lbl})")
 
-                if _is_intraday_older_than_daily(price_daily_tech, price_intra_tech, asset_class=asset_class):
+                if _is_intraday_older_than_daily(
+                    price_daily_tech,
+                    price_intra_tech,
+                    asset_class=asset_class,
+                    now_utc=eff_now_utc,
+                    symbol=price_snap.get("symbol") or symbol,
+                ):
                     intraday_lags_daily = True
                     yellow_alerts.append({
                         "layer": "data_integrity",
@@ -2607,7 +2664,16 @@ def evaluate_holding_health(
                     f"daily_bar: status=stale (base={chanlun_snap.get('symbol')}, as_of={cd_lbl}, age={cd_age:.1f}d)"
                 )
         ci_dt, ci_local, ci_has_time, _, ci_lbl = _extract_tech_timestamp(cl_i_tech, asset_class=asset_class)
-        if ci_dt is not None or ci_local is not None:
+        if ci_dt is None and ci_local is None:
+            intraday_timestamp_invalid = True
+            yellow_alerts.append({
+                "layer": "data_integrity",
+                "code": "intraday_30m_missing_time",
+                "message": "主连 30min 行情缺少有效时间戳，无法验证日内新鲜度",
+                "detail": f"base_symbol={chanlun_snap.get('symbol')}, as_of_bar={ci_lbl!r}",
+            })
+            data_warnings.append(f"intraday_30m: invalid/missing timestamp (base={chanlun_snap.get('symbol')}, as_of={ci_lbl!r})")
+        else:
             if not ci_has_time:
                 intraday_timestamp_invalid = True
                 yellow_alerts.append({
@@ -2635,6 +2701,23 @@ def evaluate_holding_health(
                     "detail": f"base_symbol={chanlun_snap.get('symbol')}, as_of_bar={ci_lbl}, bar_is_closed=False",
                 })
                 data_warnings.append(f"intraday_30m: latest 30m bar unclosed (base={chanlun_snap.get('symbol')}, as_of={ci_lbl})")
+            if _is_intraday_older_than_daily(
+                cl_d_tech,
+                cl_i_tech,
+                asset_class=asset_class,
+                now_utc=eff_now_utc,
+                symbol=chanlun_snap.get("symbol") or symbol,
+            ):
+                intraday_lags_daily = True
+                yellow_alerts.append({
+                    "layer": "data_integrity",
+                    "code": "intraday_30m_lags_daily",
+                    "message": "主连 30min 行情滞后于主连日线收盘，禁止误报绿灯",
+                    "detail": f"base_symbol={chanlun_snap.get('symbol')}, 30m={ci_lbl}, daily={cd_lbl}",
+                })
+                data_warnings.append(
+                    f"intraday_30m: lags daily (base={chanlun_snap.get('symbol')}, 30m={ci_lbl}, daily={cd_lbl})"
+                )
             ci_age = _bar_age_days(ci_dt, ci_local, ci_has_time, anchor, eff_now_utc)
             if ci_age is not None and ci_age > max_intraday_days:
                 intraday_stale = True
@@ -3027,11 +3110,21 @@ def evaluate_holding_health(
         if not any("intraday_30m" in w or "chanlun_30m" in w for w in data_warnings):
             data_warnings.append(f"chanlun_30m: status=error ({i_err})")
 
-    # If dual_alignment wasn't precomputed but both daily & intraday exist and helper exists, call it
+    chanlun_intra_untrusted = bool(
+        intraday_missing_or_failed
+        or intraday_stale
+        or intraday_lags_daily
+        or intraday_timestamp_invalid
+        or (isinstance(chanlun_snap, dict) and (chanlun_snap.get("intraday_error") or chanlun_snap.get("intraday_stale_fallback")))
+        or (isinstance(price_snap, dict) and (price_snap.get("intraday_error") or price_snap.get("intraday_stale_fallback")))
+    )
+
+    # If dual_alignment wasn't precomputed but both daily & intraday exist and intraday is fresh/valid, call it
     if (
         dual is None
         and daily_cl_valid
         and intra_cl_valid
+        and not chanlun_intra_untrusted
         and isinstance(daily_cl, dict)
         and isinstance(intra_cl, dict)
         and hasattr(cl_mod, "assess_dual_timeframe_alignment")
@@ -3106,30 +3199,31 @@ def evaluate_holding_health(
                 "detail": "；".join(dict.fromkeys(daily_loosen_reasons)),
             })
 
-        # 30min Chanlun assessment
+        # 30min Chanlun assessment (only when 30min feed is valid & non-stale; historical breach replay runs separately)
         intra_weak_reasons: list[str] = []
-        intraday_meta_from_dual = dual.get("intraday_signal_meta") if isinstance(dual, dict) else None
-        if isinstance(dual, dict):
-            i_bias = _normalize_direction(dual.get("intraday_bias"))
-            if i_bias in {"long", "short"} and i_bias != norm_dir:
-                intra_weak_reasons.append(f"30min 方向偏 {dual.get('intraday_bias')}（逆持仓方向）")
-            i_action = str(dual.get("intraday_action") or "").strip().lower()
-            if any(tok in i_action for tok in ("exit", "reduce", "tighten", "stop", "counter", "exhaustion", "撤离", "减仓")):
-                intra_weak_reasons.append(f"30min 动作提示={dual.get('intraday_action')}")
-            elif (
-                (norm_dir == "long" and i_action in {"sell", "short", "enter_short", "entry_short"})
-                or (norm_dir == "short" and i_action in {"buy", "long", "enter_long", "entry_long"})
-            ):
-                intra_weak_reasons.append(f"30min 触发反向动作={dual.get('intraday_action')}")
+        if not chanlun_intra_untrusted:
+            intraday_meta_from_dual = dual.get("intraday_signal_meta") if isinstance(dual, dict) else None
+            if isinstance(dual, dict):
+                i_bias = _normalize_direction(dual.get("intraday_bias"))
+                if i_bias in {"long", "short"} and i_bias != norm_dir:
+                    intra_weak_reasons.append(f"30min 方向偏 {dual.get('intraday_bias')}（逆持仓方向）")
+                i_action = str(dual.get("intraday_action") or "").strip().lower()
+                if any(tok in i_action for tok in ("exit", "reduce", "tighten", "stop", "counter", "exhaustion", "撤离", "减仓")):
+                    intra_weak_reasons.append(f"30min 动作提示={dual.get('intraday_action')}")
+                elif (
+                    (norm_dir == "long" and i_action in {"sell", "short", "enter_short", "entry_short"})
+                    or (norm_dir == "short" and i_action in {"buy", "long", "enter_long", "entry_long"})
+                ):
+                    intra_weak_reasons.append(f"30min 触发反向动作={dual.get('intraday_action')}")
 
-        i_strong, i_loosen = _classify_chanlun_signals(
-            intra_cl,
-            cl_container.get("intraday_signal_summary"),
-            norm_dir,
-            signal_meta=intraday_meta_from_dual,
-        )
-        intra_weak_reasons.extend(i_strong)
-        intra_weak_reasons.extend(i_loosen)
+            i_strong, i_loosen = _classify_chanlun_signals(
+                intra_cl,
+                cl_container.get("intraday_signal_summary"),
+                norm_dir,
+                signal_meta=intraday_meta_from_dual,
+            )
+            intra_weak_reasons.extend(i_strong)
+            intra_weak_reasons.extend(i_loosen)
 
         if intra_weak_reasons:
             yellow_alerts.append({
@@ -3139,7 +3233,7 @@ def evaluate_holding_health(
                 "detail": "；".join(dict.fromkeys(intra_weak_reasons)),
             })
 
-        # Trailing Stop Suggestion: ONLY from actual traded price_snap's 30m Zhongshu (never cross-contract!)
+        # Trailing Stop Suggestion: ONLY from valid, fresh traded price_snap's 30m Zhongshu (never stale cache or cross-contract!)
         price_cl = (
             price_snap.get("chanlun")
             if isinstance(price_snap, dict) and isinstance(price_snap.get("chanlun"), dict)
@@ -3163,7 +3257,12 @@ def evaluate_holding_health(
         if intra_zg is None:
             intra_zg = _to_float(price_dual.get("intraday_zg"))
 
-        if last_price is not None and entry_price is not None and tactical_stop_30m is not None:
+        if (
+            not chanlun_intra_untrusted
+            and last_price is not None
+            and entry_price is not None
+            and tactical_stop_30m is not None
+        ):
             if (
                 norm_dir == "long"
                 and last_price > entry_price
@@ -3831,10 +3930,17 @@ def _evaluate_watchlist_item(
     research_bundle: dict[str, Any] | None,
     ref_date: date,
     event_window_days: int = 14,
+    *,
+    now_utc: datetime | None = None,
 ) -> dict[str, Any]:
     """Lightweight refresh summary for a ``watchlist`` archive (kept separate from holdings)."""
     inst = archive_state.get("instrument") if isinstance(archive_state.get("instrument"), dict) else {}
-    raw_obs = extract_sentinel_observations(research_bundle, snapshot, ref_date=ref_date)
+    raw_obs = extract_sentinel_observations(
+        research_bundle,
+        snapshot,
+        ref_date=ref_date,
+        now_utc=now_utc,
+    )
     data_warnings = list(raw_obs.get("data_health_warnings") or [])
     observations = {k: v for k, v in raw_obs.items() if k != "data_health_warnings"}
 
@@ -3894,11 +4000,23 @@ def run_daily_sentinel(
     allow_manual_red_lines: bool = False,
 ) -> dict[str, Any]:
     """Run Holding Daily Sentinel across discovered holdings and optional watchlist."""
-    anchor = ref_date or (
-        now_utc.astimezone(timezone.utc).date()
-        if isinstance(now_utc, datetime) and now_utc.tzinfo is not None
-        else (now_utc.date() if isinstance(now_utc, datetime) else datetime.now(timezone.utc).date())
-    )
+    explicit_now_utc: datetime | None = None
+    if isinstance(now_utc, datetime):
+        explicit_now_utc = (
+            now_utc.astimezone(timezone.utc)
+            if now_utc.tzinfo is not None
+            else now_utc.replace(tzinfo=timezone.utc)
+        )
+
+    def _resolve_eval_clock() -> tuple[date, datetime | None]:
+        if explicit_now_utc is not None:
+            return (ref_date or explicit_now_utc.date()), explicit_now_utc
+        if ref_date is not None:
+            return ref_date, None
+        live_now = datetime.now(timezone.utc)
+        return live_now.date(), live_now
+
+    anchor, _ = _resolve_eval_clock()
     snap_fn = snapshot_fetcher or _default_snapshot_fetcher
     res_fn = research_fetcher or _default_research_fetcher
 
@@ -4098,6 +4216,7 @@ def run_daily_sentinel(
         elif sym.upper() != research_sym.upper():
             contract_snap = _fetch_snap(sym)
 
+        item_anchor, item_now_utc = _resolve_eval_clock()
         report = evaluate_holding_health(
             symbol=sym,
             direction=tgt["direction"],
@@ -4105,10 +4224,10 @@ def run_daily_sentinel(
             archive_state=tgt["archive_state"],
             snapshot=base_snap,
             research_bundle=rbundle,
-            ref_date=anchor,
+            ref_date=item_anchor,
             event_window_days=event_window_days,
             contract_snapshot=contract_snap,
-            now_utc=now_utc,
+            now_utc=item_now_utc,
             allow_manual_red_lines=allow_manual_red_lines,
         )
         report["discovery_source"] = tgt["source"]
@@ -4168,13 +4287,15 @@ def run_daily_sentinel(
             target_sym = arch_sym or ns
             snap = _fetch_snap(target_sym)
             rbundle = _fetch_res(target_sym)
+            wl_anchor, wl_now_utc = _resolve_eval_clock()
             wl_item = _evaluate_watchlist_item(
                 symbol=target_sym,
                 archive_state=arch_state,
                 snapshot=snap,
                 research_bundle=rbundle,
-                ref_date=anchor,
+                ref_date=wl_anchor,
                 event_window_days=event_window_days,
+                now_utc=wl_now_utc,
             )
 
             if update_archive and (arch_sym or target_sym):

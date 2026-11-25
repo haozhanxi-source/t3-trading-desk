@@ -30,6 +30,7 @@ import {
   inferAssetCurrency,
   optNum,
 } from "../../lib/format";
+import { isSnapshotIntradayUntrusted, selectTrustedLastQuote } from "../../lib/snapshotPrice";
 import type { PlanOverlayLines } from "../chart/ChanlunChart";
 import type { OpenPositionSeed } from "../portfolio/PortfolioDialogs";
 import { CrossCurrencyFxBanner } from "../ui/CrossCurrencyFxBanner";
@@ -80,6 +81,7 @@ interface TradePlannerCardProps {
   symbol: string;
   dualData: MarketDualResponse | null;
   snapshotLoading?: boolean;
+  snapshotError?: string | null;
   intradayInterval: "15m" | "30m" | "60m";
   portfolioInitialized?: boolean;
   accountEquity?: number | null;
@@ -98,6 +100,7 @@ export function TradePlannerCard({
   symbol,
   dualData,
   snapshotLoading = false,
+  snapshotError = null,
   intradayInterval,
   portfolioInitialized,
   accountEquity = null,
@@ -112,12 +115,11 @@ export function TradePlannerCard({
   onJumpArchive,
 }: TradePlannerCardProps) {
   const headingId = useId();
-  const align = dualData?.chanlun?.dual_alignment;
+  const snapshotStale = isSnapshotIntradayUntrusted(dualData, snapshotError);
+  const align = snapshotStale ? undefined : dualData?.chanlun?.dual_alignment;
   const dailyZs = dualData?.chanlun?.daily?.latest_zhongshu;
-  const lastClose =
-    dualData?.ohlcv_intraday?.[dualData.ohlcv_intraday.length - 1]?.close ??
-    dualData?.ohlcv_daily?.[dualData.ohlcv_daily.length - 1]?.close ??
-    null;
+  const trustedQuote = selectTrustedLastQuote(dualData, snapshotError);
+  const lastClose = trustedQuote.price;
 
   const snapInterval = dualData?.intraday_interval || align?.intraday_timeframe || intradayInterval;
   const is30mSnapshot = snapInterval === "30m" || snapInterval === "30min";
@@ -287,12 +289,25 @@ export function TradePlannerCard({
     setPairLegVerified(false);
     onRequestPickField?.(null);
 
-    const bias = (align?.daily_bias || "").toLowerCase();
+    const bias = (
+      align?.daily_bias ||
+      dualData?.chanlun?.signal_summary?.signal_meta?.direction ||
+      ""
+    ).toLowerCase();
     const nextDir: Direction =
       bias.includes("short") || bias.includes("bear") || bias.includes("down") || bias.includes("空")
         ? "short"
         : "long";
     setDirection(nextDir);
+
+    if (snapshotStale) {
+      // Never auto-prefill stale/untrusted intraday prices, stops, or derived targets
+      setEntryPrice("");
+      setStop30m("");
+      setStopDaily("");
+      setTargetPrice("");
+      return;
+    }
 
     const ep = lastClose;
     setEntryPrice(fmtInputPrice(ep));
@@ -314,10 +329,12 @@ export function TradePlannerCard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     symbol,
+    snapshotStale,
     is30mSnapshot,
     align?.daily_bias,
     align?.intraday_tactical_stop,
     align?.daily_structural_stop,
+    dualData?.chanlun?.signal_summary?.signal_meta?.direction,
     dailyZs?.zd,
     dailyZs?.zg,
     lastClose,
@@ -642,6 +659,14 @@ export function TradePlannerCard({
   const handleCalculate = async (e: FormEvent) => {
     e.preventDefault();
     onRequestPickField?.(null);
+
+    if (snapshotStale && live) {
+      invalidateInFlightAndPlan();
+      setPlan(null);
+      setPlanStale(true);
+      setErr("当前行情快照处于刷新失败或缓存降级状态，已暂停实时联立算仓自动预填；请先点击顶部「刷新」恢复实时行情后再试。");
+      return;
+    }
 
     if (ledgerUninitialized && !useSimEquity) {
       invalidateInFlightAndPlan();

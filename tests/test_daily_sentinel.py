@@ -2618,6 +2618,398 @@ class TestRound3Hardening(unittest.TestCase):
         self.assertIsNotNone(ext_hole[4])
         self.assertIn("intraday_internal_bar_gap", ext_hole[4])
 
+    def test_stale_fallback_30m_blocks_trail_stop_suggestion_and_stays_yellow(self):
+        """Codex MEDIUM #2: cached 30m fallback with intraday_error MUST stay YELLOW and NEVER suggest trail stops."""
+        pos = {
+            "position_id": "pos_lc_stale",
+            "symbol": "LC0",
+            "asset_class": "cn_future",
+            "direction": "long",
+            "entry_price": 100.0,
+            "tactical_stop_30m": 102.0,
+            "structural_stop_daily": 95.0,
+            "quantity": 1,
+            "opened_at_utc": "2026-11-20T01:00:00+00:00",
+        }
+        snap_stale = {
+            "symbol": "LC0",
+            "asset_class": "cn_future",
+            "intraday_error": "Read timed out",
+            "intraday_stale_fallback": True,
+            "technicals": {
+                "last_close": 110.0,
+                "as_of_bar": "2026-11-25",
+                "bar_is_closed": True,
+                "recent_bars_ohlc": [
+                    {"bar": "2026-11-25", "open": 108.0, "high": 111.0, "low": 107.0, "close": 110.0}
+                ],
+            },
+            "intraday_technicals": {
+                "last_close": 109.0,
+                "as_of_bar": "2026-11-24T15:00+08:00",
+                "bar_is_closed": True,
+                "recent_bars_ohlc": [
+                    {"bar": "2026-11-24T15:00+08:00", "open": 108.5, "high": 109.5, "low": 108.0, "close": 109.0}
+                ],
+            },
+            "chanlun": {
+                "signal_summary": {
+                    "tier": "中枢震荡",
+                    "summary": "日线多头延续",
+                    "signal_meta": {"direction": "long", "confirmed": False},
+                },
+                "daily": {
+                    "latest_zhongshu": {"zd": 95.0, "zg": 105.0},
+                    "signals": [],
+                    "momentum_assessment": {"verdict": "neutral_extension_up"},
+                },
+                "intraday": {
+                    "latest_zhongshu": {"zd": 106.0, "zg": 108.5},
+                    "signals": [],
+                    "momentum_assessment": {"verdict": "neutral_extension_up"},
+                },
+            },
+        }
+        res = ds.evaluate_holding_health(
+            "LC0",
+            "long",
+            position=pos,
+            snapshot=snap_stale,
+            ref_date=date(2026, 11, 25),
+            now_utc=datetime(2026, 11, 25, 8, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(res["status"], ds.STATUS_YELLOW)
+        self.assertIsNone(res.get("suggested_trail_stop"))
+
+        # Timestamp-detected stale 30m (NO intraday_error/stale_fallback flag) MUST ALSO block weakening & trail stop!
+        snap_ts_stale = {
+            "symbol": "LC0",
+            "asset_class": "cn_future",
+            "technicals": {
+                "last_close": 110.0,
+                "as_of_bar": "2026-11-25",
+                "bar_is_closed": True,
+                "recent_bars_ohlc": [
+                    {"bar": "2026-11-25", "open": 108.0, "high": 111.0, "low": 107.0, "close": 110.0}
+                ],
+            },
+            "intraday_technicals": {
+                "last_close": 109.0,
+                "as_of_bar": "2026-11-10T15:00+08:00",  # 15 days stale!
+                "bar_is_closed": True,
+                "recent_bars_ohlc": [
+                    {"bar": "2026-11-10T15:00+08:00", "open": 108.5, "high": 109.5, "low": 108.0, "close": 109.0}
+                ],
+            },
+            "chanlun": {
+                "signal_summary": {
+                    "tier": "中枢震荡",
+                    "summary": "日线多头延续",
+                    "signal_meta": {"direction": "long", "confirmed": False},
+                },
+                "daily": {
+                    "latest_zhongshu": {"zd": 95.0, "zg": 105.0},
+                    "signals": [],
+                    "momentum_assessment": {"verdict": "neutral_extension_up"},
+                },
+                "intraday": {
+                    "latest_zhongshu": {"zd": 106.0, "zg": 108.5},
+                    "signals": ["一卖(顶背驰)"],
+                    "momentum_assessment": {"verdict": "top_divergence"},
+                },
+                "intraday_signal_summary": {
+                    "tier": "买卖点信号",
+                    "summary": "30m 顶背驰一卖",
+                    "signal_meta": {"direction": "short", "confirmed": True},
+                },
+            },
+        }
+        res_ts = ds.evaluate_holding_health(
+            "LC0",
+            "long",
+            position=pos,
+            snapshot=snap_ts_stale,
+            ref_date=date(2026, 11, 25),
+            now_utc=datetime(2026, 11, 25, 8, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(res_ts["status"], ds.STATUS_YELLOW)
+        self.assertIsNone(res_ts.get("suggested_trail_stop"))
+        self.assertNotIn("intraday_30m_weakening", {a["code"] for a in res_ts["yellow_alerts"]})
+
+        # Separate contract snapshot (CU2701 valid) + continuous base snapshot (CU0) whose 30m has invalid timestamp
+        # OR lags behind closed CU0 daily bar MUST ALSO suppress intraday_30m_weakening and suggested_trail_stop!
+        pos_cu = {
+            "position_id": "pos_cu_contract",
+            "symbol": "CU0",
+            "contract_symbol": "CU2701",
+            "asset_class": "cn_future",
+            "direction": "long",
+            "entry_price": 100.0,
+            "tactical_stop_30m": 102.0,
+            "structural_stop_daily": 95.0,
+            "quantity": 1,
+            "opened_at_utc": "2026-11-20T01:00:00+00:00",
+        }
+        valid_contract_snap = {
+            "symbol": "CU2701",
+            "asset_class": "cn_future",
+            "technicals": {
+                "last_close": 110.0,
+                "as_of_bar": "2026-11-25",
+                "bar_is_closed": True,
+                "recent_bars_ohlc": [
+                    {"bar": "2026-11-25", "open": 108.0, "high": 111.0, "low": 107.0, "close": 110.0}
+                ],
+            },
+            "intraday_technicals": {
+                "last_close": 110.0,
+                "as_of_bar": "2026-11-25T15:00+08:00",
+                "bar_is_closed": True,
+                "recent_bars_ohlc": [
+                    {"bar": "2026-11-25T15:00+08:00", "open": 109.5, "high": 110.5, "low": 109.0, "close": 110.0}
+                ],
+            },
+            "chanlun": {
+                "daily": {"latest_zhongshu": {"zd": 95.0, "zg": 105.0}, "signals": []},
+                "intraday": {"latest_zhongshu": {"zd": 106.0, "zg": 108.5}, "signals": []},
+            },
+        }
+        base_lag_snap = {
+            "symbol": "CU0",
+            "asset_class": "cn_future",
+            "technicals": {"last_close": 110.0, "as_of_bar": "2026-11-25", "bar_is_closed": True},
+            "intraday_technicals": {"last_close": 109.0, "as_of_bar": "2026-11-24T15:00+08:00", "bar_is_closed": True},
+            "chanlun": {
+                "signal_summary": {"tier": "中枢震荡", "summary": "日线延续", "signal_meta": {"direction": "long", "confirmed": False}},
+                "daily": {"latest_zhongshu": {"zd": 95.0, "zg": 105.0}, "signals": [], "momentum_assessment": {"verdict": "neutral_extension_up"}},
+                "intraday": {"latest_zhongshu": {"zd": 106.0, "zg": 108.5}, "signals": ["一卖(顶背驰)"], "momentum_assessment": {"verdict": "top_divergence"}},
+                "intraday_signal_summary": {"tier": "买卖点信号", "summary": "30m 顶背驰一卖", "signal_meta": {"direction": "short", "confirmed": True}},
+            },
+        }
+        res_base_lag = ds.evaluate_holding_health(
+            "CU0",
+            "long",
+            position=pos_cu,
+            snapshot=base_lag_snap,
+            contract_snapshot=valid_contract_snap,
+            ref_date=date(2026, 11, 25),
+            now_utc=datetime(2026, 11, 25, 8, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(res_base_lag["status"], ds.STATUS_YELLOW)
+        self.assertIsNone(res_base_lag.get("suggested_trail_stop"))
+        self.assertNotIn("intraday_30m_weakening", {a["code"] for a in res_base_lag["yellow_alerts"]})
+
+        base_bad_ts_snap = {
+            **base_lag_snap,
+            "intraday_technicals": {"last_close": 109.0, "as_of_bar": "not-a-timestamp", "bar_is_closed": True},
+        }
+        res_base_bad_ts = ds.evaluate_holding_health(
+            "CU0",
+            "long",
+            position=pos_cu,
+            snapshot=base_bad_ts_snap,
+            contract_snapshot=valid_contract_snap,
+            ref_date=date(2026, 11, 25),
+            now_utc=datetime(2026, 11, 25, 8, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(res_base_bad_ts["status"], ds.STATUS_YELLOW)
+        self.assertIsNone(res_base_bad_ts.get("suggested_trail_stop"))
+        self.assertNotIn("intraday_30m_weakening", {a["code"] for a in res_base_bad_ts["yellow_alerts"]})
+
+        # Same-day pre-close base 30m (14:30) when base daily bar (2026-11-25) is closed and wall-clock is post-close (16:00 CST)
+        base_same_day_lag = {
+            **base_lag_snap,
+            "intraday_technicals": {"last_close": 109.0, "as_of_bar": "2026-11-25T14:30+08:00", "bar_is_closed": True},
+        }
+        res_same_day_lag = ds.evaluate_holding_health(
+            "CU0",
+            "long",
+            position=pos_cu,
+            snapshot=base_same_day_lag,
+            contract_snapshot=valid_contract_snap,
+            ref_date=date(2026, 11, 25),
+            now_utc=datetime(2026, 11, 25, 8, 0, tzinfo=timezone.utc),  # 16:00 CST
+        )
+        self.assertEqual(res_same_day_lag["status"], ds.STATUS_YELLOW)
+        self.assertIsNone(res_same_day_lag.get("suggested_trail_stop"))
+        self.assertNotIn("intraday_30m_weakening", {a["code"] for a in res_same_day_lag["yellow_alerts"]})
+        self.assertIn("intraday_30m_lags_daily", {a["code"] for a in res_same_day_lag["yellow_alerts"]})
+
+        # T0 at 15:16 CST: closed daily close 90 breaches stop 95 while lagging 15:00 30m still shows 110 -> MUST fall back to daily 90 and trigger RED_EXIT!
+        pos_t0 = {
+            "position_id": "pos_t0_stop",
+            "symbol": "T0",
+            "asset_class": "cn_future",
+            "direction": "long",
+            "entry_price": 100.0,
+            "tactical_stop_30m": 95.0,
+            "structural_stop_daily": 92.0,
+            "quantity": 1,
+            "opened_at_utc": "2026-11-20T01:00:00+00:00",
+        }
+        snap_t0_lag = {
+            "symbol": "T0",
+            "asset_class": "cn_future",
+            "technicals": {
+                "last_close": 90.0,
+                "as_of_bar": "2026-11-25",
+                "bar_is_closed": True,
+                "recent_bars_ohlc": [{"bar": "2026-11-25", "open": 100.0, "high": 101.0, "low": 89.5, "close": 90.0}],
+            },
+            "intraday_technicals": {
+                "last_close": 110.0,
+                "as_of_bar": "2026-11-25T15:00+08:00",
+                "bar_is_closed": True,
+                "recent_bars_ohlc": [{"bar": "2026-11-25T15:00+08:00", "open": 109.0, "high": 110.5, "low": 108.5, "close": 110.0}],
+            },
+            "chanlun": {
+                "daily": {"latest_zhongshu": {"zd": 92.0, "zg": 105.0}, "signals": []},
+                "intraday": {"latest_zhongshu": {"zd": 106.0, "zg": 109.0}, "signals": []},
+            },
+        }
+        res_t0 = ds.evaluate_holding_health(
+            "T0",
+            "long",
+            position=pos_t0,
+            snapshot=snap_t0_lag,
+            ref_date=date(2026, 11, 25),
+            now_utc=datetime(2026, 11, 25, 7, 16, tzinfo=timezone.utc),  # 15:16 CST
+        )
+        self.assertEqual(res_t0["status"], ds.STATUS_RED)
+
+        # Reverse: CU0 at 11:45 CST mid-session with date-only daily bar (90) and live 11:15 30m (110) MUST keep 30m 110 (no premature daily fallback false RED)!
+        pos_cu_mid = {
+            **pos_t0,
+            "position_id": "pos_cu_mid",
+            "symbol": "CU0",
+        }
+        snap_cu_mid = {
+            "symbol": "CU0",
+            "asset_class": "cn_future",
+            "technicals": {
+                "last_close": 90.0,
+                "as_of_bar": "2026-11-25",
+                "bar_is_closed": True,
+            },
+            "intraday_technicals": {
+                "last_close": 110.0,
+                "as_of_bar": "2026-11-25T11:15+08:00",
+                "bar_is_closed": True,
+            },
+            "chanlun": {
+                "daily": {"latest_zhongshu": {"zd": 92.0, "zg": 105.0}, "signals": []},
+                "intraday": {"latest_zhongshu": {"zd": 106.0, "zg": 109.0}, "signals": []},
+            },
+        }
+        px_mid, src_mid, _ = ds._select_latest_price(
+            snap_cu_mid,
+            asset_class="cn_future",
+            now_utc=datetime(2026, 11, 25, 3, 45, tzinfo=timezone.utc),  # 11:45 CST
+            symbol="CU0",
+        )
+        self.assertEqual(src_mid, "intraday_30m")
+        self.assertEqual(px_mid, 110.0)
+        res_cu_mid = ds.evaluate_holding_health(
+            "CU0",
+            "long",
+            position=pos_cu_mid,
+            snapshot=snap_cu_mid,
+            ref_date=date(2026, 11, 25),
+            now_utc=datetime(2026, 11, 25, 3, 45, tzinfo=timezone.utc),  # 11:45 CST
+        )
+        self.assertNotEqual(res_cu_mid["status"], ds.STATUS_RED)
+
+        # Default run_daily_sentinel() entry (now_utc=None, ref_date=None) MUST resolve current clock
+        # and forward it to BOTH holdings and watchlist so mid-session 11:45 CST never falls back to 90 / false RED!
+        with tempfile.TemporaryDirectory() as td:
+            p_dir = os.path.join(td, "portfolio")
+            r_dir = os.path.join(td, "research")
+            os.makedirs(p_dir, exist_ok=True)
+            os.makedirs(r_dir, exist_ok=True)
+            with open(os.path.join(p_dir, "positions.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {"schema_version": 1, "revision": 1, "positions": [{**pos_cu_mid, "status": "open"}]},
+                    f,
+                )
+            ds.ra_mod.init_archive("NI0", research_root=r_dir)
+            ds.ra_mod.update_state("NI0", {"status": "watchlist"}, research_root=r_dir)
+
+            snap_ni_mid = {
+                **snap_cu_mid,
+                "symbol": "NI0",
+            }
+            fixed_now = datetime(2026, 11, 25, 3, 45, tzinfo=timezone.utc)  # 11:45 CST
+
+            class _FixedDateTime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    return fixed_now.astimezone(tz) if tz is not None else fixed_now.replace(tzinfo=None)
+
+            from unittest.mock import patch as _patch
+
+            with _patch.object(ds, "datetime", _FixedDateTime):
+                run_out = ds.run_daily_sentinel(
+                    portfolio_dir=p_dir,
+                    research_root=r_dir,
+                    include_watchlist=True,
+                    skip_research=True,
+                    snapshot_fetcher=lambda s: snap_cu_mid if s == "CU0" else snap_ni_mid,
+                )
+            self.assertEqual(len(run_out["holdings"]), 1)
+            self.assertEqual(run_out["holdings"][0]["last_price"], 110.0)
+            self.assertNotEqual(run_out["holdings"][0]["status"], ds.STATUS_RED)
+            self.assertEqual(len(run_out["watchlist"]), 1)
+            self.assertEqual(run_out["watchlist"][0]["last_price"], 110.0)
+
+            # Live run starting at 14:54 CST whose fetch crosses 15:00 close and finishes at 15:01 CST
+            # with a closed 15:00 bar breaching stop (90 < 95) MUST evaluate at post-fetch time and emit RED_EXIT!
+            clock_state = {"now": datetime(2026, 11, 25, 6, 54, tzinfo=timezone.utc)}  # 14:54 CST
+
+            class _AdvancingDateTime(datetime):
+                @classmethod
+                def now(cls, tz=None):
+                    cur = clock_state["now"]
+                    return cur.astimezone(tz) if tz is not None else cur.replace(tzinfo=None)
+
+            snap_1500_breach = {
+                "symbol": "CU0",
+                "asset_class": "cn_future",
+                "technicals": {
+                    "last_close": 90.0,
+                    "as_of_bar": "2026-11-25",
+                    "bar_is_closed": True,
+                    "recent_bars_ohlc": [{"bar": "2026-11-25", "open": 100.0, "high": 101.0, "low": 89.5, "close": 90.0}],
+                },
+                "intraday_technicals": {
+                    "last_close": 90.0,
+                    "as_of_bar": "2026-11-25T15:00+08:00",
+                    "bar_is_closed": True,
+                    "recent_bars_ohlc": [{"bar": "2026-11-25T15:00+08:00", "open": 96.0, "high": 96.5, "low": 89.5, "close": 90.0}],
+                },
+                "chanlun": {
+                    "daily": {"latest_zhongshu": {"zd": 92.0, "zg": 105.0}, "signals": []},
+                    "intraday": {"latest_zhongshu": {"zd": 96.0, "zg": 100.0}, "signals": []},
+                },
+            }
+
+            def _fetch_crossing_close(_s):
+                clock_state["now"] = datetime(2026, 11, 25, 7, 1, tzinfo=timezone.utc)  # 15:01 CST
+                return snap_1500_breach
+
+            with _patch.object(ds, "datetime", _AdvancingDateTime):
+                run_cross = ds.run_daily_sentinel(
+                    portfolio_dir=p_dir,
+                    research_root=r_dir,
+                    include_watchlist=False,
+                    skip_research=True,
+                    snapshot_fetcher=_fetch_crossing_close,
+                )
+            self.assertEqual(run_cross["holdings"][0]["status"], ds.STATUS_RED)
+            self.assertNotIn(
+                "intraday_30m_future_timestamp",
+                {a["code"] for a in run_cross["holdings"][0]["yellow_alerts"]},
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

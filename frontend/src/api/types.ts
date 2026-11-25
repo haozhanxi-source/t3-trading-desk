@@ -519,6 +519,7 @@ export interface MarketDualResponse {
   fundamentals?: Dict;
   crypto_perp_funding?: unknown;
   intraday_error?: string | null;
+  intraday_stale_fallback?: boolean;
   ohlcv_daily: OhlcvDailyBar[];
   ohlcv_intraday: OhlcvIntradayBar[];
   chanlun: {

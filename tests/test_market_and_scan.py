@@ -15,10 +15,12 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 from market_snapshot import (  # noqa: E402
+    _merge_cn_future_realtime_bar,
     compute_indicators,
     fetch_a_share_intraday,
     fetch_cn_future_daily,
     fetch_cn_future_intraday,
+    fetch_cn_future_realtime_bar,
     fetch_crypto_intraday,
     get_intraday_snapshot,
     get_snapshot,
@@ -868,6 +870,497 @@ class TestIntradayFetchersAndDualSnapshot(unittest.TestCase):
              patch("sys.argv", ["market_snapshot.py", "PWR", "--dual", "--no-macro"]), \
              patch("builtins.print"):
             snapshot_main()
+
+
+class TestCnFutureRealtimeAndIntradayFallback(unittest.TestCase):
+    def test_fetch_cn_future_realtime_bar_commodity_and_financial(self):
+        lc_line = (
+            'var hq_str_nf_LC0="碳酸锂连续,150335,88000.000,88400.000,82220.000,82620.000,'
+            '82620.000,82660.000,82620.000,84180.000,89880.000,35,13,329246.000,367219,,'
+            '碳酸锂,2026-11-25,1,0,0,0,0,0,0,0,0,84185.137";'
+        )
+        mock_resp = MagicMock(status_code=200, text=lc_line)
+        with patch("market_snapshot.requests.get", return_value=mock_resp):
+            df_lc = fetch_cn_future_realtime_bar("LC0")
+        self.assertEqual(len(df_lc), 1)
+        self.assertEqual(df_lc.index[0].strftime("%Y-%m-%d"), "2026-11-25")
+        self.assertEqual(float(df_lc["Open"].iloc[0]), 88000.0)
+        self.assertEqual(float(df_lc["High"].iloc[0]), 88400.0)
+        self.assertEqual(float(df_lc["Low"].iloc[0]), 82220.0)
+        self.assertEqual(float(df_lc["Close"].iloc[0]), 82620.0)
+        self.assertEqual(float(df_lc["Volume"].iloc[0]), 367219.0)
+
+        # CFFEX 50-field financial future format (IF0)
+        if_fields = ["0"] * 50
+        if_fields[0], if_fields[1], if_fields[2], if_fields[3], if_fields[4] = (
+            "3891.0", "3908.6", "3820.2", "3824.0", "82285"
+        )
+        if_fields[14] = "3921.0"
+        if_fields[36] = "2026-11-25"
+        if_fields[37] = "15:00:00"
+        if_fields[49] = "沪深300指数期货连续"
+        if_line = 'var hq_str_nf_IF0="' + ",".join(if_fields) + '";'
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=if_line)):
+            df_if = fetch_cn_future_realtime_bar("IF0")
+        self.assertEqual(len(df_if), 1)
+        self.assertEqual(df_if.index[0].strftime("%Y-%m-%d"), "2026-11-25")
+        self.assertEqual(float(df_if["Close"].iloc[0]), 3824.0)
+        self.assertEqual(float(df_if["Volume"].iloc[0]), 82285.0)
+        self.assertTrue(df_if.attrs.get("quote_is_final_close"))
+        self.assertEqual(df_if.attrs.get("last_settle_price"), 3921.0)
+
+        # Mid-session 14:30 quote MUST NOT be flagged as final close even if fetched after 15:15
+        mid_line = (
+            'var hq_str_nf_LC0="碳酸锂连续,143000,88000.000,88400.000,82220.000,82620.000,'
+            '82620.000,82660.000,82620.000,84180.000,89880.000,35,13,329246.000,367219,,'
+            '碳酸锂,2026-11-25,1";'
+        )
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=mid_line)):
+            df_mid = fetch_cn_future_realtime_bar("LC0")
+        self.assertEqual(len(df_mid), 1)
+        self.assertFalse(df_mid.attrs.get("quote_is_final_close"))
+        self.assertEqual(df_mid.attrs.get("quote_time"), "14:30:00")
+
+        # Zero-volume flat pre-open placeholder must be ignored WITHOUT fetch_error
+        flat_line = (
+            'var hq_str_nf_LC0="碳酸锂连续,085900,88000.0,88000.0,88000.0,88000.0,'
+            '88000.0,88000.0,88000.0,88000.0,88000.0,0,0,0,0,,碳酸锂,2026-11-25,1";'
+        )
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=flat_line)):
+            df_flat = fetch_cn_future_realtime_bar("LC0")
+            self.assertTrue(df_flat.empty)
+            self.assertIsNone(df_flat.attrs.get("fetch_error"))
+
+        # HTTP 200 with unrecognized field layout MUST set fetch_error so provisional bars are preserved
+        bad_layout = 'var hq_str_nf_LC0="foo,bar,baz";'
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=bad_layout)):
+            df_bad = fetch_cn_future_realtime_bar("LC0")
+            self.assertTrue(df_bad.empty)
+            self.assertEqual(df_bad.attrs.get("fetch_error"), "unrecognized_payload_format")
+
+        # Out-of-envelope Close > High MUST set fetch_error
+        bad_env = (
+            'var hq_str_nf_LC0="碳酸锂连续,150335,100.0,105.0,95.0,120.0,'
+            '120.0,120.0,120.0,100.0,100.0,1,1,100,1000,,碳酸锂,2026-11-25,1";'
+        )
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=bad_env)):
+            df_env = fetch_cn_future_realtime_bar("LC0")
+            self.assertTrue(df_env.empty)
+            self.assertEqual(df_env.attrs.get("fetch_error"), "invalid_quote_envelope")
+
+        # NaN volume, mid-session 14:30 zero-volume flat quote, and invalid calendar date 2026-11-31 MUST set fetch_error (never raise)
+        nan_vol = (
+            'var hq_str_nf_LC0="碳酸锂连续,143000,100.0,105.0,95.0,102.0,'
+            '102.0,102.0,102.0,100.0,100.0,1,1,100,nan,,碳酸锂,2026-11-25,1";'
+        )
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=nan_vol)):
+            df_nanv = fetch_cn_future_realtime_bar("LC0")
+            self.assertTrue(df_nanv.empty)
+            self.assertEqual(df_nanv.attrs.get("fetch_error"), "invalid_quote_volume")
+
+        mid_flat = (
+            'var hq_str_nf_LC0="碳酸锂连续,143000,100.0,100.0,100.0,100.0,'
+            '100.0,100.0,100.0,100.0,100.0,0,0,0,0,,碳酸锂,2026-11-25,1";'
+        )
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=mid_flat)):
+            df_mflat = fetch_cn_future_realtime_bar("LC0")
+            self.assertTrue(df_mflat.empty)
+            self.assertEqual(df_mflat.attrs.get("fetch_error"), "zero_volume_flat_mid_session")
+
+        # Post-midnight night-session hour (00:30 for CU0, trading until 01:00) MUST NOT be treated as pre-open placeholder
+        midnight_flat = (
+            'var hq_str_nf_CU0="铜连续,003000,88000.0,88000.0,88000.0,88000.0,'
+            '88000.0,88000.0,88000.0,88000.0,88000.0,0,0,0,0,沪,铜,2026-11-25,1";'
+        )
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=midnight_flat)):
+            df_midn = fetch_cn_future_realtime_bar("CU0")
+            self.assertTrue(df_midn.empty)
+            self.assertEqual(df_midn.attrs.get("fetch_error"), "zero_volume_flat_mid_session")
+
+        bad_date = (
+            'var hq_str_nf_LC0="碳酸锂连续,150335,100.0,105.0,95.0,102.0,'
+            '102.0,102.0,102.0,100.0,100.0,1,1,100,1000,,碳酸锂,2026-11-31,1";'
+        )
+        with patch("market_snapshot.requests.get", return_value=MagicMock(status_code=200, text=bad_date)):
+            df_bdate = fetch_cn_future_realtime_bar("LC0")
+            self.assertTrue(df_bdate.empty)
+            self.assertTrue(bool(df_bdate.attrs.get("fetch_error")))
+
+    def test_merge_cn_future_realtime_bar_appends_current_session_and_guards_gaps(self):
+        dates = pd.date_range("2026-11-11", periods=10, freq="B")  # ends Tue 2026-11-24
+        hist = pd.DataFrame(
+            {
+                "Open": [90000.0] * len(dates),
+                "High": [92000.0] * len(dates),
+                "Low": [88000.0] * len(dates),
+                "Close": [88940.0] * len(dates),
+                "Volume": [200000.0] * len(dates),
+            },
+            index=dates,
+        )
+        hist.attrs["provider_source"] = "akshare_sina_main"
+        hist.attrs["last_settle_price"] = 89880.0
+
+        # 1) Contiguous next weekday (Tue 11-24 -> Wed 11-25) with post-close quote -> appended cleanly
+        rt = pd.DataFrame(
+            [{"Open": 88000.0, "High": 88400.0, "Low": 82220.0, "Close": 82620.0, "Volume": 367219.0}],
+            index=pd.DatetimeIndex([pd.Timestamp("2026-11-25")], name="Date"),
+        )
+        rt.attrs["quote_time"] = "15:03:35"
+        rt.attrs["quote_is_final_close"] = True
+        rt.attrs["last_settle_price"] = 89880.0
+        with patch("market_snapshot.fetch_cn_future_realtime_bar", return_value=rt) as mock_rt:
+            merged = _merge_cn_future_realtime_bar(
+                hist, "LC0", shanghai_today=datetime(2026, 11, 25).date()
+            )
+        self.assertEqual(mock_rt.call_count, 1)
+        self.assertEqual(len(merged), len(hist) + 1)
+        self.assertEqual(merged.index[-1].strftime("%Y-%m-%d"), "2026-11-25")
+        self.assertEqual(float(merged["Close"].iloc[-1]), 82620.0)
+        self.assertEqual(merged.attrs.get("provider_source"), "akshare_sina_main")
+        self.assertTrue(merged.attrs.get("realtime_bar_appended"))
+        self.assertNotIn("2026-11-25", merged.attrs.get("unclosed_bar_keys", []))
+
+        # 2) Mid-session quote (14:30) appends bar but marks it explicitly unclosed!
+        rt_mid = rt.copy()
+        rt_mid.attrs["quote_time"] = "14:30:00"
+        rt_mid.attrs["quote_is_final_close"] = False
+        with patch("market_snapshot.fetch_cn_future_realtime_bar", return_value=rt_mid):
+            merged_mid = _merge_cn_future_realtime_bar(
+                hist, "LC0", shanghai_today=datetime(2026, 11, 25).date()
+            )
+        self.assertIn("2026-11-25", merged_mid.attrs.get("unclosed_bar_keys", []))
+
+        # 3) Weekend date (Sat 2026-11-28) MUST be rejected
+        rt_sat = pd.DataFrame(
+            [{"Open": 88000.0, "High": 88400.0, "Low": 82220.0, "Close": 82620.0, "Volume": 367219.0}],
+            index=pd.DatetimeIndex([pd.Timestamp("2026-11-28")], name="Date"),
+        )
+        rt_sat.attrs["quote_is_final_close"] = True
+        with patch("market_snapshot.fetch_cn_future_realtime_bar", return_value=rt_sat):
+            no_sat = _merge_cn_future_realtime_bar(
+                hist, "LC0", shanghai_today=datetime(2026, 11, 25).date()
+            )
+        self.assertEqual(len(no_sat), len(hist))
+
+        # 4) Future date on non-night-session symbol (LC0 on Wed 11-25 getting Thu 11-26) MUST be rejected
+        rt_future = pd.DataFrame(
+            [{"Open": 88000.0, "High": 88400.0, "Low": 82220.0, "Close": 82620.0, "Volume": 367219.0}],
+            index=pd.DatetimeIndex([pd.Timestamp("2026-11-26")], name="Date"),
+        )
+        rt_future.attrs["quote_is_final_close"] = False
+        with patch("market_snapshot.fetch_cn_future_realtime_bar", return_value=rt_future):
+            no_future = _merge_cn_future_realtime_bar(
+                hist, "LC0", shanghai_now=datetime(2026, 11, 25, 21, 30, 0)
+            )
+        self.assertEqual(len(no_future), len(hist))
+
+        # 4b) Saturday 21:30 MUST NOT enter night-session branch even for night-session roots (CU0 -> Monday)
+        fri_dates = pd.date_range("2026-11-16", periods=10, freq="B")  # ends Fri 2026-11-27
+        hist_fri = pd.DataFrame(
+            {
+                "Open": [90000.0] * len(fri_dates),
+                "High": [92000.0] * len(fri_dates),
+                "Low": [88000.0] * len(fri_dates),
+                "Close": [89000.0] * len(fri_dates),
+                "Volume": [200000.0] * len(fri_dates),
+            },
+            index=fri_dates,
+        )
+        rt_mon = pd.DataFrame(
+            [{"Open": 89100.0, "High": 89500.0, "Low": 88800.0, "Close": 89200.0, "Volume": 10000.0}],
+            index=pd.DatetimeIndex([pd.Timestamp("2026-11-30")], name="Date"),
+        )
+        rt_mon.attrs["quote_is_final_close"] = False
+        with patch("market_snapshot.fetch_cn_future_realtime_bar", return_value=rt_mon):
+            no_sat_night = _merge_cn_future_realtime_bar(
+                hist_fri, "CU0", shanghai_now=datetime(2026, 11, 28, 21, 30, 0)
+            )
+        self.assertEqual(len(no_sat_night), len(hist_fri))
+
+        # 5) Skipped trading day (biz_gap=2, mismatched settle) MUST be rejected; true holiday (matching settle) allowed
+        hist_mon = hist.iloc[:-1].copy()  # ends Mon 2026-11-23
+        hist_mon.attrs["last_settle_price"] = 89560.0
+        rt_mismatch = rt.copy()
+        rt_mismatch.attrs["last_settle_price"] = 89880.0  # Tue 11-24 settle != Mon 11-23 settle -> missing bar!
+        with patch("market_snapshot.fetch_cn_future_realtime_bar", return_value=rt_mismatch):
+            no_skip = _merge_cn_future_realtime_bar(
+                hist_mon, "LC0", shanghai_today=datetime(2026, 11, 25).date()
+            )
+        self.assertEqual(len(no_skip), len(hist_mon))
+
+        rt_holiday_ok = rt.copy()
+        rt_holiday_ok.attrs["last_settle_price"] = 89560.0  # exact pre-holiday settle match -> Tue was exchange holiday
+        with patch("market_snapshot.fetch_cn_future_realtime_bar", return_value=rt_holiday_ok):
+            holiday_merged = _merge_cn_future_realtime_bar(
+                hist_mon, "LC0", shanghai_today=datetime(2026, 11, 25).date()
+            )
+        self.assertEqual(len(holiday_merged), len(hist_mon) + 1)
+
+        # 6) Same-date realtime bar must not overwrite already archived daily bar
+        rt_same = pd.DataFrame(
+            [{"Open": 88000.0, "High": 88400.0, "Low": 82220.0, "Close": 82620.0, "Volume": 367219.0}],
+            index=pd.DatetimeIndex([pd.Timestamp("2026-11-24")], name="Date"),
+        )
+        with patch("market_snapshot.fetch_cn_future_realtime_bar", return_value=rt_same):
+            unchanged = _merge_cn_future_realtime_bar(
+                hist, "LC0", shanghai_today=datetime(2026, 11, 25).date()
+            )
+        self.assertEqual(len(unchanged), len(hist))
+        self.assertEqual(float(unchanged["Close"].iloc[-1]), 88940.0)
+
+        # 7) Stale historical window (>15 days behind) must skip network lookup entirely
+        with patch("market_snapshot.fetch_cn_future_realtime_bar") as mock_skip:
+            skipped = _merge_cn_future_realtime_bar(
+                hist, "LC0", shanghai_today=datetime(2027, 2, 1).date()
+            )
+        mock_skip.assert_not_called()
+        self.assertEqual(len(skipped), len(hist))
+
+    def test_fetch_cn_future_intraday_retries_once_on_timeout(self):
+        import requests as _req
+
+        idx = pd.date_range("2026-11-20 09:30", periods=30, freq="30min")
+        sample_min = pd.DataFrame(
+            {
+                "datetime": idx.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": np.linspace(88000.0, 82800.0, 30),
+                "high": np.linspace(88500.0, 83000.0, 30),
+                "low": np.linspace(87500.0, 82200.0, 30),
+                "close": np.linspace(88200.0, 82620.0, 30),
+                "volume": [15000] * 30,
+                "hold": [330000] * 30,
+            }
+        )
+        with patch(
+            "market_snapshot.ak.futures_zh_minute_sina",
+            side_effect=[_req.ReadTimeout("Read timed out"), sample_min],
+        ) as mock_min, patch("market_snapshot.time.sleep"):
+            df = fetch_cn_future_intraday("LC0", interval="30m")
+        self.assertEqual(mock_min.call_count, 2)
+        self.assertEqual(len(df), 30)
+        self.assertEqual(float(df["Close"].iloc[-1]), 82620.0)
+
+    def test_get_snapshot_refresh_intraday_timeout_falls_back_to_cached_bars(self):
+        import requests as _req
+
+        daily_raw = make_cn_sample_df(rows=60, chinese_cols=True)
+        end_dt = datetime.now().replace(minute=0, second=0, microsecond=0) - timedelta(hours=1)
+        idx = pd.date_range(end=end_dt, periods=45, freq="30min")
+        intra_raw = pd.DataFrame(
+            {
+                "datetime": idx.strftime("%Y-%m-%d %H:%M:%S"),
+                "open": np.linspace(90000.0, 82800.0, 45),
+                "high": np.linspace(90500.0, 83000.0, 45),
+                "low": np.linspace(89500.0, 82220.0, 45),
+                "close": np.linspace(90100.0, 82620.0, 45),
+                "volume": [12000] * 45,
+                "hold": [320000] * 45,
+            }
+        )
+        with tempfile.TemporaryDirectory() as td:
+            db_path = os.path.join(td, "desk.db")
+            # 1) Initial fetch populates SQLite cache cleanly
+            with patch("market_snapshot.ak.futures_main_sina", return_value=daily_raw), \
+                 patch("market_snapshot.ak.futures_zh_minute_sina", return_value=intra_raw):
+                snap1 = get_snapshot(
+                    "LC0",
+                    period="3y",
+                    include_macro=False,
+                    include_fundamentals=False,
+                    include_intraday=True,
+                    intraday_interval="30m",
+                    include_ohlcv=True,
+                    refresh=True,
+                    use_store=True,
+                    db_path=db_path,
+                )
+            self.assertNotIn("intraday_error", snap1)
+            self.assertEqual(len(snap1["ohlcv_intraday"]), 45)
+
+            # 2) Forced refresh when intraday upstream times out preserves cached 30m bars AND keeps fail-closed intraday_error
+            with patch("market_snapshot.ak.futures_main_sina", return_value=daily_raw), \
+                 patch(
+                     "market_snapshot.ak.futures_zh_minute_sina",
+                     side_effect=_req.ReadTimeout("Read timed out. (read timeout=20.0)"),
+                 ), patch("market_snapshot.time.sleep"):
+                snap2 = get_snapshot(
+                    "LC0",
+                    period="3y",
+                    include_macro=False,
+                    include_fundamentals=False,
+                    include_intraday=True,
+                    intraday_interval="30m",
+                    include_ohlcv=True,
+                    refresh=True,
+                    use_store=True,
+                    db_path=db_path,
+                )
+            self.assertTrue(snap2.get("intraday_stale_fallback"))
+            self.assertIn("Read timed out", snap2.get("intraday_error", ""))
+            self.assertEqual(len(snap2["ohlcv_intraday"]), 45)
+            self.assertIn("intraday", snap2["chanlun"])
+            self.assertNotIn("dual_alignment", snap2["chanlun"])
+            self.assertEqual(snap2["intraday_sync_meta"]["cache_status"], "stale_fallback")
+
+            # 3) Upstream returning corrupt rows that sanitize to empty MUST ALSO fall back to SQLite cache
+            bad_intra = pd.DataFrame(
+                {
+                    "datetime": ["2026-11-25 14:30:00"],
+                    "open": [-1.0],
+                    "high": [-1.0],
+                    "low": [-2.0],
+                    "close": [-1.0],
+                    "volume": [0],
+                    "hold": [0],
+                }
+            )
+            with patch("market_snapshot.ak.futures_zh_minute_sina", return_value=bad_intra):
+                intra_clean_fb = get_intraday_snapshot(
+                    "LC0",
+                    interval="30m",
+                    include_ohlcv=True,
+                    refresh=True,
+                    use_store=True,
+                    db_path=db_path,
+                )
+            self.assertTrue(intra_clean_fb.get("stale_fallback"))
+            self.assertIn("upstream_error", intra_clean_fb)
+            self.assertEqual(len(intra_clean_fb["ohlcv_intraday"]), 45)
+
+            # 4) Single-interval CLI `--interval 30m` MUST exit 1 on stale_fallback while still printing cached JSON
+            printed_single: list[str] = []
+            with patch("market_snapshot.get_intraday_snapshot", return_value=intra_clean_fb), \
+                 patch("sys.argv", ["market_snapshot.py", "LC0", "--interval", "30m", "--refresh"]), \
+                 patch("builtins.print", side_effect=lambda s: printed_single.append(s)):
+                with self.assertRaises(SystemExit) as ctx_single:
+                    snapshot_main()
+            self.assertEqual(ctx_single.exception.code, 1)
+            self.assertEqual(len(printed_single), 1)
+            self.assertTrue(json.loads(printed_single[0]).get("stale_fallback"))
+
+            # 5) Short daily window refresh (period="1d") MUST grade quality on the sliced window (degraded), matching cache hits
+            with patch("market_snapshot.ak.futures_main_sina", return_value=daily_raw):
+                snap_1d_refresh = get_snapshot(
+                    "LC0",
+                    period="1d",
+                    include_macro=False,
+                    include_fundamentals=False,
+                    include_intraday=False,
+                    refresh=True,
+                    use_store=True,
+                    db_path=db_path,
+                )
+                snap_1d_cached = get_snapshot(
+                    "LC0",
+                    period="1d",
+                    include_macro=False,
+                    include_fundamentals=False,
+                    include_intraday=False,
+                    refresh=False,
+                    use_store=True,
+                    db_path=db_path,
+                )
+            self.assertEqual(snap_1d_refresh["data_quality"]["quality_grade"], "degraded")
+            self.assertIn("INSUFFICIENT_BARS", snap_1d_refresh["data_quality"]["warnings"])
+            self.assertEqual(
+                snap_1d_refresh["data_quality"]["quality_grade"],
+                snap_1d_cached["data_quality"]["quality_grade"],
+            )
+
+            # 6) HTTP 200 intraday snapshot flagged STALE_MARKET_DATA MUST suppress dual_alignment & mark stale_fallback
+            stale_intra_snap = {
+                "symbol": "LC0",
+                "asset_class": "cn_future",
+                "interval": "30m",
+                "data_source": "akshare/sina 分钟",
+                "data_quality": {"quality_grade": "caution", "warnings": ["STALE_MARKET_DATA"], "as_of_bar": "2026-11-10T15:00+08:00"},
+                "sync_meta": {"cache_status": "miss"},
+                "technicals": {"last_close": 89000.0},
+                "chanlun": {"signal_summary": {"summary": "old"}, "intraday": {"latest_zhongshu": {"zd": 88000.0, "zg": 90000.0}}},
+                "ohlcv_intraday": [{"time": 1794294000, "label": "2026-11-10T15:00+08:00", "open": 89000, "high": 89500, "low": 88500, "close": 89000, "volume": 100}],
+            }
+            with patch("market_snapshot.ak.futures_main_sina", return_value=daily_raw), \
+                 patch("market_snapshot.get_intraday_snapshot", return_value=stale_intra_snap):
+                snap_stale_200 = get_snapshot(
+                    "LC0",
+                    period="3y",
+                    include_macro=False,
+                    include_fundamentals=False,
+                    include_intraday=True,
+                    intraday_interval="30m",
+                    include_ohlcv=True,
+                    refresh=True,
+                    use_store=True,
+                    db_path=db_path,
+                )
+            self.assertTrue(snap_stale_200.get("intraday_stale_fallback"))
+            self.assertIn("stale", (snap_stale_200.get("intraday_error") or "").lower())
+            self.assertNotIn("dual_alignment", snap_stale_200["chanlun"])
+
+            # 7) Racing get_snapshot() whose archive fetch completes AFTER another writer committed a newer provisional bar
+            #    MUST NOT overwrite the newer provisional bar!
+            import data_store as _ds
+
+            store = _ds.get_store(db_path)
+            cn_key = _ds.SeriesKey("cn_future", "LC0", "1d", "akshare_sina_main", "raw_continuous")
+            d24_dates = pd.date_range("2026-11-02", periods=17, freq="B")  # ends 2026-11-24
+            d24_df = pd.DataFrame(
+                {
+                    "Open": [90000.0] * len(d24_dates),
+                    "High": [92000.0] * len(d24_dates),
+                    "Low": [88000.0] * len(d24_dates),
+                    "Close": [88940.0] * len(d24_dates),
+                    "Volume": [200000.0] * len(d24_dates),
+                },
+                index=d24_dates,
+            )
+            d24_df.attrs["provider_source"] = "akshare_sina_main"
+            # Seed DB with 2026-11-24 baseline
+            store.get_or_sync_ohlcv(
+                cn_key,
+                period="3y",
+                timestamp_anchor="end",
+                refresh=True,
+                fetch_full=lambda: d24_df,
+            )
+            d25_prov = pd.concat(
+                [
+                    d24_df,
+                    pd.DataFrame(
+                        [{"Open": 88000.0, "High": 88400.0, "Low": 82220.0, "Close": 82620.0, "Volume": 367219.0}],
+                        index=pd.DatetimeIndex([pd.Timestamp("2026-11-25")], name="Date"),
+                    ),
+                ]
+            )
+            d25_prov.attrs["unclosed_bar_keys"] = ["2026-11-25"]
+
+            def slow_daily_fetch(_sym, period="3y"):
+                # Another writer commits 2026-11-25 provisional bar while our network fetch is in flight!
+                store.get_or_sync_ohlcv(
+                    cn_key,
+                    period="3y",
+                    timestamp_anchor="end",
+                    refresh=True,
+                    fetch_full=lambda: d25_prov,
+                )
+                return d24_df
+
+            with patch("market_snapshot.fetch_cn_future_daily", side_effect=slow_daily_fetch):
+                snap_race = get_snapshot(
+                    "LC0",
+                    period="3y",
+                    include_macro=False,
+                    include_fundamentals=False,
+                    include_intraday=False,
+                    include_ohlcv=True,
+                    refresh=True,
+                    use_store=True,
+                    db_path=db_path,
+                )
+            self.assertEqual(snap_race["sync_meta"]["sync_mode"], "stale_upstream_rejected")
+            self.assertEqual(snap_race["ohlcv_daily"][-1]["time"], "2026-11-25")
+            self.assertEqual(snap_race["ohlcv_daily"][-1]["close"], 82620.0)
 
 
 if __name__ == "__main__":

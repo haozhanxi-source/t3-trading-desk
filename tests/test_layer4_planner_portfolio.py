@@ -1133,6 +1133,42 @@ class TestPositionPlanner(unittest.TestCase):
         self.assertIsNotNone(bad_payload["expression_and_carry"]["curve_data_warning"])
         self.assertEqual(bad_payload["expression_and_carry"]["expression_recommendation"], "data_stale_refresh_required")
 
+        # --live with stale_fallback cached 30m bars MUST NOT recompute alignment or derive cached entry/stop
+        cached_fb_ctx = {
+            "snapshot": {
+                "symbol": "CU0",
+                "asset_class": "cn_future",
+                "intraday_error": "Read timed out",
+                "intraday_stale_fallback": True,
+                "technicals": {"last_close": 92400.0, "as_of_bar": fresh_daily_bar},
+                "intraday_technicals": {"last_close": 103.0, "as_of_bar": "2026-11-20T15:00+08:00"},
+                "chanlun": {
+                    "daily": {
+                        "latest_zhongshu": {"zd": 90000.0, "zg": 93000.0},
+                        "signals": [],
+                        "momentum_assessment": {"verdict": "neutral_extension_down"},
+                    },
+                    "intraday": {
+                        "latest_zhongshu": {"zd": 100.0, "zg": 105.0},
+                        "signals": [],
+                        "momentum_assessment": {"verdict": "neutral_extension_up"},
+                    },
+                },
+            },
+            "research": {"fundamentals_and_supply": {}},
+            "errors": [],
+        }
+        with patch.object(tp, "_fetch_live_context", return_value=cached_fb_ctx):
+            parser = tp.build_parser()
+            args_fb = parser.parse_args([
+                "--symbol", "CU0", "--direction", "short", "--live",
+                "--target", "86000", "--equity", "1000000", "--account-currency", "CNY",
+                "--has-l1-l2",
+            ])
+            with self.assertRaises(tp.PlanInputError) as ctx_fb:
+                tp.build_trade_plan(args_fb)
+            self.assertIn("no valid intraday_tactical_stop", str(ctx_fb.exception))
+
     def test_round2_planner_live_guards_carry_gate_and_decimal_tranches(self):
         import trade_planner as tp
 

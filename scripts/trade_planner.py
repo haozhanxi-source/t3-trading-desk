@@ -2698,6 +2698,24 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
             if isinstance(intraday_30m_blk, dict) and intraday_30m_blk.get("error"):
                 upstream_errors.append(f"snapshot_intraday_error: {intraday_30m_blk['error']}")
 
+        intra_warnings = set((snap.get("intraday_data_quality") or {}).get("warnings") or ()) if isinstance(snap, dict) else set()
+        intraday_stale_cached = bool(
+            isinstance(snap, dict)
+            and (snap.get("intraday_stale_fallback") or ("STALE_MARKET_DATA" in intra_warnings))
+        )
+        intraday_untrusted = bool(
+            intraday_stale_cached
+            or (
+                isinstance(snap, dict)
+                and (
+                    snap.get("intraday_error")
+                    or (isinstance(snap.get("intraday_30m"), dict) and snap["intraday_30m"].get("error"))
+                )
+            )
+        )
+        if intraday_untrusted and not any("snapshot_intraday_error" in e for e in upstream_errors):
+            upstream_errors.append("snapshot_intraday_error: intraday 30m data is stale or fallback-cached")
+
         tech = snap.get("technicals") or {}
         intraday_tech = snap.get("intraday_technicals")
         if not isinstance(intraday_tech, dict):
@@ -2707,10 +2725,14 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
             intraday_tech = {}
 
         if entry_price is None:
-            entry_price = _opt_finite_float(intraday_tech.get("last_close")) or _opt_finite_float(tech.get("last_close"))
+            entry_price = (
+                _opt_finite_float(tech.get("last_close"))
+                if intraday_untrusted
+                else (_opt_finite_float(intraday_tech.get("last_close")) or _opt_finite_float(tech.get("last_close")))
+            )
         if atr_daily is None:
             atr_daily = _opt_finite_float(tech.get("atr14"))
-        if atr30m is None:
+        if atr30m is None and not intraday_untrusted:
             atr30m = _opt_finite_float(intraday_tech.get("atr14"))
 
         raw_chanlun_blk = snap.get("chanlun")
@@ -2721,7 +2743,13 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
             upstream_errors.append(f"daily_chanlun_error: {daily_cl['error']}")
         if isinstance(intraday_cl, dict) and intraday_cl.get("error"):
             upstream_errors.append(f"intraday_chanlun_error: {intraday_cl['error']}")
-        if isinstance(daily_cl, dict) and isinstance(intraday_cl, dict) and not daily_cl.get("error") and not intraday_cl.get("error"):
+        if (
+            not intraday_untrusted
+            and isinstance(daily_cl, dict)
+            and isinstance(intraday_cl, dict)
+            and not daily_cl.get("error")
+            and not intraday_cl.get("error")
+        ):
             try:
                 from chanlun import assess_dual_timeframe_alignment
 
@@ -2732,7 +2760,7 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
                 err_msg = f"dual_alignment_error: {exc}"
                 live_ctx["errors"].append(err_msg)
                 upstream_errors.append(err_msg)
-        if daily_alignment is None:
+        if daily_alignment is None and not intraday_stale_cached:
             for key in ("dual_alignment", "daily_30m_alignment"):
                 cand = chanlun_blk.get(key)
                 if isinstance(cand, dict):

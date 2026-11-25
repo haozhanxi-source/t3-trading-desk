@@ -1868,4 +1868,79 @@ def test_ledger_currency_mismatch_rejects_stale_fx_submission(client: TestClient
     assert "本位币 (CNY) 不一致" in r_mismatch.json()["detail"]
 
 
+def test_market_dual_does_not_cache_intraday_error_response(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    """Covers healthy cache -> forced refresh timeout (no cache poison) -> normal request recovery + epoch-safe zero-TTL."""
+    from backend.cache import TTLCache
 
+    calls = {"n": 0}
+
+    def fake_get_snapshot(symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        calls["n"] += 1
+        base = {
+            "symbol": symbol,
+            "asset_class": "cn_future",
+            "ohlcv_daily": [{"time": "2026-11-25", "label": "2026-11-25", "open": 88000, "high": 88400, "low": 82220, "close": 82620, "volume": 367219}],
+            "ohlcv_intraday": [{"time": 1795590000, "label": "2026-11-25T15:00+08:00", "open": 82820, "high": 83000, "low": 82300, "close": 82620, "volume": 19643}],
+            "chanlun": {"daily": {}, "intraday": {}},
+        }
+        if calls["n"] == 2:
+            base["intraday_error"] = "Read timed out"
+            base["intraday_stale_fallback"] = True
+        return base
+
+    monkeypatch.setattr(market_snapshot, "get_snapshot", fake_get_snapshot)
+
+    # 1) Initial healthy request populates cache
+    r0 = client.get("/api/market/dual", params={"symbol": "LC0", "intraday_interval": "30m"})
+    assert r0.status_code == 200
+    assert r0.headers.get("X-Cache") == "MISS"
+    assert "intraday_error" not in r0.json()
+
+    # 2) Forced refresh hits intraday timeout -> returns stale_fallback with intraday_error, MUST NOT cache for 60s
+    r1 = client.get("/api/market/dual", params={"symbol": "LC0", "intraday_interval": "30m", "refresh": "true"})
+    assert r1.status_code == 200
+    assert r1.headers.get("X-Cache") == "MISS"
+    assert r1.json()["intraday_error"] == "Read timed out"
+    assert r1.json()["intraday_stale_fallback"] is True
+
+    # 3) Next normal request recovers immediately (not poisoned by degraded response)
+    r2 = client.get("/api/market/dual", params={"symbol": "LC0", "intraday_interval": "30m"})
+    assert r2.status_code == 200
+    assert r2.headers.get("X-Cache") == "MISS"
+    assert "intraday_error" not in r2.json()
+    assert calls["n"] == 3
+
+    # 4) Healthy response IS cached on subsequent request
+    r3 = client.get("/api/market/dual", params={"symbol": "LC0", "intraday_interval": "30m"})
+    assert r3.status_code == 200
+    assert r3.headers.get("X-Cache") == "HIT"
+    assert calls["n"] == 3
+
+    # 5) Zero-TTL invalidate respects epoch across clear() so slow degraded request cannot evict newer entry
+    local_cache = TTLCache()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_degraded():
+        entered.set()
+        release.wait(timeout=5)
+        return {"intraday_error": "timeout"}
+
+    t_slow = threading.Thread(
+        target=lambda: local_cache.get_or_compute(
+            ("dual", "LC0"),
+            60.0,
+            slow_degraded,
+            refresh=True,
+            ttl_for_value=lambda v: 0.0 if v.get("intraday_error") else 60.0,
+        )
+    )
+    t_slow.start()
+    assert entered.wait(timeout=5)
+    local_cache.clear()
+    local_cache.set(("dual", "LC0"), {"ok": True}, 60.0)
+    release.set()
+    t_slow.join(timeout=5)
+    hit, val = local_cache.get(("dual", "LC0"))
+    assert hit is True
+    assert val == {"ok": True}

@@ -630,3 +630,282 @@ def test_consolidation_universe_futures_specs_and_refresh_passthrough(store_env,
     assert cached["snapshot"]["technicals"]["nan_probe"] is None
 
 
+def test_provisional_unclosed_daily_bar_and_concurrent_stale_rejection(store_env):
+    """Codex HIGH #1 & MEDIUM #3:
+    1. A 14:30 intraday realtime quote fetched after 15:15 MUST remain is_closed=False (never advance latest_closed_bar_key).
+    2. If realtime quote subsequently fails after close, archive-only refresh preserves the newer unclosed bar with warning.
+    3. Concurrent stale upstream response rejected by CAS MUST return the winning newer bars, never stale clean_full.
+    """
+    store = data_store.get_store(store_env["db_path"])
+    key = data_store.SeriesKey("cn_future", "LC0", "1d", "akshare_sina_main", "raw_continuous")
+    after_close_utc = datetime(2026, 11, 25, 7, 16, 0, tzinfo=timezone.utc)  # 15:16 Asia/Shanghai
+
+    dates_24 = pd.date_range("2026-11-02", periods=17, freq="B")  # ends 2026-11-24
+    df_24 = pd.DataFrame(
+        {
+            "Open": [90000.0] * len(dates_24),
+            "High": [92000.0] * len(dates_24),
+            "Low": [88000.0] * len(dates_24),
+            "Close": [88940.0] * len(dates_24),
+            "Volume": [200000.0] * len(dates_24),
+        },
+        index=dates_24,
+    )
+    df_25_mid = pd.concat(
+        [
+            df_24,
+            pd.DataFrame(
+                [{"Open": 88000.0, "High": 88400.0, "Low": 82220.0, "Close": 82620.0, "Volume": 367219.0}],
+                index=pd.DatetimeIndex([pd.Timestamp("2026-11-25")], name="Date"),
+            ),
+        ]
+    )
+    df_25_mid.attrs["unclosed_bar_keys"] = ["2026-11-25"]
+
+    # 1) Write 14:30 provisional bar at 15:16 Shanghai -> MUST stay is_closed=False
+    s1, q1, _ = store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_25_mid,
+        now_utc=after_close_utc,
+    )
+    assert s1.index[-1].strftime("%Y-%m-%d") == "2026-11-25"
+    assert bool(s1["_is_closed"].iloc[-1]) is False
+    assert q1["latest_bar_closed"] is False
+
+    # 2) Realtime quote subsequently times out -> archive-only refresh preserves provisional 11-25 unclosed bar with warning
+    df_24_rt_err = df_24.copy()
+    df_24_rt_err.attrs["realtime_bar_error"] = "Read timed out"
+    s2, q2, m2 = store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_24_rt_err,
+        now_utc=after_close_utc,
+    )
+    assert s2.index[-1].strftime("%Y-%m-%d") == "2026-11-25"
+    assert bool(s2["_is_closed"].iloc[-1]) is False
+    assert q2["latest_bar_closed"] is False
+    assert m2["sync_mode"] == "provisional_unclosed_preserved"
+    assert "PROVISIONAL_DAILY_BAR_STALE_QUOTE" in q2["warnings"]
+
+    # 3) Final post-close 11-25 bar arrives (no unclosed override) -> advances latest_closed_bar_key to 2026-11-25
+    df_25_final = df_25_mid.copy()
+    df_25_final.attrs = {}
+    s3, q3, _ = store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_25_final,
+        now_utc=after_close_utc,
+    )
+    assert bool(s3["_is_closed"].iloc[-1]) is True
+    assert q3["latest_bar_closed"] is True
+
+    # 4) Concurrent stale response (ending 11-24) arriving while another writer already advanced generation -> MUST return winning 11-25!
+    # Simulate another connection bumping generation before our write lands
+    def racing_fetch():
+        store._replace_full_series(
+            key,
+            s3,
+            q3,
+            timestamp_anchor="end",
+            covered_days=1098,
+            synced_at_iso=data_store.utc_iso(after_close_utc),
+        )
+        return df_24
+
+    s4, _, m4 = store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=racing_fetch,
+        now_utc=after_close_utc,
+    )
+    assert m4["sync_mode"] == "stale_upstream_rejected"
+    assert s4.index[-1].strftime("%Y-%m-%d") == "2026-11-25"
+    assert float(s4["Close"].iloc[-1]) == 82620.0
+
+    # 5) load_cached_ohlcv strictly honors allowed_sources allowlist EVEN on exact key match
+    other_key = data_store.SeriesKey("cn_future", "LC0", "1d", "unlisted_source", "raw_continuous")
+    assert store.load_cached_ohlcv(other_key, allowed_sources=("unlisted_source",)) is None
+    assert store.load_cached_ohlcv(key, allowed_sources=("unlisted_source",)) is None
+    allowed_hit = store.load_cached_ohlcv(other_key, allowed_sources=("unlisted_source", "akshare_sina_main"))
+    assert allowed_hit is not None
+    assert allowed_hit[2]["data_source"] == "akshare_sina_main"
+    assert allowed_hit[2]["timestamp_anchor"] == "end"
+
+    # 6) Cross-source provisional bar preservation: main archive -> fallback archive when realtime quote fails
+    fb_key = data_store.SeriesKey("cn_future", "LC0", "1d", "akshare_sina_daily_fb", "raw_continuous")
+    # Re-seed main key with unclosed 2026-11-26 provisional bar
+    df_26_prov = pd.concat(
+        [
+            df_25_final,
+            pd.DataFrame(
+                [{"Open": 82500.0, "High": 83000.0, "Low": 81500.0, "Close": 81800.0, "Volume": 120000.0}],
+                index=pd.DatetimeIndex([pd.Timestamp("2026-11-26")], name="Date"),
+            ),
+        ]
+    )
+    df_26_prov.attrs["unclosed_bar_keys"] = ["2026-11-26"]
+    store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_26_prov,
+        now_utc=datetime(2026, 11, 26, 7, 20, 0, tzinfo=timezone.utc),
+    )
+    df_25_fb_rt_err = df_25_final.copy()
+    df_25_fb_rt_err.attrs["realtime_bar_error"] = "Read timed out"
+    s_fb, q_fb, m_fb = store.get_or_sync_ohlcv(
+        fb_key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_25_fb_rt_err,
+        now_utc=datetime(2026, 11, 26, 7, 20, 0, tzinfo=timezone.utc),
+        fallback_unclosed_sources=("akshare_sina_main", "akshare_sina_daily_fb"),
+    )
+    assert s_fb.index[-1].strftime("%Y-%m-%d") == "2026-11-26"
+    assert bool(s_fb["_is_closed"].iloc[-1]) is False
+    assert m_fb["sync_mode"] == "provisional_unclosed_preserved"
+    assert "PROVISIONAL_DAILY_BAR_STALE_QUOTE" in q_fb["warnings"]
+
+    # 7) Concurrent stale response with SAME latest_closed_bar_key (11-25) MUST NOT wipe newer unclosed 11-26 bar!
+    def racing_same_closed_fetch():
+        # Concurrent writer commits newer unclosed 2026-11-27 bar (bumping generation, same closed 11-25)
+        df_27_prov = pd.concat(
+            [
+                df_25_final,
+                pd.DataFrame(
+                    [{"Open": 81800.0, "High": 82100.0, "Low": 80500.0, "Close": 80900.0, "Volume": 90000.0}],
+                    index=pd.DatetimeIndex([pd.Timestamp("2026-11-27")], name="Date"),
+                ),
+            ]
+        )
+        df_27_prov.attrs["unclosed_bar_keys"] = ["2026-11-27"]
+        c_df, c_q = data_store.sanitize_and_grade_ohlcv(
+            df_27_prov,
+            asset_class="cn_future",
+            interval="1d",
+            timestamp_anchor="end",
+            now_utc=datetime(2026, 11, 27, 6, 0, 0, tzinfo=timezone.utc),
+        )
+        store._replace_full_series(
+            key,
+            c_df,
+            c_q,
+            timestamp_anchor="end",
+            covered_days=1098,
+            synced_at_iso=data_store.utc_iso(datetime(2026, 11, 27, 6, 0, 0, tzinfo=timezone.utc)),
+        )
+        return df_25_final  # older response ending at 11-25 (same latest_closed_bar_key!)
+
+    s_race, _, m_race = store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=racing_same_closed_fetch,
+        now_utc=datetime(2026, 11, 27, 6, 0, 0, tzinfo=timezone.utc),
+    )
+    assert m_race["sync_mode"] == "stale_upstream_rejected"
+    assert s_race.index[-1].strftime("%Y-%m-%d") == "2026-11-27"
+    assert float(s_race["Close"].iloc[-1]) == 80900.0
+
+    # 8) Fallback already has older unclosed 11-26, primary has newer unclosed 11-27 -> preserving into fallback MUST keep 11-27!
+    df_25_fb_rt_err2 = df_25_final.copy()
+    df_25_fb_rt_err2.attrs["realtime_bar_error"] = "Read timed out"
+    s_fb2, q_fb2, m_fb2 = store.get_or_sync_ohlcv(
+        fb_key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_25_fb_rt_err2,
+        now_utc=datetime(2026, 11, 27, 7, 20, 0, tzinfo=timezone.utc),
+        fallback_unclosed_sources=("akshare_sina_main", "akshare_sina_daily_fb"),
+    )
+    assert m_fb2["sync_mode"] == "provisional_unclosed_preserved"
+    assert s_fb2.index[-1].strftime("%Y-%m-%d") == "2026-11-27"
+    assert float(s_fb2["Close"].iloc[-1]) == 80900.0
+    assert "PROVISIONAL_DAILY_BAR_STALE_QUOTE" in q_fb2["warnings"]
+
+    # 9) Same-day racing older quote (same latest_bar_key=11-27, older generation) MUST NOT overwrite winning newer quote!
+    df_27_old_quote = pd.concat(
+        [
+            df_25_final,
+            pd.DataFrame(
+                [{"Open": 81800.0, "High": 82100.0, "Low": 81000.0, "Close": 81500.0, "Volume": 50000.0}],
+                index=pd.DatetimeIndex([pd.Timestamp("2026-11-27")], name="Date"),
+            ),
+        ]
+    )
+    df_27_old_quote.attrs["unclosed_bar_keys"] = ["2026-11-27"]
+    pre_gen = store.get_series_generation(key)
+    # Concurrent writer commits newer same-day price 80200 first
+    df_27_new_quote = df_27_old_quote.copy()
+    df_27_new_quote.iloc[-1, df_27_new_quote.columns.get_loc("Close")] = 80200.0
+    df_27_new_quote.iloc[-1, df_27_new_quote.columns.get_loc("Low")] = 80100.0
+    store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_27_new_quote,
+        now_utc=datetime(2026, 11, 27, 6, 30, 0, tzinfo=timezone.utc),
+    )
+    s_same_race, _, m_same_race = store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_27_old_quote,
+        now_utc=datetime(2026, 11, 27, 6, 30, 0, tzinfo=timezone.utc),
+        pre_fetch_generation=pre_gen,
+    )
+    assert m_same_race["sync_mode"] == "stale_upstream_rejected"
+    assert float(s_same_race["Close"].iloc[-1]) == 80200.0
+
+    # 10) Short-window merge (3y refresh over existing 5y cache) MUST ALSO honor pre_fetch_generation against racing same-day quote!
+    store.get_or_sync_ohlcv(
+        key,
+        period="5y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_27_old_quote,
+        now_utc=datetime(2026, 11, 27, 6, 30, 0, tzinfo=timezone.utc),
+    )
+    pre_gen_5y = store.get_series_generation(key)
+    # Concurrent writer commits newer same-day quote 80150
+    df_27_winner = df_27_old_quote.copy()
+    df_27_winner.iloc[-1, df_27_winner.columns.get_loc("Close")] = 80150.0
+    df_27_winner.iloc[-1, df_27_winner.columns.get_loc("Low")] = 80100.0
+    store.get_or_sync_ohlcv(
+        key,
+        period="5y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_27_winner,
+        now_utc=datetime(2026, 11, 27, 6, 35, 0, tzinfo=timezone.utc),
+    )
+    # Stale 3y refresh (req_days < prev_cov 5y -> would hit short_window_merge) with older quote 81500 MUST NOT clobber 80150!
+    s_short_race, _, m_short_race = store.get_or_sync_ohlcv(
+        key,
+        period="3y",
+        timestamp_anchor="end",
+        refresh=True,
+        fetch_full=lambda: df_27_old_quote,
+        now_utc=datetime(2026, 11, 27, 6, 35, 0, tzinfo=timezone.utc),
+        pre_fetch_generation=pre_gen_5y,
+    )
+    assert m_short_race["sync_mode"] == "stale_upstream_rejected"
+    assert float(s_short_race["Close"].iloc[-1]) == 80150.0
+    reloaded_after = store.load_cached_ohlcv(key, period="3y", timestamp_anchor="end")
+    assert reloaded_after is not None
+    assert float(reloaded_after[0]["Close"].iloc[-1]) == 80150.0

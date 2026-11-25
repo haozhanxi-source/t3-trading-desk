@@ -276,6 +276,7 @@ def sanitize_and_grade_ohlcv(
     now_utc: datetime | None = None,
     check_staleness: bool = True,
     inherited_dropped_keys: list[str] | None = None,
+    force_unclosed_bar_keys: set[str] | frozenset[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Sanitize an OHLCV DataFrame while preserving raw High/Low provenance and grading data quality.
 
@@ -284,6 +285,11 @@ def sanitize_and_grade_ohlcv(
     """
     cols = ["Open", "High", "Low", "Close", "Volume"]
     intraday = (interval or "1d").strip().lower() != "1d"
+    unclosed_overrides: set[str] = set(str(k) for k in (force_unclosed_bar_keys or ()))
+    if raw_df is not None and isinstance(getattr(raw_df, "attrs", None), dict):
+        for k in (raw_df.attrs.get("unclosed_bar_keys") or ()):
+            if k:
+                unclosed_overrides.add(str(k))
     fetch_dt = (
         fetched_at.astimezone(timezone.utc)
         if (fetched_at is not None and fetched_at.tzinfo is not None)
@@ -383,7 +389,10 @@ def sanitize_and_grade_ohlcv(
         else:
             end_dt = compute_daily_bar_end_utc(b_key, asset_class=asset_class)
         end_iso = utc_iso(end_dt) if end_dt is not None else None
-        is_closed = bool(fetch_dt >= end_dt) if end_dt is not None else (not intraday)
+        if b_key in unclosed_overrides:
+            is_closed = False
+        else:
+            is_closed = bool(fetch_dt >= end_dt) if end_dt is not None else (not intraday)
 
         kept_indices.append(idx_val)
         rows_out.append({
@@ -874,6 +883,18 @@ class DeskDataStore:
                     return True, f"price_drift_{db_col}_at_{b_key}"
         return False, None
 
+    def get_series_generation(self, key: SeriesKey) -> int:
+        """Read current persisted generation for ``key`` (0 if series does not exist yet)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT generation FROM ohlcv_series WHERE series_id = ?",
+                (key.series_id,),
+            ).fetchone()
+            return int(row["generation"]) if row is not None else 0
+        finally:
+            conn.close()
+
     def get_or_sync_ohlcv(
         self,
         key: SeriesKey,
@@ -887,6 +908,8 @@ class DeskDataStore:
         fetch_full: Callable[[], pd.DataFrame],
         fetch_tail: Callable[[str], pd.DataFrame] | None = None,
         now_utc: datetime | None = None,
+        fallback_unclosed_sources: tuple[str, ...] | list[str] | None = None,
+        pre_fetch_generation: int | None = None,
     ) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]]:
         """Return ``(sliced_df, quality_report, sync_meta)`` backed by ``data/desk.db``."""
         intraday = key.interval != "1d"
@@ -923,6 +946,11 @@ class DeskDataStore:
                             for k in (qual.get("dropped_bar_keys") or [])
                             if str(k) >= first_sliced_key
                         ]
+                        unclosed_keys = {
+                            str(k)
+                            for k, cl in zip(sliced["_bar_key"].tolist(), sliced["_is_closed"].tolist(), strict=True)
+                            if not bool(cl)
+                        }
                         _, sliced_qual = sanitize_and_grade_ohlcv(
                             sliced[["Open", "High", "Low", "Close", "Volume"]].assign(
                                 High=sliced["_raw_high"], Low=sliced["_raw_low"]
@@ -933,6 +961,7 @@ class DeskDataStore:
                             fetched_at=parse_utc_iso(str(sliced["_fetched_at_utc"].iloc[-1])),
                             now_utc=ref_now,
                             inherited_dropped_keys=prior_dropped,
+                            force_unclosed_bar_keys=unclosed_keys,
                         )
                         return sliced, sliced_qual, {
                             "cache_status": "hit",
@@ -1093,15 +1122,21 @@ class DeskDataStore:
                     )
             else:
                 prev_cov = int(meta["covered_days"] or 0) if meta is not None else 0
-                # Never let a narrow short-period refresh (e.g. 1mo) delete wider 3y stored history unless drifted!
-                if meta is not None and req_days < prev_cov and rebuild_reason is None:
+                eff_expected_gen = pre_fetch_generation if pre_fetch_generation is not None else expected_gen
+                rt_bar_err = (
+                    raw_full.attrs.get("realtime_bar_error")
+                    if isinstance(getattr(raw_full, "attrs", None), dict)
+                    else None
+                )
+                # Never let a narrow short-period refresh (e.g. 1mo or 3y over 5y) delete wider stored history unless drifted!
+                if meta is not None and req_days < prev_cov and rebuild_reason is None and not rt_bar_err:
                     stored_map = self._load_bar_map(key.series_id)
                     drifted, drift_why = self._detect_overlap_drift(stored_map, clean_full)
                     if not drifted and self._upsert_tail_bars(
                         key,
                         clean_full,
                         timestamp_anchor=timestamp_anchor,
-                        expected_generation=expected_gen,
+                        expected_generation=eff_expected_gen,
                         synced_at_iso=utc_iso(fetch_ts),
                         intraday=False,
                     ):
@@ -1111,6 +1146,11 @@ class DeskDataStore:
                             *(str(k) for k in (qual_full.get("dropped_bar_keys") or [])),
                         ]))
                         df_all, _ = self._load_full_series(key.series_id)
+                        unclosed_all = {
+                            str(k)
+                            for k, cl in zip(df_all["_bar_key"].tolist(), df_all["_is_closed"].tolist(), strict=True)
+                            if not bool(cl)
+                        }
                         _, full_q = sanitize_and_grade_ohlcv(
                             df_all[["Open", "High", "Low", "Close", "Volume"]].assign(
                                 High=df_all["_raw_high"], Low=df_all["_raw_low"]
@@ -1121,6 +1161,7 @@ class DeskDataStore:
                             fetched_at=fetch_ts,
                             now_utc=ref_now,
                             inherited_dropped_keys=merged_drop,
+                            force_unclosed_bar_keys=unclosed_all,
                         )
                         self._update_series_quality(key.series_id, full_q)
                         sliced = self._slice_analysis_window(
@@ -1130,20 +1171,77 @@ class DeskDataStore:
                             "cache_status": "miss",
                             "sync_mode": "short_window_merge",
                             "series_id": key.series_id,
-                            "generation": expected_gen + 1,
+                            "generation": eff_expected_gen + 1,
                             "last_synced_at_utc": utc_iso(fetch_ts),
                         }
                     rebuild_reason = drift_why
 
                 # Full table replacement: record exact req_days (NEVER claim wider old covered_days!)
-                new_gen = self._replace_full_series(
+                new_gen, applied, preserved_unclosed = self._replace_full_series_with_status(
                     key,
                     clean_full,
                     qual_full,
                     timestamp_anchor=timestamp_anchor,
                     covered_days=req_days,
                     synced_at_iso=utc_iso(fetch_ts),
+                    expected_generation=eff_expected_gen,
+                    preserve_newer_unclosed=bool(rt_bar_err),
+                    fallback_unclosed_sources=fallback_unclosed_sources,
                 )
+                if not applied or preserved_unclosed:
+                    # Either an out-of-order stale upstream response was rejected by CAS/closed-bar guard,
+                    # or a newer provisional unclosed bar was preserved because realtime quote failed.
+                    # Read winning meta + bars in one atomic read transaction.
+                    win_meta, df_all, stored_q = self._load_series_snapshot_atomic(key.series_id)
+                    if win_meta is not None and not df_all.empty:
+                        sliced = self._slice_analysis_window(
+                            df_all, interval=key.interval, period=period, max_bars=max_bars
+                        )
+                        first_k = str(sliced["_bar_key"].iloc[0])
+                        prior_dropped = [
+                            str(k) for k in (stored_q.get("dropped_bar_keys") or []) if str(k) >= first_k
+                        ]
+                        unclosed_keys = {
+                            str(k)
+                            for k, cl in zip(sliced["_bar_key"].tolist(), sliced["_is_closed"].tolist(), strict=True)
+                            if not bool(cl)
+                        }
+                        _, qual_out = sanitize_and_grade_ohlcv(
+                            sliced[["Open", "High", "Low", "Close", "Volume"]].assign(
+                                High=sliced["_raw_high"], Low=sliced["_raw_low"]
+                            ),
+                            asset_class=key.asset_class,
+                            interval=key.interval,
+                            timestamp_anchor=str(win_meta["timestamp_anchor"] or timestamp_anchor),
+                            fetched_at=parse_utc_iso(str(sliced["_fetched_at_utc"].iloc[-1])),
+                            now_utc=ref_now,
+                            inherited_dropped_keys=prior_dropped,
+                            force_unclosed_bar_keys=unclosed_keys,
+                        )
+                        if preserved_unclosed:
+                            qual_out = dict(qual_out)
+                            w_list = list(qual_out.get("warnings") or [])
+                            n_list = list(qual_out.get("notes") or [])
+                            if "PROVISIONAL_DAILY_BAR_STALE_QUOTE" not in w_list:
+                                w_list.append("PROVISIONAL_DAILY_BAR_STALE_QUOTE")
+                            n_list.append(
+                                f"当日实时补齐失败（{rt_bar_err}），暂保留本地未收盘临时日K（{qual_out.get('as_of_bar')}），待收盘归档确认"
+                            )
+                            qual_out["warnings"] = w_list
+                            qual_out["notes"] = n_list
+                            if qual_out.get("quality_grade") == "good":
+                                qual_out["quality_grade"] = "caution"
+                        return sliced, qual_out, {
+                            "cache_status": "stale_fallback" if preserved_unclosed else "hit",
+                            "sync_mode": (
+                                "provisional_unclosed_preserved"
+                                if preserved_unclosed
+                                else "stale_upstream_rejected"
+                            ),
+                            "series_id": key.series_id,
+                            "generation": int(win_meta["generation"]),
+                            "last_synced_at_utc": win_meta["last_synced_at_utc"],
+                        }
                 sliced = self._slice_analysis_window(
                     clean_full, interval=key.interval, period=period, max_bars=max_bars
                 )
@@ -1158,6 +1256,101 @@ class DeskDataStore:
                 "last_synced_at_utc": utc_iso(fetch_ts),
             }
 
+    def load_cached_ohlcv(
+        self,
+        key: SeriesKey,
+        *,
+        period: str = "3y",
+        timestamp_anchor: str = "start",
+        max_bars: int | None = None,
+        now_utc: datetime | None = None,
+        allowed_sources: tuple[str, ...] | list[str] | None = None,
+    ) -> tuple[pd.DataFrame, dict[str, Any], dict[str, Any]] | None:
+        """Read-only fallback loader for stale local SQLite bars when an upstream refresh fails."""
+        ref_now = now_utc or utc_now()
+        src_allow_list = [str(s) for s in allowed_sources if s] if allowed_sources is not None else None
+        if allowed_sources is not None and not src_allow_list:
+            return None
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN;")
+            meta = None
+            if src_allow_list is None or key.data_source in src_allow_list:
+                meta = conn.execute(
+                    "SELECT * FROM ohlcv_series WHERE series_id = ? AND bar_count > 0",
+                    (key.series_id,),
+                ).fetchone()
+            if meta is None and src_allow_list:
+                placeholders = ",".join("?" for _ in src_allow_list)
+                meta = conn.execute(
+                    f"""
+                    SELECT * FROM ohlcv_series
+                    WHERE asset_class = ? AND symbol = ? AND interval = ? AND adjust_kind = ?
+                      AND data_source IN ({placeholders}) AND bar_count > 0
+                    ORDER BY last_synced_at_utc DESC
+                    LIMIT 1
+                    """,
+                    (key.asset_class, key.symbol, key.interval, key.adjust_kind, *src_allow_list),
+                ).fetchone()
+            if meta is None:
+                conn.execute("COMMIT;")
+                return None
+            resolved_sid = str(meta["series_id"])
+            rows = conn.execute(
+                "SELECT * FROM ohlcv_bars WHERE series_id = ? ORDER BY bar_key ASC",
+                (resolved_sid,),
+            ).fetchall()
+            conn.execute("COMMIT;")
+        finally:
+            conn.close()
+
+        intraday = str(meta["interval"]) != "1d"
+        df_all = self._reconstruct_dataframe(rows, str(meta["tz_name"] or ""), intraday=intraday)
+        if df_all.empty:
+            return None
+        try:
+            qual = json.loads(meta["quality_json"] or "{}")
+        except ValueError:
+            qual = {}
+
+        sliced = self._slice_analysis_window(
+            df_all, interval=key.interval, period=period, max_bars=max_bars
+        )
+        if sliced.empty:
+            return None
+
+        first_sliced_key = str(sliced["_bar_key"].iloc[0])
+        prior_dropped = [
+            str(k) for k in (qual.get("dropped_bar_keys") or []) if str(k) >= first_sliced_key
+        ]
+        unclosed_keys = {
+            str(k)
+            for k, cl in zip(sliced["_bar_key"].tolist(), sliced["_is_closed"].tolist(), strict=True)
+            if not bool(cl)
+        }
+        eff_anchor = str(meta["timestamp_anchor"] or timestamp_anchor)
+        _, sliced_qual = sanitize_and_grade_ohlcv(
+            sliced[["Open", "High", "Low", "Close", "Volume"]].assign(
+                High=sliced["_raw_high"], Low=sliced["_raw_low"]
+            ),
+            asset_class=key.asset_class,
+            interval=key.interval,
+            timestamp_anchor=eff_anchor,
+            fetched_at=parse_utc_iso(str(sliced["_fetched_at_utc"].iloc[-1])),
+            now_utc=ref_now,
+            inherited_dropped_keys=prior_dropped,
+            force_unclosed_bar_keys=unclosed_keys,
+        )
+        return sliced, sliced_qual, {
+            "cache_status": "stale_fallback",
+            "sync_mode": "sqlite_stale_fallback",
+            "series_id": resolved_sid,
+            "data_source": str(meta["data_source"]),
+            "timestamp_anchor": eff_anchor,
+            "generation": int(meta["generation"]),
+            "last_synced_at_utc": meta["last_synced_at_utc"],
+        }
+
     def _load_bar_map(self, series_id: str) -> dict[str, sqlite3.Row]:
         conn = self._connect()
         try:
@@ -1169,19 +1362,24 @@ class DeskDataStore:
         finally:
             conn.close()
 
-    def _load_full_series(self, series_id: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+    def _load_series_snapshot_atomic(
+        self, series_id: str
+    ) -> tuple[sqlite3.Row | None, pd.DataFrame, dict[str, Any]]:
         conn = self._connect()
         try:
+            conn.execute("BEGIN;")
             meta = conn.execute(
                 "SELECT * FROM ohlcv_series WHERE series_id = ?",
                 (series_id,),
             ).fetchone()
             if meta is None:
-                return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"]), {}
+                conn.execute("COMMIT;")
+                return None, pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"]), {}
             rows = conn.execute(
                 "SELECT * FROM ohlcv_bars WHERE series_id = ? ORDER BY bar_key ASC",
                 (series_id,),
             ).fetchall()
+            conn.execute("COMMIT;")
         finally:
             conn.close()
         intraday = str(meta["interval"]) != "1d"
@@ -1190,6 +1388,10 @@ class DeskDataStore:
             qual = json.loads(meta["quality_json"] or "{}")
         except ValueError:
             qual = {}
+        return meta, df, qual
+
+    def _load_full_series(self, series_id: str) -> tuple[pd.DataFrame, dict[str, Any]]:
+        _, df, qual = self._load_series_snapshot_atomic(series_id)
         return df, qual
 
     def _update_series_quality(self, series_id: str, quality: dict[str, Any]) -> None:
@@ -1315,7 +1517,7 @@ class DeskDataStore:
         finally:
             conn.close()
 
-    def _replace_full_series(
+    def _replace_full_series_with_status(
         self,
         key: SeriesKey,
         full_df: pd.DataFrame,
@@ -1324,17 +1526,22 @@ class DeskDataStore:
         timestamp_anchor: str,
         covered_days: int,
         synced_at_iso: str,
-    ) -> int:
+        expected_generation: int | None = None,
+        preserve_newer_unclosed: bool = False,
+        fallback_unclosed_sources: tuple[str, ...] | list[str] | None = None,
+    ) -> tuple[int, bool, bool]:
+        """Atomically replace a series and return ``(generation, applied, preserved_newer_unclosed)``."""
         intraday = key.interval != "1d"
         bar_tuples = self._df_to_bar_tuples(key.series_id, full_df, intraday=intraday)
         tz_name = self._extract_tz_name(full_df.index)
         closed_keys = [t[1] for t in bar_tuples if t[14] == 1]
+        new_max_key = str(bar_tuples[-1][1]) if bar_tuples else None
 
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE;")
             cur = conn.execute(
-                "SELECT generation, latest_closed_bar_key FROM ohlcv_series WHERE series_id = ?",
+                "SELECT generation, latest_bar_key, latest_closed_bar_key FROM ohlcv_series WHERE series_id = ?",
                 (key.series_id,),
             ).fetchone()
             next_gen = (int(cur["generation"]) + 1) if cur is not None else 1
@@ -1348,7 +1555,60 @@ class DeskDataStore:
                 and str(new_max_closed) < str(cur["latest_closed_bar_key"])
             ):
                 conn.execute("ROLLBACK;")
-                return int(cur["generation"])
+                return int(cur["generation"]), False, False
+
+            # Also prevent a racing stale fetch (older generation) from wiping either a newer
+            # unclosed/provisional bar OR a fresher same-day quote committed by a winning concurrent writer,
+            # unless this write strictly advances latest_closed_bar_key.
+            advances_closed = bool(
+                new_max_closed
+                and (not cur["latest_closed_bar_key"] or str(new_max_closed) > str(cur["latest_closed_bar_key"]))
+            ) if cur is not None else False
+            if (
+                cur is not None
+                and expected_generation is not None
+                and int(cur["generation"]) != expected_generation
+                and not advances_closed
+                and cur["latest_bar_key"]
+                and new_max_key
+                and str(new_max_key) <= str(cur["latest_bar_key"])
+            ):
+                conn.execute("ROLLBACK;")
+                return int(cur["generation"]), False, False
+
+            preserved_rows: list[tuple[Any, ...]] = []
+            if preserve_newer_unclosed and new_max_key is not None:
+                # Scan BOTH current series_id and all declared fallback_unclosed_sources so a newer
+                # provisional bar (e.g. 11-26 in primary) is never shadowed by an older 11-25 bar in fallback.
+                candidate_sources: list[str] = [key.data_source]
+                for s in (fallback_unclosed_sources or ()):
+                    s_str = str(s)
+                    if s_str and s_str not in candidate_sources:
+                        candidate_sources.append(s_str)
+                placeholders = ",".join("?" for _ in candidate_sources)
+                cand_rows = conn.execute(
+                    f"""
+                    SELECT b.bar_key, b.bar_ts_iso, b.open, b.high, b.low, b.close, b.volume,
+                           b.raw_high, b.raw_low, b.envelope_repaired, b.is_flat,
+                           b.bar_end_utc, b.fetched_at_utc, b.is_closed
+                    FROM ohlcv_bars AS b
+                    INNER JOIN ohlcv_series AS s ON s.series_id = b.series_id
+                    WHERE s.asset_class = ? AND s.symbol = ? AND s.interval = ? AND s.adjust_kind = ?
+                      AND s.data_source IN ({placeholders})
+                      AND b.is_closed = 0 AND b.bar_key > ?
+                    ORDER BY b.bar_key ASC, b.fetched_at_utc DESC, s.last_synced_at_utc DESC
+                    """,
+                    (key.asset_class, key.symbol, key.interval, key.adjust_kind, *candidate_sources, new_max_key),
+                ).fetchall()
+                by_bar_key: dict[str, tuple[Any, ...]] = {}
+                for r in cand_rows:
+                    bk = str(r["bar_key"])
+                    if bk not in by_bar_key:
+                        by_bar_key[bk] = (key.series_id, *tuple(r))
+                preserved_rows = [by_bar_key[k] for k in sorted(by_bar_key)]
+
+            final_tuples = [*bar_tuples, *preserved_rows]
+            preserved_flag = bool(preserved_rows)
 
             conn.execute(
                 """
@@ -1381,9 +1641,9 @@ class DeskDataStore:
                     tz_name,
                     timestamp_anchor,
                     next_gen,
-                    len(bar_tuples),
-                    bar_tuples[0][1] if bar_tuples else None,
-                    bar_tuples[-1][1] if bar_tuples else None,
+                    len(final_tuples),
+                    final_tuples[0][1] if final_tuples else None,
+                    final_tuples[-1][1] if final_tuples else None,
                     new_max_closed,
                     covered_days,
                     synced_at_iso,
@@ -1399,16 +1659,36 @@ class DeskDataStore:
                     raw_high, raw_low, envelope_repaired, is_flat, bar_end_utc, fetched_at_utc, is_closed
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                bar_tuples,
+                final_tuples,
             )
             conn.execute("COMMIT;")
-            return next_gen
+            return next_gen, True, preserved_flag
         except BaseException:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute("ROLLBACK;")
             raise
         finally:
             conn.close()
+
+    def _replace_full_series(
+        self,
+        key: SeriesKey,
+        full_df: pd.DataFrame,
+        quality: dict[str, Any],
+        *,
+        timestamp_anchor: str,
+        covered_days: int,
+        synced_at_iso: str,
+    ) -> int:
+        gen, _, _ = self._replace_full_series_with_status(
+            key,
+            full_df,
+            quality,
+            timestamp_anchor=timestamp_anchor,
+            covered_days=covered_days,
+            synced_at_iso=synced_at_iso,
+        )
+        return gen
 
     def _commit_intraday_window(
         self,

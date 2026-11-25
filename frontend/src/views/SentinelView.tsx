@@ -76,6 +76,7 @@ export function SentinelView({
   /* Dialog states */
   const [initOpen, setInitOpen] = useState(false);
   const [openPosModal, setOpenPosModal] = useState(false);
+  const [openSeed, setOpenSeed] = useState<OpenPositionSeed | undefined>(undefined);
   const [trailTarget, setTrailTarget] = useState<{
     positionId: string;
     symbol: string;
@@ -91,6 +92,7 @@ export function SentinelView({
     lastPrice?: number | null;
     reason?: string;
   } | null>(null);
+  const [voidTarget, setVoidTarget] = useState<Position | null>(null);
 
   const loadAbortRef = useRef<AbortController | null>(null);
   const loadReqIdRef = useRef(0);
@@ -234,7 +236,14 @@ export function SentinelView({
             <span>巡检观察池</span>
           </button>
           {portfolio?.initialized ? (
-            <button type="button" className="btn btn-primary" onClick={() => setOpenPosModal(true)}>
+            <button
+              type="button"
+              className="btn btn-primary"
+              onClick={() => {
+                setOpenSeed(undefined);
+                setOpenPosModal(true);
+              }}
+            >
               <PlusCircle className="h-3.5 w-3.5" aria-hidden="true" />
               <span>新增持仓</span>
             </button>
@@ -542,6 +551,17 @@ export function SentinelView({
                           <ArrowLeftRight className="h-3 w-3 text-muted" aria-hidden="true" />
                           <span>换龙头</span>
                         </button>
+                        {canVoidMistakenPosition(pos) ? (
+                          <button
+                            type="button"
+                            className="btn btn-sm"
+                            title="误填价格或手数时无损作废重填（不结算虚假盈亏、不扣减本金）"
+                            onClick={() => setVoidTarget(pos)}
+                          >
+                            <RotateCcw className="h-3 w-3 text-muted" aria-hidden="true" />
+                            <span>误录重填</span>
+                          </button>
+                        ) : null}
                         <button
                           type="button"
                           className="btn btn-sm btn-danger"
@@ -870,8 +890,12 @@ export function SentinelView({
       <InitPortfolioDialog open={initOpen} onClose={() => setInitOpen(false)} onSuccess={handleMutationSuccess} />
       <OpenPositionDialog
         open={openPosModal}
-        onClose={() => setOpenPosModal(false)}
+        onClose={() => {
+          setOpenPosModal(false);
+          setOpenSeed(undefined);
+        }}
         onSuccess={handleMutationSuccess}
+        seed={openSeed}
         accountCurrency={summary?.base_currency}
       />
       <TrailStopDialog
@@ -907,6 +931,17 @@ export function SentinelView({
         position={closeTarget?.position ?? null}
         lastPrice={closeTarget?.lastPrice}
         defaultReason={closeTarget?.reason}
+        onSwitchToVoid={(pos) => setVoidTarget(pos)}
+      />
+      <VoidPositionDialog
+        open={voidTarget !== null}
+        onClose={() => setVoidTarget(null)}
+        onSuccess={handleMutationSuccess}
+        position={voidTarget}
+        onReopenSeed={(seed) => {
+          setOpenSeed(seed);
+          setOpenPosModal(true);
+        }}
       />
     </div>
   );

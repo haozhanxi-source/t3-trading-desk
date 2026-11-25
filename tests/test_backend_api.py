@@ -1623,6 +1623,67 @@ def test_fx_reference_daily_usd_cny_and_cross_rates(client: TestClient, monkeypa
     assert b5["usd_cny"] == 7.2
 
 
+def test_portfolio_void_mistaken_entry_preserves_equity_and_rejects_trimmed(client: TestClient):
+    client.post(
+        "/api/portfolio/init",
+        json={"equity": 1_000_000.0, "base_currency": "USD", "default_risk_per_trade_pct": 3.0},
+    )
+
+    # 1. Open a mistaken position (e.g. NI0 typed at 150000 instead of 115210)
+    r_open = client.post(
+        "/api/portfolio/positions/open",
+        json={
+            "symbol": "NI0",
+            "direction": "long",
+            "sector_theme": "民族资源主义",
+            "entry_price": 150_000.0,
+            "tactical_stop_30m": 140_000.0,
+            "quantity": 19,
+            "fx_to_account": 0.150179,
+        },
+    )
+    assert r_open.status_code == 200
+    pid = r_open.json()["position"]["position_id"]
+
+    # 2. Void it cleanly: equity stays 1,000,000, closed_positions_count stays 0, sector slot freed
+    r_void = client.post(f"/api/portfolio/positions/{pid}/void", json={"reason": "误填入场价 150000，作废重录"})
+    assert r_void.status_code == 200
+    assert r_void.json()["status"] == "voided"
+
+    summary_res = client.get("/api/portfolio/summary").json()
+    assert summary_res["summary"]["equity"] == 1_000_000.0
+    assert summary_res["summary"]["open_positions_count"] == 0
+    assert summary_res["summary"]["closed_positions_count"] == 0
+    assert any(j.get("action") == "void" and j.get("position_id") == pid for j in summary_res["journal"])
+
+    # 3. Re-open NI0 with corrected entry/stop succeeds immediately in the same sector
+    r_reopen = client.post(
+        "/api/portfolio/positions/open",
+        json={
+            "symbol": "NI0",
+            "direction": "long",
+            "sector_theme": "民族资源主义",
+            "entry_price": 115_210.0,
+            "tactical_stop_30m": 114_000.0,
+            "quantity": 19,
+            "fx_to_account": 0.150179,
+        },
+    )
+    assert r_reopen.status_code == 200
+    pid2 = r_reopen.json()["position"]["position_id"]
+
+    # 4. Once trimmed (partial PnL booked), voiding is forbidden (422)
+    r_trim = client.post(
+        f"/api/portfolio/positions/{pid2}/trim",
+        json={"trim_price": 116_000.0, "trim_quantity": 5, "reason": "partial"},
+    )
+    assert r_trim.status_code == 200
+    r_void_fail = client.post(f"/api/portfolio/positions/{pid2}/void", json={"reason": "try void after trim"})
+    assert r_void_fail.status_code == 422
+    assert "void_requires_untrimmed_initial_position" in r_void_fail.json()["detail"]
+
+
+
     # Conflicting market vs market_override fails loudly with 422
     assert client.get("/api/research/archive", params={"symbol": "PWR", "market": "FX", "market_override": "US"}).status_code == 422
 

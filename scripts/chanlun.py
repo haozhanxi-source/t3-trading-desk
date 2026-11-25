@@ -897,13 +897,12 @@ def build_segments(strokes: list[Stroke]) -> list[Segment]:
 
 
 def _is_valid_entering_unit(enter: Stroke | Segment, zd: float, zg: float) -> bool:
-    """Verify the entering unit genuinely enters [ZD, ZG] from its directional side.
+    """Project heuristic verifying the entering unit genuinely enters [ZD, ZG] from its side.
 
-    Uses midline penetration (`mid = (zd + zg) / 2`) so that:
-    - Upward entry ('up') starts below mid and rises to/above mid.
-    - Downward entry ('down') starts above mid and drops to/below mid.
-    Rejects unrelated or opposite-side prior swings so a major trend leg is never swallowed
-    as b1 of an inverted Zhongshu, while still accepting minor reversal overshoots.
+    Note: The original Chanlun texts define entering direction without a fixed midline threshold;
+    this midline-penetration heuristic (`mid = (zd + zg) / 2`) prevents unrelated opposite-side
+    swings from swallowing a major trend leg as `b1` of an inverted Zhongshu, while still
+    accepting minor reversal overshoots.
     """
     mid = (zd + zg) / 2.0
     if enter.direction == "up":
@@ -971,15 +970,21 @@ def _scan_zhongshu_extension(
         uj = units[j]
         if not uj.is_confirmed:
             break
-        if uj.low <= zg and uj.high >= zd:
-            overlapping.append(uj)
-            j += 1
-        else:
-            if uj.low > zg:
-                status = "broken_up"
-            elif uj.high < zd:
-                status = "broken_down"
+        # Lesson 20 strict 3rd-buy/3rd-sell boundary rule:
+        # - Upward breakout confirmed if next unit stays strictly above ZG OR is a downward retest
+        #   touching ZG without breaking below it (low == ZG, high > ZG).
+        # - Downward breakdown confirmed if next unit stays strictly below ZD OR is an upward retest
+        #   touching ZD without breaking above it (high == ZD, low < ZD).
+        is_3b_break = uj.low > zg or (uj.direction == "down" and uj.low == zg and uj.high > zg)
+        is_3s_break = uj.high < zd or (uj.direction == "up" and uj.high == zd and uj.low < zd)
+        if is_3b_break:
+            status = "broken_up"
             break
+        if is_3s_break:
+            status = "broken_down"
+            break
+        overlapping.append(uj)
+        j += 1
 
     if overlapping:
         if status in ("broken_up", "broken_down"):
@@ -1002,7 +1007,7 @@ def _scan_zhongshu_extension(
     else:
         ext_stage = "extended"
         nine_date = None
-    return j, status, osc_count, osc_end_date, round(osc_dd, 4), round(osc_gg, 4), ext_stage, nine_date
+    return j, status, osc_count, osc_end_date, round(osc_dd, 6), round(osc_gg, 6), ext_stage, nine_date
 
 
 def _detect_unit_zhongshus(units: Sequence[Stroke | Segment]) -> list[Zhongshu]:
@@ -1047,14 +1052,19 @@ def _detect_unit_zhongshus(units: Sequence[Stroke | Segment]) -> list[Zhongshu]:
             units, i + 3, zd, zg, dd, gg
         )
 
-        curr_eff_dd = osc_dd if osc_dd is not None else dd
-        curr_eff_gg = osc_gg if osc_gg is not None else gg
+        # Normalize stored precision once (6 dp preserves FX sub-pip separation) before classifying relation
+        zd_r = round(zd, 6)
+        zg_r = round(zg, 6)
+        dd_r = round(dd, 6)
+        gg_r = round(gg, 6)
+        curr_eff_dd = osc_dd if osc_dd is not None else dd_r
+        curr_eff_gg = osc_gg if osc_gg is not None else gg_r
 
         trend_idx = 1
         relation = "initial"
         if zhongshus:
             prev_z = zhongshus[-1]
-            relation = _classify_zhongshu_relation(prev_z, zd, zg, curr_eff_dd, curr_eff_gg)
+            relation = _classify_zhongshu_relation(prev_z, zd_r, zg_r, curr_eff_dd, curr_eff_gg)
             if relation == "new_up":
                 trend_idx = (prev_z.trend_zs_index + 1) if last_trend_dir == "up" else 1
                 last_trend_dir = "up"
@@ -1077,10 +1087,10 @@ def _detect_unit_zhongshus(units: Sequence[Stroke | Segment]) -> list[Zhongshu]:
             Zhongshu(
                 zs_id=zs_id,
                 direction=enter_dir,
-                zd=round(zd, 4),
-                zg=round(zg, 4),
-                dd=round(dd, 4),
-                gg=round(gg, 4),
+                zd=zd_r,
+                zg=zg_r,
+                dd=dd_r,
+                gg=gg_r,
                 start_date=start_date,
                 end_date=end_date,
                 stroke_count=3,
@@ -1138,10 +1148,16 @@ def select_active_zhongshus(
     if needs_upgrade and segment_zss:
         latest_seg = segment_zss[-1]
         seg_reach = latest_seg.oscillation_end_date or latest_seg.end_date
+        # Segment Zhongshu must cover at least the 9-stroke upgrade date / active extension horizon
+        st_upgrade_anchor = (
+            latest_st.nine_upgrade_date
+            or latest_st.oscillation_end_date
+            or latest_st.end_date
+        )
         seg_dd, seg_gg = _effective_extremes(latest_seg)
         st_dd, st_gg = _effective_extremes(latest_st)
         price_overlaps = seg_dd <= st_gg and seg_gg >= st_dd
-        if _ts_ge(seg_reach, latest_st.end_date) and price_overlaps:
+        if _ts_ge(seg_reach, st_upgrade_anchor) and price_overlaps:
             reason = "九段升级" if latest_st.is_nine_upgrade else "震荡拓宽升级"
             return "segment", f"{tf}一级线段中枢({reason})", segment_zss
 
@@ -1395,11 +1411,14 @@ def classify_chanlun_signals(
         zhongshu_level_label = f"{timeframe_label}笔中枢"
     signals: list[str] = []
 
-    # 1. Macro structure from Zhongshu sequence (distinguish standard trend vs 中枢扩张 vs 中枢扩展)
+    # 1. Macro structure from Zhongshu sequence (reuse detector's stored relation for single source of truth)
     if len(zhongshus) >= 2:
         z_prev, z_curr = zhongshus[-2], zhongshus[-1]
-        curr_dd, curr_gg = _effective_extremes(z_curr)
-        rel = _classify_zhongshu_relation(z_prev, z_curr.zd, z_curr.zg, curr_dd, curr_gg)
+        if z_curr.relation_to_prev in ("new_up", "new_down", "expansion_up", "expansion_down", "overlap"):
+            rel = z_curr.relation_to_prev
+        else:
+            curr_dd, curr_gg = _effective_extremes(z_curr)
+            rel = _classify_zhongshu_relation(z_prev, z_curr.zd, z_curr.zg, curr_dd, curr_gg)
         if rel == "new_up":
             macro_structure = "双中枢上涨趋势"
         elif rel == "expansion_up":
@@ -1438,7 +1457,9 @@ def classify_chanlun_signals(
     curr = strokes[-1] if strokes else None
     prev_same = [s for s in strokes[:-1] if curr and s.direction == curr.direction]
 
-    # 3. Lesson 14 Direction-aware First-Zhongshu Third Buy / Third Sell check
+    # 3. Lesson 14 Direction-aware First-Zhongshu Third Buy / Third Sell check (Lesson 20 boundary-touch inclusive)
+    is_nonfirst_3b = False
+    is_nonfirst_3s = False
     if latest_zs:
         is_nonfirst_3b = latest_zs.trend_zs_index >= 2 and latest_zs.relation_to_prev in ("new_up", "initial")
         is_nonfirst_3s = latest_zs.trend_zs_index >= 2 and latest_zs.relation_to_prev in ("new_down", "initial")
@@ -1456,7 +1477,7 @@ def classify_chanlun_signals(
         u_curr = unit_seq[-1]
         if u_curr.direction == "down":
             prev_up = unit_seq[-2]
-            if prev_up.direction == "up" and prev_up.high > latest_zs.zg and u_curr.low > latest_zs.zg:
+            if prev_up.direction == "up" and prev_up.high > latest_zs.zg and u_curr.low >= latest_zs.zg:
                 has_3b = True
                 if frac_just_confirmed and latest_frac and latest_frac.kind == "bottom":
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag_3b}三买确认(回踩不破ZG={latest_zs.zg}+底分型)")
@@ -1465,12 +1486,12 @@ def classify_chanlun_signals(
             elif not u_curr.is_confirmed and len(unit_seq) >= 3:
                 prev_rebound = unit_seq[-2]
                 prev_break = unit_seq[-3]
-                if prev_rebound.direction == "up" and prev_break.direction == "down" and prev_break.low < latest_zs.zd and prev_rebound.high < latest_zs.zd:
+                if prev_rebound.direction == "up" and prev_break.direction == "down" and prev_break.low < latest_zs.zd and prev_rebound.high <= latest_zs.zd:
                     has_3s = True
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag_3s}三卖确认(反抽不过ZD={latest_zs.zd}·顶分型下行)")
         elif u_curr.direction == "up":
             prev_dn = unit_seq[-2]
-            if prev_dn.direction == "down" and prev_dn.low < latest_zs.zd and u_curr.high < latest_zs.zd:
+            if prev_dn.direction == "down" and prev_dn.low < latest_zs.zd and u_curr.high <= latest_zs.zd:
                 has_3s = True
                 if frac_just_confirmed and latest_frac and latest_frac.kind == "top":
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag_3s}三卖确认(反抽不过ZD={latest_zs.zd}+顶分型)")
@@ -1479,7 +1500,7 @@ def classify_chanlun_signals(
             elif not u_curr.is_confirmed and len(unit_seq) >= 3:
                 prev_pullback = unit_seq[-2]
                 prev_break = unit_seq[-3]
-                if prev_pullback.direction == "down" and prev_break.direction == "up" and prev_break.high > latest_zs.zg and prev_pullback.low > latest_zs.zg:
+                if prev_pullback.direction == "down" and prev_break.direction == "up" and prev_break.high > latest_zs.zg and prev_pullback.low >= latest_zs.zg:
                     has_3b = True
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag_3b}三买确认(回踩不破ZG={latest_zs.zg}·底分型上攻)")
 
@@ -1546,7 +1567,7 @@ def classify_chanlun_signals(
 
     # 5. Lesson 8/13/15: 恃强凌弱 (找大哥) + 3出 / 4出 / 2+3 + 2买/2卖
     if len(strokes) >= 3 and curr:
-        if curr.direction == "down" and prev_same:
+        if curr.direction == "down" and prev_same and not (has_3b and is_nonfirst_3b):
             prev_dn = prev_same[-1]
             prev_up = strokes[-2]
             # Higher low pullback (底抬高) -> potential D3 (3出) or D4 (4出) / 二买
@@ -1557,14 +1578,14 @@ def classify_chanlun_signals(
                 # Distinguish D3 (first higher low after down leg) vs D4 (2nd higher low / post-ZS)
                 is_d4 = bool(latest_zs and _ts_ge(latest_zs.end_date, prev_dn.start_date) and len(prev_same) >= 2 and prev_same[-1].end_price > prev_same[-2].end_price)
                 out_tag = "4出(D4)" if is_d4 else "3出(D3·首次底抬高)"
-                mode_tag = "2+3买" if has_3b else "二买"
+                mode_tag = "2+3买" if (has_3b and not is_nonfirst_3b) else "二买"
                 trig_ok = bool(stroke_end_trigger and stroke_end_trigger.get("triggered"))
                 if (frac_just_confirmed and latest_frac and latest_frac.kind == "bottom") or trig_ok:
                     strong_note = "+找大哥(多强空弱)" if brother_strong else ""
                     signals.append(f"{timeframe_label}{out_tag}/{mode_tag}确认(回踩不破前低{prev_dn.end_price}{strong_note})")
                 elif latest_zs and curr.end_price >= latest_zs.zd:
                     signals.append(f"{timeframe_label}{out_tag}蓄势(不破前低{prev_dn.end_price}·等底分型/破反向阳线)")
-        elif curr.direction == "up" and prev_same:
+        elif curr.direction == "up" and prev_same and not (has_3s and is_nonfirst_3s):
             prev_up = prev_same[-1]
             prev_dn = strokes[-2]
             if curr.end_price < prev_up.end_price:
@@ -1572,7 +1593,7 @@ def classify_chanlun_signals(
                 brother_strong = bool(prior_dn and (prev_dn.low < prior_dn[-1].low or abs(prev_dn.pct_change) > abs(curr.pct_change)))
                 is_d4 = bool(latest_zs and _ts_ge(latest_zs.end_date, prev_up.start_date) and len(prev_same) >= 2 and prev_same[-1].end_price < prev_same[-2].end_price)
                 out_tag = "4出(D4)空" if is_d4 else "3出(D3·首次顶降低)"
-                mode_tag = "2+3卖" if has_3s else "二卖"
+                mode_tag = "2+3卖" if (has_3s and not is_nonfirst_3s) else "二卖"
                 trig_ok = bool(stroke_end_trigger and stroke_end_trigger.get("triggered"))
                 if (frac_just_confirmed and latest_frac and latest_frac.kind == "top") or trig_ok:
                     strong_note = "+空强多弱" if brother_strong else ""
@@ -1588,7 +1609,7 @@ def classify_chanlun_signals(
                 pm_tag = _mom_ratio_tag(prev_mom)
                 kind_label = "趋势背驰" if macro_structure == "双中枢下跌趋势" else "盘整背驰"
                 signals.append(f"{timeframe_label}{kind_label}+底分型启动(一买/盘背·{last_opp.strength_class}类笔·{pm_tag})")
-            elif last_opp.end_price > prev_opp.end_price and (frac_just_confirmed and latest_frac and latest_frac.kind == "bottom"):
+            elif last_opp.end_price > prev_opp.end_price and (frac_just_confirmed and latest_frac and latest_frac.kind == "bottom") and not (has_3b and is_nonfirst_3b):
                 if not any("3出" in s or "4出" in s or "二买" in s for s in signals):
                     signals.append(f"{timeframe_label}3出(D3)/二买启动(不破前低{prev_opp.end_price}+底分型)")
         elif curr.direction == "down" and last_opp.direction == "up" and prev_opp.direction == "up":
@@ -1596,7 +1617,7 @@ def classify_chanlun_signals(
                 pm_tag = _mom_ratio_tag(prev_mom)
                 kind_label = "趋势背驰" if macro_structure == "双中枢上涨趋势" else "盘整背驰"
                 signals.append(f"{timeframe_label}{kind_label}+顶分型启动(一卖/盘背·{last_opp.strength_class}类笔·{pm_tag})")
-            elif last_opp.end_price < prev_opp.end_price and (frac_just_confirmed and latest_frac and latest_frac.kind == "top"):
+            elif last_opp.end_price < prev_opp.end_price and (frac_just_confirmed and latest_frac and latest_frac.kind == "top") and not (has_3s and is_nonfirst_3s):
                 if not any("3出" in s or "4出" in s or "二卖" in s for s in signals):
                     signals.append(f"{timeframe_label}3出(D3)/二卖启动(不过前高{prev_opp.end_price}+顶分型)")
 
@@ -1906,7 +1927,7 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
     signal_type = "neutral"
     direction = "neutral"
 
-    if has_2p3_buy or has_first_zs_3b:
+    if (has_2p3_buy and not has_nonfirst_3b) or has_first_zs_3b:
         tier = "买卖点信号"
         summary = f"{tf}首中枢三买 / 2+3买结构"
         action_bias = f"回踩不破首中枢上沿 ZG 配合{tf}底分型/破反向阳线，顺势做多"
@@ -1914,7 +1935,7 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
         direction = "long"
         confirmed = True
         momentum_confirmed = bool(regime_strong_up or (d_cons and d_dir == "up" and not has_neutral_or_weak_regime))
-    elif has_2p3_sell or has_first_zs_3s:
+    elif (has_2p3_sell and not has_nonfirst_3s) or has_first_zs_3s:
         tier = "买卖点信号"
         summary = f"{tf}首中枢三卖 / 2+3卖结构"
         action_bias = "反抽不过首中枢下沿 ZD 配合顶分型/破反向阴线，顺势减仓或做空"
@@ -1922,7 +1943,7 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
         direction = "short"
         confirmed = True
         momentum_confirmed = bool(regime_strong_down or (d_cons and d_dir == "down" and not has_neutral_or_weak_regime))
-    elif has_d3_d4_sell or has_1s_2s:
+    elif (has_d3_d4_sell or has_1s_2s) and not has_nonfirst_3s:
         tier = "买卖点信号"
         summary = f"{tf} 3出/4出/一二卖结构触发"
         action_bias = "反弹不过前高配合顶分型或破反向阴线，顺势减仓/做空"
@@ -1930,7 +1951,7 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
         direction = "short"
         confirmed = True
         momentum_confirmed = bool(regime_strong_down or (d_cons and d_dir == "down" and not has_neutral_or_weak_regime))
-    elif has_d3_d4_buy or has_1b_2b:
+    elif (has_d3_d4_buy or has_1b_2b) and not has_nonfirst_3b:
         tier = "买卖点信号"
         summary = f"{tf} 3出/4出/一二买结构触发"
         action_bias = "围绕底抬高与破反向阳线触发，结合前低防守评估中长线建仓"

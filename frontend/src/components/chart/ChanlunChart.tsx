@@ -154,10 +154,10 @@ export function ChanlunChart({
   );
   const tableZhongshuBoxes = useMemo(
     () => [
-      ...prepared.strokeZhongshuBoxes.slice(-6),
-      ...prepared.segmentZhongshuBoxes.slice(-6),
+      ...(showStrokeZhongshu ? prepared.strokeZhongshuBoxes.slice(-6) : []),
+      ...(showSegmentZhongshu ? prepared.segmentZhongshuBoxes.slice(-6) : []),
     ],
-    [prepared.strokeZhongshuBoxes, prepared.segmentZhongshuBoxes],
+    [prepared.strokeZhongshuBoxes, prepared.segmentZhongshuBoxes, showStrokeZhongshu, showSegmentZhongshu],
   );
   const dynamicFormats = useMemo(() => computeSeriesPriceFormat(prepared.bars), [prepared.bars]);
 

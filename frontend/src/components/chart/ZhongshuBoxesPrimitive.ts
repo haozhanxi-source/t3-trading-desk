@@ -250,14 +250,15 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
             ctx.stroke();
             ctx.setLineDash([]);
 
-            /* Optional 9-unit upgrade milestone tick inside the extension tail */
-            if (box.nineX !== null && box.nineX > eLeft + 4 && box.nineX < eRight - 4) {
+            /* 9-unit upgrade milestone tick inside (or exactly at the right edge of) the extension tail */
+            if (box.nineX !== null && box.nineX >= eLeft + 2 && box.nineX <= eRight + 0.5) {
+              const tickX = Math.min(eRight, box.nineX);
               ctx.strokeStyle = pal.warning;
-              ctx.lineWidth = 1;
+              ctx.lineWidth = 1.25;
               ctx.setLineDash([2, 2]);
               ctx.beginPath();
-              ctx.moveTo(box.nineX, top + 1);
-              ctx.lineTo(box.nineX, bottom - 1);
+              ctx.moveTo(tickX, top + 1);
+              ctx.lineTo(tickX, bottom - 1);
               ctx.stroke();
               ctx.setLineDash([]);
             }

@@ -1361,6 +1361,149 @@ class TestChanlunEngine(unittest.TestCase):
         self.assertEqual(z_seq[2].relation_to_prev, "new_up")
         self.assertEqual(z_seq[2].trend_zs_index, 2)
 
+    def test_codex_audit_regressions_nonfirst_2p3_stale_seg_precision_and_edge_touch(self):
+        from chanlun import (
+            Fractal,
+            MergedBar,
+            Stroke,
+            Zhongshu,
+            classify_chanlun_signals,
+            select_active_zhongshus,
+        )
+
+        def mk_st(idx: int, direction: str, sp: float, ep: float, sd: str, ed: str, conf: bool = True) -> Stroke:
+            return Stroke(
+                direction=direction,
+                start_date=sd,
+                end_date=ed,
+                start_price=sp,
+                end_price=ep,
+                high=max(sp, ep),
+                low=min(sp, ep),
+                start_merged_idx=idx * 4,
+                end_merged_idx=idx * 4 + 4,
+                start_raw_idx=idx * 4,
+                end_raw_idx=idx * 4 + 4,
+                raw_bars=5,
+                pct_change=round((ep / sp - 1.0) * 100.0, 2),
+                macd_area=10.0,
+                macd_peak=2.0,
+                dif_extreme=1.0 if direction == "up" else -1.0,
+                efficiency=1.0,
+                avg_vol_ratio=1.0,
+                is_confirmed=conf,
+            )
+
+        # 1) Non-first Zhongshu 3B must NOT be bypassed by 2+3买 / confirmed_buy on a higher-low retest
+        z_second_up = Zhongshu(
+            zs_id=2, direction="up", zd=100.0, zg=110.0, dd=98.0, gg=112.0,
+            start_date="2026-01-01", end_date="2026-01-10", stroke_count=3,
+            is_extended=False, status="broken_up", trend_zs_index=2, relation_to_prev="new_up",
+        )
+        strokes_nonfirst = [
+            mk_st(0, "up", 102.0, 125.0, "2026-01-10", "2026-01-15"),
+            mk_st(1, "down", 125.0, 115.0, "2026-01-15", "2026-01-18"),
+            mk_st(2, "up", 115.0, 132.0, "2026-01-18", "2026-01-22"),
+            mk_st(3, "down", 132.0, 120.0, "2026-01-22", "2026-01-26"),
+        ]
+        merged_stub = [
+            MergedBar(k, 125.0, 120.0, 122.0, 123.0, 100.0, k, k, "2026-01-26", "2026-01-26", k, "2026-01-26", k, "2026-01-26")
+            for k in range(5)
+        ]
+        bot_frac = Fractal("bottom", 3, 122.0, 120.0, 120.0, 3, "2026-01-26", 4, "2026-01-27", "strong")
+        _, _, sigs_nf = classify_chanlun_signals(
+            last_close=121.0,
+            timeframe_label="日线",
+            merged=merged_stub,
+            fractals=[bot_frac],
+            pivots=[bot_frac],
+            strokes=strokes_nonfirst,
+            zhongshus=[z_second_up],
+            momentum={},
+        )
+        self.assertTrue(any("非首中枢三买确认" in s for s in sigs_nf), msg=sigs_nf)
+        self.assertFalse(any("2+3买" in s for s in sigs_nf), msg=sigs_nf)
+        tier_nf = evaluate_signal_tier(
+            {"timeframe": "日线", "signals": sigs_nf, "momentum_assessment": {}},
+            timeframe_label="日线",
+        )
+        self.assertEqual(tier_nf["signal_meta"]["signal_type"], "exhaustion_buy_warn")
+        self.assertFalse(tier_nf["signal_meta"]["confirmed"])
+        self.assertTrue(tier_nf["signal_meta"]["is_exhaustion"])
+
+        # 2) Stale Segment Zhongshu ending Jan 07 must NOT override a Stroke Zhongshu upgraded Jan 16..20
+        st_upgraded = Zhongshu(
+            zs_id=3, direction="up", zd=100.0, zg=110.0, dd=98.0, gg=112.0,
+            start_date="2026-01-01", end_date="2026-01-04", stroke_count=3,
+            is_extended=True, status="active", oscillation_strokes=8,
+            oscillation_end_date="2026-01-20", oscillation_dd=97.0, oscillation_gg=114.0,
+            is_nine_upgrade=True, extension_stage="upgraded_9", nine_upgrade_date="2026-01-16",
+        )
+        seg_stale = Zhongshu(
+            zs_id=1, direction="up", zd=101.0, zg=109.0, dd=99.0, gg=111.0,
+            start_date="2025-12-15", end_date="2026-01-07", stroke_count=3,
+            is_extended=False, status="broken_up",
+        )
+        lvl_stale, _, chosen_stale = select_active_zhongshus([st_upgraded], [seg_stale], [], timeframe_label="日线")
+        self.assertEqual(lvl_stale, "stroke")
+        self.assertEqual(chosen_stale[0].zs_id, 3)
+
+        # 3) Sub-4dp FX precision: Z1.zg=1.000040 vs Z2.zd=1.000047 stays consistent between detector and signals
+        fx_strokes = [
+            mk_st(0, "up", 0.999000, 1.000060, "2026-01-01", "2026-01-02"),
+            mk_st(1, "down", 1.000060, 0.999900, "2026-01-02", "2026-01-03"),
+            mk_st(2, "up", 0.999900, 1.000040, "2026-01-03", "2026-01-04"),
+            mk_st(3, "down", 1.000040, 0.999920, "2026-01-04", "2026-01-05"),  # Z1 [0.999920, 1.000040], gg=1.000060
+            mk_st(4, "up", 0.999920, 1.000200, "2026-01-05", "2026-01-06"),    # leaves Z1
+            mk_st(5, "down", 1.000200, 1.000047, "2026-01-06", "2026-01-07"),  # 3B > 1.000040
+            mk_st(6, "up", 1.000047, 1.000180, "2026-01-07", "2026-01-08"),
+            mk_st(7, "down", 1.000180, 1.000050, "2026-01-08", "2026-01-09"),  # Z2 [1.000050, 1.000180], dd=1.000047 <= 1.000060
+        ]
+        fx_zss = detect_zhongshus(fx_strokes, last_close=1.000100)
+        self.assertEqual(len(fx_zss), 2)
+        self.assertEqual(fx_zss[1].relation_to_prev, "expansion_up")
+        macro_fx, _, _ = classify_chanlun_signals(
+            last_close=1.000100,
+            timeframe_label="日线",
+            merged=[],
+            fractals=[],
+            pivots=[],
+            strokes=fx_strokes,
+            zhongshus=fx_zss,
+            momentum={},
+        )
+        self.assertEqual(macro_fx, "上涨中枢扩张(震荡升级)")
+
+        # 4) Lesson 20 boundary-touch retest: core [9, 12], up 9->14, down 14->12 (touches ZG without entering)
+        touch_up = [
+            mk_st(0, "up", 6.0, 12.0, "2026-01-01", "2026-01-02"),
+            mk_st(1, "down", 12.0, 9.0, "2026-01-02", "2026-01-03"),
+            mk_st(2, "up", 9.0, 12.0, "2026-01-03", "2026-01-04"),
+            mk_st(3, "down", 12.0, 9.0, "2026-01-04", "2026-01-05"),  # core [9, 12]
+            mk_st(4, "up", 9.0, 14.0, "2026-01-05", "2026-01-06"),    # leaving stroke up
+            mk_st(5, "down", 14.0, 12.0, "2026-01-06", "2026-01-07"), # exact touch ZG=12 -> broken_up
+        ]
+        z_touch_up = detect_zhongshus(touch_up, last_close=12.5)
+        self.assertEqual(len(z_touch_up), 1)
+        self.assertEqual(z_touch_up[0].status, "broken_up")
+        self.assertFalse(z_touch_up[0].is_extended)
+        self.assertEqual(z_touch_up[0].oscillation_strokes, 0)
+
+        # Symmetric downward boundary-touch retest: core [9, 12], down 12->7, up 7->9 (touches ZD=9)
+        touch_dn = [
+            mk_st(0, "down", 15.0, 9.0, "2026-01-01", "2026-01-02"),
+            mk_st(1, "up", 9.0, 12.0, "2026-01-02", "2026-01-03"),
+            mk_st(2, "down", 12.0, 9.0, "2026-01-03", "2026-01-04"),
+            mk_st(3, "up", 9.0, 12.0, "2026-01-04", "2026-01-05"),    # core [9, 12]
+            mk_st(4, "down", 12.0, 7.0, "2026-01-05", "2026-01-06"),  # leaving stroke down
+            mk_st(5, "up", 7.0, 9.0, "2026-01-06", "2026-01-07"),     # exact touch ZD=9 -> broken_down
+        ]
+        z_touch_dn = detect_zhongshus(touch_dn, last_close=8.5)
+        self.assertEqual(len(z_touch_dn), 1)
+        self.assertEqual(z_touch_dn[0].status, "broken_down")
+        self.assertFalse(z_touch_dn[0].is_extended)
+        self.assertEqual(z_touch_dn[0].oscillation_strokes, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

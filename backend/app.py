@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime, timezone
@@ -51,8 +52,11 @@ CORS_ORIGINS = [
     "http://localhost:8055",
 ]
 SSE_HEARTBEAT_SECONDS = 15.0
+TTL_FX_REFERENCE_SECONDS = 3600.0
 FRONTEND_DIST = os.path.join(ROOT_DIR, "frontend", "dist")
 PERIOD_PATTERN = r"^(\d+(d|wk|mo|y)|ytd|max)$"
+_USD_BASE_FX_CCYS = {"CNY", "CNH", "HKD", "JPY", "CAD", "CHF", "SGD", "KRW", "TWD", "MXN", "INR"}
+_CCY_BASE_FX_CCYS = {"EUR", "GBP", "AUD", "NZD"}
 
 Direction = Literal["long", "short"]
 
@@ -128,6 +132,11 @@ class CloseReq(_Strict):
     exit_reason: str
     exit_category: str = "manual"
     update_account_equity: bool = True
+    idempotency_key: str | None = None
+
+
+class VoidReq(_Strict):
+    reason: str = "误录作废"
     idempotency_key: str | None = None
 
 
@@ -290,6 +299,144 @@ def ok(data: Any, status_code: int = 200, headers: dict[str, str] | None = None)
 
 def _cache_headers(hit: bool) -> dict[str, str]:
     return {"X-Cache": "HIT" if hit else "MISS"}
+
+
+def _get_fx_usd_leg(currency: str, *, refresh: bool = False) -> dict[str, Any]:
+    """Return USD value per 1 unit of ``currency`` from cached daily FX bars."""
+    ccy = currency.strip().upper()
+    if ccy == "USD":
+        return {
+            "currency": "USD",
+            "available": True,
+            "usd_per_unit": 1.0,
+            "units_per_usd": 1.0,
+            "as_of_date": None,
+            "pair_symbol": "USD",
+            "source": "identity",
+        }
+
+    key = ("fx_usd_leg", ccy)
+    if not refresh:
+        hit, cached = CACHE.get(key)
+        if hit and isinstance(cached, dict):
+            return cached
+
+    if ccy in _USD_BASE_FX_CCYS:
+        pair_symbol = f"USD{ccy}=X"
+        invert = True
+    elif ccy in _CCY_BASE_FX_CCYS:
+        pair_symbol = f"{ccy}USD=X"
+        invert = False
+    else:
+        return {"currency": ccy, "available": False, "error": f"Unsupported FX reference currency: {ccy}"}
+
+    snap_kw: dict[str, Any] = {
+        "period": "1mo",
+        "include_macro": False,
+        "include_fundamentals": False,
+        "full_chanlun": False,
+        "include_intraday": False,
+    }
+    if refresh and "refresh" in inspect.signature(market_snapshot.get_snapshot).parameters:
+        snap_kw["refresh"] = True
+
+    snap = market_snapshot.get_snapshot(pair_symbol, **snap_kw)
+    tech = snap.get("technicals") if isinstance(snap, dict) else None
+    raw_close = tech.get("last_close") if isinstance(tech, dict) else None
+    try:
+        spot = float(raw_close) if raw_close is not None else float("nan")
+    except (TypeError, ValueError):
+        spot = float("nan")
+
+    if not math.isfinite(spot) or spot <= 0:
+        err_msg = snap.get("error") if isinstance(snap, dict) else None
+        out = {
+            "currency": ccy,
+            "available": False,
+            "pair_symbol": pair_symbol,
+            "error": str(err_msg or f"Unavailable spot quote for {pair_symbol}"),
+        }
+        CACHE.set(key, out, 15.0)
+        return out
+
+    usd_per_unit = (1.0 / spot) if invert else spot
+    units_per_usd = spot if invert else (1.0 / spot)
+    as_of = str(tech.get("as_of_bar") or "").strip()[:10] or None
+    source_raw = str(snap.get("data_source") or "market_snapshot")
+    out = {
+        "currency": ccy,
+        "available": True,
+        "usd_per_unit": usd_per_unit,
+        "units_per_usd": units_per_usd,
+        "as_of_date": as_of,
+        "pair_symbol": pair_symbol,
+        "source": f"{source_raw} ({pair_symbol})",
+    }
+    CACHE.set(key, out, TTL_FX_REFERENCE_SECONDS)
+    return out
+
+
+def _build_fx_reference(quote_currency: str, account_currency: str, *, refresh: bool = False) -> dict[str, Any]:
+    q = (quote_currency or "CNY").strip().upper()
+    a = (account_currency or "USD").strip().upper()
+    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    cny_leg = _get_fx_usd_leg("CNY", refresh=refresh)
+    usd_cny = round(float(cny_leg["units_per_usd"]), 4) if cny_leg.get("available") else None
+    cny_usd = round(float(cny_leg["usd_per_unit"]), 6) if cny_leg.get("available") else None
+    usd_cny_date = cny_leg.get("as_of_date")
+
+    if q == a:
+        return {
+            "quote_currency": q,
+            "account_currency": a,
+            "available": True,
+            "fx_to_account": 1.0,
+            "account_to_quote": 1.0,
+            "usd_cny": usd_cny,
+            "cny_usd": cny_usd,
+            "as_of_date": usd_cny_date,
+            "source": "identity",
+            "fetched_at_utc": now_iso,
+        }
+
+    q_leg = cny_leg if q == "CNY" else _get_fx_usd_leg(q, refresh=refresh)
+    a_leg = cny_leg if a == "CNY" else _get_fx_usd_leg(a, refresh=refresh)
+    if not q_leg.get("available") or not a_leg.get("available"):
+        return {
+            "quote_currency": q,
+            "account_currency": a,
+            "available": False,
+            "fx_to_account": None,
+            "account_to_quote": None,
+            "usd_cny": usd_cny,
+            "cny_usd": cny_usd,
+            "as_of_date": usd_cny_date,
+            "source": cny_leg.get("source") if cny_leg.get("available") else None,
+            "error": q_leg.get("error") or a_leg.get("error") or "FX reference unavailable",
+            "fetched_at_utc": now_iso,
+        }
+
+    raw_fx = float(q_leg["usd_per_unit"]) / float(a_leg["usd_per_unit"])
+    raw_inv = float(a_leg["usd_per_unit"]) / float(q_leg["usd_per_unit"])
+    dates = [d for d in (q_leg.get("as_of_date"), a_leg.get("as_of_date"), usd_cny_date) if d]
+    sources = [
+        str(s)
+        for s in (q_leg.get("source"), a_leg.get("source"))
+        if s and s != "identity"
+    ]
+    return {
+        "quote_currency": q,
+        "account_currency": a,
+        "available": True,
+        "fx_to_account": round(raw_fx, 6),
+        "account_to_quote": round(raw_inv, 4),
+        "usd_cny": usd_cny,
+        "cny_usd": cny_usd,
+        "as_of_date": max(dates) if dates else None,
+        "source": " / ".join(dict.fromkeys(sources)) if sources else "identity",
+        "fetched_at_utc": now_iso,
+    }
 
 
 def portfolio_initialized() -> bool:
@@ -549,6 +696,25 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         CACHE.set(key, bundle, ttl)
         return ok(bundle, headers=_cache_headers(False))
 
+    @app.get("/api/fx/reference")
+    def fx_reference(
+        quote: str = Query("CNY", min_length=3, max_length=6),
+        account: str = Query("USD", min_length=3, max_length=6),
+        refresh: bool = False,
+    ):
+        q_ccy = quote.strip().upper()
+        a_ccy = account.strip().upper()
+        key = ("fx_reference", q_ccy, a_ccy)
+        if not refresh:
+            hit, cached = CACHE.get(key)
+            if hit:
+                return ok(cached, headers=_cache_headers(True))
+
+        bundle = _build_fx_reference(q_ccy, a_ccy, refresh=refresh)
+        ttl = TTL_FX_REFERENCE_SECONDS if bundle.get("available") else 15.0
+        CACHE.set(key, bundle, ttl)
+        return ok(bundle, headers=_cache_headers(False))
+
     # ----------------------------------------------------------------- screen 1: portfolio & sentinel
     @app.get("/api/portfolio/summary")
     def portfolio_summary():
@@ -579,6 +745,10 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     @app.post("/api/portfolio/positions/{position_id}/close")
     def portfolio_close(position_id: str, req: CloseReq):
         return portfolio_call(pm.close_position, position_id=position_id, **req.model_dump(exclude_none=True))
+
+    @app.post("/api/portfolio/positions/{position_id}/void")
+    def portfolio_void(position_id: str, req: VoidReq):
+        return portfolio_call(pm.void_position, position_id=position_id, **req.model_dump(exclude_none=True))
 
     @app.post("/api/portfolio/positions/{position_id}/rotate")
     def portfolio_rotate(position_id: str, req: RotateReq):

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "instrument": {
+    "market": "CN_FUTURES",
+    "symbol": "NI0",
+    "name": "沪镍",
+    "asset_class": "cn_future",
+    "subtype": "",
+    "cik": null
+  },
+  "status": "watchlist",
+  "direction_bias": "neutral",
+  "layer1_drivers": {
+    "primary": "印尼政策",
+    "secondary": ""
+  },
+  "thesis_summary": "待补充核心论点",
+  "chanlun_anchors": {
+    "as_of_bar": null,
+    "zhongshu_level": null,
+    "zd": null,
+    "zg": null,
+    "tactical_stop": null,
+    "structural_invalidation": null,
+    "target_zone": null
+  },
+  "valuation_or_balance": {},
+  "triggers": [],
+  "pending_verifications": [],
+  "events": [],
+  "source_watermarks": {},
+  "created_at_utc": "2026-11-25 03:00 UTC",
+  "updated_at_utc": "2026-11-25 03:00 UTC"
+}

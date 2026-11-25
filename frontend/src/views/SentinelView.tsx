@@ -9,6 +9,7 @@ import {
   History,
   PlusCircle,
   RefreshCw,
+  RotateCcw,
   Scissors,
   Shield,
   TrendingUp,
@@ -17,12 +18,15 @@ import {
 import { api, errorMessage } from "../api/client";
 import type { PortfolioSummaryResponse, Position, SentinelHolding, SentinelResponse, UpcomingEvent } from "../api/types";
 import {
+  canVoidMistakenPosition,
   ClosePositionDialog,
   InitPortfolioDialog,
   OpenPositionDialog,
+  type OpenPositionSeed,
   RotatePositionDialog,
   TrailStopDialog,
   TrimPositionDialog,
+  VoidPositionDialog,
 } from "../components/portfolio/PortfolioDialogs";
 import {
   DirectionBadge,
@@ -36,10 +40,16 @@ import { getSymbolName } from "../lib/symbols";
 
 const JOURNAL_ACTION_ZH: Record<string, string> = {
   init_account: "初始化账本",
+  open: "建仓入账",
   open_position: "建仓入账",
+  add_on_profit: "浮盈顺势加仓",
   trail_stop: "收紧保护止损",
+  trim: "分批减仓",
   trim_position: "分批减仓",
+  close: "清仓了结",
   close_position: "清仓了结",
+  void: "误录无损作废",
+  void_position: "误录无损作废",
   rotate_leader: "原子龙头换仓",
   leader_rotation: "原子龙头换仓",
 };

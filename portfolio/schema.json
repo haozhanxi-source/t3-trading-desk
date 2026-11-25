@@ -244,7 +244,7 @@
         "timestamp_utc": { "type": "string" },
         "action": {
           "type": "string",
-          "enum": ["open", "add_on_profit", "trail_stop", "rotate_leader", "trim", "close"]
+          "enum": ["open", "add_on_profit", "trail_stop", "rotate_leader", "trim", "close", "void"]
         },
         "leg": { "type": "string", "enum": ["close_old_leader", "open_new_leader"] },
         "rotation_id": { "type": "string" },

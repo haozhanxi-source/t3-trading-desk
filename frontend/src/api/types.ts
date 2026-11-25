@@ -15,6 +15,20 @@ export interface HealthResponse {
   now_utc: string;
 }
 
+export interface FxReferenceResponse {
+  quote_currency: string;
+  account_currency: string;
+  available: boolean;
+  fx_to_account: number | null;
+  account_to_quote: number | null;
+  usd_cny: number | null;
+  cny_usd: number | null;
+  as_of_date: string | null;
+  source?: string | null;
+  error?: string | null;
+  fetched_at_utc?: string;
+}
+
 export interface SymbolSearchItem {
   symbol: string;
   label: string;
@@ -54,8 +68,13 @@ export interface Position {
   sector_theme: string;
   leader_role?: "sole_leader" | "co_leader" | string;
   co_leader_reason?: string | null;
-  entry_price: number;
+  entry_price?: number;
+  avg_entry_price?: number;
   quantity: number;
+  initial_quantity?: number;
+  fx_to_account?: number;
+  partial_realized_pnl?: number;
+  tranches?: unknown[];
   tactical_stop_30m?: number | null;
   structural_stop_daily?: number | null;
   target_price?: number | null;
@@ -157,6 +176,10 @@ export interface CloseBody {
   exit_price: number;
   exit_reason: string;
   exit_category?: string;
+}
+
+export interface VoidBody {
+  reason?: string;
 }
 
 export interface RotateNewPositionBody {

@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "revision": 2,
+  "instrument": {
+    "market": "FX",
+    "symbol": "AUDUSD=X",
+    "name": "澳元美元 AUD/USD",
+    "asset_class": "fx",
+    "subtype": "fx_commodity_currency",
+    "cik": null
+  },
+  "status": "watchlist",
+  "direction_bias": "short",
+  "layer1_drivers": {
+    "primary": "宏观双核与美澳政策利差边际拐点（维度1）",
+    "secondary": "中国内需收缩与铁矿石贸易条件恶化（维度4）+ 高Beta资金流（维度6）"
+  },
+  "thesis_summary": "美澳政策利差边际拐点逆转（RBA加息至4.85%后10月就业骤减43,500、失业率跳至4.9%被迫停火 vs Fed因黏性通胀仍偏鹰）叠加中国地产收缩与铁矿跌至$90.67/吨，中期看空澳元；但因11/25澳洲CPI、12/8-9双央行及资管净空-48.82% OI拥挤，暂定待观察，等待30min右侧破位或反抽高盈亏比卖点，同时备选无美元Beta交叉盘EURAUD做多。",
+  "chanlun_anchors": {
+    "as_of_bar": "2026-11-23",
+    "zhongshu_level": "stroke",
+    "zd": 0.6924,
+    "zg": 0.7029,
+    "tactical_stop": 0.6659,
+    "structural_invalidation": 0.6924,
+    "target_zone": [
+      0.62,
+      0.64
+    ]
+  },
+  "valuation_or_balance": {
+    "rba_cash_rate_pct": 4.85,
+    "fed_funds_pct": 3.88,
+    "policy_spread_au_minus_us_bp": 97,
+    "annualized_short_carry_pct": -0.97,
+    "cftc_asset_mgr_net_pct_oi": -48.82,
+    "cftc_lev_funds_net_pct_oi": 10.15,
+    "iron_ore_62_cfr_usd_t": 90.67
+  },
+  "triggers": [
+    {
+      "id": "trig_30m_entry",
+      "category": "chanlun",
+      "metric": "audusd_30m_close",
+      "operator": "<",
+      "threshold": 0.663,
+      "action": "30min收盘跌破0.6630且确认不破0.6659顶分型后，等11/25澳洲CPI落地评估轻仓试探"
+    },
+    {
+      "id": "trig_daily_falsify",
+      "category": "chanlun",
+      "metric": "audusd_daily_close",
+      "operator": ">",
+      "threshold": 0.6924,
+      "action": "日线收盘重回主中枢下沿ZD上方，空头结构证伪"
+    },
+    {
+      "id": "trig_us10y_falsify",
+      "category": "rate_diff",
+      "metric": "us10y_yield",
+      "operator": "<",
+      "threshold": 4.6,
+      "action": "美债10Y跌破4.60%（Fed转鸽），直盘空头逻辑证伪"
+    },
+    {
+      "id": "trig_vix_falsify",
+      "category": "macro",
+      "metric": "vix",
+      "operator": "<",
+      "threshold": 24.0,
+      "action": "VIX回落至24下方，Risk-Off溢价消退警惕轧空"
+    },
+    {
+      "id": "trig_iron_ore_falsify",
+      "category": "supply_demand",
+      "metric": "iron_ore_62_cfr",
+      "operator": ">",
+      "threshold": 105.0,
+      "action": "62%铁矿石重返$105/t上方，澳洲贸易条件恶化逻辑证伪"
+    }
+  ],
+  "pending_verifications": [],
+  "events": [
+    {
+      "date": "2026-11-25",
+      "title": "ABS Australia Oct Monthly CPI (11:30 AEDT)"
+    },
+    {
+      "date": "2026-12-01",
+      "title": "RBA Gov Bullock ABE Dinner Speech"
+    },
+    {
+      "date": "2026-12-03",
+      "title": "ABS Australia Q3 2026 GDP"
+    },
+    {
+      "date": "2026-12-08",
+      "title": "RBA Monetary Policy Decision (4.85%)"
+    },
+    {
+      "date": "2026-12-09",
+      "title": "FOMC Rate Decision & Dot Plot"
+    }
+  ],
+  "source_watermarks": {},
+  "created_at_utc": "2026-11-23 15:10 UTC",
+  "updated_at_utc": "2026-11-23 15:11 UTC"
+}

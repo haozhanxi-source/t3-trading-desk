@@ -5,6 +5,7 @@ import type {
   ArchiveState,
   CloseBody,
   EvidenceItem,
+  FxReferenceResponse,
   HealthResponse,
   MarketDualResponse,
   OpenPositionBody,
@@ -22,6 +23,7 @@ import type {
   TrailStopBody,
   TrimBody,
   UniversePool,
+  VoidBody,
   WarehouseSummary,
 } from "./types";
 
@@ -115,6 +117,16 @@ export const api = {
   health: (signal?: AbortSignal) => get<HealthResponse>("/health", undefined, signal),
   macroSnapshot: (refresh = false, signal?: AbortSignal) =>
     get<{ macro_context: Record<string, unknown>; fetched_at_utc?: string }>("/macro/snapshot", { refresh }, signal),
+  fxReference: (q: { quote: string; account: string; refresh?: boolean }, signal?: AbortSignal) =>
+    get<FxReferenceResponse>(
+      "/fx/reference",
+      {
+        quote: q.quote,
+        account: q.account,
+        refresh: q.refresh ?? false,
+      },
+      signal,
+    ),
   searchSymbols: (q: string, limit = 30, signal?: AbortSignal) =>
     get<{ items: SymbolSearchItem[] }>("/symbols/search", { q, limit }, signal),
 
@@ -128,6 +140,8 @@ export const api = {
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/trim`, body),
   closePosition: (id: string, body: CloseBody) =>
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/close`, body),
+  voidPosition: (id: string, body: VoidBody = {}) =>
+    post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/void`, body),
   rotatePosition: (id: string, body: RotatePositionBody) =>
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/rotate`, body),
   sentinel: (

@@ -3,6 +3,7 @@ import { api, errorMessage } from "../../api/client";
 import type { Direction, OpenPositionBody, Position } from "../../api/types";
 import { fmtInputPrice, fmtPlanNum, fmtPrice, inferAssetCurrency, optNum, parseSymbolList } from "../../lib/format";
 import { formatSymbolWithCode } from "../../lib/symbols";
+import { CrossCurrencyFxBanner } from "../ui/CrossCurrencyFxBanner";
 import { ModalDialog } from "../ui/ModalDialog";
 
 /* ------------------------------------------------------------------
@@ -147,12 +148,29 @@ export interface OpenPositionSeed {
   symbol?: string;
   direction?: Direction;
   sector_theme?: string;
+  leader_role?: "sole_leader" | "co_leader";
+  co_leader_reason?: string | null;
   entry_price?: number | null;
   tactical_stop_30m?: number | null;
   structural_stop_daily?: number | null;
   target_price?: number | null;
   quantity?: number | null;
   fx_to_account?: number | null;
+  macro_factors?: string[];
+  exit_red_lines?: string[];
+  notes?: string | null;
+}
+
+export function canVoidMistakenPosition(pos: Position | null | undefined): boolean {
+  if (!pos || (pos.status && pos.status !== "open")) return false;
+  const tranches = Array.isArray(pos.tranches) ? pos.tranches : [];
+  if (tranches.length > 1) return false;
+  const partialPnl = typeof pos.partial_realized_pnl === "number" ? pos.partial_realized_pnl : 0;
+  if (Math.abs(partialPnl) > 1e-9) return false;
+  if (typeof pos.initial_quantity === "number" && Math.abs(pos.quantity - pos.initial_quantity) > 1e-9) {
+    return false;
+  }
+  return true;
 }
 
 export function OpenPositionDialog({
@@ -190,17 +208,17 @@ export function OpenPositionDialog({
     setSymbol(seed?.symbol ?? "");
     setDirection(seed?.direction ?? "long");
     setSectorTheme(seed?.sector_theme ?? "");
-    setLeaderRole("sole_leader");
-    setCoLeaderReason("");
+    setLeaderRole(seed?.leader_role === "co_leader" ? "co_leader" : "sole_leader");
+    setCoLeaderReason(seed?.co_leader_reason ?? "");
     setEntryPrice(seed?.entry_price != null ? fmtPlanNum(seed.entry_price, 6) : "");
     setStop30m(seed?.tactical_stop_30m != null ? fmtPlanNum(seed.tactical_stop_30m, 6) : "");
     setStopDaily(seed?.structural_stop_daily != null ? fmtPlanNum(seed.structural_stop_daily, 6) : "");
     setTargetPrice(seed?.target_price != null ? fmtPlanNum(seed.target_price, 6) : "");
     setQuantity(seed?.quantity != null && seed.quantity > 0 ? fmtPlanNum(seed.quantity, 6) : "");
     setFxToAccount(seed?.fx_to_account != null && seed.fx_to_account > 0 ? fmtPlanNum(seed.fx_to_account, 6) : "");
-    setMacroFactors("");
-    setRedLines("");
-    setNotes("");
+    setMacroFactors((seed?.macro_factors ?? []).join(", "));
+    setRedLines((seed?.exit_red_lines ?? []).join("\n"));
+    setNotes(seed?.notes ?? "");
     setErr(null);
   }, [open, seed]);
 
@@ -331,25 +349,16 @@ export function OpenPositionDialog({
           </label>
         </div>
 
-        {needsCrossFx ? (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-ink">
-            <span>
-              跨币种必填：报价币 <strong>{quoteCcy}</strong> → 账户币 <strong>{acctCcy}</strong>
-            </span>
-            <label className="inline-flex items-center gap-1.5">
-              <span className="font-mono text-[11px] text-muted">1 {quoteCcy} =</span>
-              <input
-                className="input h-7 w-28 font-mono"
-                type="number"
-                step="any"
-                min="0.000001"
-                required
-                placeholder={`? ${acctCcy}`}
-                value={fxToAccount}
-                onChange={(e) => setFxToAccount(e.target.value)}
-              />
-            </label>
-          </div>
+        {needsCrossFx && quoteCcy ? (
+          <CrossCurrencyFxBanner
+            symbol={symbol}
+            quoteCurrency={quoteCcy}
+            accountCurrency={acctCcy}
+            value={fxToAccount}
+            onChange={setFxToAccount}
+            required
+            enabled={open}
+          />
         ) : null}
 
         {leaderRole === "co_leader" ? (
@@ -373,6 +382,7 @@ export function OpenPositionDialog({
               type="number"
               step="any"
               required
+              autoFocus={Boolean(seed?.symbol && seed?.sector_theme && seed?.entry_price == null)}
               value={entryPrice}
               onChange={(e) => setEntryPrice(e.target.value)}
             />
@@ -646,7 +656,8 @@ export function TrimPositionDialog({
 
   useEffect(() => {
     if (!open || !position) return;
-    setTrimPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(position.entry_price, 6));
+    const entryRef = position.avg_entry_price ?? position.entry_price;
+    setTrimPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(entryRef, 6));
     setTrimQty(String(Math.max(1, Math.floor(position.quantity / 2))));
     setReason("指标松动/分批止盈减仓");
     setErr(null);
@@ -683,7 +694,7 @@ export function TrimPositionDialog({
       open={open}
       onClose={onClose}
       title={`分批减仓 · ${formatSymbolWithCode(position?.symbol)}`}
-      subtitle={`当前持仓数量：${position?.quantity ?? "—"} · 入场均价：${fmtPrice(position?.entry_price)}`}
+      subtitle={`当前持仓数量：${position?.quantity ?? "—"} · 入场均价：${fmtPrice(position?.avg_entry_price ?? position?.entry_price)}`}
     >
       <form onSubmit={submit} className="flex flex-col gap-3.5 p-5">
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -770,7 +781,8 @@ export function RotatePositionDialog({
 
   useEffect(() => {
     if (!open || !position) return;
-    setExitPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(position.entry_price, 6));
+    const entryRef = position.avg_entry_price ?? position.entry_price;
+    setExitPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(entryRef, 6));
     setExitReason("原龙头动能弱化，原子切换至同板块新引领龙头");
     setNewSymbol("");
     setNewDirection(position.direction || "long");
@@ -958,19 +970,16 @@ export function RotatePositionDialog({
             </label>
           </div>
 
-          {needsCrossFx ? (
-            <label className="field">
-              <span>跨币种汇率 (1 {quoteCcy} = ? {acctCcy}) *</span>
-              <input
-                className="input font-mono"
-                type="number"
-                step="any"
-                min="0.000001"
-                required
-                value={fxToAccount}
-                onChange={(e) => setFxToAccount(e.target.value)}
-              />
-            </label>
+          {needsCrossFx && quoteCcy ? (
+            <CrossCurrencyFxBanner
+              symbol={newSymbol}
+              quoteCurrency={quoteCcy}
+              accountCurrency={acctCcy}
+              value={fxToAccount}
+              onChange={setFxToAccount}
+              required
+              enabled={open}
+            />
           ) : null}
         </div>
 
@@ -1003,6 +1012,7 @@ export function ClosePositionDialog({
   position,
   lastPrice,
   defaultReason,
+  onSwitchToVoid,
 }: {
   open: boolean;
   onClose: () => void;
@@ -1010,6 +1020,7 @@ export function ClosePositionDialog({
   position: Position | null;
   lastPrice?: number | null;
   defaultReason?: string;
+  onSwitchToVoid?: (pos: Position) => void;
 }) {
   const [exitPrice, setExitPrice] = useState("");
   const [exitReason, setExitReason] = useState("");
@@ -1019,7 +1030,8 @@ export function ClosePositionDialog({
 
   useEffect(() => {
     if (!open || !position) return;
-    setExitPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(position.entry_price, 6));
+    const entryRef = position.avg_entry_price ?? position.entry_price;
+    setExitPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(entryRef, 6));
     setExitReason(defaultReason || "触发撤离红线或逻辑松动果断平仓");
     setExitCategory("red_line_exit");
     setErr(null);
@@ -1058,6 +1070,24 @@ export function ClosePositionDialog({
       subtitle="逻辑或关键指标松动绝不硬扛，结算盈亏并释放板块龙头席位"
     >
       <form onSubmit={submit} className="flex flex-col gap-3.5 p-5">
+        {canVoidMistakenPosition(position) && onSwitchToVoid && position ? (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-ink">
+            <span>
+              <strong>不小心填错入场价或手数了？</strong>请勿按市价平仓（会误扣账本净值），可无损作废后重填。
+            </span>
+            <button
+              type="button"
+              className="chip py-0.5 text-[11px] font-medium"
+              onClick={() => {
+                onClose();
+                onSwitchToVoid(position);
+              }}
+            >
+              改用误录作废 / 重填
+            </button>
+          </div>
+        ) : null}
+
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <label className="field">
             <span>平仓结算价 *</span>
@@ -1107,6 +1137,137 @@ export function ClosePositionDialog({
           </button>
         </div>
       </form>
+    </ModalDialog>
+  );
+}
+
+/* ------------------------------------------------------------------
+ * 7. Void Mistaken Entry Dialog (/api/portfolio/positions/{id}/void)
+ * ------------------------------------------------------------------ */
+export function VoidPositionDialog({
+  open,
+  onClose,
+  onSuccess,
+  onReopenSeed,
+  position,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onSuccess: () => void;
+  onReopenSeed?: (seed: OpenPositionSeed) => void;
+  position: Position | null;
+}) {
+  const [reason, setReason] = useState("误录价格/手数，无损作废重填");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    setReason("误录价格/手数，无损作废重填");
+    setErr(null);
+  }, [open, position]);
+
+  const executeVoid = async (reopenForm: boolean) => {
+    if (!position) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const seedSnapshot: OpenPositionSeed = {
+        symbol: position.symbol,
+        direction: position.direction,
+        sector_theme: position.sector_theme,
+        leader_role: position.leader_role === "co_leader" ? "co_leader" : "sole_leader",
+        co_leader_reason: position.co_leader_reason ?? "",
+        entry_price: null,
+        tactical_stop_30m: null,
+        structural_stop_daily: position.structural_stop_daily ?? null,
+        target_price: position.target_price ?? null,
+        quantity: position.quantity,
+        fx_to_account: position.fx_to_account ?? null,
+        macro_factors: position.macro_factors ?? [],
+        exit_red_lines: (position.exit_red_lines ?? []).map((x) => String(x)),
+        notes: position.notes ?? "",
+      };
+      await api.voidPosition(position.position_id, {
+        reason: reason.trim() || "误录作废",
+      });
+      onSuccess();
+      onClose();
+      if (reopenForm && onReopenSeed) {
+        onReopenSeed(seedSnapshot);
+      }
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const entryRef = position?.avg_entry_price ?? position?.entry_price;
+
+  return (
+    <ModalDialog
+      open={open}
+      onClose={onClose}
+      title={`误录无损作废 · ${formatSymbolWithCode(position?.symbol)}`}
+      subtitle="仅限未发生加减仓的初始录入：不结算虚假盈亏、不扣减账本净值、不污染历史胜率"
+    >
+      <div className="flex flex-col gap-3.5 p-5">
+        <div className="metric-strip grid-cols-3">
+          <div className="metric-cell">
+            <span className="metric-label">当前误填入场价</span>
+            <span className="metric-val">{fmtPrice(entryRef)}</span>
+          </div>
+          <div className="metric-cell">
+            <span className="metric-label">当前 30m 止损</span>
+            <span className="metric-val">{fmtPrice(position?.tactical_stop_30m)}</span>
+          </div>
+          <div className="metric-cell">
+            <span className="metric-label">录入数量</span>
+            <span className="metric-val">{position?.quantity ?? "—"}</span>
+          </div>
+        </div>
+
+        <label className="field">
+          <span>作废审计备注</span>
+          <input
+            className="input"
+            name="void_reason"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+          />
+        </label>
+
+        {err ? (
+          <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
+            {err}
+          </div>
+        ) : null}
+
+        <div className="flex flex-wrap justify-end gap-2 border-t border-hairline pt-3">
+          <button type="button" className="btn" autoFocus onClick={onClose} disabled={busy}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="btn btn-danger"
+            disabled={busy}
+            onClick={() => void executeVoid(false)}
+          >
+            {busy ? "处理中…" : "仅作废移除"}
+          </button>
+          {onReopenSeed ? (
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={busy}
+              onClick={() => void executeVoid(true)}
+            >
+              {busy ? "处理中…" : "作废并重新填写价格"}
+            </button>
+          ) : null}
+        </div>
+      </div>
     </ModalDialog>
   );
 }

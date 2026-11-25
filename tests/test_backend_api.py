@@ -1557,6 +1557,72 @@ def test_research_archive_market_override_propagation(client: TestClient):
     assert loaded["state"]["revision"] == 2
     assert "Confirmed FX archive override." in loaded["thesis_md"]
 
+
+def test_fx_reference_daily_usd_cny_and_cross_rates(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    calls: list[str] = []
+
+    def fake_get_snapshot(symbol: str, **_kwargs: Any) -> dict[str, Any]:
+        calls.append(symbol)
+        quotes = {
+            "USDCNY=X": ("2026-11-25", 7.20),
+            "USDHKD=X": ("2026-11-24", 7.80),
+            "EURUSD=X": ("2026-11-25", 1.05),
+        }
+        if symbol not in quotes:
+            return {"symbol": symbol, "error": f"No data for {symbol}"}
+        bar_date, close_val = quotes[symbol]
+        return {
+            "symbol": symbol,
+            "data_source": "yfinance",
+            "technicals": {"as_of_bar": bar_date, "last_close": close_val},
+        }
+
+    monkeypatch.setattr(market_snapshot, "get_snapshot", fake_get_snapshot)
+
+    # 1. CNY -> USD returns both USD/CNY (7.20) and 1 CNY -> USD (0.138889)
+    r1 = client.get("/api/fx/reference", params={"quote": "CNY", "account": "USD"})
+    assert r1.status_code == 200
+    assert r1.headers.get("X-Cache") == "MISS"
+    b1 = r1.json()
+    assert b1["available"] is True
+    assert b1["usd_cny"] == 7.2
+    assert b1["cny_usd"] == pytest.approx(1.0 / 7.2, abs=1e-6)
+    assert b1["fx_to_account"] == pytest.approx(1.0 / 7.2, abs=1e-6)
+    assert b1["account_to_quote"] == 7.2
+    assert b1["as_of_date"] == "2026-11-25"
+
+    # 2. Second request hits cache without re-fetching
+    prev_calls = len(calls)
+    r2 = client.get("/api/fx/reference", params={"quote": "cny", "account": "usd"})
+    assert r2.status_code == 200
+    assert r2.headers.get("X-Cache") == "HIT"
+    assert len(calls) == prev_calls
+
+    # 3. HKD -> USD also includes the daily USD/CNY benchmark
+    r3 = client.get("/api/fx/reference", params={"quote": "HKD", "account": "USD"})
+    assert r3.status_code == 200
+    b3 = r3.json()
+    assert b3["available"] is True
+    assert b3["fx_to_account"] == pytest.approx(1.0 / 7.8, abs=1e-6)
+    assert b3["usd_cny"] == 7.2
+    assert b3["as_of_date"] == "2026-11-25"
+
+    # 4. EUR -> CNY cross rate via USD legs (1 EUR = 1.05 * 7.20 = 7.56 CNY)
+    r4 = client.get("/api/fx/reference", params={"quote": "EUR", "account": "CNY"})
+    assert r4.status_code == 200
+    b4 = r4.json()
+    assert b4["available"] is True
+    assert b4["fx_to_account"] == pytest.approx(7.56, abs=1e-6)
+
+    # 5. Unsupported currency fails gracefully with HTTP 200 available=False (never crashes dialog)
+    r5 = client.get("/api/fx/reference", params={"quote": "ZAR", "account": "USD"})
+    assert r5.status_code == 200
+    b5 = r5.json()
+    assert b5["available"] is False
+    assert b5["fx_to_account"] is None
+    assert b5["usd_cny"] == 7.2
+
+
     # Conflicting market vs market_override fails loudly with 422
     assert client.get("/api/research/archive", params={"symbol": "PWR", "market": "FX", "market_override": "US"}).status_code == 422
 

@@ -32,6 +32,7 @@ import {
 } from "../../lib/format";
 import type { PlanOverlayLines } from "../chart/ChanlunChart";
 import type { OpenPositionSeed } from "../portfolio/PortfolioDialogs";
+import { CrossCurrencyFxBanner } from "../ui/CrossCurrencyFxBanner";
 import { GateDecisionBadge, StatusBadge } from "../ui/StatusBadge";
 
 export type PickPriceField = "entry" | "stop30m" | "target";
@@ -260,6 +261,20 @@ export function TradePlannerCard({
     setManualQty("");
   }, [symbol]);
 
+  const pickValidDailyStop = (dir: Direction, refEntry: number | null | undefined): number | null => {
+    const candidates = [
+      align?.daily_structural_stop,
+      dir === "long" ? dailyZs?.zd : dailyZs?.zg,
+    ];
+    for (const c of candidates) {
+      if (typeof c !== "number" || !Number.isFinite(c) || c <= 0) continue;
+      if (refEntry == null || !Number.isFinite(refEntry)) return c;
+      if (dir === "long" && c < refEntry) return c;
+      if (dir === "short" && c > refEntry) return c;
+    }
+    return null;
+  };
+
   /* Auto-seed direction & stops when symbol or snapshot changes */
   useEffect(() => {
     invalidateInFlightAndPlan();
@@ -286,8 +301,7 @@ export function TradePlannerCard({
     const s30 = is30mSnapshot ? (align?.intraday_tactical_stop ?? null) : null;
     setStop30m(fmtInputPrice(s30));
 
-    const sDaily =
-      align?.daily_structural_stop ?? (nextDir === "long" ? dailyZs?.zd : dailyZs?.zg) ?? null;
+    const sDaily = pickValidDailyStop(nextDir, ep);
     setStopDaily(fmtInputPrice(sDaily));
 
     if (ep != null && s30 != null && ep !== s30) {
@@ -1021,6 +1035,13 @@ export function TradePlannerCard({
                 onClick={() => {
                   if (direction !== "long") {
                     setDirection("long");
+                    if (!live) {
+                      const curSd = optNum(stopDaily);
+                      const refEp = optNum(entryPrice) ?? lastClose;
+                      if (curSd != null && refEp != null && curSd >= refEp) {
+                        setStopDaily(fmtInputPrice(pickValidDailyStop("long", refEp)));
+                      }
+                    }
                     markStale();
                   }
                 }}
@@ -1034,6 +1055,13 @@ export function TradePlannerCard({
                 onClick={() => {
                   if (direction !== "short") {
                     setDirection("short");
+                    if (!live) {
+                      const curSd = optNum(stopDaily);
+                      const refEp = optNum(entryPrice) ?? lastClose;
+                      if (curSd != null && refEp != null && curSd <= refEp) {
+                        setStopDaily(fmtInputPrice(pickValidDailyStop("short", refEp)));
+                      }
+                    }
                     markStale();
                   }
                 }}
@@ -1393,32 +1421,17 @@ export function TradePlannerCard({
         </div>
 
         {/* Cross-Currency Banner surfaced immediately when required */}
-        {needsCrossCurrencyFx ? (
-          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-ink">
-            <span>
-              <strong>跨币种必填汇率：</strong>
-              {symbol} 报价币为 <strong>{inferredQuoteCurrency}</strong>，当前账户币为{" "}
-              <strong>{effectiveAcctCurrency}</strong>（如 CNY→USD 约 <code>0.138</code>）。
-            </span>
-            <label className="inline-flex items-center gap-1.5">
-              <span className="font-mono text-[11px] text-muted">
-                1 {inferredQuoteCurrency} =
-              </span>
-              <input
-                className="input h-7 w-28 font-mono"
-                type="number"
-                step="any"
-                min="0.000001"
-                placeholder={`? ${effectiveAcctCurrency}`}
-                value={fxToAccount}
-                onChange={(e) => {
-                  setFxToAccount(e.target.value);
-                  markStale();
-                }}
-              />
-              <span className="font-mono text-[11px] text-muted">{effectiveAcctCurrency}</span>
-            </label>
-          </div>
+        {needsCrossCurrencyFx && inferredQuoteCurrency ? (
+          <CrossCurrencyFxBanner
+            symbol={symbol}
+            quoteCurrency={inferredQuoteCurrency}
+            accountCurrency={effectiveAcctCurrency}
+            value={fxToAccount}
+            onChange={(val) => {
+              setFxToAccount(val);
+              markStale();
+            }}
+          />
         ) : null}
 
         {/* Progressive Disclosure: Secondary Risk Gates, Pair-Trade & Horizon */}

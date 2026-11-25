@@ -65,7 +65,7 @@ DEFAULT_DRAWDOWN_STEPS: list[dict[str, float]] = [
 ]
 
 VALID_LEADER_ROLES = {"sole_leader", "co_leader"}
-VALID_JOURNAL_ACTIONS = {"open", "add_on_profit", "trail_stop", "rotate_leader", "trim", "close"}
+VALID_JOURNAL_ACTIONS = {"open", "add_on_profit", "trail_stop", "rotate_leader", "trim", "close", "void"}
 
 _INPROC_LOCKS_GUARD = threading.Lock()
 _INPROC_LOCKS: dict[str, threading.RLock] = {}
@@ -2552,6 +2552,106 @@ def close_position(
         }
 
 
+def void_position(
+    position_id: str,
+    reason: str = "误录作废",
+    portfolio_dir: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Void a mistakenly entered open position without booking fake PnL or closed-trade history.
+
+    Strictly restricted to untrimmed, single-tranche open positions whose ``partial_realized_pnl``
+    is zero, ensuring ``account.equity`` and ``peak_equity`` were never mutated by this record.
+    """
+    idem_key = _normalize_idempotency_key(idempotency_key)
+    req_hash = (
+        _compute_request_hash(
+            "void_position",
+            {
+                "position_id": position_id,
+                "reason": reason,
+            },
+        )
+        if idem_key is not None
+        else ""
+    )
+    pdir = _resolve_portfolio_dir(portfolio_dir)
+
+    with _portfolio_lock(pdir):
+        replayed_result: dict[str, Any] | None = None
+        result_payload: dict[str, Any] | None = None
+        with _sqlite_write_tx(pdir) as conn:
+            _maybe_migrate_legacy_json_in_tx(conn, pdir)
+            cached = _db_lookup_idempotency(conn, idem_key, "void_position", req_hash)
+            if cached is not None:
+                replayed_result = cached
+            else:
+                clean_reason = (reason or "").strip() or "误录作废"
+                account = _db_read_account(conn, pdir)
+                doc = _db_read_positions_doc(conn, pdir)
+                positions: list[dict[str, Any]] = list(doc.get("positions") or [])
+                idx = next((i for i, p in enumerate(positions) if p.get("position_id") == position_id), None)
+                if idx is None:
+                    raise ValueError(f"Position not found: {position_id}")
+                pos = dict(positions[idx])
+                if pos.get("status") != "open":
+                    raise ValueError(f"Position {position_id} is already closed and cannot be voided")
+
+                tranches = list(pos.get("tranches") or [])
+                partial_pnl = float(pos.get("partial_realized_pnl") or 0.0)
+                qty_now = float(pos.get("quantity") or 0.0)
+                qty_init = float(pos.get("initial_quantity") or qty_now)
+                if len(tranches) > 1 or abs(partial_pnl) > 1e-9 or abs(qty_now - qty_init) > 1e-9:
+                    raise ValueError(
+                        "void_requires_untrimmed_initial_position: "
+                        "该头寸已发生分批加仓或减仓结算，无法按误录无损作废，请使用平仓了结"
+                    )
+
+                old_risk = float(pos.get("current_open_risk_amount") or 0.0)
+                now = utc_now_str()
+                new_revision = int(doc.get("revision") or 0) + 1
+                journal_entry = {
+                    "timestamp_utc": now,
+                    "action": "void",
+                    "position_id": position_id,
+                    "symbol": pos["symbol"],
+                    "sector_theme": pos["sector_theme"],
+                    "direction": pos["direction"],
+                    "price": pos["avg_entry_price"],
+                    "stop_30m": pos["tactical_stop_30m"],
+                    "quantity": pos["quantity"],
+                    "equity_after": account["equity"],
+                    "risk_delta": round(-old_risk, 2),
+                    "reason": clean_reason,
+                }
+                result_payload = {
+                    "status": "voided",
+                    "revision": new_revision,
+                    "account": account,
+                    "voided_position": pos,
+                    "freed_risk_amount": round(old_risk, 2),
+                }
+                conn.execute("DELETE FROM positions WHERE position_id = ?", (position_id,))
+                _db_update_meta(conn, revision=new_revision, updated_at_utc=now)
+                _db_insert_journal_records(conn, [journal_entry])
+                _db_store_idempotency(conn, idem_key, "void_position", req_hash, result_payload, now)
+
+        mirror_ok, mirror_err = _safe_export_mirrors_unlocked(pdir)
+        if replayed_result is not None:
+            return {
+                **replayed_result,
+                "idempotent_replay": True,
+                "mirror_sync_ok": mirror_ok,
+                "mirror_sync_error": mirror_err,
+            }
+        assert result_payload is not None
+        return {
+            **result_payload,
+            "mirror_sync_ok": mirror_ok,
+            "mirror_sync_error": mirror_err,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Portfolio Summary
 # ---------------------------------------------------------------------------
@@ -2783,6 +2883,12 @@ def main(argv: list[str] | None = None) -> int:
     p_close.add_argument("--no-update-equity", dest="update_equity", action="store_false")
     p_close.add_argument("--idempotency-key", default=None)
 
+    # void
+    p_void = sub.add_parser("void", help="Void a mistakenly entered open position without booking PnL")
+    p_void.add_argument("--id", required=True)
+    p_void.add_argument("--reason", default="误录作废")
+    p_void.add_argument("--idempotency-key", default=None)
+
     args = parser.parse_args(argv)
 
     try:
@@ -2903,6 +3009,13 @@ def main(argv: list[str] | None = None) -> int:
                 exit_category=args.exit_category,
                 portfolio_dir=args.portfolio_dir,
                 update_account_equity=args.update_equity,
+                idempotency_key=args.idempotency_key,
+            )
+        elif args.command == "void":
+            res = void_position(
+                position_id=args.id,
+                reason=args.reason,
+                portfolio_dir=args.portfolio_dir,
                 idempotency_key=args.idempotency_key,
             )
         else:  # pragma: no cover

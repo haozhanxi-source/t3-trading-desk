@@ -31,8 +31,12 @@ export interface ChartPalette {
   segUnconfirmed: string;
   zsStrokeFill: string;
   zsStrokeBorder: string;
+  zsStrokeExtFill: string;
+  zsStrokeExtBorder: string;
   zsSegFill: string;
   zsSegBorder: string;
+  zsSegExtFill: string;
+  zsSegExtBorder: string;
 }
 
 export const DARK_CHART_PALETTE: ChartPalette = {
@@ -60,10 +64,14 @@ export const DARK_CHART_PALETTE: ChartPalette = {
   strokeUnconfirmed: "rgba(180, 190, 204, 0.72)",
   segConfirmed: "#f59e0b",
   segUnconfirmed: "rgba(245, 158, 11, 0.78)",
-  zsStrokeFill: "rgba(96, 165, 250, 0.075)",
-  zsStrokeBorder: "rgba(96, 165, 250, 0.62)",
-  zsSegFill: "rgba(245, 158, 11, 0.085)",
-  zsSegBorder: "rgba(245, 158, 11, 0.80)",
+  zsStrokeFill: "rgba(96, 165, 250, 0.085)",
+  zsStrokeBorder: "rgba(96, 165, 250, 0.68)",
+  zsStrokeExtFill: "rgba(96, 165, 250, 0.032)",
+  zsStrokeExtBorder: "rgba(96, 165, 250, 0.42)",
+  zsSegFill: "rgba(245, 158, 11, 0.095)",
+  zsSegBorder: "rgba(245, 158, 11, 0.82)",
+  zsSegExtFill: "rgba(245, 158, 11, 0.036)",
+  zsSegExtBorder: "rgba(245, 158, 11, 0.48)",
 };
 
 export const LIGHT_CHART_PALETTE: ChartPalette = {
@@ -91,10 +99,14 @@ export const LIGHT_CHART_PALETTE: ChartPalette = {
   strokeUnconfirmed: "rgba(71, 85, 105, 0.68)",
   segConfirmed: "#d97706",
   segUnconfirmed: "rgba(217, 119, 6, 0.76)",
-  zsStrokeFill: "rgba(37, 99, 235, 0.065)",
-  zsStrokeBorder: "rgba(37, 99, 235, 0.60)",
-  zsSegFill: "rgba(217, 119, 6, 0.08)",
-  zsSegBorder: "rgba(217, 119, 6, 0.78)",
+  zsStrokeFill: "rgba(37, 99, 235, 0.075)",
+  zsStrokeBorder: "rgba(37, 99, 235, 0.64)",
+  zsStrokeExtFill: "rgba(37, 99, 235, 0.026)",
+  zsStrokeExtBorder: "rgba(37, 99, 235, 0.40)",
+  zsSegFill: "rgba(217, 119, 6, 0.09)",
+  zsSegBorder: "rgba(217, 119, 6, 0.80)",
+  zsSegExtFill: "rgba(217, 119, 6, 0.030)",
+  zsSegExtBorder: "rgba(217, 119, 6, 0.46)",
 };
 
 interface ThemeContextValue {

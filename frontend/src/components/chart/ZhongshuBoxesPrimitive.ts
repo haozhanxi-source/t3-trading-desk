@@ -7,36 +7,131 @@ import type {
   SeriesType,
   Time,
 } from "lightweight-charts";
+import type { ZhongshuExtensionStage, ZhongshuRelation } from "../../api/types";
 import type { ChartPalette } from "../../lib/theme";
 import { fmtPrice } from "../../lib/format";
 
 export interface ZhongshuBoxDrawItem {
   key: string;
+  zsId: number;
   kind: "stroke" | "segment";
   label: string;
-  startTime: Time;
-  endTime: Time;
+  compactCode: string;
+  coreStartTime: Time | null;
+  coreEndTime: Time | null;
+  extStartTime: Time | null;
+  extEndTime: Time | null;
+  nineUpgradeTime?: Time | null;
   startLabel?: string;
-  endLabel?: string;
+  coreEndLabel?: string;
+  extEndLabel?: string | null;
+  nineUpgradeLabel?: string | null;
+  clampedLeft?: boolean;
+  clampedRight?: boolean;
   zd: number;
   zg: number;
   dd?: number;
   gg?: number;
+  oscillationStrokes?: number;
   isExtended?: boolean;
   isNineUpgrade?: boolean;
+  status?: string;
+  trendZsIndex?: number;
+  relationToPrev?: ZhongshuRelation;
+  extensionStage?: ZhongshuExtensionStage;
 }
 
 type RenderTarget = Parameters<IPrimitivePaneRenderer["draw"]>[0];
 
 interface PixelBox {
-  x1: number;
-  x2: number;
+  coreX1: number | null;
+  coreX2: number | null;
+  extX1: number | null;
+  extX2: number | null;
+  nineX: number | null;
   yTop: number;
   yBottom: number;
-  label: string;
+  compactCode: string;
   rangeText: string;
   kind: "stroke" | "segment";
-  isNineUpgrade?: boolean;
+  oscillationStrokes: number;
+  isExtended: boolean;
+  isNineUpgrade: boolean;
+  relationToPrev: ZhongshuRelation;
+  clampedLeft: boolean;
+  clampedRight: boolean;
+}
+
+function relationShortTag(rel: ZhongshuRelation): string {
+  switch (rel) {
+    case "new_up":
+      return "↑新生";
+    case "new_down":
+      return "↓新生";
+    case "expansion_up":
+      return "↑扩张";
+    case "expansion_down":
+      return "↓扩张";
+    case "overlap":
+      return "扩展";
+    default:
+      return "";
+  }
+}
+
+function relationTinyTag(rel: ZhongshuRelation): string {
+  switch (rel) {
+    case "new_up":
+      return "↑新";
+    case "new_down":
+      return "↓新";
+    case "expansion_up":
+      return "↑扩";
+    case "expansion_down":
+      return "↓扩";
+    case "overlap":
+      return "叠";
+    default:
+      return "";
+  }
+}
+
+function accentForBox(box: PixelBox, pal: ChartPalette): string | null {
+  if (box.isNineUpgrade || box.relationToPrev === "expansion_up" || box.relationToPrev === "expansion_down") {
+    return pal.warning;
+  }
+  if (box.relationToPrev === "new_up") return pal.bull;
+  if (box.relationToPrev === "new_down") return pal.bear;
+  if (box.relationToPrev === "overlap") return pal.muted;
+  return null;
+}
+
+function buildPillText(box: PixelBox, totalVisibleW: number): string {
+  const unit = box.kind === "segment" ? "段" : "笔";
+  const totalUnits = 3 + Math.max(0, box.oscillationStrokes);
+  const relShort = relationShortTag(box.relationToPrev);
+  const relTiny = relationTinyTag(box.relationToPrev);
+
+  if (totalVisibleW < 108) {
+    if (box.isNineUpgrade) return `${box.compactCode}·九段`;
+    if (box.isExtended) return `${box.compactCode}·延+${box.oscillationStrokes}`;
+    if (relTiny) return `${box.compactCode}·${relTiny}`;
+    return box.compactCode;
+  }
+
+  const parts = [box.compactCode];
+  if (relShort) parts.push(relShort);
+  if (box.isNineUpgrade) {
+    parts.push(`九段(${totalUnits}${unit})`);
+  } else if (box.isExtended) {
+    parts.push(`延伸+${box.oscillationStrokes}${unit}`);
+  }
+  const semantic = parts.join("·");
+
+  if (totalVisibleW >= 196) {
+    return `${semantic} [${box.rangeText}]`;
+  }
+  return semantic;
 }
 
 class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
@@ -62,76 +157,158 @@ class ZhongshuPaneRenderer implements IPrimitivePaneRenderer {
       ctx.save();
 
       for (const box of this._boxes) {
-        const left = Math.max(0, Math.min(box.x1, box.x2));
-        const right = Math.min(w, Math.max(box.x1, box.x2));
-        if (right <= 0 || left >= w) continue;
-
-        const width = Math.max(6, right - left);
         const top = Math.min(box.yTop, box.yBottom);
         const bottom = Math.max(box.yTop, box.yBottom);
         if (bottom < 0 || top > h) continue;
         const height = Math.max(2, bottom - top);
 
         const isSeg = box.kind === "segment";
-        const fill = isSeg ? pal.zsSegFill : pal.zsStrokeFill;
-        const border = isSeg ? pal.zsSegBorder : pal.zsStrokeBorder;
+        const coreFill = isSeg ? pal.zsSegFill : pal.zsStrokeFill;
+        const coreBorder = isSeg ? pal.zsSegBorder : pal.zsStrokeBorder;
+        const extFill = isSeg ? pal.zsSegExtFill : pal.zsStrokeExtFill;
+        const extBorder = isSeg ? pal.zsSegExtBorder : pal.zsStrokeExtBorder;
 
-        /* Translucent Zhongshu body */
-        ctx.fillStyle = fill;
-        ctx.fillRect(left, top, width, height);
+        let visibleLeft: number | null = null;
+        let visibleRight: number | null = null;
+        let hasCoreVisible = false;
+        let hasExtVisible = false;
+        let coreRightClamped = 0;
 
-        /* Crisp ZG (top) and ZD (bottom) horizontal boundaries (segment > stroke visual hierarchy) */
-        ctx.strokeStyle = border;
-        ctx.lineWidth = isSeg ? 2.0 : box.isNineUpgrade ? 1.5 : 1.1;
-        ctx.setLineDash([]);
-        ctx.beginPath();
-        ctx.moveTo(left, top);
-        ctx.lineTo(left + width, top);
-        ctx.moveTo(left, bottom);
-        ctx.lineTo(left + width, bottom);
-        ctx.stroke();
+        /* 1. Founding 3-unit core box: solid fill + crisp solid [ZD, ZG] borders */
+        const hasExtCoords = box.extX1 !== null && box.extX2 !== null;
+        if (box.coreX1 !== null && box.coreX2 !== null) {
+          const cLeft = Math.max(0, Math.min(box.coreX1, box.coreX2));
+          const cRight = Math.min(w, Math.max(box.coreX1, box.coreX2));
+          if (cRight > 0 && cLeft < w) {
+            const rawWidth = cRight - cLeft;
+            const minCoreW = hasExtCoords ? 1 : 4;
+            coreRightClamped = Math.min(w, cLeft + Math.max(minCoreW, rawWidth));
+            const cWidth = coreRightClamped - cLeft;
+            if (cWidth > 0) {
+              hasCoreVisible = true;
+              visibleLeft = cLeft;
+              visibleRight = coreRightClamped;
 
-        /* Subtle dashed left/right vertical walls */
-        ctx.lineWidth = 1;
-        ctx.setLineDash([3, 3]);
-        ctx.beginPath();
-        ctx.moveTo(left, top);
-        ctx.lineTo(left, bottom);
-        ctx.moveTo(left + width, top);
-        ctx.lineTo(left + width, bottom);
-        ctx.stroke();
-        ctx.setLineDash([]);
+              ctx.fillStyle = coreFill;
+              ctx.fillRect(cLeft, top, cWidth, height);
 
-        /* Watermark-style monospace tag: stroke ZS anchored top-left, segment ZS anchored bottom-left to prevent collision */
-        if (width >= 36 && bottom >= 12 && top <= h - 6) {
-          const compactLabel = box.label.replace("笔中枢 ", "Z·").replace("线段中枢 ", "S·");
-          const text = width >= 128 ? `${compactLabel} [${box.rangeText}]` : compactLabel;
+              ctx.strokeStyle = coreBorder;
+              ctx.lineWidth = isSeg ? 2.0 : box.isNineUpgrade ? 1.5 : 1.25;
+              ctx.setLineDash([]);
+              ctx.beginPath();
+              ctx.moveTo(cLeft, top);
+              ctx.lineTo(coreRightClamped, top);
+              ctx.moveTo(cLeft, bottom);
+              ctx.lineTo(coreRightClamped, bottom);
+              ctx.stroke();
+
+              /* Vertical left wall + right wall (divider when extension follows) */
+              ctx.lineWidth = 1;
+              ctx.setLineDash([3, 3]);
+              ctx.beginPath();
+              ctx.moveTo(cLeft, top);
+              ctx.lineTo(cLeft, bottom);
+              ctx.moveTo(coreRightClamped, top);
+              ctx.lineTo(coreRightClamped, bottom);
+              ctx.stroke();
+              ctx.setLineDash([]);
+            }
+          }
+        }
+
+        /* 2. Genuine extension tail: lighter fill + dashed [ZD, ZG] borders */
+        if (box.extX1 !== null && box.extX2 !== null) {
+          const rawExtLeft = Math.min(box.extX1, box.extX2);
+          const rawExtRight = Math.max(box.extX1, box.extX2);
+          const eLeft = Math.max(hasCoreVisible ? coreRightClamped : 0, rawExtLeft);
+          const eRight = Math.min(w, rawExtRight);
+          if (eRight > eLeft + 1 && eRight > 0 && eLeft < w) {
+            hasExtVisible = true;
+            const eWidth = eRight - eLeft;
+            visibleLeft = visibleLeft === null ? eLeft : Math.min(visibleLeft, eLeft);
+            visibleRight = visibleRight === null ? eRight : Math.max(visibleRight, eRight);
+
+            ctx.fillStyle = extFill;
+            ctx.fillRect(eLeft, top, eWidth, height);
+
+            ctx.strokeStyle = extBorder;
+            ctx.lineWidth = isSeg ? 1.4 : 1.05;
+            ctx.setLineDash([5, 4]);
+            ctx.beginPath();
+            ctx.moveTo(eLeft, top);
+            ctx.lineTo(eRight, top);
+            ctx.moveTo(eLeft, bottom);
+            ctx.lineTo(eRight, bottom);
+            ctx.stroke();
+
+            /* Subtle closing dotted wall at extension end */
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 3]);
+            ctx.beginPath();
+            ctx.moveTo(eRight, top);
+            ctx.lineTo(eRight, bottom);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            /* Optional 9-unit upgrade milestone tick inside the extension tail */
+            if (box.nineX !== null && box.nineX > eLeft + 4 && box.nineX < eRight - 4) {
+              ctx.strokeStyle = pal.warning;
+              ctx.lineWidth = 1;
+              ctx.setLineDash([2, 2]);
+              ctx.beginPath();
+              ctx.moveTo(box.nineX, top + 1);
+              ctx.lineTo(box.nineX, bottom - 1);
+              ctx.stroke();
+              ctx.setLineDash([]);
+            }
+          }
+        }
+
+        if ((!hasCoreVisible && !hasExtVisible) || visibleLeft === null || visibleRight === null) {
+          continue;
+        }
+
+        const totalVisibleW = Math.max(0, visibleRight - visibleLeft);
+
+        /* 3. Watermark-style monospace pill tag: stroke ZS top-left, segment ZS bottom-left */
+        if (totalVisibleW >= 38 && bottom >= 12 && top <= h - 6) {
+          const text = buildPillText(box, totalVisibleW);
           ctx.font = '500 10px "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace';
           const textW = ctx.measureText(text).width;
-          const tagW = Math.min(width - 4, textW + 8);
-          const tagH = 14;
-          const tagX = left + 3;
-          const insideFits = height >= 18;
-          const tagY = isSeg
-            ? insideFits
-              ? Math.min(h - tagH - 2, bottom - tagH - 2)
-              : Math.min(h - tagH - 2, bottom + 2)
-            : insideFits
-              ? Math.max(2, top + 2)
-              : Math.max(2, top - tagH - 2);
+          const accent = accentForBox(box, pal);
+          const padLeft = accent ? 7 : 4;
+          const tagW = Math.min(totalVisibleW - 4, textW + padLeft + 5);
+          if (tagW < 18) continue;
 
-          ctx.fillStyle = pal.mode === "dark" ? "rgba(12, 14, 18, 0.76)" : "rgba(255, 255, 255, 0.84)";
+          const tagH = 15;
+          const tagX = visibleLeft + 3;
+          const insideFits = height >= 19;
+          const rawTagY = isSeg
+            ? insideFits
+              ? bottom - tagH - 2
+              : bottom + 2
+            : insideFits
+              ? top + 2
+              : top - tagH - 2;
+          const tagY = Math.max(2, Math.min(Math.max(2, h - tagH - 2), rawTagY));
+
+          ctx.fillStyle = pal.mode === "dark" ? "rgba(12, 14, 18, 0.80)" : "rgba(255, 255, 255, 0.88)";
           ctx.beginPath();
           ctx.roundRect(tagX, tagY, tagW, tagH, 2.5);
           ctx.fill();
 
+          if (accent) {
+            ctx.fillStyle = accent;
+            ctx.fillRect(tagX + 1.5, tagY + 2, 2, tagH - 4);
+          }
+
           ctx.save();
           ctx.beginPath();
-          ctx.rect(tagX + 2, tagY, tagW - 4, tagH);
+          ctx.rect(tagX + padLeft - 1, tagY, tagW - padLeft - 1, tagH);
           ctx.clip();
-          ctx.fillStyle = border;
+          ctx.fillStyle = coreBorder;
           ctx.textBaseline = "middle";
-          ctx.fillText(text, tagX + 4, tagY + tagH / 2 + 0.5);
+          ctx.fillText(text, tagX + padLeft, tagY + tagH / 2 + 0.5);
           ctx.restore();
         }
       }
@@ -163,7 +340,7 @@ class ZhongshuPaneView implements IPrimitivePaneView {
 
 /**
  * Custom Lightweight Charts v5 ISeriesPrimitive drawing Chanlun Zhongshu (`[ZD, ZG]`) boxes
- * directly on the candlestick pane canvas.
+ * with strict visual separation between the founding 3-unit core and genuine extension tails.
  */
 export class ZhongshuBoxesPrimitive implements ISeriesPrimitive<Time> {
   private _attached: SeriesAttachedParameter<Time, SeriesType> | null = null;
@@ -217,20 +394,40 @@ export class ZhongshuBoxesPrimitive implements ISeriesPrimitive<Time> {
     const computed: PixelBox[] = [];
 
     for (const item of this._items) {
-      const x1 = timeScale.timeToCoordinate(item.startTime);
-      const x2 = timeScale.timeToCoordinate(item.endTime);
       const yZg = series.priceToCoordinate(item.zg);
       const yZd = series.priceToCoordinate(item.zd);
-      if (x1 === null || x2 === null || yZg === null || yZd === null) continue;
+      if (yZg === null || yZd === null) continue;
+
+      const coreX1 = item.coreStartTime !== null ? timeScale.timeToCoordinate(item.coreStartTime) : null;
+      const coreX2 = item.coreEndTime !== null ? timeScale.timeToCoordinate(item.coreEndTime) : null;
+      const extX1 = item.extStartTime !== null ? timeScale.timeToCoordinate(item.extStartTime) : null;
+      const extX2 = item.extEndTime !== null ? timeScale.timeToCoordinate(item.extEndTime) : null;
+      const nineX =
+        item.nineUpgradeTime !== null && item.nineUpgradeTime !== undefined
+          ? timeScale.timeToCoordinate(item.nineUpgradeTime)
+          : null;
+
+      const hasCore = coreX1 !== null && coreX2 !== null;
+      const hasExt = extX1 !== null && extX2 !== null;
+      if (!hasCore && !hasExt) continue;
+
       computed.push({
-        x1,
-        x2,
+        coreX1: hasCore ? coreX1 : null,
+        coreX2: hasCore ? coreX2 : null,
+        extX1: hasExt ? extX1 : null,
+        extX2: hasExt ? extX2 : null,
+        nineX,
         yTop: yZg,
         yBottom: yZd,
-        label: item.label,
+        compactCode: item.compactCode,
         rangeText: `${fmtPrice(item.zd)}–${fmtPrice(item.zg)}`,
         kind: item.kind,
-        isNineUpgrade: item.isNineUpgrade,
+        oscillationStrokes: item.oscillationStrokes ?? 0,
+        isExtended: Boolean(item.isExtended),
+        isNineUpgrade: Boolean(item.isNineUpgrade),
+        relationToPrev: item.relationToPrev ?? "initial",
+        clampedLeft: Boolean(item.clampedLeft),
+        clampedRight: Boolean(item.clampedRight),
       });
     }
 

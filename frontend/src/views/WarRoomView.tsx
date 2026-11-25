@@ -619,6 +619,7 @@ export function WarRoomView({
       <div className="grid grid-cols-1 gap-3.5 xl:grid-cols-2">
         <ChanlunChart
           title="3Y 日线结构"
+          resetKey={resolvedSym}
           bars={currentData?.ohlcv_daily ?? []}
           chanlun={daily}
           signalSummary={currentData?.chanlun?.signal_summary}
@@ -633,6 +634,7 @@ export function WarRoomView({
 
         <ChanlunChart
           title={`${loadedInterval} 区间套执行`}
+          resetKey={`${resolvedSym}:${loadedInterval}`}
           bars={currentData?.ohlcv_intraday ?? []}
           chanlun={intraday}
           signalSummary={currentData?.chanlun?.intraday_signal_summary}

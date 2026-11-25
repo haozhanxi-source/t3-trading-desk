@@ -349,9 +349,19 @@ export interface ChanlunSegment {
   is_confirmed: boolean;
 }
 
+export type ZhongshuRelation =
+  | "initial"
+  | "new_up"
+  | "new_down"
+  | "expansion_up"
+  | "expansion_down"
+  | "overlap";
+
+export type ZhongshuExtensionStage = "core" | "extended" | "upgraded_9";
+
 export interface Zhongshu {
   zs_id: number;
-  direction: "up" | "down";
+  direction: "up" | "down" | "neutral" | string;
   zd: number;
   zg: number;
   dd?: number;
@@ -363,8 +373,13 @@ export interface Zhongshu {
   status?: string;
   oscillation_strokes?: number;
   oscillation_end_date?: string | null;
+  oscillation_dd?: number | null;
+  oscillation_gg?: number | null;
   is_nine_upgrade?: boolean;
   trend_zs_index?: number;
+  relation_to_prev?: ZhongshuRelation | string | null;
+  extension_stage?: ZhongshuExtensionStage | string | null;
+  nine_upgrade_date?: string | null;
 }
 
 export interface SignalMeta {

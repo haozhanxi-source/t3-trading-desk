@@ -1200,6 +1200,167 @@ class TestChanlunEngine(unittest.TestCase):
         self.assertEqual(macro_dn_trend, "双中枢下跌趋势")
         self.assertTrue(any("趋势背驰" in s for s in sigs_dn_trend))
 
+    def test_entering_unit_orientation_relation_nine_upgrade_and_price_overlap_guard(self):
+        from chanlun import (
+            Stroke,
+            Zhongshu,
+            classify_chanlun_signals,
+            select_active_zhongshus,
+        )
+
+        def mk_st(idx: int, direction: str, sp: float, ep: float, sd: str, ed: str, conf: bool = True) -> Stroke:
+            return Stroke(
+                direction=direction,
+                start_date=sd,
+                end_date=ed,
+                start_price=sp,
+                end_price=ep,
+                high=max(sp, ep),
+                low=min(sp, ep),
+                start_merged_idx=idx * 4,
+                end_merged_idx=idx * 4 + 4,
+                start_raw_idx=idx * 4,
+                end_raw_idx=idx * 4 + 4,
+                raw_bars=5,
+                pct_change=round((ep / sp - 1.0) * 100.0, 2),
+                macd_area=10.0,
+                macd_peak=2.0,
+                dif_extreme=1.0 if direction == "up" else -1.0,
+                efficiency=1.0,
+                avg_vol_ratio=1.0,
+                is_confirmed=conf,
+            )
+
+        # 1) LC0-daily regression: tiny pullback (102.5k->90k) + huge +110% rally (90k->189.4k)
+        #    MUST treat 90k->189.4k as UP entering stroke (NOT b1 of a fake down Zhongshu)!
+        lc0_like = [
+            mk_st(0, "down", 102500.0, 90000.0, "2025-11-20", "2025-11-24"),
+            mk_st(1, "up", 90000.0, 189440.0, "2025-11-24", "2026-01-26"),
+            mk_st(2, "down", 189440.0, 124100.0, "2026-01-26", "2026-02-06"),
+            mk_st(3, "up", 124100.0, 187700.0, "2026-02-06", "2026-02-26"),
+            mk_st(4, "down", 187700.0, 146060.0, "2026-02-26", "2026-03-04"),
+            # 6 more oscillating strokes -> reaches 9-unit upgrade on the 6th extension stroke
+            mk_st(5, "up", 146060.0, 167280.0, "2026-03-04", "2026-03-11"),
+            mk_st(6, "down", 167280.0, 140040.0, "2026-03-11", "2026-03-23"),
+            mk_st(7, "up", 140040.0, 173000.0, "2026-03-23", "2026-03-30"),
+            mk_st(8, "down", 173000.0, 152500.0, "2026-03-30", "2026-04-09"),
+            mk_st(9, "up", 152500.0, 209880.0, "2026-04-09", "2026-05-13"),
+            mk_st(10, "down", 209880.0, 175200.0, "2026-05-13", "2026-05-20"),
+            # Breakdown + 3rd sell + lower Zhongshu
+            mk_st(11, "down", 175200.0, 90880.0, "2026-05-20", "2026-10-23"),
+            mk_st(12, "up", 90880.0, 101520.0, "2026-10-23", "2026-10-28"),
+            mk_st(13, "down", 101520.0, 86360.0, "2026-10-28", "2026-11-11"),
+            mk_st(14, "up", 86360.0, 93620.0, "2026-11-11", "2026-11-20"),
+        ]
+        zss = detect_zhongshus(lc0_like, last_close=88940.0)
+        self.assertEqual(len(zss), 2)
+        z_top, z_bot = zss
+        self.assertEqual(z_top.direction, "up")
+        self.assertEqual(z_top.start_date, "2026-01-26")
+        self.assertEqual(z_top.end_date, "2026-03-04")
+        self.assertAlmostEqual(z_top.zd, 146060.0)
+        self.assertAlmostEqual(z_top.zg, 187700.0)
+        self.assertAlmostEqual(z_top.dd, 124100.0)
+        self.assertEqual(z_top.extension_stage, "upgraded_9")
+        self.assertTrue(z_top.is_nine_upgrade)
+        self.assertEqual(z_top.nine_upgrade_date, "2026-05-20")
+        self.assertEqual(z_top.status, "broken_down")
+
+        # Lower Zhongshu is strictly disjoint from z_top effective [dd, gg] -> new_down (双中枢下跌趋势)
+        self.assertEqual(z_bot.direction, "down")
+        self.assertEqual(z_bot.relation_to_prev, "new_down")
+        self.assertEqual(z_bot.extension_stage, "core")
+        macro_lc0, _, _ = classify_chanlun_signals(
+            last_close=88940.0,
+            timeframe_label="日线",
+            merged=[],
+            fractals=[],
+            pivots=[],
+            strokes=lc0_like,
+            zhongshus=zss,
+            momentum={},
+        )
+        self.assertEqual(macro_lc0, "双中枢下跌趋势")
+
+        # 2) Symmetric crash regression (LC0-30m Z9): tiny bounce (117k->125k) + crash (125k->95k)
+        #    MUST treat 125k->95k as DOWN entering stroke (NOT b1 of a fake up Zhongshu)
+        crash_like = [
+            mk_st(0, "up", 117060.0, 125120.0, "2026-10-01", "2026-10-02"),
+            mk_st(1, "down", 125120.0, 94880.0, "2026-10-02", "2026-10-08"),
+            mk_st(2, "up", 94880.0, 102400.0, "2026-10-08", "2026-10-12"),
+            mk_st(3, "down", 102400.0, 99380.0, "2026-10-12", "2026-10-15"),
+            mk_st(4, "up", 99380.0, 102000.0, "2026-10-15", "2026-10-19"),
+        ]
+        crash_zss = detect_zhongshus(crash_like, last_close=100500.0)
+        self.assertEqual(len(crash_zss), 1)
+        self.assertEqual(crash_zss[0].direction, "down")
+        self.assertEqual(crash_zss[0].start_date, "2026-10-08")
+        self.assertAlmostEqual(crash_zss[0].zd, 99380.0)
+        self.assertAlmostEqual(crash_zss[0].zg, 102000.0)
+        self.assertAlmostEqual(crash_zss[0].gg, 102400.0)
+
+        # 3) Direction-aware First-Zhongshu 3S tag: an uptrend 2nd Zhongshu breaking down for the
+        #    FIRST time must be tagged 首中枢三卖, NOT 第2个中枢·非首中枢三卖
+        z_up_2 = Zhongshu(
+            zs_id=2, direction="up", zd=760.0, zg=773.0, dd=748.0, gg=780.0,
+            start_date="2026-08-13", end_date="2026-09-16", stroke_count=3,
+            is_extended=False, status="active", trend_zs_index=2, relation_to_prev="new_up",
+        )
+        _, _, sigs_3s = classify_chanlun_signals(
+            last_close=720.0,
+            timeframe_label="日线",
+            merged=[],
+            fractals=[],
+            pivots=[],
+            strokes=[
+                mk_st(1, "down", 775.0, 687.0, "2026-11-04", "2026-11-20"),
+                mk_st(2, "up", 687.0, 728.0, "2026-11-20", "2026-11-23"),
+            ],
+            zhongshus=[z_up_2],
+            momentum={},
+        )
+        self.assertTrue(any("首中枢" in s and "三卖" in s for s in sigs_3s), msg=sigs_3s)
+        self.assertFalse(any("非首中枢" in s for s in sigs_3s), msg=sigs_3s)
+
+        # 4) select_active_zhongshus price-overlap guard: must NOT jump to a price-disjoint Segment ZS
+        st_nine = Zhongshu(
+            zs_id=9, direction="down", zd=88360.0, zg=91960.0, dd=87680.0, gg=92620.0,
+            start_date="2026-10-29", end_date="2026-11-02", stroke_count=3,
+            is_extended=True, status="active", oscillation_strokes=9,
+            oscillation_end_date="2026-11-24", oscillation_dd=87680.0, oscillation_gg=92620.0,
+            is_nine_upgrade=True,
+        )
+        seg_far_above = Zhongshu(
+            zs_id=2, direction="down", zd=94880.0, zg=102180.0, dd=94000.0, gg=105000.0,
+            start_date="2026-10-08", end_date="2026-11-10", stroke_count=3,
+            is_extended=False, status="broken_down",
+        )
+        lvl, _, chosen = select_active_zhongshus([st_nine], [seg_far_above], [], timeframe_label="30分钟")
+        self.assertEqual(lvl, "stroke")
+        self.assertEqual(chosen[0].zs_id, 9)
+
+        # 5) expansion_up followed by new_up MUST increment trend_zs_index to 2 (prevent late 3B false 首中枢)
+        exp_then_new = [
+            mk_st(0, "up", 90.0, 112.0, "2026-01-01", "2026-01-05"),
+            mk_st(1, "down", 112.0, 100.0, "2026-01-05", "2026-01-08"),
+            mk_st(2, "up", 100.0, 114.0, "2026-01-08", "2026-01-11"),
+            mk_st(3, "down", 114.0, 102.0, "2026-01-11", "2026-01-14"),  # Z1 [102, 112] gg=114
+            mk_st(4, "up", 102.0, 122.0, "2026-01-14", "2026-01-18"),    # leaves Z1
+            mk_st(5, "down", 122.0, 113.0, "2026-01-18", "2026-01-21"),  # 3B > 112, dd=111<=114 -> expansion_up
+            mk_st(6, "up", 113.0, 120.0, "2026-01-21", "2026-01-24"),
+            mk_st(7, "down", 120.0, 111.0, "2026-01-24", "2026-01-27"),  # Z2 [113, 120] dd=111 <= Z1.gg=114
+            mk_st(8, "up", 111.0, 148.0, "2026-01-27", "2026-02-01"),    # leaves Z2
+            mk_st(9, "down", 148.0, 135.0, "2026-02-01", "2026-02-04"),  # 3B > 120
+            mk_st(10, "up", 135.0, 145.0, "2026-02-04", "2026-02-07"),
+            mk_st(11, "down", 145.0, 132.0, "2026-02-07", "2026-02-10"), # Z3 [135, 145] dd=132 > Z2.gg=122 -> new_up
+        ]
+        z_seq = detect_zhongshus(exp_then_new, last_close=146.0)
+        self.assertEqual(len(z_seq), 3)
+        self.assertEqual(z_seq[1].relation_to_prev, "expansion_up")
+        self.assertEqual(z_seq[1].trend_zs_index, 1)
+        self.assertEqual(z_seq[2].relation_to_prev, "new_up")
+        self.assertEqual(z_seq[2].trend_zs_index, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

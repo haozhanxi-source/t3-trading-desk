@@ -16,11 +16,40 @@ import {
   type Time,
 } from "lightweight-charts";
 import { Crosshair, Layers, Maximize2, Table2 } from "lucide-react";
-import type { ChanlunTimeframe, SignalSummary } from "../../api/types";
+import type { ChanlunTimeframe, SignalSummary, ZhongshuRelation } from "../../api/types";
 import { fmtFixed, fmtMomentumVerdict, fmtPct, fmtPosVsZs, fmtPrice, shortTime } from "../../lib/format";
 import { useTheme } from "../../lib/theme";
-import { ZhongshuBoxesPrimitive } from "./ZhongshuBoxesPrimitive";
-import { prepareChanlunSeries, timeKey, type AnyBar, type IndexedBar } from "./chanlunUtils";
+import { ZhongshuBoxesPrimitive, type ZhongshuBoxDrawItem } from "./ZhongshuBoxesPrimitive";
+import { computePosVsZs, prepareChanlunSeries, timeKey, type AnyBar, type IndexedBar } from "./chanlunUtils";
+
+function fmtRelationLabel(rel: ZhongshuRelation | undefined): string {
+  switch (rel) {
+    case "new_up":
+      return "↑新生(趋势)";
+    case "new_down":
+      return "↓新生(趋势)";
+    case "expansion_up":
+      return "↑扩张(升级)";
+    case "expansion_down":
+      return "↓扩张(升级)";
+    case "overlap":
+      return "扩展重叠";
+    default:
+      return "首枢";
+  }
+}
+
+function fmtExtensionLabel(z: ZhongshuBoxDrawItem): string {
+  const unit = z.kind === "segment" ? "段" : "笔";
+  const osc = z.oscillationStrokes ?? 0;
+  if (z.isNineUpgrade || z.extensionStage === "upgraded_9") {
+    return `九段升级(共${3 + osc}${unit})`;
+  }
+  if (z.isExtended || osc > 0) {
+    return `延伸+${osc}${unit}`;
+  }
+  return `标准3${unit}`;
+}
 
 function computeSeriesPriceFormat(bars: IndexedBar[]) {
   const closes = bars
@@ -68,6 +97,7 @@ export interface ChanlunChartProps {
   onPickPrice?: ((price: number, bar: IndexedBar | null) => void) | null;
   syncDate?: string | null;
   onHoverDate?: ((ymd: string | null) => void) | null;
+  resetKey?: string;
 }
 
 export function ChanlunChart({
@@ -83,6 +113,7 @@ export function ChanlunChart({
   onPickPrice = null,
   syncDate = null,
   onHoverDate = null,
+  resetKey,
 }: ChanlunChartProps) {
   const { palette } = useTheme();
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -91,9 +122,24 @@ export function ChanlunChart({
   const [showStrokes, setShowStrokes] = useState(true);
   const [showStrokeZhongshu, setShowStrokeZhongshu] = useState(true);
   const [showSegments, setShowSegments] = useState(false);
-  const [showSegmentZhongshu, setShowSegmentZhongshu] = useState(false);
+  const segUserToggledRef = useRef(false);
+  const lastResetKeyRef = useRef<string | undefined>(resetKey);
+  const [showSegmentZhongshu, setShowSegmentZhongshu] = useState(
+    () => chanlun?.zhongshu_level === "segment",
+  );
   const [showMarkers, setShowMarkers] = useState(true);
   const [showTable, setShowTable] = useState(false);
+
+  /* Reset user segment-layer override when switching symbol/timeframe, and auto-overlay on segment upgrade */
+  useEffect(() => {
+    if (resetKey !== lastResetKeyRef.current) {
+      lastResetKeyRef.current = resetKey;
+      segUserToggledRef.current = false;
+    }
+    if (!segUserToggledRef.current) {
+      setShowSegmentZhongshu(chanlun?.zhongshu_level === "segment");
+    }
+  }, [resetKey, chanlun?.zhongshu_level]);
 
   const prepared = useMemo(
     () => prepareChanlunSeries(bars, chanlun, signalSummary, palette, intraday),
@@ -603,14 +649,14 @@ export function ChanlunChart({
 
     const latestStrokeZs = prepared.latestStrokeZhongshu;
     if (showStrokeZhongshu && latestStrokeZs) {
-      addLine(latestStrokeZs.zg, "Z·ZG", palette.zsStrokeBorder, LineStyle.Dotted, 1);
-      addLine(latestStrokeZs.zd, "Z·ZD", palette.zsStrokeBorder, LineStyle.Dotted, 1);
+      addLine(latestStrokeZs.zg, `Z${latestStrokeZs.zs_id}·ZG`, palette.zsStrokeBorder, LineStyle.Dotted, 1);
+      addLine(latestStrokeZs.zd, `Z${latestStrokeZs.zs_id}·ZD`, palette.zsStrokeBorder, LineStyle.Dotted, 1);
     }
 
     const latestSegmentZs = prepared.latestSegmentZhongshu;
     if (showSegmentZhongshu && latestSegmentZs) {
-      addLine(latestSegmentZs.zg, "S·ZG", palette.zsSegBorder, LineStyle.Dotted, 1);
-      addLine(latestSegmentZs.zd, "S·ZD", palette.zsSegBorder, LineStyle.Dotted, 1);
+      addLine(latestSegmentZs.zg, `S${latestSegmentZs.zs_id}·ZG`, palette.zsSegBorder, LineStyle.Dotted, 1);
+      addLine(latestSegmentZs.zd, `S${latestSegmentZs.zs_id}·ZD`, palette.zsSegBorder, LineStyle.Dotted, 1);
     }
 
     if (planOverlay) {
@@ -639,7 +685,91 @@ export function ChanlunChart({
     });
   };
 
-  const latestZs = chanlun?.latest_zhongshu;
+  const lastCloseVal = chanlun?.last_close ?? prepared.bars[prepared.bars.length - 1]?.close ?? null;
+  const engineIsSegment = chanlun?.zhongshu_level === "segment";
+  const latestStrokeZs = prepared.latestStrokeZhongshu;
+  const latestSegmentZs = prepared.latestSegmentZhongshu;
+
+  /* Align HUD Zhongshu telemetry strictly with the currently visible layer(s) */
+  const hudPrimary = useMemo(() => {
+    if (showStrokeZhongshu && !showSegmentZhongshu) {
+      return latestStrokeZs
+        ? {
+            prefix: `笔枢 Z${latestStrokeZs.zs_id}`,
+            zs: latestStrokeZs,
+            pos: computePosVsZs(lastCloseVal, latestStrokeZs),
+            muted: false,
+          }
+        : null;
+    }
+    if (showSegmentZhongshu && !showStrokeZhongshu) {
+      return latestSegmentZs
+        ? {
+            prefix: `段枢 S${latestSegmentZs.zs_id}`,
+            zs: latestSegmentZs,
+            pos: computePosVsZs(lastCloseVal, latestSegmentZs),
+            muted: false,
+          }
+        : null;
+    }
+    if (showStrokeZhongshu && showSegmentZhongshu) {
+      if (engineIsSegment && latestSegmentZs) {
+        return {
+          prefix: `段枢 S${latestSegmentZs.zs_id}`,
+          zs: latestSegmentZs,
+          pos: computePosVsZs(lastCloseVal, latestSegmentZs),
+          muted: false,
+        };
+      }
+      if (latestStrokeZs) {
+        return {
+          prefix: `笔枢 Z${latestStrokeZs.zs_id}`,
+          zs: latestStrokeZs,
+          pos: computePosVsZs(lastCloseVal, latestStrokeZs),
+          muted: false,
+        };
+      }
+      if (latestSegmentZs) {
+        return {
+          prefix: `段枢 S${latestSegmentZs.zs_id}`,
+          zs: latestSegmentZs,
+          pos: computePosVsZs(lastCloseVal, latestSegmentZs),
+          muted: false,
+        };
+      }
+      return null;
+    }
+    const fallbackZs = chanlun?.latest_zhongshu ?? null;
+    return fallbackZs
+      ? {
+          prefix: engineIsSegment ? `引擎主枢(段 S${fallbackZs.zs_id})` : `引擎主枢(笔 Z${fallbackZs.zs_id})`,
+          zs: fallbackZs,
+          pos: chanlun?.price_vs_zhongshu ?? computePosVsZs(lastCloseVal, fallbackZs),
+          muted: true,
+        }
+      : null;
+  }, [
+    showStrokeZhongshu,
+    showSegmentZhongshu,
+    latestStrokeZs,
+    latestSegmentZs,
+    engineIsSegment,
+    lastCloseVal,
+    chanlun?.latest_zhongshu,
+    chanlun?.price_vs_zhongshu,
+  ]);
+
+  const hudSecondary = useMemo(() => {
+    if (!(showStrokeZhongshu && showSegmentZhongshu)) return null;
+    if (engineIsSegment && latestSegmentZs && latestStrokeZs) {
+      return { prefix: `笔枢 Z${latestStrokeZs.zs_id}`, zs: latestStrokeZs };
+    }
+    if (!engineIsSegment && latestStrokeZs && latestSegmentZs) {
+      return { prefix: `段枢 S${latestSegmentZs.zs_id}`, zs: latestSegmentZs };
+    }
+    return null;
+  }, [showStrokeZhongshu, showSegmentZhongshu, engineIsSegment, latestSegmentZs, latestStrokeZs]);
+
   const mom = chanlun?.momentum_assessment;
   const latestStroke = chanlun?.all_strokes?.[chanlun.all_strokes.length - 1];
 
@@ -658,9 +788,23 @@ export function ChanlunChart({
             </span>
           ) : null}
           {chanlun?.zhongshu_level_label ? (
-            <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[10.5px] text-muted">
-              {chanlun.zhongshu_level_label}
-            </span>
+            engineIsSegment && !showSegmentZhongshu ? (
+              <button
+                type="button"
+                onClick={() => {
+                  segUserToggledRef.current = true;
+                  setShowSegmentZhongshu(true);
+                }}
+                className="rounded border border-amber-500/45 bg-amber-500/10 px-1.5 py-0.5 text-[10.5px] text-amber-400 transition-colors hover:bg-amber-500/20"
+                title="当前引擎主判已升级至线段中枢，点击立即叠加段枢图层"
+              >
+                {chanlun.zhongshu_level_label} · 叠加段枢
+              </button>
+            ) : (
+              <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[10.5px] text-muted">
+                {chanlun.zhongshu_level_label}
+              </span>
+            )
           ) : null}
         </div>
 
@@ -695,11 +839,25 @@ export function ChanlunChart({
             type="button"
             className="chip px-2"
             aria-pressed={showSegmentZhongshu}
-            onClick={() => setShowSegmentZhongshu((v) => !v)}
-            title={`显示/隐藏线段中枢（当前 ${prepared.segmentZhongshuBoxes.length} 个）`}
+            onClick={() => {
+              segUserToggledRef.current = true;
+              setShowSegmentZhongshu((v) => !v);
+            }}
+            title={
+              engineIsSegment
+                ? `显示/隐藏线段中枢（当前 ${prepared.segmentZhongshuBoxes.length} 个 · 引擎主判已升级至段枢）`
+                : `显示/隐藏线段中枢（当前 ${prepared.segmentZhongshuBoxes.length} 个）`
+            }
           >
             <Layers className="h-3 w-3" style={{ color: palette.zsSegBorder }} aria-hidden="true" />
             <span>段枢</span>
+            {engineIsSegment ? (
+              <span
+                className="inline-block h-1.5 w-1.5 rounded-full"
+                style={{ backgroundColor: palette.zsSegBorder }}
+                aria-hidden="true"
+              />
+            ) : null}
           </button>
           <button type="button" className="chip px-2" aria-pressed={showMarkers} onClick={() => setShowMarkers((v) => !v)}>
             <span>信号</span>
@@ -752,17 +910,25 @@ export function ChanlunChart({
         </div>
 
         <div className="tnum no-scrollbar flex h-[18px] items-center gap-x-2.5 overflow-x-auto whitespace-nowrap font-sans text-[11px] leading-[18px] text-muted">
-          {latestZs ? (
-            <span className="shrink-0">
-              中枢{" "}
+          {hudPrimary ? (
+            <span className={`shrink-0 ${hudPrimary.muted ? "opacity-75" : ""}`}>
+              {hudPrimary.prefix}{" "}
               <span className="font-mono text-ink-2">
-                [{fmtPrice(latestZs.zd)}, {fmtPrice(latestZs.zg)}]
+                [{fmtPrice(hudPrimary.zs.zd)}, {fmtPrice(hudPrimary.zs.zg)}]
               </span>{" "}
-              · {fmtPosVsZs(chanlun?.price_vs_zhongshu)}
+              · {fmtPosVsZs(hudPrimary.pos)}
             </span>
           ) : (
             <span className="shrink-0">未成中枢</span>
           )}
+          {hudSecondary ? (
+            <span className="shrink-0 text-muted/85">
+              {hudSecondary.prefix}{" "}
+              <span className="font-mono">
+                [{fmtPrice(hudSecondary.zs.zd)}, {fmtPrice(hudSecondary.zs.zg)}]
+              </span>
+            </span>
+          ) : null}
           {latestStroke?.strength_tier ? (
             <span className="shrink-0">
               近笔：{latestStroke.direction === "up" ? "↑" : "↓"}
@@ -830,39 +996,53 @@ export function ChanlunChart({
                 <thead>
                   <tr>
                     <th scope="col">中枢标识</th>
+                    <th scope="col">演化与延伸</th>
                     <th scope="col" className="num">
                       ZD 下沿
                     </th>
                     <th scope="col" className="num">
                       ZG 上沿
                     </th>
-                    <th scope="col">起止时间</th>
+                    <th scope="col">核心 / 延伸时间</th>
                   </tr>
                 </thead>
                 <tbody>
                   {tableZhongshuBoxes.length === 0 ? (
                     <tr>
                       <th scope="row">无</th>
+                      <td data-label="演化与延伸">—</td>
                       <td data-label="ZD 下沿" className="num">
                         —
                       </td>
                       <td data-label="ZG 上沿" className="num">
                         —
                       </td>
-                      <td data-label="起止时间">尚未形成中枢</td>
+                      <td data-label="核心 / 延伸时间">尚未形成中枢</td>
                     </tr>
                   ) : (
                     tableZhongshuBoxes.map((z) => (
                       <tr key={z.key}>
                         <th scope="row">{z.label}</th>
+                        <td data-label="演化与延伸" className="text-[11px]">
+                          <span className="text-ink-2">{fmtRelationLabel(z.relationToPrev)}</span>
+                          <span className="ml-1.5 text-muted">{fmtExtensionLabel(z)}</span>
+                        </td>
                         <td data-label="ZD 下沿" className="num">
                           {fmtPrice(z.zd)}
                         </td>
                         <td data-label="ZG 上沿" className="num">
                           {fmtPrice(z.zg)}
                         </td>
-                        <td data-label="起止时间" className="font-mono text-[11px] text-muted">
-                          {z.startLabel ?? String(z.startTime)} → {z.endLabel ?? String(z.endTime)}
+                        <td data-label="核心 / 延伸时间" className="font-mono text-[11px] text-muted">
+                          <div>
+                            核心 {z.startLabel ?? "—"} → {z.coreEndLabel ?? "—"}
+                          </div>
+                          {z.extEndLabel ? (
+                            <div className="text-[10px] opacity-80">
+                              延伸至 {z.extEndLabel}
+                              {z.nineUpgradeLabel ? ` (九段 ${z.nineUpgradeLabel})` : ""}
+                            </div>
+                          ) : null}
                         </td>
                       </tr>
                     ))

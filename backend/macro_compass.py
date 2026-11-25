@@ -60,6 +60,8 @@ VALID_CONVICTIONS = frozenset({"high", "medium"})
 VALID_HORIZONS = frozenset({"1Q", "1Q~2Q", "2Q~1Y", "1Q~1Y"})
 VALID_ASSET_SCOPES = frozenset({"commodities", "us_equities", "a_shares", "fx", "crypto", "cross_asset"})
 EQUITY_ASSET_CLASSES = frozenset({"us_stock_or_etf", "a_share"})
+# Option A policy: US equities/ETFs allow disciplined Davis double-kill shorting; A-shares remain strictly long-only.
+LONG_ONLY_EQUITY_ASSET_CLASSES = frozenset({"a_share"})
 
 CROSS_ASSET_ANCHORS: tuple[dict[str, str], ...] = (
     # US Equities & Sector Pricing Anchors
@@ -71,11 +73,11 @@ CROSS_ASSET_ANCHORS: tuple[dict[str, str], ...] = (
     {"symbol": "XLI", "name": "工业基建", "group": "us_equities", "group_label": "美股行业锚"},
     {"symbol": "XLB", "name": "基础材料", "group": "us_equities", "group_label": "美股行业锚"},
     {"symbol": "COPX", "name": "全球铜矿", "group": "us_equities", "group_label": "美股行业锚"},
-    # Commodities
-    {"symbol": "GC=F", "name": "黄金", "group": "commodities", "group_label": "大宗商品锚"},
-    {"symbol": "HG=F", "name": "COMEX铜", "group": "commodities", "group_label": "大宗商品锚"},
-    {"symbol": "CL=F", "name": "WTI原油", "group": "commodities", "group_label": "大宗商品锚"},
-    {"symbol": "ALI=F", "name": "COMEX铝", "group": "commodities", "group_label": "大宗商品锚"},
+    # Overseas Commodities
+    {"symbol": "GC=F", "name": "黄金", "group": "commodities", "group_label": "海外大宗锚"},
+    {"symbol": "HG=F", "name": "COMEX铜", "group": "commodities", "group_label": "海外大宗锚"},
+    {"symbol": "CL=F", "name": "WTI原油", "group": "commodities", "group_label": "海外大宗锚"},
+    {"symbol": "ALI=F", "name": "COMEX铝", "group": "commodities", "group_label": "海外大宗锚"},
     # A-shares, FX & Crypto
     {"symbol": "510300.SS", "name": "沪深300", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
     {"symbol": "510880.SS", "name": "A股红利", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
@@ -84,6 +86,15 @@ CROSS_ASSET_ANCHORS: tuple[dict[str, str], ...] = (
     {"symbol": "AUDUSD=X", "name": "澳元/美元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
     {"symbol": "USDCNY=X", "name": "美元/人民币", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
     {"symbol": "BTC-USD", "name": "比特币", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
+)
+
+CN_FUTURES_ANCHORS: tuple[dict[str, str], ...] = (
+    {"symbol": "CU0", "name": "沪铜", "group": "cn_futures", "group_label": "国内核心期货锚"},
+    {"symbol": "SN0", "name": "沪锡", "group": "cn_futures", "group_label": "国内核心期货锚"},
+    {"symbol": "AL0", "name": "沪铝", "group": "cn_futures", "group_label": "国内核心期货锚"},
+    {"symbol": "NI0", "name": "沪镍", "group": "cn_futures", "group_label": "国内核心期货锚"},
+    {"symbol": "I0", "name": "铁矿石", "group": "cn_futures", "group_label": "国内核心期货锚"},
+    {"symbol": "LC0", "name": "碳酸锂", "group": "cn_futures", "group_label": "国内核心期货锚"},
 )
 
 FOCUS_SCOPES_CATALOG: tuple[dict[str, str], ...] = (
@@ -126,14 +137,14 @@ FOCUS_SCOPES_CATALOG: tuple[dict[str, str], ...] = (
     {
         "id": "us_equities",
         "label": "美股板块与产业迭代",
-        "group": "权益市场（仅做多）",
-        "prompt_hint": "美股具备 1~3 年远期预期差的产业迭代与瓶颈赛道（科技算力、电力电网、军工航天、医药、资源矿业股等，严格仅做多）",
+        "group": "权益市场（美股支持双杀做空 · A股仅做多）",
+        "prompt_hint": "美股具备 1~3 年远期预期差的产业迭代与瓶颈赛道（科技算力、电力电网、军工航天、医药、资源矿业股等；景气上行期做多，高利率紧缩+盈利/CapEx增速证伪戴维斯双杀期允许顺势做空板块/ETF）",
     },
     {
         "id": "a_shares",
         "label": "A 股主线与出海",
-        "group": "权益市场（仅做多）",
-        "prompt_hint": "A 股高股息红利、制造业出海、资源周期与国内产业政策催化主线（严格仅做多）",
+        "group": "权益市场（美股支持双杀做空 · A股仅做多）",
+        "prompt_hint": "A 股高股息红利、制造业出海、资源周期与国内产业政策催化主线（严格仅做多，禁止做空）",
     },
 )
 
@@ -163,8 +174,11 @@ def format_focus_scopes_summary(scopes: list[str], focus_prompt: str = "") -> st
 _POOL_SLUG_RE = re.compile(r"[^a-z0-9_]+")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
-# Bounded non-blocking executor & single-flight state for free macro overview fetches
-_MACRO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="compass-macro")
+# Bounded non-blocking executors & single-flight state for free macro overview fetches
+_MACRO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="compass-macro")
+_CN_ANCHOR_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="compass-cn-anchor")
+_CN_ANCHOR_INFLIGHT_LOCK = threading.Lock()
+_CN_ANCHOR_INFLIGHT: dict[str, concurrent.futures.Future[dict[str, Any]]] = {}
 _MACRO_INFLIGHT_LOCK = threading.Lock()
 _MACRO_INFLIGHT_FUTURE: concurrent.futures.Future[dict[str, Any]] | None = None
 _LAST_GOOD_LOCK = threading.Lock()
@@ -221,8 +235,57 @@ def clear_macro_source_cache() -> None:
 # ---------------------------------------------------------------------------
 # Free Hard-Data Foundation (US-China Macro Dual-Core + Cross-Asset Anchors)
 # ---------------------------------------------------------------------------
+def _is_bar_stale(as_of: str | None, *, max_age_days: int = 7) -> bool:
+    if not as_of or not _is_valid_iso_date(as_of):
+        return False
+    try:
+        bar_date = date.fromisoformat(as_of[:10])
+        return (datetime.now(timezone.utc).date() - bar_date).days > max_age_days
+    except ValueError:
+        return False
+
+
+def _anchor_item_from_close_series(
+    meta: dict[str, str],
+    close_series: Any,
+    *,
+    stale_fallback: bool = False,
+) -> dict[str, Any]:
+    if close_series is None or len(close_series) < 2:
+        return {
+            **meta,
+            "status": "unavailable",
+            "last": None,
+            "ret_5d_pct": None,
+            "ret_20d_pct": None,
+            "ret_60d_pct": None,
+            "as_of": None,
+        }
+    n_bars = len(close_series)
+    last = _to_float(close_series.iloc[-1])
+    # Strict lookback windows: never substitute shorter history into a longer return window
+    p5 = _to_float(close_series.iloc[-6]) if n_bars >= 6 else None
+    p20 = _to_float(close_series.iloc[-21]) if n_bars >= 21 else None
+    p60 = _to_float(close_series.iloc[-61]) if n_bars >= 61 else None
+    as_of_raw = close_series.index[-1]
+    as_of = as_of_raw.strftime("%Y-%m-%d") if hasattr(as_of_raw, "strftime") else str(as_of_raw)[:10]
+    is_stale = bool(stale_fallback) or _is_bar_stale(as_of)
+    item: dict[str, Any] = {
+        **meta,
+        "status": "stale" if is_stale else "ok",
+        "last": round(last, 4) if last is not None else None,
+        "ret_5d_pct": _safe_pct_change(last, p5),
+        "ret_20d_pct": _safe_pct_change(last, p20),
+        "ret_60d_pct": _safe_pct_change(last, p60),
+        "as_of": as_of,
+    }
+    if is_stale:
+        item["stale_fallback"] = True
+    return item
+
+
 def fetch_cross_asset_anchors() -> dict[str, Any]:
-    """Batch-fetch strict 5D / 20D / 60D relative returns for 17 global pricing anchors via yfinance."""
+    """Batch-fetch strict 5D / 20D / 60D relative returns for 19 global pricing anchors via yfinance."""
     if yf is None:
         return {"status": "error", "error": "yfinance is not installed", "items": []}
 
@@ -257,44 +320,260 @@ def fetch_cross_asset_anchors() -> dict[str, Any]:
         except Exception:
             close_series = None
 
-        if close_series is None or len(close_series) < 2:
-            items.append(
-                {
-                    **meta,
-                    "status": "unavailable",
-                    "last": None,
-                    "ret_5d_pct": None,
-                    "ret_20d_pct": None,
-                    "ret_60d_pct": None,
-                    "as_of": None,
-                }
-            )
-            continue
-
-        n_bars = len(close_series)
-        last = _to_float(close_series.iloc[-1])
-        # Strict lookback windows: never substitute shorter history into a longer return window
-        p5 = _to_float(close_series.iloc[-6]) if n_bars >= 6 else None
-        p20 = _to_float(close_series.iloc[-21]) if n_bars >= 21 else None
-        p60 = _to_float(close_series.iloc[-61]) if n_bars >= 61 else None
-        as_of_raw = close_series.index[-1]
-        as_of = as_of_raw.strftime("%Y-%m-%d") if hasattr(as_of_raw, "strftime") else str(as_of_raw)[:10]
-
-        items.append(
-            {
-                **meta,
-                "status": "ok",
-                "last": round(last, 4) if last is not None else None,
-                "ret_5d_pct": _safe_pct_change(last, p5),
-                "ret_20d_pct": _safe_pct_change(last, p20),
-                "ret_60d_pct": _safe_pct_change(last, p60),
-                "as_of": as_of,
-            }
-        )
-        ok_count += 1
+        item = _anchor_item_from_close_series(meta, close_series)
+        items.append(item)
+        if item["status"] == "ok":
+            ok_count += 1
 
     status = "ok" if ok_count == len(CROSS_ASSET_ANCHORS) else ("partial" if ok_count > 0 else "error")
     return {"status": status, "ok_count": ok_count, "total": len(CROSS_ASSET_ANCHORS), "items": items}
+
+
+def _read_cached_cn_future_close(sym: str) -> Any:
+    """Lock-free read-only SQLite fallback via load_cached_ohlcv regardless of TTL expiry."""
+    if not data_store.is_store_enabled():
+        return None
+    try:
+        store = data_store.get_store()
+        key = data_store.SeriesKey("cn_future", sym, "1d", "akshare_sina_main", "raw_continuous")
+        loaded = store.load_cached_ohlcv(
+            key,
+            period="6mo",
+            timestamp_anchor="end",
+            allowed_sources=("akshare_sina_main", "akshare_sina_daily_fb"),
+        )
+        if loaded is None:
+            return None
+        df_cached, _, _ = loaded
+        if df_cached is not None and not df_cached.empty and "Close" in df_cached.columns:
+            cs = df_cached["Close"].dropna()
+            if len(cs) >= 2:
+                return cs
+        return None
+    except Exception:
+        return None
+
+
+def _fetch_single_cn_future_anchor(
+    meta: dict[str, str],
+    *,
+    refresh: bool = False,
+    http_budget_seconds: float = 5.0,
+) -> dict[str, Any]:
+    sym = meta["symbol"]
+    read_to = max(0.5, min(5.0, http_budget_seconds))
+    conn_to = max(0.5, min(3.0, read_to))
+    try:
+        with data_store.scoped_http_timeout((conn_to, read_to)):
+            snap = market_snapshot.get_snapshot(sym, period="6mo", refresh=refresh)
+        if isinstance(snap, dict) and not snap.get("error"):
+            tech = snap.get("technicals") or {}
+            last = _to_float(tech.get("last_close"))
+            as_of = str(tech.get("as_of_bar") or "")[:10] or None
+            if last is not None:
+                is_stale = _is_bar_stale(as_of)
+                item: dict[str, Any] = {
+                    **meta,
+                    "status": "stale" if is_stale else "ok",
+                    "last": round(last, 4),
+                    "ret_5d_pct": _to_float(tech.get("return_5d_pct")),
+                    "ret_20d_pct": _to_float(tech.get("return_20d_pct")),
+                    "ret_60d_pct": _to_float(tech.get("return_60d_pct")),
+                    "as_of": as_of,
+                }
+                if is_stale:
+                    item["stale_fallback"] = True
+                return item
+    except Exception:
+        pass
+
+    cached_close = _read_cached_cn_future_close(sym)
+    if cached_close is not None:
+        return _anchor_item_from_close_series(meta, cached_close, stale_fallback=True)
+
+    return _anchor_item_from_close_series(meta, None)
+
+
+def _submit_cn_anchor_dedup(
+    meta: dict[str, str],
+    *,
+    refresh: bool,
+    http_budget_seconds: float,
+) -> concurrent.futures.Future[dict[str, Any]]:
+    """Reuse any still-running per-symbol future so overlapping refreshes never pile up on _CN_ANCHOR_EXECUTOR."""
+    sym = meta["symbol"]
+    with _CN_ANCHOR_INFLIGHT_LOCK:
+        existing = _CN_ANCHOR_INFLIGHT.get(sym)
+        if existing is not None and not existing.done():
+            return existing
+        fut = _CN_ANCHOR_EXECUTOR.submit(
+            _fetch_single_cn_future_anchor,
+            meta,
+            refresh=refresh,
+            http_budget_seconds=http_budget_seconds,
+        )
+        _CN_ANCHOR_INFLIGHT[sym] = fut
+
+    # Register callback OUTSIDE _CN_ANCHOR_INFLIGHT_LOCK because add_done_callback runs
+    # synchronously on the caller thread if fut has already finished!
+    def _cleanup(_f: concurrent.futures.Future[dict[str, Any]], _s: str = sym) -> None:
+        with _CN_ANCHOR_INFLIGHT_LOCK:
+            if _CN_ANCHOR_INFLIGHT.get(_s) is _f:
+                _CN_ANCHOR_INFLIGHT.pop(_s, None)
+
+    fut.add_done_callback(_cleanup)
+    return fut
+
+
+def fetch_cn_futures_anchors(*, refresh: bool = False, timeout_seconds: float = 9.0) -> dict[str, Any]:
+    """Fetch strict 5D / 20D / 60D returns for 6 China-priced futures anchors within a unified deadline."""
+    budget = max(0.15, float(timeout_seconds))
+    deadline = time.monotonic() + budget
+    # Reserve a small slice at the end for fast local SQLite fallback reads on any timed-out symbols
+    fallback_reserve = min(0.2, budget * 0.25)
+    wait_budget = max(0.05, budget - fallback_reserve)
+    http_budget = max(0.5, min(5.0, wait_budget))
+
+    fut_map: dict[concurrent.futures.Future[dict[str, Any]], dict[str, str]] = {
+        _submit_cn_anchor_dedup(meta, refresh=refresh, http_budget_seconds=http_budget): meta
+        for meta in CN_FUTURES_ANCHORS
+    }
+    done, not_done = concurrent.futures.wait(list(fut_map.keys()), timeout=wait_budget)
+
+    by_sym: dict[str, dict[str, Any]] = {}
+    for fut in done:
+        meta = fut_map[fut]
+        try:
+            by_sym[meta["symbol"]] = fut.result(timeout=0)
+        except Exception:
+            by_sym[meta["symbol"]] = _anchor_item_from_close_series(meta, None)
+
+    for fut in not_done:
+        meta = fut_map[fut]
+        if time.monotonic() < deadline:
+            cached_close = _read_cached_cn_future_close(meta["symbol"])
+        else:
+            cached_close = None
+        by_sym[meta["symbol"]] = _anchor_item_from_close_series(
+            meta,
+            cached_close,
+            stale_fallback=cached_close is not None,
+        )
+
+    items = [by_sym[m["symbol"]] for m in CN_FUTURES_ANCHORS]
+    ok_count = sum(1 for it in items if it.get("status") == "ok")
+    stale_count = sum(1 for it in items if it.get("status") == "stale")
+    if ok_count == len(CN_FUTURES_ANCHORS):
+        status = "ok"
+    elif ok_count > 0:
+        status = "partial"
+    elif stale_count > 0:
+        status = "stale"
+    else:
+        status = "error"
+    return {
+        "status": status,
+        "ok_count": ok_count,
+        "stale_count": stale_count,
+        "total": len(CN_FUTURES_ANCHORS),
+        "items": items,
+    }
+
+
+def compute_tape_movers(items: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize extreme 20D/60D movers & market breadth strictly from FRESH ('ok') anchors.
+
+    Each mover is assigned to at most one list (losers OR gainers) based on its dominant
+    magnitude window (20D vs 60D) and carries explicit ``driver_window`` / ``driver_ret_pct``
+    so UI badges always match the ranking sign.
+    """
+    fresh_items = [
+        it
+        for it in items
+        if isinstance(it, dict)
+        and it.get("status") == "ok"
+        and not it.get("stale_fallback")
+        and (it.get("ret_20d_pct") is not None or it.get("ret_60d_pct") is not None)
+    ]
+
+    def _dominant_move(it: dict[str, Any]) -> tuple[str, float] | None:
+        r20 = _to_float(it.get("ret_20d_pct"))
+        r60 = _to_float(it.get("ret_60d_pct"))
+        if r20 is None and r60 is None:
+            return None
+        if r20 is not None and r60 is None:
+            return ("20D", r20)
+        if r60 is not None and r20 is None:
+            return ("60D", r60)
+        assert r20 is not None and r60 is not None
+        # Choose the larger absolute move (20D wins ties for recency)
+        return ("20D", r20) if abs(r20) >= abs(r60) else ("60D", r60)
+
+    def _compact(it: dict[str, Any], window: str, driver_ret: float) -> dict[str, Any]:
+        return {
+            "symbol": it.get("symbol"),
+            "name": it.get("name"),
+            "group": it.get("group"),
+            "last": it.get("last"),
+            "ret_5d_pct": it.get("ret_5d_pct"),
+            "ret_20d_pct": it.get("ret_20d_pct"),
+            "ret_60d_pct": it.get("ret_60d_pct"),
+            "driver_window": window,
+            "driver_ret_pct": driver_ret,
+            "as_of": it.get("as_of"),
+        }
+
+    losers_scored: list[tuple[float, dict[str, Any]]] = []
+    gainers_scored: list[tuple[float, dict[str, Any]]] = []
+    for it in fresh_items:
+        dom = _dominant_move(it)
+        if dom is None:
+            continue
+        win, val = dom
+        if (win == "20D" and val <= -3.0) or (win == "60D" and val <= -6.0):
+            losers_scored.append((val, _compact(it, win, val)))
+        elif (win == "20D" and val >= 2.0) or (win == "60D" and val >= 5.0):
+            gainers_scored.append((val, _compact(it, win, val)))
+
+    losers_scored.sort(key=lambda pair: pair[0])
+    gainers_scored.sort(key=lambda pair: pair[0], reverse=True)
+
+    with_20d = [it for it in fresh_items if it.get("ret_20d_pct") is not None]
+    total_20d = len(with_20d)
+    declining_20d = sum(1 for it in with_20d if float(it["ret_20d_pct"]) < 0)
+    advancing_20d = sum(1 for it in with_20d if float(it["ret_20d_pct"]) > 0)
+    severe_drawdown = sum(
+        1
+        for it in fresh_items
+        if (it.get("ret_20d_pct") is not None and float(it["ret_20d_pct"]) <= -10.0)
+        or (it.get("ret_60d_pct") is not None and float(it["ret_60d_pct"]) <= -15.0)
+    )
+    strong_rally = sum(
+        1
+        for it in fresh_items
+        if (it.get("ret_20d_pct") is not None and float(it["ret_20d_pct"]) >= 10.0)
+        or (it.get("ret_60d_pct") is not None and float(it["ret_60d_pct"]) >= 15.0)
+    )
+
+    if total_20d >= 6 and (declining_20d / total_20d) >= 0.70 and severe_drawdown >= 5:
+        breadth_label = "全面紧缩/普跌（空头主战场）"
+    elif total_20d >= 6 and (advancing_20d / total_20d) >= 0.70 and strong_rally >= 5:
+        breadth_label = "全面扩张/普涨（多头主战场）"
+    else:
+        breadth_label = "结构分化（多空双向择优）"
+
+    return {
+        "top_losers": [item for _, item in losers_scored[:8]],
+        "top_gainers": [item for _, item in gainers_scored[:5]],
+        "regime_breadth": {
+            "total_available": total_20d,
+            "declining_20d_count": declining_20d,
+            "advancing_20d_count": advancing_20d,
+            "severe_drawdown_count": severe_drawdown,
+            "strong_rally_count": strong_rally,
+            "breadth_label": breadth_label,
+        },
+    }
 
 
 def _extract_china_pmi_headline(china_macro: dict[str, Any]) -> dict[str, Any] | None:
@@ -492,7 +771,40 @@ def _build_headline_metrics_and_tags(
     return metrics, tags
 
 
-def _fetch_macro_overview_uncached(deadline_seconds: float) -> dict[str, Any]:
+def _merge_anchor_items_preserving_fresher(
+    new_items: list[dict[str, Any]],
+    prior_items: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Merge per-symbol anchor rows so a stale/unavailable item never clobbers a fresher last-known-good row."""
+    prior_by_sym = {
+        str(it.get("symbol") or ""): it
+        for it in prior_items
+        if isinstance(it, dict) and it.get("symbol")
+    }
+    rank_status = {"ok": 2, "stale": 1, "unavailable": 0}
+    merged: list[dict[str, Any]] = []
+    for it in new_items:
+        if not isinstance(it, dict):
+            continue
+        sym = str(it.get("symbol") or "")
+        prev = prior_by_sym.get(sym)
+        if prev is None:
+            merged.append(it)
+            continue
+        new_st = str(it.get("status") or "unavailable")
+        prev_st = str(prev.get("status") or "unavailable")
+        new_asof = str(it.get("as_of") or "")
+        prev_asof = str(prev.get("as_of") or "")
+        # Prefer higher freshness status when new is degraded, or strictly newer as_of
+        if rank_status.get(new_st, 0) < rank_status.get(prev_st, 0) and prev_asof >= new_asof:
+            # Mark carried-over item as stale so live breadth never treats prior cache as newly fetched
+            merged.append({**prev, "status": "stale", "stale_fallback": True})
+        else:
+            merged.append(it)
+    return merged
+
+
+def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = False) -> dict[str, Any]:
     """Execute one bounded parallel macro overview fetch without blocking on timed-out threads."""
     now_iso = _utc_iso()
     http_read_timeout = max(0.5, min(12.0, deadline_seconds))
@@ -501,11 +813,15 @@ def _fetch_macro_overview_uncached(deadline_seconds: float) -> dict[str, Any]:
         with data_store.scoped_http_timeout((min(4.0, http_read_timeout), http_read_timeout)):
             return fn()
 
+    cn_timeout = max(0.2, min(9.0, deadline_seconds * 0.9))
     fut_map: dict[concurrent.futures.Future[Any], str] = {
         _MACRO_EXECUTOR.submit(_wrapped, market_snapshot.fetch_macro_context): "live_macro",
         _MACRO_EXECUTOR.submit(_wrapped, research_data.fetch_fred_macro): "us_fred",
         _MACRO_EXECUTOR.submit(_wrapped, research_data.fetch_china_macro_core): "cn_macro",
         _MACRO_EXECUTOR.submit(_wrapped, fetch_cross_asset_anchors): "cross_asset_anchors",
+        _MACRO_EXECUTOR.submit(
+            lambda: fetch_cn_futures_anchors(refresh=refresh, timeout_seconds=cn_timeout)
+        ): "cn_futures_anchors",
     }
 
     done, not_done = concurrent.futures.wait(
@@ -531,16 +847,47 @@ def _fetch_macro_overview_uncached(deadline_seconds: float) -> dict[str, Any]:
     def _resolve_source(name: str, default_empty: Any, ok_check: Callable[[Any], bool]) -> tuple[Any, str, dict[str, Any] | None]:
         val = raw_results.get(name)
         if name not in errors and ok_check(val):
-            with _LAST_GOOD_LOCK:
-                _LAST_GOOD_MACRO_SOURCES[name] = {"data": val, "fetched_at_utc": now_iso}
             st = str(val.get("status") or "ok") if isinstance(val, dict) and "status" in val else "ok"
+            with _LAST_GOOD_LOCK:
+                prior = _LAST_GOOD_MACRO_SOURCES.get(name)
+                if st == "partial" and prior is not None and isinstance(val, dict) and isinstance(val.get("items"), list):
+                    prior_items = (prior.get("data") or {}).get("items") or []
+                    merged_sub = _merge_anchor_items_preserving_fresher(val["items"], prior_items)
+                    val = {
+                        **val,
+                        "items": merged_sub,
+                        "ok_count": sum(1 for it in merged_sub if it.get("status") == "ok"),
+                    }
+                    # Only promote to last-known-good if it doesn't shrink fresh ok_count
+                    prev_ok = int((prior.get("data") or {}).get("ok_count") or 0)
+                    if int(val.get("ok_count") or 0) >= prev_ok:
+                        _LAST_GOOD_MACRO_SOURCES[name] = {"data": val, "fetched_at_utc": now_iso}
+                else:
+                    _LAST_GOOD_MACRO_SOURCES[name] = {"data": val, "fetched_at_utc": now_iso}
             return val, st, None
 
+        # If source returned stale fallback items (e.g. SQLite cached bars on Sina timeout),
+        # never clobber _LAST_GOOD_MACRO_SOURCES and mark degraded stale!
         err_msg = errors.get(name) or (str(val.get("error")) if isinstance(val, dict) and val.get("error") else "fetch failed")
         with _LAST_GOOD_LOCK:
             prior = _LAST_GOOD_MACRO_SOURCES.get(name)
+        if isinstance(val, dict) and str(val.get("status") or "") == "stale":
+            if prior is not None and isinstance(val.get("items"), list):
+                prior_items = (prior.get("data") or {}).get("items") or []
+                merged_sub = _merge_anchor_items_preserving_fresher(val["items"], prior_items)
+                val = {**val, "items": merged_sub, "ok_count": 0}
+                return val, "stale", {"last_good_at_utc": prior["fetched_at_utc"], "error": err_msg or "stale sqlite fallback"}
+            return val, "stale", {"last_good_at_utc": None, "error": err_msg or "stale sqlite fallback"}
         if prior is not None:
-            return prior["data"], "stale", {"last_good_at_utc": prior["fetched_at_utc"], "error": err_msg}
+            prior_data = prior["data"]
+            if isinstance(prior_data, dict) and isinstance(prior_data.get("items"), list):
+                stale_items = [
+                    ({**it, "status": "stale", "stale_fallback": True} if it.get("status") == "ok" else it)
+                    for it in prior_data["items"]
+                    if isinstance(it, dict)
+                ]
+                prior_data = {**prior_data, "status": "stale", "ok_count": 0, "items": stale_items}
+            return prior_data, "stale", {"last_good_at_utc": prior["fetched_at_utc"], "error": err_msg}
         return default_empty, "error", {"last_good_at_utc": None, "error": err_msg}
 
     live_ctx, st_live, stale_live = _resolve_source(
@@ -558,17 +905,41 @@ def _fetch_macro_overview_uncached(deadline_seconds: float) -> dict[str, Any]:
         {"status": "error", "error": errors.get("cn_macro", "unavailable")},
         lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
     )
-    anchors, st_anc, stale_anc = _resolve_source(
+    yf_anchors, st_anc, stale_anc = _resolve_source(
         "cross_asset_anchors",
-        {"status": "error", "items": [], "error": errors.get("cross_asset_anchors", "unavailable")},
+        {"status": "error", "items": [], "ok_count": 0, "total": len(CROSS_ASSET_ANCHORS), "error": errors.get("cross_asset_anchors", "unavailable")},
         lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
     )
+    cn_anchors, st_cn_anc, stale_cn_anc = _resolve_source(
+        "cn_futures_anchors",
+        {"status": "error", "items": [], "ok_count": 0, "total": len(CN_FUTURES_ANCHORS), "error": errors.get("cn_futures_anchors", "unavailable")},
+        lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
+    )
+
+    merged_items: list[dict[str, Any]] = [
+        *(yf_anchors.get("items") or []),
+        *(cn_anchors.get("items") or []),
+    ]
+    merged_ok = sum(1 for it in merged_items if isinstance(it, dict) and it.get("status") == "ok")
+    declared_total = int(yf_anchors.get("total") or len(yf_anchors.get("items") or [])) + int(
+        cn_anchors.get("total") or len(cn_anchors.get("items") or [])
+    )
+    merged_total = max(len(merged_items), declared_total)
+    merged_status = "ok" if (merged_total > 0 and merged_ok == merged_total) else ("partial" if merged_ok > 0 else "error")
+    anchors = {
+        "status": merged_status,
+        "ok_count": merged_ok,
+        "total": merged_total,
+        "items": merged_items,
+    }
+    tape_movers = compute_tape_movers(merged_items)
 
     sources_status = {
         "live_macro": st_live,
         "us_fred": st_fred,
         "cn_macro": st_cn,
         "cross_asset_anchors": st_anc,
+        "cn_futures_anchors": st_cn_anc,
     }
     stale_sources = {
         k: info
@@ -577,6 +948,7 @@ def _fetch_macro_overview_uncached(deadline_seconds: float) -> dict[str, Any]:
             ("us_fred", stale_fred),
             ("cn_macro", stale_cn),
             ("cross_asset_anchors", stale_anc),
+            ("cn_futures_anchors", stale_cn_anc),
         )
         if info is not None
     }
@@ -597,6 +969,7 @@ def _fetch_macro_overview_uncached(deadline_seconds: float) -> dict[str, Any]:
             "us_fred": fred_macro,
             "china_macro": china_macro,
             "anchors": anchors,
+            "tape_movers": tape_movers,
         }
     )
     CACHE.set(("compass_macro_overview",), bundle, ttl)
@@ -608,7 +981,7 @@ def collect_macro_overview(
     refresh: bool = False,
     deadline_seconds: float = DEFAULT_MACRO_DEADLINE_SECONDS,
 ) -> dict[str, Any]:
-    """Collect and cache free US-China macro dual-core + 17 cross-asset anchors with single-flight coalescing."""
+    """Collect and cache free US-China macro dual-core + 25 cross-asset & CN futures anchors with single-flight coalescing."""
     global _MACRO_INFLIGHT_FUTURE
     cache_key = ("compass_macro_overview",)
     if not refresh:
@@ -636,7 +1009,7 @@ def collect_macro_overview(
             raise
 
     try:
-        bundle = _fetch_macro_overview_uncached(deadline_seconds=deadline_seconds)
+        bundle = _fetch_macro_overview_uncached(deadline_seconds=deadline_seconds, refresh=refresh)
         shared_future.set_result(bundle)
         return bundle
     except BaseException as exc:
@@ -839,6 +1212,8 @@ def build_compass_brief(
 ) -> dict[str, Any]:
     """Assemble a strictly unanchored macro brief (NO existing_universes, NO current holdings)."""
     clean_scopes = normalize_focus_scopes(focus_scopes or [])
+    anchor_items = (macro_overview.get("anchors") or {}).get("items") or []
+    tape_movers = macro_overview.get("tape_movers") or compute_tape_movers(anchor_items)
     return sanitize(
         {
             "generated_at_utc": _utc_iso(),
@@ -848,6 +1223,7 @@ def build_compass_brief(
             ],
             "focus_prompt": focus_prompt.strip(),
             "seven_dimensions": list(SEVEN_DIMENSIONS),
+            "tape_movers": tape_movers,
             "macro_overview": {
                 "fetched_at_utc": macro_overview.get("fetched_at_utc"),
                 "sources_status": macro_overview.get("sources_status"),
@@ -855,7 +1231,7 @@ def build_compass_brief(
                 "regime_tags": macro_overview.get("regime_tags"),
                 "headline_metrics": macro_overview.get("headline_metrics"),
                 "china_macro": macro_overview.get("china_macro"),
-                "cross_asset_anchors": (macro_overview.get("anchors") or {}).get("items") or [],
+                "cross_asset_anchors": anchor_items,
             },
         }
     )
@@ -888,21 +1264,28 @@ def build_compass_prompt(
         "从当下真实世界正在发生的最大级别宏观、地缘、政策、供需与产业变化出发，只回答第一层最核心的战略问题：\n"
         "**“在当前环境下，未来 1 个季度至 1 年（1Q~1Y）最有逻辑的多空方向和核心板块（Sector / Theme）是什么？产业链该切哪个环节？又该回避哪些逆风板块？”**\n\n"
         "【Layer 1 职责边界与铁律（严格遵守）】\n"
-        "1. **数据时效优先（警惕滞后月度宏观统计）**：简报中的月度宏观数据（如 `CN_PMI`、`FEDFUNDS`、`PCOPPUSDM`）天然滞后 1~2 个月，仅作背景参考；**实时市场定价（`cross_asset_anchors` 近 5D/20D/60D 异动、`VIX`/`US10Y`/`DXY`）与你通过 WebSearch 检索到的近 1~2 周最新政策/库存/会议/市场定价变化享有绝对最高优先级**。严禁因为简报里的 19 个定价锚恰好列了某几个品种就只搜那几个，必须主动覆盖目标战场内所有核心品种（如铜/铝/镍/铁矿、商品货币澳元/加元/日元/欧元等）。\n"
+        "1. **极端盘面异动强制归因（Tape-to-Macro Radar · 打破旧共识钢印！）**：\n"
+        "   - 简报中的月度宏观数据（如 `CN_PMI`、`FEDFUNDS`、`PCOPPUSDM`）天然滞后 1~2 个月，仅作背景参考；**实时市场定价（`tape_movers` 极端领涨/领跌榜、`cross_asset_anchors` 含国内核心期货锚的近 5D/20D/60D 异动、`VIX`/`US10Y`/`DXY`）与你通过 WebSearch 检索到的近 1~2 周最新变化享有绝对最高优先级**。\n"
+        "   - **强制动作**：先逐一审视 `brief.json` 里的 `tape_movers.top_losers` 和 `top_gainers`！凡是 20D/60D 已经出现 **≥15% 极端单边走势**的品种/板块（无论海外资产还是国内期货锚），背后往往是**资金方向的高度一致（未背驰主趋势段）**，绝非短线噪音！你必须主动联网追问：这轮大跌/大涨是不是由“高利率金融属性重定价 + 下游景气/CapEx 叙事证伪 + 需求坍塌 + 拥挤多头踩踏”等多维度复合驱动的 1Q~1Y 级大行情？\n"
+        "   - **严禁卖方旧共识钢印**：绝不能因为脑海里残留着旧叙事（例如“某金属长期矿端短缺”或“某科技赛道长期高增长”）就对盘面已经砸出 -18%~-38% 的主跌段视而不见，更不要放着真金白银在走的大趋势不做，反而去猜横盘品种的左侧拐点！\n"
         "2. **只选方向与板块，不代用户硬选具体个股/唯一龙头**：Layer 1 负责把宏观大局、多空方向、核心板块及产业链选龙头抓手（`value_chain_focus`）讲透；具体挑哪只真龙头并做日线缠论验证，交由用户在下方 Layer 2 自主完成。你可以可选填 0~2 个板块基准定价锚（如一级行业 ETF 或主流商品/汇率基准代码），但绝不要越俎代庖替用户锁定某一只个股。\n"
-        "3. **大逻辑先行（严禁凭短线涨跌或超买超卖倒推逻辑）**：不使用 RSI/布林带/均值回归作为推荐依据，只做真正具备 1Q~1Y 基本面预期差、供需失衡或宏观流动性共振的板块。\n"
+        "3. **大逻辑先行（严禁凭 RSI/超买超卖逆势猜底摸顶）**：不使用 RSI/布林带/均值回归作为推荐依据，只做真正具备 1Q~1Y 基本面预期差、戴维斯双击/双杀、供需失衡或宏观流动性共振的板块。\n"
         "4. **7 维驱动共振门槛（强制 ≥2 个不同维度共振，且均须有非空摘要）**：每个板块必须明确标注主驱动维度 + 不同的次驱动维度，规范名限定为：\n"
         "   - `宏观双核`（美国利率/美债/美元流动性 + 中国财政/地产/信用周期）\n"
         "   - `地缘与资源国政策`（地缘冲突、贸易与航运咽喉、资源国出口/配额/矿业税/收储政策、关税壁垒）\n"
-        "   - `技术与产业迭代`（核心技术代际切换、卡脖子基础设施瓶颈、商业化景气拐点）\n"
+        "   - `技术与产业迭代`（核心技术代际切换、卡脖子基础设施瓶颈、商业化景气拐点或 CapEx 证伪下修）\n"
         "   - `商品供需平衡与库存周期`（未来1Q~1Y新增产能投产爬坡 vs 下游需求增量或坍塌、产能出清、气候冲击）\n"
         "   - `产业政策与监管`（财政补贴、限产/反内卷与产能整合、行业监管或法案审批）\n"
-        "   - `资金流与市场结构`（机构配置/ETF申赎、衍生品持仓拥挤度、套息交易平仓）\n"
+        "   - `资金流与市场结构`（机构配置/ETF申赎、衍生品持仓拥挤度踩踏、套息交易平仓）\n"
         "   - `突发供给冲击`（主产区不可抗力、停产、物流封锁或突发禁令）\n"
-        "5. **跨资产多空非对称 + 逆风转化为交易策略（严禁把商品/外汇/加密的极佳空头机会浪费在纯回避栏！）**：\n"
-        "   - **股票板块（美股 / A股）严格禁止做空（包括配对中的空头腿）**，仅允许做多（`long`）或配对中的多头板块腿；\n"
-        "   - **大宗商品、外汇（FX）、加密货币**多空完全对称，`short` 做空与 `pair` 同产业链多空配对与 `long` 同等重要！若商品（如过剩金属/原油/黑色）、外汇或加密存在硬核逆风（即使当下低库存呈大 B 结构），**优先直接升格进 `directions` 作为 `short` 或 `pair` 空头腿**，绝不只写一句“建议回避”就丢掉！\n"
-        "   - **每一条 `avoid_sectors` 逆风点都必须延伸出可落地策略（`derived_strategy`）**：若是股票逆风，严禁空正股，但必须指出能否通过**跨资产非股票代理做空**（如中国地产链逆风 → 延伸做空黑色系期货或商品货币澳元）或转向**产业链反向受益轮动**；若是未挤进前 6 张卡的商品/外汇/加密次优空头，直接标明 `short_proxy_possible: true` 并写清 `short_proxy_hint`，供用户在 UI 一键选标做空！\n"
+        "5. **顺周期动态多空配比 + 跨资产分层权限 + 产业链传导（严禁凑伪平衡、严禁浪费极佳空头！）**：\n"
+        "   - **按宏观宽度决定多空比例（拒绝机械 50/50）**：参考 `tape_movers.regime_breadth`。在“全面紧缩/普跌”象限，**完全允许 4~5 张方向卡全是纯空头（`short`）**，绝不要为了显得“攻守平衡”硬凑弱逻辑多头，更**严禁把 20D/60D 正在深跌（如跌幅超 -10%）的弱势资产硬塞进 `pair` 的多头腿去对冲空头利润**！只有当多头腿自身具备独立走强动能与硬缺口时，才使用 `pair`。\n"
+        "   - **跨资产分层权限（美股双杀可空 · A股严禁做空 · 商品/外汇/加密全对称）**：\n"
+        "     - **美股 / 美股行业 ETF**：景气上行期做多；而在**高实际利率压制估值 + 未来 1~3 年盈利/CapEx 增长故事证伪（戴维斯双杀）**的熊市主跌段，**允许直接输出 `short` 做空方向卡（或作为 `pair` 空头腿）**！\n"
+        "     - **A 股**：受限于融券制度，**严格禁止做空（含配对空头腿）**，仅允许 `long`。\n"
+        "     - **大宗商品（海外 + 国内期货）、外汇（FX）、加密货币**：多空完全对称，`short` 做空与 `long` 同等重要！商品即使短期低库存呈大 B 结构，强现实弱预期劈叉照样可以做空。\n"
+        "   - **强制追踪跨资产产业链传导**：每当某个超大权重权益主线进入戴维斯双杀或宏观收缩（例如算力硬件/半导体 CapEx 放缓、或中国地产/信用收缩），必须顺藤摸瓜同时审视其**上游工业/电子金属（如电子焊料金属、数据中心用铜、黑色原料）与商品货币**的联动空头机会——最强的主跌空头直接升格进 `directions`！\n"
+        "   - **每一条 `avoid_sectors` 逆风点都必须延伸出可落地策略（`derived_strategy`）**：说明能否直接通过美股/ETF、商品期货、外汇或加密空头表达（A 股严禁直接做空，但可延伸至上游商品/外汇代理空头或反向受益轮动），并如实填写 `short_proxy_possible` 与 `short_proxy_hint`。\n"
         "6. **0-编造红线**：引用宏观数据必须与 `brief.json` 或最新联网来源一致（且标明日期）；每个板块必须给出 **≥2 条**真实联网证据，含精确 `YYYY-MM-DD` 日期、来源机构名、`L1~L4` 证据等级与可验证的 `https://` 链接。\n"
         f"{scopes_block}"
         f"{focus_block}\n"
@@ -911,20 +1294,20 @@ def build_compass_prompt(
         "```json\n"
         "{\n"
         '  "regime_title": "15~32字精炼概括当前全球宏观总定调",\n'
-        '  "regime_summary": "2~4句清晰判断当下美国利率/美元 + 中国信用/财政双核所处象限，以及未来1Q~1Y资金主战场与整体攻守姿态",\n'
+        '  "regime_summary": "2~4句清晰判断当下美国利率/美元 + 中国信用/财政双核所处象限，结合盘面宽度判断未来1Q~1Y资金主战场与整体攻守姿态",\n'
         '  "macro_signals": {\n'
         '    "us_macro": "美国利率/通胀/美元流动性现状与未来1~2季路径（1句）",\n'
         '    "china_macro": "中国财政/地产/PMI/出口脉动与对周期及股市的含义（1句）",\n'
         '    "geopolitics_supply": "当前全球最关键的地缘/关税/资源国供给焦点（1句）",\n'
-        '    "tech_industry": "当前科技与制造业产业链最核心的景气迭代主线（1句）"\n'
+        '    "tech_industry": "当前科技与制造业产业链最核心的景气迭代或CapEx证伪主线（1句）"\n'
         "  },\n"
         '  "avoid_sectors": [\n'
         "    {\n"
         '      "sector": "当下处于逆风的板块/方向",\n'
         '      "reason": "1句讲清为何处于逆风或预期证伪",\n'
-        '      "derived_strategy": "1~2句延伸策略：股票仅规避/止盈或切向反向受益环节，同时说明能否通过非股票（商品期货/外汇/加密）做空或代理表达",\n'
+        '      "derived_strategy": "1~2句延伸策略：说明如何通过美股ETF/商品期货/外汇/加密空头表达，或A股规避+跨资产代理做空/反向轮动",\n'
         '      "short_proxy_possible": true,\n'
-        '      "short_proxy_hint": "若存在合规非股票空头/代理（严禁为股票），简写工具方向（如 黑色系期货/商品货币空头、加密永续空头、过剩金属期货空头）；无则空字符串"\n'
+        '      "short_proxy_hint": "若存在合规空头/代理（A股严禁直接做空；美股ETF/商品/外汇/加密均可），简写工具方向；无则空字符串"\n'
         "    }\n"
         "  ],\n"
         '  "directions": [\n'
@@ -938,10 +1321,10 @@ def build_compass_prompt(
         '      "asset_scope": "commodities | us_equities | a_shares | fx | crypto | cross_asset",\n'
         '      "primary_driver": {"dimension": "7维规范名之一", "summary": "主驱动逻辑核心要点（1句，必填）"},\n'
         '      "secondary_driver": {"dimension": "另1个不同的7维规范名", "summary": "次驱动共振要点（1句，必填）"},\n'
-        '      "thesis": "2~3句讲透未来1Q~1Y该板块的核心预期差、供需/盈利传导链与为什么现在是最优方向",\n'
-        '      "value_chain_focus": "1~2句明确产业链最该切入的环节及 Layer 2 选真龙头的硬标准（如上游资源壁垒/成本曲线左端/订单兑现纯度）",\n'
-        '      "long_leg_sector": "仅 pair 配对必填：做多哪一细分板块/品种环节",\n'
-        '      "short_leg_sector": "仅 pair 配对必填（严禁为股票）：做空哪一非股票过剩/弱势环节",\n'
+        '      "thesis": "2~3句讲透未来1Q~1Y该板块的核心预期差、供需/盈利传导链与为什么现在是最优方向（若对应盘面大幅异动须讲清资金一致性驱动）",\n'
+        '      "value_chain_focus": "1~2句明确产业链最该切入的环节及 Layer 2 选真龙头的硬标准（如上游资源壁垒/成本曲线左端/估值泡沫最脆弱或订单兑现纯度；若该方向20D/60D已暴跌超25%，必须明确提醒 Layer 2 等待反抽二卖/三卖或30min结构卖点，严禁远离中枢盲目追空）",\n'
+        '      "long_leg_sector": "仅 pair 配对必填：做多哪一细分板块/品种环节（必须自身具备独立走强逻辑，严禁塞入深跌资产）",\n'
+        '      "short_leg_sector": "仅 pair 配对必填（A股严禁做空）：做空哪一过剩/双杀/弱势环节",\n'
         '      "sector_keywords": ["板块中英文核心关键词1", "关键词2", "关键词3"],\n'
         '      "reference_anchors": ["可选0~2个板块基准定价锚代码，用于辅助定位，可空数组"],\n'
         '      "key_catalyst": "未来1~3个月具体催化事件与时间节点",\n'
@@ -960,8 +1343,63 @@ def build_compass_prompt(
         '  "risk_warnings": ["1~3条当前宏观与跨资产层面最需警惕的尾部风险或因子重叠提醒"]\n'
         "}\n"
         "```\n"
-        "要求：`directions` 输出 **4~6 个**按优先级排序（`rank` 1..N）的高共振板块方向，涵盖真正有逻辑的做多板块、商品/外汇/加密做空板块或同产业链配对，每个板块至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据，严格遵守股票禁空铁律。"
+        "要求：`directions` 输出 **4~6 个**按优先级排序（`rank` 1..N）的高共振板块方向，多空比例完全服从当下宏观象限与盘面真实资金流（紧缩熊市允许 4~5 张纯空头卡），每个板块至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据，严格遵守 A 股禁空铁律（美股双杀、商品、外汇、加密均允许做空）。"
     )
+
+
+_A_SHARE_MARKET_TOKENS = (
+    "a股",
+    "沪深",
+    "创业板",
+    "科创板",
+    "北交所",
+    "a-share",
+    "ashare",
+    "上证",
+    "深证",
+    "中证",
+    "中国股票",
+    "chinastock",
+)
+_A_SHARE_NEGATION_CLAUSE_RE = re.compile(
+    r"(?:(?:严禁|禁止|避免|不要|切勿|不可|不得|不建议|不能)(?:直接)?(?:做空|空)(?:a股|沪深\d*|创业板|科创板|北交所|中国股票|a-?shares?))"
+    r"|(?:(?:a股|沪深\d*|创业板|科创板|北交所)(?:严禁|禁止|不可|不得)?(?:直接)?(?:禁空|做空|严禁做空|禁止做空))"
+    r"|(?:do\s*not\s*short\s*a-?shares?)",
+    re.IGNORECASE,
+)
+
+
+def _compact_lower(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").lower())
+
+
+def _mentions_a_share_market(text: str) -> bool:
+    norm = _compact_lower(text)
+    if not norm:
+        return False
+    return any(tok in norm for tok in _A_SHARE_MARKET_TOKENS)
+
+
+def _sanitize_avoid_short_proxy_hint(hint: str) -> tuple[str, bool]:
+    """Validate an avoid_sectors short_proxy_hint under Option A (A-share shorts forbidden).
+
+    Returns ``(clean_hint, rejected_as_a_share_short)``.
+    Compliant hints that include a negation reminder alongside a valid non-A-share proxy
+    (e.g. "避免做空A股，改空铁矿") are preserved; affirmative A-share short hints
+    (e.g. "做空 A 股白酒") or bare A-share prohibitions with no alternative proxy are cleared.
+    """
+    raw = str(hint or "").strip()
+    if not raw:
+        return "", False
+    norm = _compact_lower(raw)
+    residual = _A_SHARE_NEGATION_CLAUSE_RE.sub("", norm)
+    # Strip punctuation/connectors to check whether any compliant non-A-share proxy remains
+    residual_meaningful = re.sub(r"[，,。.;；:：()（）\[\]【】/\\|、\-—\s]+", "", residual)
+    if any(tok in residual for tok in _A_SHARE_MARKET_TOKENS):
+        return "", True
+    if norm != residual and not residual_meaningful:
+        return "", True
+    return raw, False
 
 
 def _match_canonical_dimension(raw: Any) -> str | None:
@@ -1055,12 +1493,12 @@ def normalize_compass_output(
             sec = str(item.get("sector") or item.get("name") or "").strip()
             rsn = str(item.get("reason") or "").strip()
             derived = str(item.get("derived_strategy") or "").strip()
-            proxy_hint = str(item.get("short_proxy_hint") or "").strip()
-            # Never allow equity short hints inside proxy hints
-            if any(tok in proxy_hint.lower() for tok in ("做空股票", "空美股", "空a股", "short stock", "short equity")):
-                proxy_hint = ""
+            proxy_hint, proxy_rejected = _sanitize_avoid_short_proxy_hint(str(item.get("short_proxy_hint") or ""))
             raw_poss = item.get("short_proxy_possible")
-            short_proxy_possible = bool(raw_poss) if isinstance(raw_poss, bool) else bool(proxy_hint)
+            if proxy_rejected:
+                short_proxy_possible = False
+            else:
+                short_proxy_possible = bool(raw_poss) if isinstance(raw_poss, bool) else bool(proxy_hint)
             if sec:
                 avoid_sectors.append(
                     {
@@ -1112,12 +1550,15 @@ def normalize_compass_output(
         raw_scope = str(raw_d.get("asset_scope") or "cross_asset").strip().lower()
         asset_scope = raw_scope if raw_scope in VALID_ASSET_SCOPES else "cross_asset"
 
-        # Equities (US / A-shares) NEVER allowed as pure short direction or pure equity pair short
-        if direction == "short" and asset_scope in ("us_equities", "a_shares"):
-            rejected_reasons.append(f"{title}: 违反股票禁空铁律")
+        # Option A policy: A-shares strictly forbidden as pure short or pure A-share pair; US equities/ETFs allowed
+        if direction == "short" and asset_scope == "a_shares":
+            rejected_reasons.append(f"{title}: 违反 A 股禁空铁律")
             continue
-        if direction == "pair" and asset_scope in ("us_equities", "a_shares"):
-            rejected_reasons.append(f"{title}: 纯股票配对违反股票禁空铁律")
+        if direction == "short" and _mentions_a_share_market(title):
+            rejected_reasons.append(f"{title}: 做空标题指向 A 股，违反 A 股禁空铁律")
+            continue
+        if direction == "pair" and asset_scope == "a_shares":
+            rejected_reasons.append(f"{title}: 纯 A 股配对违反 A 股禁空铁律")
             continue
 
         # Enforce 2 DISTINCT valid driving dimensions with non-empty summaries
@@ -1134,9 +1575,10 @@ def normalize_compass_output(
         long_leg_sector = str(raw_d.get("long_leg_sector") or "").strip()
         short_leg_sector = str(raw_d.get("short_leg_sector") or "").strip()
 
-        # Optional reference anchors (normalized, equity short forbidden)
+        # Optional reference anchors (normalized; A-share short rejects the card outright instead of silent stripping)
         reference_anchors: list[str] = []
         seen_anchors: set[tuple[str, str]] = set()
+        has_forbidden_a_share_anchor = False
         for raw_a in raw_d.get("reference_anchors") or []:
             s = str(raw_a or "").strip()
             if not s:
@@ -1145,8 +1587,9 @@ def normalize_compass_output(
                 norm_s, ac = market_snapshot.normalize_symbol(s)
             except Exception:
                 continue
-            if direction == "short" and ac in EQUITY_ASSET_CLASSES:
-                continue
+            if direction == "short" and ac in LONG_ONLY_EQUITY_ASSET_CLASSES:
+                has_forbidden_a_share_anchor = True
+                break
             key = (ac, norm_s.upper())
             if key in seen_anchors:
                 continue
@@ -1154,12 +1597,16 @@ def normalize_compass_output(
             reference_anchors.append(norm_s)
             if len(reference_anchors) >= 2:
                 break
+        if has_forbidden_a_share_anchor:
+            rejected_reasons.append(f"{title}: 做空方向包含 A 股参考锚，违反 A 股禁空铁律")
+            continue
 
         # Optional legacy/hint leaders (strictly validated if present, NEVER required in sector-first mode)
         raw_leaders_input = raw_d.get("leaders") or []
         long_leaders: list[dict[str, str]] = []
         short_leaders: list[dict[str, str]] = []
         seen_canonical: set[tuple[str, str]] = set()
+        has_forbidden_a_share_short_leader = False
         for raw_l in raw_leaders_input:
             if not isinstance(raw_l, dict):
                 continue
@@ -1177,7 +1624,8 @@ def normalize_compass_output(
             leg_raw = str(raw_l.get("leg") or ("short" if direction == "short" else "long")).strip().lower()
             if leg_raw not in ("long", "short"):
                 continue
-            if leg_raw == "short" and ac in EQUITY_ASSET_CLASSES:
+            if leg_raw == "short" and ac in LONG_ONLY_EQUITY_ASSET_CLASSES:
+                has_forbidden_a_share_short_leader = True
                 continue
             if direction == "long" and leg_raw != "long":
                 continue
@@ -1209,26 +1657,30 @@ def normalize_compass_output(
                 seen_canonical.add(canonical_key)
                 short_leaders.append(entry)
 
+        if has_forbidden_a_share_short_leader:
+            rejected_reasons.append(f"{title}: 空头腿包含 A 股标的，违反 A 股禁空铁律")
+            continue
+
         # If caller/model explicitly provided leaders, enforce strict leg hygiene; otherwise allow sector-only cards
         if raw_leaders_input:
             if direction == "long" and not long_leaders:
                 rejected_reasons.append(f"{title}: 做多方向无有效多头标的")
                 continue
             if direction == "short" and not short_leaders:
-                rejected_reasons.append(f"{title}: 做空方向无有效非股票空头标的")
+                rejected_reasons.append(f"{title}: 做空方向无有效合规空头标的（A 股禁空）")
                 continue
             if direction == "pair" and (not long_leaders or not short_leaders):
-                rejected_reasons.append(f"{title}: 配对方向缺少多头或非股票空头腿")
+                rejected_reasons.append(f"{title}: 配对方向缺少多头或合规空头腿（A 股禁空）")
                 continue
             leaders = [*long_leaders[:1], *short_leaders[:1]] if direction == "pair" else (long_leaders if direction == "long" else short_leaders)
         else:
             leaders = []
             if direction == "pair":
                 if not long_leg_sector or not short_leg_sector:
-                    rejected_reasons.append(f"{title}: 配对板块必须明确多头腿与非股票空头腿")
+                    rejected_reasons.append(f"{title}: 配对板块必须明确多头腿与合规空头腿")
                     continue
-                if any(tok in short_leg_sector.lower() for tok in ("美股", "a股", "股票", "个股", "stock", "equity", "equities")):
-                    rejected_reasons.append(f"{title}: 配对空头腿禁止为股票")
+                if _mentions_a_share_market(short_leg_sector):
+                    rejected_reasons.append(f"{title}: 配对空头腿禁止为 A 股")
                     continue
 
         # Enforce >=2 valid evidence items with ISO date + non-empty source + strict URL hygiene

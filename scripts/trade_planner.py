@@ -753,6 +753,24 @@ def get_contract_spec(symbol: str, asset_class: str | None = None) -> dict[str, 
     norm_sym, detected_ac = normalize_symbol(raw)
     resolved_ac = explicit_ac or detected_ac
 
+    # Explicit A-share symbols MUST NOT be reclassified as US equities or other classes (protects A-share short ban)
+    if detected_ac == "a_share" and explicit_ac is not None and explicit_ac != "a_share":
+        return _enrich_spec({
+            "symbol": norm_sym,
+            "root": norm_sym,
+            "asset_class": "a_share",
+            "multiplier": None,
+            "min_order_qty": 100,
+            "lot_step": 100,
+            "lot_size": 100,
+            "currency": "CNY",
+            "margin_rate": 1.0,
+            "fractional": False,
+            "known_spec": False,
+            "warning": f"Conflicting asset_class={explicit_ac!r} for A-share symbol {norm_sym!r}.",
+            "unit_note": f"Conflicting asset_class={explicit_ac!r} for A-share symbol {norm_sym!r}",
+        })
+
     # Detect dated CN futures contracts (e.g. CU2701, TA609, CN:CU2701) even when normalize_symbol
     # did not match ^[A-Z]{1,2}0$
     cn_root_candidate = _extract_cn_future_root(raw_upper if cn_prefixed else norm_sym)
@@ -1513,14 +1531,26 @@ def evaluate_expression_and_carry(
         "expression_recommendation": (
             "cash_equity_staggered_long"
             if norm_dir == "long"
-            else "equity_hedge_or_pair_expression_only"
+            else (
+                "us_equity_davis_double_kill_short"
+                if norm_ac == "us_stock_or_etf"
+                else "a_share_short_forbidden"
+            )
         ),
         "contract_guidance": (
             "正股分批顺势建仓为主；临近财报窗口可评估领口/保护性看跌期权对冲，不碰二三线跟风标的。"
             if norm_dir == "long"
-            else "股票端仅在明确组合对冲或同产业链多空配对时表达空头，严禁裸空高成长龙头。"
+            else (
+                "美股/行业 ETF 仅在高利率紧缩+远期盈利/CapEx证伪（戴维斯双杀）或强周期见顶反转、且日线与30min空头结构共振时顺势做空，须盯紧借券费与财报跳空风险。"
+                if norm_ac == "us_stock_or_etf"
+                else "A 股受限严格禁止做空（含对冲与配对空头腿），看空观点请转译为合规商品期货、外汇或海外 ETF 代理。"
+            )
         ),
-        "warnings": [],
+        "warnings": (
+            ["美股做空须具备 Layer 3 戴维斯双杀或周期见顶 L1/L2 证据，严禁仅凭静态高 PE 或逆日线裸空。"]
+            if (norm_ac == "us_stock_or_etf" and norm_dir == "short")
+            else []
+        ),
     }
 
 
@@ -1545,6 +1575,7 @@ def evaluate_four_quadrant_gate(
     pair_leg_verified: bool = False,
     carry_adjusted_rr_ratio: float | None = None,
     curve_stale_or_error: bool = False,
+    us_short_thesis_verified: bool | None = None,
 ) -> dict[str, Any]:
     """Enforce fail-closed Layer-4 decision gate across thesis, alignment, sizing, capital, carry, and R:R."""
     norm_dir = str(direction or "").strip().lower()
@@ -1601,11 +1632,16 @@ def evaluate_four_quadrant_gate(
     )
     sizing_ok = (qty_val is not None and qty_val > 0) and bool(within_capital_limits)
 
+    us_short_basis_ok = (
+        True
+        if not (norm_ac == "us_stock_or_etf" and norm_dir == "short" and not hedge_only and not is_pair_trade)
+        else (us_short_thesis_verified is not False)
+    )
+
     checks = {
         "thesis_falsified": bool(thesis_falsified),
-        "equity_short_allowed": not (
-            norm_ac in {"us_stock_or_etf", "a_share"} and norm_dir == "short" and not hedge_only and not is_pair_trade
-        ),
+        "equity_short_allowed": not (norm_ac == "a_share" and norm_dir == "short"),
+        "us_short_thesis_verified": us_short_thesis_verified if (norm_ac == "us_stock_or_etf" and norm_dir == "short") else None,
         "upstream_errors": up_errors,
         "curve_stale_or_error": bool(curve_stale_or_error),
         "upstream_ok": len(up_errors) == 0,
@@ -1637,8 +1673,8 @@ def evaluate_four_quadrant_gate(
             "checks": checks,
         }
 
-    if norm_ac in {"us_stock_or_etf", "a_share"} and norm_dir == "short" and not hedge_only and not is_pair_trade:
-        msg = "股票中长线以做多为主，不直接做空（除非明确对冲/配对）"
+    if norm_ac == "a_share" and norm_dir == "short":
+        msg = "A 股受限严格仅做多，无条件禁止直接做空（含对冲与配对空头腿）"
         return {
             "decision": "rejected",
             "actionable": False,
@@ -1681,6 +1717,10 @@ def evaluate_four_quadrant_gate(
     evidence_reasons: list[str] = []
     if not has_l1_l2_evidence:
         evidence_reasons.append("缺少 L1/L2 一手硬证据支撑，禁止直接放行建仓")
+    if not us_short_basis_ok:
+        evidence_reasons.append(
+            "美股做空须经第三层研究裁决为看空（戴维斯双杀或周期见顶反转，direction_bias=short），当前档案尚未确认看空裁决，先入观察池"
+        )
     if pending_verifications_count >= 2:
         evidence_reasons.append(f"尚有 {pending_verifications_count} 项关键核验未完成（>=2 项），先入观察池")
     if evidence_reasons:
@@ -2926,6 +2966,7 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
         pair_leg_verified=args.pair_leg_verified,
         carry_adjusted_rr_ratio=expression.get("carry_adjusted_rr_ratio"),
         curve_stale_or_error=bool(expression.get("curve_data_warning")),
+        us_short_thesis_verified=getattr(args, "us_short_thesis_verified", None),
     )
 
     stop_source = "live_30m_chanlun" if args.live else "manual_scenario"

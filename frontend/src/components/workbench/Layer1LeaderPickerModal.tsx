@@ -47,6 +47,11 @@ function dedupeUpper(list: string[]): string[] {
   return out;
 }
 
+function isAShareCode(raw: string): boolean {
+  const cleaned = raw.trim().toUpperCase().replace(/^US:/, "");
+  return /^\d{6}(\.(SS|SH|SZ|BJ))?$/.test(cleaned);
+}
+
 export function Layer1LeaderPickerModal({
   open,
   card,
@@ -247,6 +252,11 @@ export function Layer1LeaderPickerModal({
       setErr("多空配对需要分别选择至少 1 只多头腿标的和 1 只空头腿标的");
       return;
     }
+    const illegalAShareShorts = finalShort.filter(isAShareCode);
+    if (illegalAShareShorts.length > 0) {
+      setErr(`A 股严禁做空，请从空头标的移除：${illegalAShareShorts.join(", ")}（可选美股/ETF、商品期货或外汇空头）`);
+      return;
+    }
 
     setSubmitting(true);
     setErr(null);
@@ -402,7 +412,7 @@ export function Layer1LeaderPickerModal({
               }`}
             >
               <div className="flex items-center justify-between text-[11px]">
-                <span className="font-semibold text-bear">空头腿标的 ({shortSymbols.length}) · 限非股票</span>
+                <span className="font-semibold text-bear">空头腿标的 ({shortSymbols.length}) · A股禁空</span>
                 {activeLeg === "short" ? <span className="text-[10px] text-bear">正在添加至此腿</span> : null}
               </div>
               <div className="flex min-h-7 flex-wrap items-center gap-1.5">

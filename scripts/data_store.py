@@ -94,9 +94,19 @@ def _ensure_http_adapter_timeout_hook() -> None:
 
 @contextlib.contextmanager
 def scoped_http_timeout(timeout: tuple[float, float] | float = (5.0, 12.0)):
-    """Inject a default ``(connect, read)`` timeout into ``requests`` calls within this context only."""
+    """Inject a default ``(connect, read)`` timeout into ``requests`` calls within this context only.
+
+    Nested scopes clamp to the tighter of outer and inner budgets so an inner default
+    (e.g. ``(5.0, 15.0)``) can never silently widen an outer deadline.
+    """
     _ensure_http_adapter_timeout_hook()
-    token = _HTTP_TIMEOUT_VAR.set(timeout)
+    outer = _HTTP_TIMEOUT_VAR.get()
+    effective = timeout
+    if outer is not None:
+        o_pair = (float(outer[0]), float(outer[1])) if isinstance(outer, tuple) else (float(outer), float(outer))
+        i_pair = (float(timeout[0]), float(timeout[1])) if isinstance(timeout, tuple) else (float(timeout), float(timeout))
+        effective = (min(o_pair[0], i_pair[0]), min(o_pair[1], i_pair[1]))
+    token = _HTTP_TIMEOUT_VAR.set(effective)
     try:
         yield
     finally:

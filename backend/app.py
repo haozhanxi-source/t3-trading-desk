@@ -614,15 +614,19 @@ def _plan_args(req: TradePlanReq) -> tuple[Any, str]:
     args.max_margin_pct = req.max_margin_pct
     args.allow_equity_margin = req.allow_equity_margin
     args.horizon_days = req.horizon_days
-    # Server-side research archive on disk is the sole source of truth for L1/L2 evidence gate
+    # Server-side research archive on disk is the sole source of truth for L1/L2 evidence & US-short verdict gate
     try:
         arch = ra.load_archive(req.symbol, evidence_limit=0)
         args.has_l1_l2 = any(
             isinstance(ev, dict) and ev.get("level") in ("L1", "L2")
             for ev in (arch.get("recent_evidence") or [])
         )
+        arch_state = arch.get("state") if isinstance(arch.get("state"), dict) else {}
+        arch_bias = str(arch_state.get("direction_bias") or "").strip().lower()
+        args.us_short_thesis_verified = bool(args.has_l1_l2 and arch_bias == "short")
     except (FileNotFoundError, ValueError, OSError):
         args.has_l1_l2 = False
+        args.us_short_thesis_verified = False
     args.pending_verifications = req.pending_verifications
     args.thesis_falsified = req.thesis_falsified
     args.hedge_only = req.hedge_only
@@ -1177,18 +1181,36 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             raise HTTPException(status_code=422, detail="No scan targets resolved")
         dumped = req.model_dump()
         if req.compass_context is not None:
-            # Canonicalize expected_directions keys so Layer 2 rows match aliases reliably
+            # Canonicalize expected_directions keys and strictly enforce A-share short ban on explicit & implicit short legs
             norm_expected: dict[str, str] = {}
+            forbidden_a_share_shorts: list[str] = []
             for raw_sym, exp_dir in req.compass_context.expected_directions.items():
                 s = str(raw_sym or "").strip()
                 if not s:
                     continue
                 norm_expected[s.upper()] = exp_dir
                 try:
-                    canon_sym, _ = market_snapshot.normalize_symbol(s)
+                    canon_sym, ac = market_snapshot.normalize_symbol(s)
                     norm_expected[canon_sym.upper()] = exp_dir
+                    if exp_dir == "short" and ac == "a_share" and canon_sym not in forbidden_a_share_shorts:
+                        forbidden_a_share_shorts.append(canon_sym)
                 except Exception:
                     pass
+            # Also check implicit short targets when the Compass card direction itself is "short"
+            if req.compass_context.direction == "short":
+                for _mkt, tgt_sym in targets:
+                    try:
+                        canon_sym, ac = market_snapshot.normalize_symbol(str(tgt_sym))
+                        explicit_dir = norm_expected.get(canon_sym.upper()) or norm_expected.get(str(tgt_sym).upper())
+                        if ac == "a_share" and explicit_dir != "long" and canon_sym not in forbidden_a_share_shorts:
+                            forbidden_a_share_shorts.append(canon_sym)
+                    except Exception:
+                        pass
+            if forbidden_a_share_shorts:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"A 股严禁作为做空标的（请改用美股/ETF、商品期货或外汇空头代理）：{', '.join(forbidden_a_share_shorts)}",
+                )
             dumped["compass_context"] = {
                 **req.compass_context.model_dump(),
                 "expected_directions": norm_expected,

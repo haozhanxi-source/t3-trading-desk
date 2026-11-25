@@ -89,10 +89,10 @@ const FOCUS_SCOPE_GROUPS: {
     ],
   },
   {
-    group: "权益市场（仅做多）",
+    group: "权益市场（美股支持双杀做空 · A 股仅做多）",
     items: [
-      { id: "us_equities", label: "美股板块与产业迭代", hint: "科技/电力/军工/医药/矿业股" },
-      { id: "a_shares", label: "A 股主线与出海", hint: "红利/周期资源/制造出海/科技" },
+      { id: "us_equities", label: "美股板块与产业迭代", hint: "科技/电力/军工/医药/矿业（双杀可空）" },
+      { id: "a_shares", label: "A 股主线与出海", hint: "红利/周期资源/制造出海（严格仅做多）" },
     ],
   },
 ];
@@ -196,14 +196,16 @@ function isLegacyHeadwindShortable(item: CompassAvoidSectorItem): boolean {
     return item.short_proxy_possible;
   }
   const text = `${item.sector} ${item.reason}`.toLowerCase();
-  return /(原油|石油|金属|锂|铝|铜|镍|铁矿|黑色|地产|加密|比特币|btc|eth|外汇|汇率|商品|农产品|生猪)/.test(text);
+  return /(美股|美国|ai|算力|芯片|科技|数据中心|纳斯达克|原油|石油|金属|锂|铝|铜|锡|镍|铁矿|黑色|地产|加密|比特币|btc|eth|外汇|汇率|商品|农产品|生猪)/.test(
+    text,
+  );
 }
 
 function buildShortCardFromHeadwind(item: CompassAvoidSectorItem, index: number): CompassDirectionCard {
   const hint =
     item.short_proxy_hint ||
     item.derived_strategy ||
-    "限选用对应商品期货、外汇或加密货币空头/跨资产代理工具（严禁做空美股或 A 股正股）";
+    "可选美股/行业 ETF、商品期货、外汇或加密货币空头/跨资产代理（A 股严禁直接做空）";
   return {
     id: `headwind_short_${index + 1}`,
     rank: index + 1,
@@ -213,7 +215,7 @@ function buildShortCardFromHeadwind(item: CompassAvoidSectorItem, index: number)
     conviction: "medium",
     asset_scope: "cross_asset",
     primary_driver: { dimension: "宏观双核", summary: item.reason || item.sector },
-    secondary_driver: { dimension: "商品供需平衡与库存周期", summary: "逆风逻辑延伸非股票空头/代理表达" },
+    secondary_driver: { dimension: "商品供需平衡与库存周期", summary: "逆风逻辑延伸合规空头/代理表达" },
     thesis: item.reason || item.sector,
     value_chain_focus: hint,
     key_catalyst: "",
@@ -691,7 +693,7 @@ export function Layer1CompassPanel({
               className="btn btn-sm"
               disabled={macroLoading}
               onClick={() => void loadMacro(true)}
-              title="重新拉取 FRED / 国家统计局 / 17 个跨资产定价锚（免费硬数据，零 AI 消耗）"
+              title="重新拉取 FRED / 国家统计局 / 25 个跨资产与国内期货定价锚（免费硬数据，零 AI 消耗）"
             >
               <RefreshCw className={`h-3 w-3 ${macroLoading ? "animate-spin" : ""}`} aria-hidden="true" />
               <span>刷新宏观</span>
@@ -732,18 +734,54 @@ export function Layer1CompassPanel({
           {!macro && macroLoading ? (
             <div className="col-span-full flex items-center gap-2 py-2 text-xs text-muted">
               <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" aria-hidden="true" />
-              <span>正在拉取 FRED 美债/通胀、中国 PMI 与 17 个跨资产定价锚…</span>
+              <span>正在拉取 FRED 美债/通胀、中国 PMI 与 25 个跨资产/国内期货定价锚…</span>
             </div>
           ) : null}
         </div>
 
-        {/* On-demand Native Disclosure: 17 Cross-Asset Pricing Anchors (20D / 60D Relative Strength) */}
+        {/* Compact Tape-to-Macro Extreme Movers Radar Strip */}
+        {macro?.tape_movers &&
+        (macro.tape_movers.top_losers.length > 0 || macro.tape_movers.top_gainers.length > 0) ? (
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-hairline-soft bg-sunken/40 px-2.5 py-1.5 text-[11px]">
+            <span className="font-semibold text-ink-2">
+              盘面极端雷达 · {macro.tape_movers.regime_breadth.breadth_label}
+            </span>
+            {macro.tape_movers.top_losers.slice(0, 5).map((mv) => (
+              <button
+                key={`lose-${mv.symbol}`}
+                type="button"
+                onClick={() => onJumpWarRoom(mv.symbol)}
+                className="inline-flex cursor-pointer items-center gap-1 rounded border border-bear/30 bg-bear/8 px-1.5 py-0.5 font-mono text-[10.5px] text-bear hover:border-bear/60"
+                title={`20D ${fmtPct(mv.ret_20d_pct, 1)} / 60D ${fmtPct(mv.ret_60d_pct, 1)} · 点击进入战情室`}
+              >
+                <span className="font-sans">{mv.name}</span>
+                {mv.driver_window ? <span className="text-[9.5px] opacity-75">{mv.driver_window}</span> : null}
+                <span>{fmtPct(mv.driver_ret_pct ?? mv.ret_20d_pct ?? mv.ret_60d_pct, 1)}</span>
+              </button>
+            ))}
+            {macro.tape_movers.top_gainers.slice(0, 2).map((mv) => (
+              <button
+                key={`gain-${mv.symbol}`}
+                type="button"
+                onClick={() => onJumpWarRoom(mv.symbol)}
+                className="inline-flex cursor-pointer items-center gap-1 rounded border border-bull/30 bg-bull/8 px-1.5 py-0.5 font-mono text-[10.5px] text-bull hover:border-bull/60"
+                title={`20D ${fmtPct(mv.ret_20d_pct, 1)} / 60D ${fmtPct(mv.ret_60d_pct, 1)} · 点击进入战情室`}
+              >
+                <span className="font-sans">{mv.name}</span>
+                {mv.driver_window ? <span className="text-[9.5px] opacity-75">{mv.driver_window}</span> : null}
+                <span>{fmtPct(mv.driver_ret_pct ?? mv.ret_20d_pct ?? mv.ret_60d_pct, 1)}</span>
+              </button>
+            ))}
+          </div>
+        ) : null}
+
+        {/* On-demand Native Disclosure: 25 Cross-Asset & CN Futures Pricing Anchors (20D / 60D Relative Strength) */}
         {anchorGroups.length > 0 ? (
           <details className="border-t border-hairline-soft pt-2">
             <summary className="cursor-pointer select-none text-[11px] font-medium text-muted hover:text-ink">
-              展开跨资产 20D / 60D 相对强弱定价锚（{macro?.anchors?.ok_count ?? 0}/{macro?.anchors?.total ?? 0} 实时可用）
+              展开跨资产与国内期货 20D / 60D 相对强弱定价锚（{macro?.anchors?.ok_count ?? 0}/{macro?.anchors?.total ?? 0} 实时可用）
             </summary>
-            <div className="mt-2.5 grid grid-cols-1 gap-3 lg:grid-cols-3">
+            <div className="mt-2.5 grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-4">
               {anchorGroups.map((grp) => (
                 <div key={grp.label} className="rounded-md border border-hairline-soft bg-sunken/50 p-2.5">
                   <div className="mb-1.5 text-[11px] font-semibold text-ink-2">{grp.label}</div>
@@ -1054,7 +1092,7 @@ export function Layer1CompassPanel({
                                 </span>
                               ) : (
                                 <span className="text-[10px] text-muted">
-                                  可用商品/外汇/加密空头或代理表达（禁空正股）
+                                  可用美股/ETF、商品/外汇/加密空头或代理表达（A 股禁空）
                                 </span>
                               )}
                               <button
@@ -1062,7 +1100,7 @@ export function Layer1CompassPanel({
                                 className="btn btn-sm border-bear/35 px-2 py-0.5 text-[10.5px] text-bear"
                                 disabled={scanBusy}
                                 onClick={() => setPickerCard(buildShortCardFromHeadwind(av, i))}
-                                title="按此逆风逻辑挑选非股票空头/代理标的并跑日线缠论过筛"
+                                title="按此逆风逻辑挑选合规空头/代理标的并跑日线缠论过筛（A 股禁空）"
                               >
                                 <TrendingDown className="h-2.5 w-2.5" aria-hidden="true" />
                                 <span>衍生做空选标</span>

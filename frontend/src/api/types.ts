@@ -995,6 +995,33 @@ export interface CrossAssetAnchorItem {
   ret_20d_pct: number | null;
   ret_60d_pct: number | null;
   as_of?: string | null;
+  stale_fallback?: boolean;
+}
+
+export interface CompassTapeMoverItem {
+  symbol: string;
+  name: string;
+  group?: string;
+  last: number | null;
+  ret_5d_pct: number | null;
+  ret_20d_pct: number | null;
+  ret_60d_pct: number | null;
+  driver_window?: "20D" | "60D" | string;
+  driver_ret_pct?: number | null;
+  as_of?: string | null;
+}
+
+export interface CompassTapeMovers {
+  top_losers: CompassTapeMoverItem[];
+  top_gainers: CompassTapeMoverItem[];
+  regime_breadth: {
+    total_available: number;
+    declining_20d_count: number;
+    advancing_20d_count: number;
+    severe_drawdown_count: number;
+    strong_rally_count: number;
+    breadth_label: string;
+  };
 }
 
 export interface CompassMacroOverview {
@@ -1010,6 +1037,7 @@ export interface CompassMacroOverview {
     total?: number;
     items: CrossAssetAnchorItem[];
   };
+  tape_movers?: CompassTapeMovers;
 }
 
 export interface CompassDriverItem {

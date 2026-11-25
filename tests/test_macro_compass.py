@@ -169,30 +169,101 @@ def test_normalize_compass_output_enforces_hygiene_and_alias_dedup():
     assert d3["suggested_pool_name"].startswith("commodities_base_theme")
 
 
-def test_normalize_compass_rejects_equity_shorts_single_sided_pairs_bad_drivers_and_sparse_evidence():
+def test_normalize_compass_allows_us_equity_shorts_but_rejects_a_share_shorts_bad_drivers_and_sparse_evidence():
+    # US equity / ETF short in Davis double-kill MUST now pass Option A validation
+    us_short_payload = {
+        "regime_title": "高利率紧缩与 AI 估值双杀",
+        "regime_summary": "实际利率高企叠加算力资本开支延宕，美股高估值芯片板块允许顺势做空。",
+        "avoid_sectors": [
+            {
+                "sector": "中国地产链 A 股",
+                "reason": "销售与投资延续下行",
+                "derived_strategy": "A 股严禁做空，改用铁矿/澳元代理",
+                "short_proxy_possible": True,
+                "short_proxy_hint": "空A股地产龙头",  # must be stripped
+            }
+        ],
+        "directions": [
+            {
+                "id": "us_ai_semis_short",
+                "rank": 1,
+                "title": "美国高估值 AI 算力芯片做空",
+                "direction": "short",
+                "asset_scope": "us_equities",
+                "primary_driver": {"dimension": "宏观双核", "summary": "实际利率维持高位压制久期估值。"},
+                "secondary_driver": {"dimension": "技术与产业迭代", "summary": "数据中心审批延宕引发 CapEx 下修。"},
+                "thesis": "盈利与估值同步下修形成戴维斯双杀，美股芯片 ETF 可顺势做空。",
+                "value_chain_focus": "优先挑选估值最高、CapEx 依赖度最重的芯片 ETF 或高弹性算力链。",
+                "reference_anchors": ["SMH"],
+                "evidence": [
+                    {"fact": "SMH 近 20 日下跌 23.5%", "level": "L1", "date": "2026-11-24", "source": "yfinance"},
+                    {"fact": "多州收紧数据中心并网审批", "level": "L2", "date": "2026-11-20", "source": "Reuters"},
+                ],
+            },
+            {
+                "id": "us_utilities_vs_semis_pair",
+                "rank": 2,
+                "title": "多美国电网公用空半导体配对",
+                "direction": "pair",
+                "asset_scope": "us_equities",
+                "primary_driver": {"dimension": "技术与产业迭代", "summary": "电网瓶颈确定性高于芯片扩张。"},
+                "secondary_driver": {"dimension": "资金流与市场结构", "summary": "资金从高估值算力切换至防御公用事业。"},
+                "thesis": "电网公用事业独立走强而半导体深陷双杀，构成同市场多空配对。",
+                "long_leg_sector": "美国受监管电网公用事业",
+                "short_leg_sector": "美国高估值半导体板块",
+                "evidence": [
+                    {"fact": "PJM 批发平均电价同比上涨 40.9%", "level": "L1", "date": "2026-11-20", "source": "PJM"},
+                    {"fact": "半导体 ETF 资金净流出扩大", "level": "L2", "date": "2026-11-22", "source": "Bloomberg"},
+                ],
+            },
+        ],
+    }
+    norm_us = macro_compass.normalize_compass_output(us_short_payload, valid_universes={"us_semis_ai", "us_power_grid"})
+    assert len(norm_us["directions"]) == 2
+    assert norm_us["directions"][0]["direction"] == "short"
+    assert norm_us["directions"][0]["reference_anchors"] == ["SMH"]
+    assert norm_us["directions"][1]["direction"] == "pair"
+    assert norm_us["avoid_sectors"][0]["short_proxy_hint"] == ""
+
+    # A-share shorts, A-share pairs, duplicate dimensions & sparse evidence MUST still be rejected
     bad_payload = {
         "regime_title": "测试违规过滤",
         "regime_summary": "包含多张违规卡片，应全部被拒。",
         "directions": [
-            # 1. Equity short legs inside a pair card (should fail pair check because short leg is stripped)
+            # 1. A-share pure short forbidden
             {
-                "id": "bad_equity_pair",
-                "title": "违规股票做空配对",
-                "direction": "pair",
-                "asset_scope": "us_equities",
-                "primary_driver": {"dimension": "宏观双核", "summary": "高利率。"},
-                "secondary_driver": {"dimension": "技术与产业迭代", "summary": "AI分化。"},
-                "thesis": "买强空弱美股。",
-                "leaders": [
-                    {"symbol": "NVDA", "name": "英伟达", "leg": "long", "role": "sole_leader", "reason": "多"},
-                    {"symbol": "INTC", "name": "英特尔", "leg": "short", "role": "sole_leader", "reason": "空股票禁止"},
-                ],
+                "id": "bad_a_share_short",
+                "title": "违规做空 A 股",
+                "direction": "short",
+                "asset_scope": "a_shares",
+                "primary_driver": {"dimension": "宏观双核", "summary": "内需偏弱。"},
+                "secondary_driver": {"dimension": "资金流与市场结构", "summary": "流出。"},
+                "thesis": "违规做空 A 股。",
+                "reference_anchors": ["600519.SS"],
                 "evidence": [
-                    {"fact": "事实1", "level": "L1", "date": "2026-11-20", "source": "SEC"},
-                    {"fact": "事实2", "level": "L2", "date": "2026-11-21", "source": "公司指引"},
+                    {"fact": "事实1", "level": "L1", "date": "2026-11-20", "source": "NBS"},
+                    {"fact": "事实2", "level": "L2", "date": "2026-11-21", "source": "交易所"},
                 ],
             },
-            # 2. Duplicate dimensions + empty summary
+            # 2. A-share short leg inside a pair card (should fail because A-share short leg is stripped)
+            {
+                "id": "bad_a_share_pair",
+                "title": "违规 A 股空头腿配对",
+                "direction": "pair",
+                "asset_scope": "cross_asset",
+                "primary_driver": {"dimension": "宏观双核", "summary": "分化。"},
+                "secondary_driver": {"dimension": "产业政策与监管", "summary": "政策。"},
+                "thesis": "多商品空 A 股。",
+                "leaders": [
+                    {"symbol": "GC=F", "name": "黄金", "leg": "long", "role": "sole_leader", "reason": "多"},
+                    {"symbol": "600519.SS", "name": "茅台", "leg": "short", "role": "sole_leader", "reason": "空A股禁止"},
+                ],
+                "evidence": [
+                    {"fact": "事实1", "level": "L1", "date": "2026-11-20", "source": "交易所"},
+                    {"fact": "事实2", "level": "L2", "date": "2026-11-21", "source": "协会"},
+                ],
+            },
+            # 3. Duplicate dimensions + empty summary
             {
                 "id": "bad_dup_dim",
                 "title": "重复维度卡片",
@@ -207,7 +278,7 @@ def test_normalize_compass_rejects_equity_shorts_single_sided_pairs_bad_drivers_
                     {"fact": "事实2", "level": "L2", "date": "2026-11-21", "source": "WGC"},
                 ],
             },
-            # 3. Empty / insufficient evidence
+            # 4. Empty / insufficient evidence
             {
                 "id": "bad_no_ev",
                 "title": "无证据卡片",
@@ -435,6 +506,7 @@ def test_collect_macro_overview_nonblocking_timeout_stale_fallback_and_coalescin
     }
     fake_cn = {"status": "ok", "pmi": {"status": "ok", "records": [{"月份": "2026年10月份", "制造业-指数": 49.5}]}}
     fake_anc = {"status": "ok", "ok_count": 1, "total": 1, "items": []}
+    fake_cn_anc = {"status": "ok", "ok_count": 1, "total": 1, "items": []}
 
     # Seed last-known-good first
     with (
@@ -442,6 +514,7 @@ def test_collect_macro_overview_nonblocking_timeout_stale_fallback_and_coalescin
         patch.object(macro_compass.research_data, "fetch_fred_macro", return_value=fake_fred),
         patch.object(macro_compass.research_data, "fetch_china_macro_core", return_value=fake_cn),
         patch.object(macro_compass, "fetch_cross_asset_anchors", return_value=fake_anc),
+        patch.object(macro_compass, "fetch_cn_futures_anchors", return_value=fake_cn_anc),
     ):
         good = macro_compass.collect_macro_overview(refresh=True)
         assert good["sources_status"]["cn_macro"] == "ok"
@@ -464,6 +537,7 @@ def test_collect_macro_overview_nonblocking_timeout_stale_fallback_and_coalescin
         patch.object(macro_compass.research_data, "fetch_fred_macro", return_value=fake_fred),
         patch.object(macro_compass.research_data, "fetch_china_macro_core", side_effect=slow_cn),
         patch.object(macro_compass, "fetch_cross_asset_anchors", return_value=fake_anc),
+        patch.object(macro_compass, "fetch_cn_futures_anchors", return_value=fake_cn_anc),
     ):
         t0 = time.monotonic()
         # Concurrent callers must coalesce into ONE upstream batch
@@ -698,3 +772,193 @@ def test_compass_api_end_to_end_task_and_history():
         assert body["latest"]["run_id"] == task_id
         assert len(body["latest"]["result"]["directions"]) == 3
         assert len(body["history"]) == 1
+
+
+def test_compute_tape_movers_and_cn_futures_sqlite_fallback():
+    # 1. Broad selloff triggers "全面紧缩/普跌" breadth label & surfaces extreme losers at top
+    sample_items = [
+        {"symbol": "COPX", "name": "全球铜矿", "group": "us_equities", "status": "ok", "last": 40.0, "ret_5d_pct": -11.8, "ret_20d_pct": -24.9, "ret_60d_pct": -38.0, "as_of": "2026-11-24"},
+        {"symbol": "SN0", "name": "沪锡", "group": "cn_futures", "status": "ok", "last": 288990.0, "ret_5d_pct": -13.9, "ret_20d_pct": -25.4, "ret_60d_pct": -32.1, "as_of": "2026-11-25"},
+        {"symbol": "SMH", "name": "半导体", "group": "us_equities", "status": "ok", "last": 210.0, "ret_5d_pct": -7.3, "ret_20d_pct": -23.5, "ret_60d_pct": -23.3, "as_of": "2026-11-24"},
+        {"symbol": "HG=F", "name": "COMEX铜", "group": "commodities", "status": "ok", "last": 4.1, "ret_5d_pct": -4.9, "ret_20d_pct": -18.9, "ret_60d_pct": -17.3, "as_of": "2026-11-25"},
+        {"symbol": "BTC-USD", "name": "比特币", "group": "cn_fx_crypto", "status": "ok", "last": 65000.0, "ret_5d_pct": -0.8, "ret_20d_pct": -23.2, "ret_60d_pct": -30.9, "as_of": "2026-11-25"},
+        {"symbol": "ALI=F", "name": "COMEX铝", "group": "commodities", "status": "ok", "last": 2400.0, "ret_5d_pct": -6.1, "ret_20d_pct": -16.4, "ret_60d_pct": -19.7, "as_of": "2026-11-25"},
+        {"symbol": "XLU", "name": "电力公用", "group": "us_equities", "status": "ok", "last": 82.0, "ret_5d_pct": -0.1, "ret_20d_pct": 1.3, "ret_60d_pct": 3.5, "as_of": "2026-11-24"},
+    ]
+    radar = macro_compass.compute_tape_movers(sample_items)
+    assert radar["regime_breadth"]["breadth_label"] == "全面紧缩/普跌（空头主战场）"
+    assert radar["regime_breadth"]["severe_drawdown_count"] == 6
+    assert [m["symbol"] for m in radar["top_losers"][:3]] == ["COPX", "SN0", "BTC-USD"]
+    assert any(m["symbol"] == "SMH" for m in radar["top_losers"])
+
+    # Brief includes tape_movers without anchoring
+    brief = macro_compass.build_compass_brief(
+        macro_overview={"fetched_at_utc": "2026-11-25T08:00:00+00:00", "anchors": {"items": sample_items}},
+    )
+    assert brief["tape_movers"]["regime_breadth"]["breadth_label"] == "全面紧缩/普跌（空头主战场）"
+    assert len(brief["tape_movers"]["top_losers"]) == 6
+
+    # 2. CN futures anchor degrades cleanly to cached SQLite series when live get_snapshot times out
+    idx = pd.date_range("2026-08-01", periods=65, freq="B")
+    cached_close = pd.Series([100.0 + i for i in range(65)], index=idx)
+
+    def fake_get_snapshot(sym, **_kwargs):
+        if sym == "CU0":
+            return {"error": "Read timed out"}
+        return {
+            "technicals": {
+                "last_close": 288990.0,
+                "return_5d_pct": -13.93,
+                "return_20d_pct": -25.41,
+                "return_60d_pct": -32.08,
+                "as_of_bar": "2026-11-25",
+            }
+        }
+
+    with (
+        patch.object(macro_compass.market_snapshot, "get_snapshot", side_effect=fake_get_snapshot),
+        patch.object(macro_compass, "_read_cached_cn_future_close", return_value=cached_close),
+    ):
+        cn_res = macro_compass.fetch_cn_futures_anchors(refresh=False, timeout_seconds=5.0)
+    # 5 fresh + 1 stale SQLite fallback -> partial (NEVER 'ok') so degraded TTL & freshness tracking stay honest
+    assert cn_res["status"] == "partial"
+    assert cn_res["ok_count"] == len(macro_compass.CN_FUTURES_ANCHORS) - 1
+    assert cn_res["stale_count"] == 1
+    cu_item = next(it for it in cn_res["items"] if it["symbol"] == "CU0")
+    assert cu_item["status"] == "stale"
+    assert cu_item["stale_fallback"] is True
+    assert cu_item["ret_60d_pct"] is not None
+    sn_item = next(it for it in cn_res["items"] if it["symbol"] == "SN0")
+    assert sn_item["status"] == "ok"
+    assert sn_item["ret_20d_pct"] == -25.41
+
+
+def test_codex_review_regressions_a_share_bypasses_stale_breadth_mixed_radar_and_timeout_clamp(tmp_path: Path):
+    # 1. US:600519.SS MUST still normalize as a_share (Finding 2)
+    sym, ac = macro_compass.market_snapshot.normalize_symbol("US:600519.SS")
+    assert sym == "600519.SS" and ac == "a_share"
+
+    # 2. cross_asset short card with A-share reference_anchor or spaced A-share short_leg_sector MUST be rejected (Finding 2)
+    bypass_payload = {
+        "regime_title": "绕过测试",
+        "regime_summary": "测试各种 A 股做空绕过路径。",
+        "directions": [
+            {
+                "id": "sneaky_anchor_short",
+                "title": "消费白酒估值回归",
+                "direction": "short",
+                "asset_scope": "cross_asset",
+                "primary_driver": {"dimension": "宏观双核", "summary": "内需弱"},
+                "secondary_driver": {"dimension": "资金流与市场结构", "summary": "流出"},
+                "thesis": "做空白酒。",
+                "reference_anchors": ["600519.SS"],
+                "evidence": [
+                    {"fact": "事实1", "level": "L1", "date": "2026-11-20", "source": "NBS"},
+                    {"fact": "事实2", "level": "L2", "date": "2026-11-21", "source": "协会"},
+                ],
+            },
+            {
+                "id": "spaced_a_share_pair",
+                "title": "多黄金空白酒配对",
+                "direction": "pair",
+                "asset_scope": "cross_asset",
+                "primary_driver": {"dimension": "宏观双核", "summary": "分化"},
+                "secondary_driver": {"dimension": "资金流与市场结构", "summary": "切换"},
+                "thesis": "配对。",
+                "long_leg_sector": "海外黄金期货",
+                "short_leg_sector": "A 股白酒",
+                "evidence": [
+                    {"fact": "事实1", "level": "L1", "date": "2026-11-20", "source": "WGC"},
+                    {"fact": "事实2", "level": "L2", "date": "2026-11-21", "source": "协会"},
+                ],
+            },
+        ],
+    }
+    with pytest.raises(ValueError, match="未通过纪律校验"):
+        macro_compass.normalize_compass_output(bypass_payload, valid_universes=set())
+
+    # 3. avoid_sectors short_proxy_hint handles whitespace & preserves negated prohibition + valid proxy (Finding 8)
+    clean_bad, bad_flag = macro_compass._sanitize_avoid_short_proxy_hint("做空 A 股白酒")
+    assert clean_bad == "" and bad_flag is True
+    clean_good, good_flag = macro_compass._sanitize_avoid_short_proxy_hint("避免做空A股，改空铁矿")
+    assert clean_good == "避免做空A股，改空铁矿" and good_flag is False
+
+    # 4. Scan API rejects explicit and implicit A-share short legs with 422 (Finding 2)
+    app = app_mod.create_app()
+    with TestClient(app) as client:
+        r_imp = client.post(
+            "/api/tasks/scan",
+            json={
+                "universes": [],
+                "symbols": ["600519.SS"],
+                "compass_context": {
+                    "direction": "short",
+                    "expected_directions": {},
+                },
+            },
+        )
+        assert r_imp.status_code == 422
+        assert "A 股严禁" in r_imp.json()["detail"]
+
+    # 5. Stale fallback items excluded from live breadth & mixed-sign mover appears in only one list with matching driver_ret_pct (Findings 6 & 7)
+    mixed_items = [
+        {"symbol": "MIX", "name": "混合锚", "group": "commodities", "status": "ok", "last": 100.0, "ret_5d_pct": 1.0, "ret_20d_pct": 3.0, "ret_60d_pct": -20.0, "as_of": "2026-11-25"},
+        {"symbol": "OLD1", "name": "旧期货1", "group": "cn_futures", "status": "stale", "stale_fallback": True, "last": 100.0, "ret_5d_pct": -5.0, "ret_20d_pct": -25.0, "ret_60d_pct": -30.0, "as_of": "2026-10-01"},
+        {"symbol": "OLD2", "name": "旧期货2", "group": "cn_futures", "status": "stale", "stale_fallback": True, "last": 100.0, "ret_5d_pct": -5.0, "ret_20d_pct": -25.0, "ret_60d_pct": -30.0, "as_of": "2026-10-01"},
+        {"symbol": "OLD3", "name": "旧期货3", "group": "cn_futures", "status": "stale", "stale_fallback": True, "last": 100.0, "ret_5d_pct": -5.0, "ret_20d_pct": -25.0, "ret_60d_pct": -30.0, "as_of": "2026-10-01"},
+        {"symbol": "OLD4", "name": "旧期货4", "group": "cn_futures", "status": "stale", "stale_fallback": True, "last": 100.0, "ret_5d_pct": -5.0, "ret_20d_pct": -25.0, "ret_60d_pct": -30.0, "as_of": "2026-10-01"},
+        {"symbol": "OLD5", "name": "旧期货5", "group": "cn_futures", "status": "stale", "stale_fallback": True, "last": 100.0, "ret_5d_pct": -5.0, "ret_20d_pct": -25.0, "ret_60d_pct": -30.0, "as_of": "2026-10-01"},
+    ]
+    radar = macro_compass.compute_tape_movers(mixed_items)
+    assert radar["regime_breadth"]["total_available"] == 1
+    assert radar["regime_breadth"]["breadth_label"] == "结构分化（多空双向择优）"
+    assert [m["symbol"] for m in radar["top_losers"]] == ["MIX"]
+    assert radar["top_losers"][0]["driver_window"] == "60D"
+    assert radar["top_losers"][0]["driver_ret_pct"] == -20.0
+    assert radar["top_gainers"] == []
+
+    # 6. Nested scoped_http_timeout clamps to tighter outer timeout (Finding 5)
+    with data_store.scoped_http_timeout((3.0, 5.0)):
+        with data_store.scoped_http_timeout((5.0, 15.0)):
+            assert data_store._HTTP_TIMEOUT_VAR.get() == (3.0, 5.0)
+
+    # 7. _read_cached_cn_future_close uses load_cached_ohlcv and reads 80-bar series synced >21d ago (Finding 4)
+    db_file = tmp_path / "cu_stale.db"
+    store = data_store.DeskDataStore(str(db_file))
+    idx = pd.date_range("2026-07-01", periods=80, freq="B")
+    df_cu = pd.DataFrame(
+        {
+            "Open": [100.0 + i for i in range(80)],
+            "High": [101.0 + i for i in range(80)],
+            "Low": [99.0 + i for i in range(80)],
+            "Close": [100.0 + i for i in range(80)],
+            "Volume": [1000.0] * 80,
+        },
+        index=idx,
+    )
+    cu_key = data_store.SeriesKey("cn_future", "CU0", "1d", "akshare_sina_main", "raw_continuous")
+    store.get_or_sync_ohlcv(
+        cu_key,
+        period="3y",
+        timestamp_anchor="end",
+        ttl_seconds=3600,
+        refresh=True,
+        supports_incremental=False,
+        fetch_full=lambda: df_cu,
+    )
+    # Age last_synced_at_utc by 21 days to prove load_cached_ohlcv still reads it
+    conn = store._connect()
+    try:
+        conn.execute("UPDATE ohlcv_series SET last_synced_at_utc = '2026-10-01T00:00:00+00:00'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with (
+        patch.object(macro_compass.data_store, "is_store_enabled", return_value=True),
+        patch.object(macro_compass.data_store, "get_store", return_value=store),
+    ):
+        cs = macro_compass._read_cached_cn_future_close("CU0")
+    assert cs is not None and len(cs) == 80
+
+

@@ -154,7 +154,19 @@ def normalize_symbol(raw: str):
     s = raw.strip()
     upper = s.upper()
     if upper.startswith("US:") and len(upper) > 3:
-        return upper[3:].strip(), "us_stock_or_etf"
+        us_inner = upper[3:].strip()
+        # Prevent explicit A-share codes (e.g. US:600519.SS or US:600519) from masquerading as US equities
+        if re.fullmatch(r"\d{6}\.(SS|SH|SZ|BJ)", us_inner):
+            return us_inner.replace(".SH", ".SS"), "a_share"
+        if re.fullmatch(r"\d{6}", us_inner):
+            if us_inner.startswith(("4", "8", "92")):
+                suffix = ".BJ"
+            elif us_inner.startswith(("6", "9")):
+                suffix = ".SS"
+            else:
+                suffix = ".SZ"
+            return f"{us_inner}{suffix}", "a_share"
+        return us_inner, "us_stock_or_etf"
     if upper.startswith("CN:") and len(upper) > 3:
         cn_key = s[3:].strip()
         cn_upper = cn_key.upper()

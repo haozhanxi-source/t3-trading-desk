@@ -441,20 +441,48 @@ class TestExpressionCarryAndGate(unittest.TestCase):
         self.assertEqual(g1["decision"], "rejected")
         self.assertFalse(g1["actionable"])
 
-        # 2) Equity outright short blocked unless hedge_only=True
-        g2 = evaluate_four_quadrant_gate("short", "us_stock_or_etf", True, daily_alignment=aligned_short, rr_ratio=3.0)
-        self.assertEqual(g2["decision"], "rejected")
-        self.assertIn("股票中长线以做多为主", g2["reason"])
+        # 2) Option A policy: US equities/ETFs allow outright shorting in Davis double-kill (when L3 verdict verified);
+        # A-shares are UNCONDITIONALLY blocked on short legs (including hedge_only & is_pair_trade)
+        g2_us = evaluate_four_quadrant_gate(
+            "short", "us_stock_or_etf", True,
+            daily_alignment=aligned_short, rr_ratio=3.0, total_quantity=100,
+            us_short_thesis_verified=True,
+        )
+        self.assertEqual(g2_us["decision"], "actionable_short")
+        self.assertTrue(g2_us["actionable"])
+
+        # US equity short without L3 bearish verdict must downgrade to watchlist
+        g2_us_unverified = evaluate_four_quadrant_gate(
+            "short", "us_stock_or_etf", True,
+            daily_alignment=aligned_short, rr_ratio=3.0, total_quantity=100,
+            us_short_thesis_verified=False,
+        )
+        self.assertEqual(g2_us_unverified["decision"], "watchlist")
+        self.assertFalse(g2_us_unverified["actionable"])
 
         g2_a = evaluate_four_quadrant_gate("short", "a_share", True, daily_alignment=aligned_short, rr_ratio=3.0)
         self.assertEqual(g2_a["decision"], "rejected")
+        self.assertIn("A 股受限严格仅做多", g2_a["reason"])
 
-        g2_hedge = evaluate_four_quadrant_gate(
-            "short", "us_stock_or_etf", True,
+        g2_a_hedge = evaluate_four_quadrant_gate(
+            "short", "a_share", True,
             daily_alignment=aligned_short, rr_ratio=3.0, total_quantity=100, hedge_only=True,
         )
-        self.assertEqual(g2_hedge["decision"], "actionable_short")
-        self.assertTrue(g2_hedge["actionable"])
+        self.assertEqual(g2_a_hedge["decision"], "rejected")
+        self.assertFalse(g2_a_hedge["actionable"])
+
+        g2_a_pair = evaluate_four_quadrant_gate(
+            "short", "a_share", True,
+            daily_alignment=aligned_short, rr_ratio=3.0, total_quantity=100,
+            is_pair_trade=True, pair_leg_verified=True,
+        )
+        self.assertEqual(g2_a_pair["decision"], "rejected")
+        self.assertFalse(g2_a_pair["actionable"])
+
+        # Explicit A-share symbol cannot be reclassified as us_stock_or_etf via asset_class override
+        bad_a_spec = get_contract_spec("600519.SS", asset_class="us_stock_or_etf")
+        self.assertEqual(bad_a_spec["asset_class"], "a_share")
+        self.assertFalse(bad_a_spec["known_spec"])
 
         # 3) Upstream errors or curve_stale_or_error -> fail-closed watchlist_upstream_error
         g_up = evaluate_four_quadrant_gate(

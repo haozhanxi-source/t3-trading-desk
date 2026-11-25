@@ -17,7 +17,7 @@ import {
 } from "lightweight-charts";
 import { Crosshair, Layers, Maximize2, Table2 } from "lucide-react";
 import type { ChanlunTimeframe, SignalSummary } from "../../api/types";
-import { fmtFixed, fmtMomentumVerdict, fmtPct, fmtPosVsZs, fmtPrice } from "../../lib/format";
+import { fmtFixed, fmtMomentumVerdict, fmtPct, fmtPosVsZs, fmtPrice, shortTime } from "../../lib/format";
 import { useTheme } from "../../lib/theme";
 import { ZhongshuBoxesPrimitive } from "./ZhongshuBoxesPrimitive";
 import { prepareChanlunSeries, timeKey, type AnyBar, type IndexedBar } from "./chanlunUtils";
@@ -117,6 +117,17 @@ export function ChanlunChart({
 
   const [hoveredBar, setHoveredBar] = useState<IndexedBar | null>(null);
   const displayBar = hoveredBar ?? prepared.bars[prepared.bars.length - 1] ?? null;
+  const macdHistText = displayBar ? fmtFixed(displayBar.hist, dynamicFormats.macdDp, true) : "—";
+  const [macdOverlay, setMacdOverlay] = useState<{
+    top: number;
+    maxWidth: number | null;
+    visible: boolean;
+  }>(() => ({
+    top: Math.max(0, Math.round((height - 26) * 0.74)),
+    maxWidth: null,
+    visible: true,
+  }));
+  const syncMacdOverlayRef = useRef<(() => void) | null>(null);
 
   /* Persistent Lightweight Charts v5 refs */
   const chartRef = useRef<IChartApi | null>(null);
@@ -294,13 +305,88 @@ export function ChanlunChart({
     };
     chart.subscribeClick(onClick);
 
-    const ro = new ResizeObserver((entries) => {
-      const rect = entries[0]?.contentRect;
-      if (rect && rect.width > 0) {
-        chart.applyOptions({ width: Math.floor(rect.width) });
+    const observedEls = new WeakSet<Element>();
+    const observePaneTargets = (observer: ResizeObserver) => {
+      for (const pane of chart.panes()) {
+        const paneEl = pane.getHTMLElement();
+        if (!paneEl) continue;
+        if (!observedEls.has(paneEl)) {
+          observer.observe(paneEl);
+          observedEls.add(paneEl);
+        }
+        for (const target of paneEl.querySelectorAll("td, canvas")) {
+          if (!observedEls.has(target)) {
+            observer.observe(target);
+            observedEls.add(target);
+          }
+        }
       }
+    };
+
+    const computeMacdMaxWidth = (containerWidth: number): number | null => {
+      const panePlotW = chart.paneSize(1)?.width ?? 0;
+      const rightScaleW = Math.max(
+        chart.priceScale("right", 0)?.width() ?? 0,
+        chart.priceScale("right", 1)?.width() ?? 0,
+      );
+      const fromContainer = containerWidth > 0 && rightScaleW > 0 ? containerWidth - rightScaleW : 0;
+      let plotW = 0;
+      if (panePlotW > 0 && fromContainer > 0) {
+        plotW = Math.min(panePlotW, fromContainer);
+      } else {
+        plotW = panePlotW || fromContainer;
+      }
+      if (plotW <= 0) return null;
+      /* Overlay sits at left: 8px; keep 8px clearance before the right price scale */
+      return Math.max(0, Math.floor(plotW) - 16);
+    };
+
+    let ro: ResizeObserver | null = null;
+    const syncMacdOverlay = () => {
+      if (ro) observePaneTargets(ro);
+      const containerRect = el.getBoundingClientRect();
+      if (containerRect.height <= 0) return;
+      const nextMaxWidth = computeMacdMaxWidth(containerRect.width);
+      const paneEl = macdPane.getHTMLElement();
+      if (paneEl) {
+        const paneRect = paneEl.getBoundingClientRect();
+        if (paneRect.height > 0) {
+          const nextTop = Math.max(0, Math.round(paneRect.top - containerRect.top));
+          const nextVisible = paneRect.height >= 28 && (nextMaxWidth === null || nextMaxWidth >= 48);
+          setMacdOverlay((prev) =>
+            prev.top === nextTop && prev.maxWidth === nextMaxWidth && prev.visible === nextVisible
+              ? prev
+              : { top: nextTop, maxWidth: nextMaxWidth, visible: nextVisible },
+          );
+          return;
+        }
+      }
+      const mainHeight = chart.panes()[0]?.getHeight() ?? 0;
+      const macdHeight = macdPane.getHeight();
+      if (mainHeight > 0) {
+        const nextTop = Math.round(mainHeight);
+        const nextVisible =
+          (macdHeight <= 0 || macdHeight >= 28) && (nextMaxWidth === null || nextMaxWidth >= 48);
+        setMacdOverlay((prev) =>
+          prev.top === nextTop && prev.maxWidth === nextMaxWidth && prev.visible === nextVisible
+            ? prev
+            : { top: nextTop, maxWidth: nextMaxWidth, visible: nextVisible },
+        );
+      }
+    };
+    syncMacdOverlayRef.current = syncMacdOverlay;
+
+    ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target === el && entry.contentRect.width > 0) {
+          chart.applyOptions({ width: Math.floor(entry.contentRect.width) });
+        }
+      }
+      syncMacdOverlay();
     });
     ro.observe(el);
+    observePaneTargets(ro);
+    const rafId = window.requestAnimationFrame(syncMacdOverlay);
 
     chartRef.current = chart;
     candleRef.current = candleSeries;
@@ -315,7 +401,9 @@ export function ChanlunChart({
     zsPrimitiveRef.current = zsPrimitive;
 
     return () => {
+      window.cancelAnimationFrame(rafId);
       ro.disconnect();
+      syncMacdOverlayRef.current = null;
       chart.unsubscribeCrosshairMove(onCrosshair);
       chart.unsubscribeClick(onClick);
       markersPlugin.detach();
@@ -347,6 +435,8 @@ export function ChanlunChart({
     if (el && chart && el.clientWidth > 0) {
       chart.applyOptions({ width: Math.floor(el.clientWidth) });
     }
+    const rafId = window.requestAnimationFrame(() => syncMacdOverlayRef.current?.());
+    return () => window.cancelAnimationFrame(rafId);
   }, [active]);
 
   /* Sync theme palette dynamically */
@@ -425,6 +515,8 @@ export function ChanlunChart({
         to: total + 4,
       });
     }
+    const rafId = window.requestAnimationFrame(() => syncMacdOverlayRef.current?.());
+    return () => window.cancelAnimationFrame(rafId);
   }, [prepared, dynamicFormats, intraday, height]);
 
   /* Push Chanlun structural overlays independently (multi-chain confirmed segments across gaps) */
@@ -633,40 +725,35 @@ export function ChanlunChart({
         </div>
       </div>
 
-      {/* Compact Monospace Readout & Structural Telemetry Strip */}
-      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 border-b border-hairline-soft bg-sunken/70 px-3 py-1 font-mono text-[11px]">
-        {displayBar ? (
-          <div className="tnum flex flex-wrap items-center gap-x-2.5 gap-y-0.5 text-ink-2">
-            <span className="text-muted">{displayBar.label}</span>
-            <span>
-              O <strong className="font-medium text-ink">{fmtPrice(displayBar.open)}</strong>
-            </span>
-            <span>
-              H <strong className="font-medium text-ink">{fmtPrice(displayBar.high)}</strong>
-            </span>
-            <span>
-              L <strong className="font-medium text-ink">{fmtPrice(displayBar.low)}</strong>
-            </span>
-            <span>
-              C <strong className="font-semibold text-ink">{fmtPrice(displayBar.close)}</strong>
-            </span>
-            <span className="text-slot1">DIF {fmtFixed(displayBar.dif, dynamicFormats.macdDp)}</span>
-            <span className="text-slot4">DEA {fmtFixed(displayBar.dea, dynamicFormats.macdDp)}</span>
-            <span
-              className={
-                displayBar.hist != null && displayBar.hist >= 0 ? "text-bull" : "text-bear"
-              }
-            >
-              HIST {fmtFixed(displayBar.hist, dynamicFormats.macdDp)}
-            </span>
-          </div>
-        ) : (
-          <span className="font-sans text-muted">暂无 K 线数据</span>
-        )}
+      {/* Compact Monospace Readout & Structural Telemetry Strip (fixed 2-row height prevents vertical jitter) */}
+      <div className="flex flex-col gap-0.5 border-b border-hairline-soft bg-sunken/70 px-3 py-1 font-mono text-[11px]">
+        <div className="tnum no-scrollbar flex h-[18px] items-center gap-x-2.5 overflow-x-auto whitespace-nowrap leading-[18px] text-ink-2">
+          {displayBar ? (
+            <>
+              <span className="shrink-0 text-muted" title={displayBar.label}>
+                {shortTime(displayBar.label)}
+              </span>
+              <span className="shrink-0">
+                O <strong className="font-medium text-ink">{fmtPrice(displayBar.open)}</strong>
+              </span>
+              <span className="shrink-0">
+                H <strong className="font-medium text-ink">{fmtPrice(displayBar.high)}</strong>
+              </span>
+              <span className="shrink-0">
+                L <strong className="font-medium text-ink">{fmtPrice(displayBar.low)}</strong>
+              </span>
+              <span className="shrink-0">
+                C <strong className="font-semibold text-ink">{fmtPrice(displayBar.close)}</strong>
+              </span>
+            </>
+          ) : (
+            <span className="font-sans text-muted">暂无 K 线数据</span>
+          )}
+        </div>
 
-        <div className="tnum flex flex-wrap items-center gap-x-2.5 font-sans text-[11px] text-muted">
+        <div className="tnum no-scrollbar flex h-[18px] items-center gap-x-2.5 overflow-x-auto whitespace-nowrap font-sans text-[11px] leading-[18px] text-muted">
           {latestZs ? (
-            <span>
+            <span className="shrink-0">
               中枢{" "}
               <span className="font-mono text-ink-2">
                 [{fmtPrice(latestZs.zd)}, {fmtPrice(latestZs.zg)}]
@@ -674,15 +761,15 @@ export function ChanlunChart({
               · {fmtPosVsZs(chanlun?.price_vs_zhongshu)}
             </span>
           ) : (
-            <span>未成中枢</span>
+            <span className="shrink-0">未成中枢</span>
           )}
           {latestStroke?.strength_tier ? (
-            <span>
+            <span className="shrink-0">
               近笔：{latestStroke.direction === "up" ? "↑" : "↓"}
               {latestStroke.strength_tier}
             </span>
           ) : null}
-          {mom?.verdict ? <span>{fmtMomentumVerdict(mom.verdict)}</span> : null}
+          {mom?.verdict ? <span className="shrink-0">{fmtMomentumVerdict(mom.verdict)}</span> : null}
         </div>
       </div>
 
@@ -692,6 +779,31 @@ export function ChanlunChart({
           <div className="pointer-events-none absolute top-2 left-3 z-10 inline-flex items-center gap-1.5 rounded border border-accent/45 bg-surface/92 px-2.5 py-1 text-[11px] font-medium text-ink shadow-sm backdrop-blur-xs">
             <Crosshair className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
             <span>{pickHint}（点击 K 线画布取价 · Esc 取消）</span>
+          </div>
+        ) : null}
+        {displayBar && prepared.bars.length > 0 && macdOverlay.visible ? (
+          <div
+            className="tnum pointer-events-none absolute left-2 z-[5] flex items-center gap-x-2 overflow-hidden whitespace-nowrap rounded bg-surface/80 px-1.5 py-0.5 font-mono text-[10.5px] leading-tight backdrop-blur-[1px]"
+            style={{
+              top: `${macdOverlay.top + 4}px`,
+              maxWidth: macdOverlay.maxWidth !== null ? `${macdOverlay.maxWidth}px` : "calc(100% - 96px)",
+            }}
+            aria-label="MACD 指标读数"
+          >
+            <span className="shrink-0 font-sans text-[10px] text-muted">MACD</span>
+            <span className="shrink-0 text-slot1">DIF {fmtFixed(displayBar.dif, dynamicFormats.macdDp, true)}</span>
+            <span className="shrink-0 text-slot4">DEA {fmtFixed(displayBar.dea, dynamicFormats.macdDp, true)}</span>
+            <span
+              className={`shrink-0 ${
+                macdHistText.startsWith("-")
+                  ? "text-bear"
+                  : macdHistText.startsWith("+")
+                    ? "text-bull"
+                    : "text-muted"
+              }`}
+            >
+              HIST {macdHistText}
+            </span>
           </div>
         ) : null}
         <div ref={containerRef} className="w-full" style={{ height: `${height}px` }} />

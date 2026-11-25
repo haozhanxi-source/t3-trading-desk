@@ -770,22 +770,24 @@ export function Layer1CompassPanel({
               </div>
             ) : null}
 
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={isRunActive}
-              onClick={() => {
-                setLaunchErr(null);
-                setLaunchOpen(true);
-              }}
-            >
-              {isRunActive ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-              ) : (
-                <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-              )}
-              <span>{isRunActive ? "战略推演运行中…" : currentRun ? "重新运行战略推演" : "运行 Layer 1 战略推演"}</span>
-            </button>
+            {payload || isRunActive ? (
+              <button
+                type="button"
+                className="btn btn-primary"
+                disabled={isRunActive}
+                onClick={() => {
+                  setLaunchErr(null);
+                  setLaunchOpen(true);
+                }}
+              >
+                {isRunActive ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                <span>{isRunActive ? "战略推演运行中…" : "重新运行战略推演"}</span>
+              </button>
+            ) : null}
           </div>
         </div>
 
@@ -896,21 +898,22 @@ export function Layer1CompassPanel({
                 尚未生成本期 Layer 1 自上而下战略定调
               </div>
               <p className="m-0 mt-1 text-xs leading-relaxed text-muted">
-                不要在 17 个板块池里凭感觉盲选。点击右上角「运行 Layer 1 战略推演」，系统将基于上方中美宏观双核硬数据 + 实时联网检索，严格按 7 维驱动框架推演出当下未来 1Q~1Y 最具逻辑的做多、做空（商品/外汇/加密）及多空配对主线，并直接给出每个板块的真龙头与一键日线过筛入口。
+                不要在本地板块池里凭感觉盲选。点击下方按钮，系统将基于上方中美宏观双核硬数据 + 实时联网检索，严格按 7 维驱动框架推演出当下未来 1Q~1Y 最具逻辑的做多、做空（商品/外汇/加密）及多空配对主线，并直接给出每个板块的真龙头与一键日线过筛入口。
               </p>
             </div>
-            <button
-              type="button"
-              className="btn btn-primary"
-              disabled={isRunActive}
-              onClick={() => {
-                setLaunchErr(null);
-                setLaunchOpen(true);
-              }}
-            >
-              <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>立即生成本期战略罗盘</span>
-            </button>
+            {!isRunActive ? (
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => {
+                  setLaunchErr(null);
+                  setLaunchOpen(true);
+                }}
+              >
+                <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>运行 Layer 1 战略推演</span>
+              </button>
+            ) : null}
           </div>
         ) : (
           <>

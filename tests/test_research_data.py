@@ -1150,6 +1150,195 @@ class TestMultiAssetExtensionsAndStrictRouting(unittest.TestCase):
             spy_btc.assert_not_called()
             spy_eth.assert_called_once_with("ETH")
 
+    def test_extract_sec_submissions_8k_post_period_and_capital_events(self):
+        sub_json = {
+            "name": "Example Semi Corp",
+            "filings": {
+                "recent": {
+                    "form": ["8-K", "10-Q/A", "8-K", "10-Q", "8-K", "10-K"],
+                    "filingDate": [
+                        "2026-11-18",
+                        "2026-11-10",
+                        "2026-11-05",
+                        "2026-10-30",
+                        "2026-10-25",
+                        "2026-02-20",
+                    ],
+                    "reportDate": [
+                        "2026-11-15",
+                        "2025-12-31",  # old-period amendment should NOT override latest_periodic reportDate!
+                        "2026-11-04",
+                        "2026-09-30",
+                        "2026-10-25",
+                        "2025-12-31",
+                    ],
+                    "accessionNumber": [
+                        "0001045810-26-000105",
+                        "0001045810-26-000104",
+                        "0001045810-26-000103",
+                        "0001045810-26-000102",
+                        "0001045810-26-000101",
+                        "0001045810-26-000010",
+                    ],
+                    "primaryDocument": [
+                        "ex8k_acq.htm",
+                        "q_amend.htm",
+                        "ex8k_regfd.htm",
+                        "q3_2026.htm",
+                        "ex8k_earn.htm",
+                        "fy2025.htm",
+                    ],
+                    "primaryDocDescription": [
+                        "8-K M&A closing",
+                        "10-Q/A",
+                        "8-K Reg FD",
+                        "10-Q",
+                        "8-K Earnings",
+                        "10-K",
+                    ],
+                    "items": [
+                        ["2.01", "2.03", "9.01"],
+                        [],
+                        ["7.01"],
+                        [],
+                        ["2.02", "9.01"],
+                        [],
+                    ],
+                }
+            },
+        }
+        out = rd.extract_sec_submissions_filings(sub_json, cik_int=1045810, periodic_limit=4, eight_k_limit=10)
+        self.assertEqual(len(out["recent_filings"]), 3)
+        self.assertEqual(len(out["recent_8k_filings"]), 3)
+
+        summary = out["post_report_8k_summary"]
+        self.assertEqual(summary["latest_periodic_form"], "10-Q")
+        self.assertEqual(summary["latest_periodic_report_date"], "2026-09-30")
+        self.assertEqual(summary["latest_periodic_filing_date"], "2026-10-30")
+        # All 3 8-K events have reportDate > 2026-09-30 (post balance sheet date)
+        self.assertEqual(summary["post_report_8k_count"], 3)
+        self.assertEqual(summary["material_capital_8k_count"], 1)
+
+        acq_8k = out["recent_8k_filings"][0]
+        self.assertTrue(acq_8k["post_latest_periodic_report"])
+        self.assertTrue(acq_8k["is_material_capital_event"])
+        self.assertIn("2.01", acq_8k["items"])
+        self.assertTrue(any("并购" in lbl for lbl in acq_8k["item_labels"]))
+        self.assertIn("000104581026000105/ex8k_acq.htm", acq_8k["url"])
+
+        regfd_8k = out["recent_8k_filings"][1]
+        self.assertTrue(regfd_8k["post_latest_periodic_report"])
+        self.assertFalse(regfd_8k["is_material_capital_event"])
+
+    def test_extract_sec_companyfacts_capital_structure_and_dei_shares_yoy(self):
+        facts = {
+            "cik": 1045810,
+            "entityName": "Example Semi Corp",
+            "facts": {
+                "dei": {
+                    "EntityCommonStockSharesOutstanding": {
+                        "units": {
+                            "shares": [
+                                {"end": "2026-09-30", "val": 105000000, "form": "10-Q", "filed": "2026-10-30"},
+                                {"end": "2025-09-30", "val": 100000000, "form": "10-Q", "filed": "2025-10-30"},
+                            ]
+                        }
+                    }
+                },
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-07-01", "end": "2026-09-30", "val": 5000000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "CashAndCashEquivalentsAtCarryingValue": {
+                        "units": {
+                            "USD": [
+                                {"end": "2026-09-30", "val": 1440000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "MarketableSecuritiesCurrent": {
+                        "units": {
+                            "USD": [
+                                {"end": "2026-09-30", "val": 600000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "LongTermDebtNoncurrent": {
+                        "units": {
+                            "USD": [
+                                {"end": "2026-09-30", "val": 900000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "ShortTermBorrowings": {
+                        "units": {
+                            "USD": [
+                                {"end": "2026-09-30", "val": 150000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "ShareBasedCompensation": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-01-01", "end": "2026-09-30", "val": 320000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "PaymentsForRepurchaseOfCommonStock": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-01-01", "end": "2026-09-30", "val": 180000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "WeightedAverageNumberOfDilutedSharesOutstanding": {
+                        "units": {
+                            "shares": [
+                                {"start": "2026-07-01", "end": "2026-09-30", "val": 108000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "InventoryNet": {
+                        "units": {
+                            "USD": [
+                                {"end": "2026-09-30", "val": 820000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                    "AccountsReceivableNetCurrent": {
+                        "units": {
+                            "USD": [
+                                {"end": "2026-09-30", "val": 710000000, "form": "10-Q", "filed": "2026-10-30"}
+                            ]
+                        }
+                    },
+                },
+            },
+        }
+        res = rd.extract_sec_companyfacts(facts, limit=6)
+        metrics = res["metrics"]
+        self.assertEqual(metrics["cash_and_equivalents"]["records"][0]["val"], 1440000000)
+        self.assertEqual(metrics["short_term_investments"]["records"][0]["val"], 600000000)
+        self.assertEqual(metrics["long_term_debt"]["records"][0]["val"], 900000000)
+        self.assertEqual(metrics["short_term_debt"]["records"][0]["val"], 150000000)
+        self.assertEqual(metrics["stock_based_compensation"]["records"][0]["val"], 320000000)
+        self.assertEqual(metrics["share_repurchases"]["records"][0]["val"], 180000000)
+        self.assertEqual(metrics["shares_outstanding_ending"]["tag"], "dei:EntityCommonStockSharesOutstanding")
+        self.assertEqual(metrics["shares_outstanding_ending"]["unit"], "shares")
+        self.assertEqual(metrics["shares_diluted_weighted"]["records"][0]["val"], 108000000)
+        self.assertEqual(metrics["inventory"]["records"][0]["val"], 820000000)
+        self.assertEqual(metrics["accounts_receivable"]["records"][0]["val"], 710000000)
+
+        snap = res["capital_structure_snapshot"]
+        self.assertEqual(snap["cash_and_equivalents"]["val"], 1440000000)
+        self.assertAlmostEqual(snap["ending_shares_yoy_pct"], 5.0, places=2)
+        self.assertEqual(snap["ending_shares_yoy_base_end"], "2025-09-30")
+        self.assertIn("8-K", snap["audit_note"])
+
 
 if __name__ == "__main__":
     unittest.main()

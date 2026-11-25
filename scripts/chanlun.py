@@ -1372,6 +1372,17 @@ def assess_momentum(strokes: list[Stroke]) -> dict:
                 verdict = "divergence_candidate_down" if curr.direction == "down" else "divergence_candidate_up"
         else:
             verdict = "neutral_extension_down" if curr.direction == "down" else "neutral_extension_up"
+    elif made_new_extreme:
+        # MACD area/peak ratio unavailable (e.g. near-zero histogram on opposite side of zero axis):
+        # never misclassify a genuine new-extreme breakout/breakdown as higher_low_pullback/lower_high_rebound.
+        if steep_strong_impulse:
+            is_non_divergence_power = True
+            verdict = "non_divergence_down" if curr.direction == "down" else "non_divergence_up"
+        elif dif_new_extreme and slope_ratio is not None and slope_ratio >= 1.0:
+            is_consensus = True
+            verdict = "capital_consensus_down" if curr.direction == "down" else "capital_consensus_up"
+        else:
+            verdict = "neutral_extension_down" if curr.direction == "down" else "neutral_extension_up"
     else:
         if curr.direction == "down":
             verdict = "higher_low_pullback"

@@ -1524,6 +1524,26 @@ class TestChanlunEngine(unittest.TestCase):
         self.assertFalse(z_touch_dn[0].is_extended)
         self.assertEqual(z_touch_dn[0].oscillation_strokes, 0)
 
+        # 5) Zero-MACD-area stroke making a new price low must NOT be labeled higher_low_pullback
+        zero_area_prev = Stroke(
+            direction="down", start_date="2026-10-28", end_date="2026-11-11",
+            start_price=101520.0, end_price=86360.0, high=101520.0, low=86360.0,
+            start_merged_idx=0, end_merged_idx=10, start_raw_idx=0, end_raw_idx=10,
+            raw_bars=11, pct_change=-14.93, macd_area=0.0, macd_peak=0.0, dif_extreme=-5000.0,
+            efficiency=1.35, avg_vol_ratio=1.0, is_confirmed=True, strength_class=5, strength_tier="中",
+        )
+        zero_area_curr = Stroke(
+            direction="down", start_date="2026-11-20", end_date="2026-11-25",
+            start_price=93620.0, end_price=82220.0, high=93620.0, low=82220.0,
+            start_merged_idx=12, end_merged_idx=16, start_raw_idx=12, end_raw_idx=16,
+            raw_bars=4, pct_change=-12.18, macd_area=0.0, macd_peak=0.0, dif_extreme=-4500.0,
+            efficiency=3.04, avg_vol_ratio=1.0, is_confirmed=False, strength_class=5, strength_tier="中",
+        )
+        mom_zero = assess_momentum([zero_area_prev, zero_area_curr])
+        self.assertTrue(mom_zero["made_new_extreme"])
+        self.assertNotEqual(mom_zero["verdict"], "higher_low_pullback")
+        self.assertEqual(mom_zero["verdict"], "neutral_extension_down")
+
 
 if __name__ == "__main__":
     unittest.main()

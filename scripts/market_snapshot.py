@@ -433,8 +433,18 @@ def fetch_cn_future_intraday(symbol: str, interval: str = "30m") -> pd.DataFrame
     _, period_min, _ = _validate_intraday_interval(interval)
     if ak is None:
         raise RuntimeError("akshare is not installed; required for domestic futures intraday (cn_future)")
-    with scoped_http_timeout((5.0, 12.0)):
-        raw = ak.futures_zh_minute_sina(symbol=symbol, period=period_min)
+    last_exc: Exception | None = None
+    raw = None
+    for timeout_read in (12.0, 18.0):
+        try:
+            with scoped_http_timeout((5.0, timeout_read)):
+                raw = ak.futures_zh_minute_sina(symbol=symbol, period=period_min)
+            break
+        except Exception as exc:
+            last_exc = exc
+    if raw is None:
+        assert last_exc is not None
+        raise last_exc
     df = normalize_cn_future_frame(raw)
     out = _localize_df_index(df, "Asia/Shanghai")
     out.attrs["provider_source"] = "akshare_sina_min"
@@ -962,19 +972,43 @@ def get_intraday_snapshot(
                 df_cached = pd.DataFrame()
 
             if df_cached.empty:
-                raw_fetched = fetch_fn()
-                actual_src_id = str(raw_fetched.attrs.get("provider_source") or primary_src_id)
-                actual_key = SeriesKey(asset_class, norm_sym, iv, actual_src_id, adjust_kind)
-                df, intra_quality, sync_meta = store.get_or_sync_ohlcv(
-                    actual_key,
-                    period="60d",
-                    timestamp_anchor=timestamp_anchor,
-                    ttl_seconds=ttl_seconds,
-                    refresh=True,
-                    max_bars=max_bars,
-                    supports_incremental=False,
-                    fetch_full=lambda: raw_fetched,
-                )
+                try:
+                    raw_fetched = fetch_fn()
+                except Exception as fetch_exc:
+                    # Graceful stale-cache fallback when upstream times out / glitches
+                    fb_df, fb_qual, fb_meta = store.get_or_sync_ohlcv(
+                        primary_key,
+                        period="60d",
+                        timestamp_anchor=timestamp_anchor,
+                        ttl_seconds=10**9,
+                        refresh=False,
+                        max_bars=max_bars,
+                        supports_incremental=False,
+                        fetch_full=lambda: pd.DataFrame(),
+                    )
+                    if fb_df is not None and not fb_df.empty:
+                        df = fb_df
+                        intra_quality = {**fb_qual, "stale_fallback": True}
+                        sync_meta = {
+                            **fb_meta,
+                            "cache_status": "stale_fallback",
+                            "upstream_error": str(fetch_exc),
+                        }
+                    else:
+                        raise
+                else:
+                    actual_src_id = str(raw_fetched.attrs.get("provider_source") or primary_src_id)
+                    actual_key = SeriesKey(asset_class, norm_sym, iv, actual_src_id, adjust_kind)
+                    df, intra_quality, sync_meta = store.get_or_sync_ohlcv(
+                        actual_key,
+                        period="60d",
+                        timestamp_anchor=timestamp_anchor,
+                        ttl_seconds=ttl_seconds,
+                        refresh=True,
+                        max_bars=max_bars,
+                        supports_incremental=False,
+                        fetch_full=lambda: raw_fetched,
+                    )
         else:
             raw_fetched = fetch_fn()
             df, intra_quality = sanitize_and_grade_ohlcv(

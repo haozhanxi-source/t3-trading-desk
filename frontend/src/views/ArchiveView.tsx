@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  Bot,
   CalendarPlus,
   Crosshair,
   Database,
@@ -10,6 +11,7 @@ import {
   FilePlus2,
   FileText,
   ListChecks,
+  Loader2,
   Plus,
   RefreshCw,
   Save,
@@ -23,9 +25,19 @@ import type {
   ArchiveListItem,
   ArchiveStatus,
   ArchiveTrigger,
+  DeepResearchEngine,
+  DeepResearchMode,
   EvidenceItem,
   ResearchDataResponse,
+  ResearchEnginesResponse,
+  TaskRecord,
 } from "../api/types";
+import {
+  DeepResearchDialog,
+  DeepResearchProgressCard,
+  type DeepResearchLogLine,
+  type DeepResearchRunState,
+} from "../components/archive/DeepResearchControls";
 import { HardDataVisuals } from "../components/archive/HardDataVisuals";
 import { ModalDialog } from "../components/ui/ModalDialog";
 import { DirectionBadge, StatusBadge } from "../components/ui/StatusBadge";
@@ -231,6 +243,7 @@ export function ArchiveView({
   const hardAbortRef = useRef<AbortController | null>(null);
   const hardReqIdRef = useRef(0);
   const detailReqIdRef = useRef(0);
+  const loadHardDataRef = useRef<(forceRefresh?: boolean) => Promise<void>>(async () => {});
 
   /* In-place Hard Data + Trigger Check Refresh Action (per-key runId map prevents cross-archive collision) */
   const [checkingRuns, setCheckingRuns] = useState<Record<string, number>>({});
@@ -244,7 +257,14 @@ export function ArchiveView({
   /* Modals */
   const [initModalOpen, setInitModalOpen] = useState(false);
   const [evidenceModalOpen, setEvidenceModalOpen] = useState(false);
+  const [deepDialogOpen, setDeepDialogOpen] = useState(false);
   const [statusBusy, setStatusBusy] = useState(false);
+
+  /* AI Deep Research engine probe + per-archive SSE task map */
+  const [enginesInfo, setEnginesInfo] = useState<ResearchEnginesResponse | null>(null);
+  const [deepRuns, setDeepRuns] = useState<Record<string, DeepResearchRunState>>({});
+  const [cancellingTasks, setCancellingTasks] = useState<Record<string, boolean>>({});
+  const deepStreamsRef = useRef<Map<string, EventSource>>(new Map());
 
   useEffect(() => {
     const incomingKey = makeArchiveKey(market, symbol);
@@ -407,9 +427,340 @@ export function ArchiveView({
   }, [active, activeKey, activeSym, activeMarket, archivesLoaded, archives, detail, notFoundSym, editSession, workspaceRev, loadDetail]);
 
   useEffect(() => {
+    const streams = deepStreamsRef.current;
     return () => {
       hardAbortRef.current?.abort();
+      for (const es of streams.values()) {
+        es.close();
+      }
+      streams.clear();
     };
+  }, []);
+
+  const formatLogClock = (iso?: string): string => {
+    const d = iso ? new Date(iso) : new Date();
+    if (Number.isNaN(d.getTime())) return new Date().toTimeString().slice(0, 8);
+    return d.toTimeString().slice(0, 8);
+  };
+
+  const attachDeepResearchStream = useCallback(
+    (task: TaskRecord, fallbackSym: string, fallbackMarket: string | null) => {
+      const params = (task.params || {}) as Record<string, unknown>;
+      const sym = String(params.symbol || fallbackSym || "").trim().toUpperCase();
+      const mktRaw = params.market ? String(params.market).trim().toUpperCase() : fallbackMarket?.trim().toUpperCase() ?? null;
+      if (!sym) return;
+      const runKey = makeArchiveKey(mktRaw, sym);
+      const taskId = task.id || task.task_id || "";
+      if (!taskId) return;
+
+      const mode: DeepResearchMode = params.mode === "adversarial" ? "adversarial" : "standard";
+      const engine: DeepResearchEngine = params.engine === "codex" ? "codex" : "claude";
+      const parsedStart = task.started_at || task.created_at ? Date.parse(String(task.started_at || task.created_at)) : NaN;
+      const startedAtMs = Number.isFinite(parsedStart) ? parsedStart : Date.now();
+
+      const progObj =
+        task.progress && typeof task.progress === "object" ? task.progress : null;
+      setDeepRuns((prev) => {
+        const cur = prev[runKey];
+        if (cur && cur.taskId === taskId && (cur.status === "queued" || cur.status === "running")) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [runKey]: {
+            taskId,
+            symbol: sym,
+            market: mktRaw,
+            mode,
+            engine,
+            status: task.status === "queued" ? "queued" : "running",
+            stage: "collect_data",
+            done: progObj?.done ?? 0,
+            total: progObj?.total ?? 5,
+            startedAtMs,
+            logs: [],
+          },
+        };
+      });
+
+      if (deepStreamsRef.current.has(taskId)) return;
+
+      const es = new EventSource(api.taskEventsUrl(taskId));
+      deepStreamsRef.current.set(taskId, es);
+
+      const closeStream = () => {
+        es.close();
+        if (deepStreamsRef.current.get(taskId) === es) {
+          deepStreamsRef.current.delete(taskId);
+        }
+      };
+
+      const appendLog = (stage: string | undefined, message: string, ts?: string) => {
+        const clean = message.trim();
+        if (!clean) return;
+        const entry: DeepResearchLogLine = { ts: formatLogClock(ts), stage, message: clean };
+        setDeepRuns((prev) => {
+          const cur = prev[runKey];
+          if (!cur || cur.taskId !== taskId) return prev;
+          const prevLogs = cur.logs;
+          const last = prevLogs[prevLogs.length - 1];
+          if (last && last.message === entry.message) return prev;
+          return {
+            ...prev,
+            [runKey]: {
+              ...cur,
+              status: "running",
+              stage: stage || cur.stage,
+              logs: [...prevLogs.slice(-39), entry],
+            },
+          };
+        });
+      };
+
+      es.addEventListener("step", (ev) => {
+        const parsed = typeof (ev as MessageEvent).data === "string" ? parseTaskEvent((ev as MessageEvent).data, "step") : null;
+        if (!parsed) return;
+        const stage = typeof parsed.data?.stage === "string" ? parsed.data.stage : undefined;
+        const msg = String(parsed.data?.message || parsed.message || "");
+        if (msg && msg !== "deep_research started") {
+          appendLog(stage, msg, parsed.ts);
+        } else if (stage) {
+          setDeepRuns((prev) => {
+            const cur = prev[runKey];
+            if (!cur || cur.taskId !== taskId) return prev;
+            return { ...prev, [runKey]: { ...cur, status: "running", stage } };
+          });
+        }
+      });
+
+      es.addEventListener("log", (ev) => {
+        const parsed = typeof (ev as MessageEvent).data === "string" ? parseTaskEvent((ev as MessageEvent).data, "log") : null;
+        if (!parsed) return;
+        const stage = typeof parsed.data?.stage === "string" ? parsed.data.stage : undefined;
+        const msg = String(parsed.data?.message || parsed.message || "");
+        appendLog(stage, msg, parsed.ts);
+      });
+
+      es.addEventListener("progress", (ev) => {
+        const parsed = typeof (ev as MessageEvent).data === "string" ? parseTaskEvent((ev as MessageEvent).data, "progress") : null;
+        if (!parsed) return;
+        const flat = parsed as unknown as Record<string, unknown>;
+        const done =
+          typeof parsed.data?.done === "number"
+            ? parsed.data.done
+            : typeof flat.done === "number"
+              ? flat.done
+              : undefined;
+        const total =
+          typeof parsed.data?.total === "number"
+            ? parsed.data.total
+            : typeof flat.total === "number"
+              ? flat.total
+              : undefined;
+        setDeepRuns((prev) => {
+          const cur = prev[runKey];
+          if (!cur || cur.taskId !== taskId) return prev;
+          return {
+            ...prev,
+            [runKey]: {
+              ...cur,
+              status: "running",
+              done: done ?? cur.done,
+              total: total ?? cur.total,
+            },
+          };
+        });
+      });
+
+      es.addEventListener("done", (ev) => {
+        closeStream();
+        const parsed = typeof (ev as MessageEvent).data === "string" ? parseTaskEvent((ev as MessageEvent).data, "done") : null;
+        const res = (parsed?.data?.result ?? parsed?.result ?? {}) as Record<string, unknown>;
+        const rev = res.revision ? `v${res.revision}` : "";
+        const dir = res.direction_bias ? `方向 ${String(res.direction_bias).toUpperCase()}` : "";
+        const evAdded = typeof res.evidence_added === "number" ? `新增 ${res.evidence_added} 条证据` : "";
+        const trigCnt = typeof res.triggers_count === "number" ? `${res.triggers_count} 项触发器` : "";
+        const evCnt = typeof res.events_count === "number" ? `${res.events_count} 条催化事件` : "";
+        const summary = [rev, dir, evAdded, trigCnt, evCnt].filter(Boolean).join(" · ") || "研报已成功写回档案";
+
+        setDeepRuns((prev) => {
+          const cur = prev[runKey];
+          if (!cur || cur.taskId !== taskId) return prev;
+          return {
+            ...prev,
+            [runKey]: {
+              ...cur,
+              status: "completed",
+              stage: "persist_archive",
+              done: cur.total,
+              finishedAtMs: Date.now(),
+              resultSummary: summary,
+            },
+          };
+        });
+
+        loadedKeyRef.current = "";
+        void loadList();
+        if (activeKeyRef.current === runKey || makeArchiveKey(null, sym) === activeKeyRef.current) {
+          void loadDetail(sym, mktRaw);
+          void loadHardDataRef.current(false);
+        }
+        onArchiveMutated?.();
+      });
+
+      es.addEventListener("cancelled", (ev) => {
+        closeStream();
+        const rawData = typeof (ev as MessageEvent).data === "string" ? (ev as MessageEvent).data : "";
+        const parsed = rawData ? parseTaskEvent(rawData, "cancelled") : null;
+        const msg = String(parsed?.data?.message || parsed?.message || "用户已终止该研究任务");
+        setDeepRuns((prev) => {
+          const cur = prev[runKey];
+          if (!cur || cur.taskId !== taskId) return prev;
+          return {
+            ...prev,
+            [runKey]: {
+              ...cur,
+              status: "cancelled",
+              finishedAtMs: Date.now(),
+              error: msg,
+            },
+          };
+        });
+      });
+
+      es.addEventListener("error", (ev) => {
+        const rawData = typeof (ev as MessageEvent).data === "string" ? (ev as MessageEvent).data : "";
+        if (rawData) {
+          closeStream();
+          const parsed = parseTaskEvent(rawData, "error");
+          const msg = String(parsed?.data?.message || parsed?.message || "深度研究执行异常");
+          setDeepRuns((prev) => {
+            const cur = prev[runKey];
+            if (!cur || cur.taskId !== taskId) return prev;
+            return {
+              ...prev,
+              [runKey]: {
+                ...cur,
+                status: "failed",
+                finishedAtMs: Date.now(),
+                error: msg,
+              },
+            };
+          });
+          return;
+        }
+        /* Native EventSource network error: verify actual server task status before failing */
+        void api
+          .task(taskId)
+          .then((latestTask) => {
+            if (latestTask.status === "completed") {
+              closeStream();
+              setDeepRuns((prev) => {
+                const cur = prev[runKey];
+                if (!cur || cur.taskId !== taskId) return prev;
+                return {
+                  ...prev,
+                  [runKey]: {
+                    ...cur,
+                    status: "completed",
+                    done: cur.total,
+                    finishedAtMs: Date.now(),
+                    resultSummary: "深度研究已在后台完成并写回档案",
+                  },
+                };
+              });
+              loadedKeyRef.current = "";
+              void loadList();
+              if (activeKeyRef.current === runKey) void loadDetail(sym, mktRaw);
+              onArchiveMutated?.();
+            } else if (latestTask.status === "failed" || latestTask.status === "cancelled") {
+              closeStream();
+              setDeepRuns((prev) => {
+                const cur = prev[runKey];
+                if (!cur || cur.taskId !== taskId) return prev;
+                return {
+                  ...prev,
+                  [runKey]: {
+                    ...cur,
+                    status: latestTask.status === "cancelled" ? "cancelled" : "failed",
+                    finishedAtMs: Date.now(),
+                    error: latestTask.error || "研究任务已结束",
+                  },
+                };
+              });
+            }
+          })
+          .catch(() => {
+            /* Keep EventSource auto-reconnect alive on transient proxy hiccups */
+          });
+      });
+    },
+    [loadDetail, loadList, onArchiveMutated],
+  );
+
+  useEffect(() => {
+    if (!active) return;
+    const ctrl = new AbortController();
+    void api
+      .researchEngines(ctrl.signal)
+      .then((res) => {
+        if (!ctrl.signal.aborted) setEnginesInfo(res);
+      })
+      .catch(() => {});
+
+    void api
+      .tasks(ctrl.signal)
+      .then((res) => {
+        if (ctrl.signal.aborted) return;
+        for (const t of res.tasks ?? []) {
+          if (t.kind === "deep_research" && (t.status === "queued" || t.status === "running")) {
+            const p = (t.params || {}) as Record<string, unknown>;
+            attachDeepResearchStream(t, String(p.symbol || ""), p.market ? String(p.market) : null);
+          }
+        }
+      })
+      .catch(() => {});
+
+    return () => ctrl.abort();
+  }, [active, attachDeepResearchStream]);
+
+  const handleLaunchDeepResearch = useCallback(
+    async (opts: {
+      symbol?: string;
+      market?: string | null;
+      mode: DeepResearchMode;
+      engine: DeepResearchEngine;
+      focus_prompt: string;
+    }) => {
+      const targetSym = (opts.symbol || detail?.symbol || activeSym).trim();
+      const targetMkt = opts.market !== undefined ? opts.market : (detail?.market ?? activeMarket);
+      if (!targetSym) return;
+      const task = await api.startDeepResearch({
+        symbol: targetSym,
+        market: targetMkt,
+        mode: opts.mode,
+        engine: opts.engine,
+        focus_prompt: opts.focus_prompt,
+        include_macro: true,
+      });
+      attachDeepResearchStream(task, targetSym, targetMkt);
+    },
+    [activeMarket, activeSym, attachDeepResearchStream, detail?.market, detail?.symbol],
+  );
+
+  const handleCancelDeepResearch = useCallback(async (run: DeepResearchRunState) => {
+    setCancellingTasks((prev) => ({ ...prev, [run.taskId]: true }));
+    try {
+      await api.cancelTask(run.taskId);
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setCancellingTasks((prev) => {
+        const next = { ...prev };
+        delete next[run.taskId];
+        return next;
+      });
+    }
   }, []);
 
   const loadHardData = useCallback(
@@ -452,6 +803,7 @@ export function ArchiveView({
     },
     [activeSym, activeKey],
   );
+  loadHardDataRef.current = loadHardData;
 
   useEffect(() => {
     if (tab === "harddata" && !hardData && !hardLoading && failedHardKey !== activeKey && activeSym) {
@@ -794,12 +1146,38 @@ export function ArchiveView({
 
   const showCompanion = Boolean(detail && tab !== "harddata" && tab !== "triggers");
 
+  const activeDeepRun = useMemo(() => {
+    const exact = deepRuns[makeArchiveKey(effectiveMarket, detail?.symbol || activeSym)];
+    if (exact) return exact;
+    const symUpper = (detail?.symbol || activeSym).trim().toUpperCase();
+    if (!symUpper) return undefined;
+    return Object.values(deepRuns).find((r) => r.symbol.toUpperCase() === symUpper);
+  }, [activeSym, deepRuns, detail?.symbol, effectiveMarket]);
+
+  const isDeepRunning =
+    activeDeepRun?.status === "queued" || activeDeepRun?.status === "running";
+
+  const isBlankTemplate = Boolean(
+    detail &&
+      (detail.evidence_count ?? 0) === 0 &&
+      (!detail.state.thesis_summary ||
+        detail.state.thesis_summary.includes("待补充") ||
+        (detail.thesis_md || "").includes("待补充：")),
+  );
+
   const renderArchiveRow = (a: ArchiveListItem) => {
     const activeRow =
       a.symbol.toUpperCase() === activeSym.toUpperCase() &&
       (resolvedActiveMarket === null || a.market.toUpperCase() === resolvedActiveMarket);
-    const dotClass =
-      a.status === "holding" ? "bg-bull" : a.status === "watchlist" ? "bg-warning" : "bg-muted";
+    const rowRun = deepRuns[makeArchiveKey(a.market, a.symbol)];
+    const rowResearching = rowRun?.status === "queued" || rowRun?.status === "running";
+    const dotClass = rowResearching
+      ? "bg-accent animate-ping"
+      : a.status === "holding"
+        ? "bg-bull"
+        : a.status === "watchlist"
+          ? "bg-warning"
+          : "bg-muted";
     return (
       <li key={`${a.market}-${a.symbol}`}>
         <button
@@ -813,7 +1191,14 @@ export function ArchiveView({
         >
           <div className="flex items-center justify-between gap-2">
             <SymbolLabel symbol={a.symbol} name={a.name} size="sm" badgeTicker={false} />
-            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} title={a.status} aria-hidden="true" />
+            <span className="flex shrink-0 items-center gap-1.5">
+              {rowResearching ? (
+                <span className="rounded bg-accent/15 px-1 py-0.5 text-[10px] font-medium text-accent">
+                  研究中
+                </span>
+              ) : null}
+              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} title={a.status} aria-hidden="true" />
+            </span>
           </div>
           <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
             <span className="font-mono">
@@ -911,6 +1296,20 @@ export function ArchiveView({
             </div>
 
             <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                disabled={!activeSym || isDeepRunning}
+                onClick={() => setDeepDialogOpen(true)}
+                title="调用后台 AI 投研引擎完成第三层深度研究、红蓝对抗与第四层缠论执行框架并写回档案"
+              >
+                {isDeepRunning ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                ) : (
+                  <Bot className="h-3.5 w-3.5" aria-hidden="true" />
+                )}
+                <span>{isDeepRunning ? "AI 研究中…" : "AI 深度研究"}</span>
+              </button>
               <button
                 type="button"
                 className="btn btn-sm"
@@ -1017,6 +1416,43 @@ export function ArchiveView({
           <div role="alert" className="card border-critical/50 bg-critical/10 px-4 py-3 text-xs text-ink">
             {err}
           </div>
+        ) : null}
+
+        {activeDeepRun ? (
+          <DeepResearchProgressCard
+            run={activeDeepRun}
+            cancelling={Boolean(cancellingTasks[activeDeepRun.taskId])}
+            onCancel={() => void handleCancelDeepResearch(activeDeepRun)}
+            onDismiss={() => {
+              const targetKey = makeArchiveKey(activeDeepRun.market, activeDeepRun.symbol);
+              setDeepRuns((prev) => {
+                const next = { ...prev };
+                delete next[targetKey];
+                return next;
+              });
+            }}
+          />
+        ) : null}
+
+        {isBlankTemplate && !activeDeepRun && tab === "thesis" ? (
+          <section className="card flex flex-wrap items-center justify-between gap-3 border-accent/40 bg-accent/8 px-4 py-3">
+            <div className="min-w-0 flex-1">
+              <div className="text-xs font-semibold text-ink">
+                该档案尚未完成 AI 深度研究（当前为空白研究模板）
+              </div>
+              <p className="m-0 mt-0.5 text-[11.5px] leading-relaxed text-muted">
+                点击右侧一键启动，后台将自动拉取白名单硬数据与日线/30m 缠论，执行联网验真与红蓝对抗，并将完整研报、L1~L4 证据、撤离红线与事件日历写回此档案。
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn btn-sm btn-primary shrink-0"
+              onClick={() => setDeepDialogOpen(true)}
+            >
+              <Bot className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>立即 AI 深度研究</span>
+            </button>
+          </section>
         ) : null}
 
         {notFoundSym && tab !== "harddata" ? (
@@ -1560,8 +1996,9 @@ export function ArchiveView({
         open={initModalOpen}
         defaultSymbol={notFoundSym || activeSym}
         defaultMarket={effectiveMarket}
+        canAutoResearch={Boolean(enginesInfo?.any_available ?? true)}
         onClose={() => setInitModalOpen(false)}
-        onCreated={(newSym, createdMarket) => {
+        onCreated={(newSym, createdMarket, autoResearch) => {
           loadedKeyRef.current = "";
           onArchiveMutated?.();
           void loadList().then((list) => {
@@ -1573,7 +2010,29 @@ export function ArchiveView({
             const resolvedMkt = createdMarket ?? matched?.market ?? null;
             selectArchiveTuple(resolvedMkt, newSym);
             void loadDetail(newSym, resolvedMkt);
+            if (autoResearch) {
+              void handleLaunchDeepResearch({
+                symbol: newSym,
+                market: resolvedMkt,
+                mode: "standard",
+                engine: enginesInfo?.default_engine ?? "claude",
+                focus_prompt: "",
+              }).catch((ex) => setErr(errorMessage(ex)));
+            }
           });
+        }}
+      />
+
+      <DeepResearchDialog
+        open={deepDialogOpen}
+        symbol={detail?.symbol || activeSym}
+        name={detail?.state?.instrument?.name}
+        market={effectiveMarket}
+        isHolding={detail?.state?.status === "holding"}
+        enginesInfo={enginesInfo}
+        onClose={() => setDeepDialogOpen(false)}
+        onLaunch={async (opts) => {
+          await handleLaunchDeepResearch(opts);
         }}
       />
 
@@ -1600,14 +2059,16 @@ function InitArchiveDialog({
   open,
   defaultSymbol,
   defaultMarket,
+  canAutoResearch = true,
   onClose,
   onCreated,
 }: {
   open: boolean;
   defaultSymbol: string;
   defaultMarket?: string | null;
+  canAutoResearch?: boolean;
   onClose: () => void;
-  onCreated: (symbol: string, market: string | null) => void;
+  onCreated: (symbol: string, market: string | null, autoResearch: boolean) => void;
 }) {
   const [sym, setSym] = useState(defaultSymbol);
   const [market, setMarket] = useState(defaultMarket || "");
@@ -1616,6 +2077,7 @@ function InitArchiveDialog({
   const [primaryDriver, setPrimaryDriver] = useState("");
   const [secondaryDriver, setSecondaryDriver] = useState("");
   const [summary, setSummary] = useState("");
+  const [autoResearch, setAutoResearch] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -1628,8 +2090,9 @@ function InitArchiveDialog({
     setPrimaryDriver("");
     setSecondaryDriver("");
     setSummary("");
+    setAutoResearch(canAutoResearch);
     setErr(null);
-  }, [open, defaultSymbol]);
+  }, [open, defaultSymbol, canAutoResearch]);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -1647,7 +2110,7 @@ function InitArchiveDialog({
         secondary_driver: secondaryDriver.trim(),
         thesis_summary: summary.trim(),
       });
-      onCreated(sym.trim().toUpperCase(), mkt ?? null);
+      onCreated(sym.trim().toUpperCase(), mkt ?? null, autoResearch && canAutoResearch);
       onClose();
     } catch (ex) {
       setErr(errorMessage(ex));
@@ -1737,6 +2200,18 @@ function InitArchiveDialog({
             onChange={(e) => setSummary(e.target.value)}
           />
         </label>
+
+        {canAutoResearch ? (
+          <label className="flex cursor-pointer items-center gap-2 rounded-md border border-hairline-soft bg-sunken/50 px-3 py-2 text-xs text-ink-2">
+            <input
+              type="checkbox"
+              className="accent-accent"
+              checked={autoResearch}
+              onChange={(e) => setAutoResearch(e.target.checked)}
+            />
+            <span>创建档案后立即在后台启动 AI 深度研究（自动填满研报、证据与撤离红线）</span>
+          </label>
+        ) : null}
 
         {err ? (
           <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">

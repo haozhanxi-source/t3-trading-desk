@@ -25,6 +25,7 @@ import research_archive
 import research_data
 import scan_opportunities
 
+from . import deep_research
 from .cache import CACHE, TTL_RESEARCH_SECONDS, TTL_SENTINEL_SECONDS
 from .serializers import sanitize
 
@@ -32,7 +33,7 @@ MAX_TASKS = 50
 MAX_PERSISTED_SCANS = 10
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 TERMINAL_EVENT_TYPES = frozenset({"done", "error", "cancelled"})
-TASK_KINDS = ("scan", "research_refresh", "sentinel")
+TASK_KINDS = ("scan", "research_refresh", "sentinel", "deep_research")
 
 Emit = Callable[[str, dict[str, Any]], None]
 
@@ -440,6 +441,38 @@ class TaskManager:
         bg.add_done_callback(self._background.discard)
         return task
 
+    @staticmethod
+    def _deep_research_key(symbol: str, market: str | None) -> tuple[str, str]:
+        return ((market or "").strip().upper(), (symbol or "").strip().upper())
+
+    def start_deep_research(self, params: dict[str, Any]) -> tuple[Task, bool]:
+        """Single-flight deep-research starter per (market, symbol).
+
+        Returns ``(task, already_running)``. If the same archive already has an active
+        queued/running deep-research task, attaches to it instead of spawning duplicates.
+        """
+        target_key = self._deep_research_key(str(params.get("symbol") or ""), params.get("market"))
+        with self._lock:
+            self._ensure_hydrated_unlocked()
+            for existing in self._tasks.values():
+                if existing.kind != "deep_research" or existing.terminal:
+                    continue
+                ex_key = self._deep_research_key(
+                    str(existing.params.get("symbol") or ""),
+                    existing.params.get("market"),
+                )
+                if ex_key == target_key:
+                    return existing, True
+            task = Task("deep_research", params)
+            while len(self._tasks) >= self.max_tasks:
+                victim = next((tid for tid, t in self._tasks.items() if t.terminal), next(iter(self._tasks)))
+                self._tasks.pop(victim)
+            self._tasks[task.id] = task
+        bg = asyncio.get_running_loop().create_task(self._run(task))
+        self._background.add(bg)
+        bg.add_done_callback(self._background.discard)
+        return task, False
+
     async def _run(self, task: Task) -> None:
         runner = RUNNERS[task.kind]
         with self._lock:
@@ -467,7 +500,7 @@ class TaskManager:
 
         try:
             result = await asyncio.to_thread(runner, task.params, emit, **runner_kwargs)
-        except TaskCancelledError:
+        except (TaskCancelledError, deep_research.DeepResearchCancelledError):
             with self._lock:
                 if not task.terminal:
                     task.status = "cancelled"
@@ -711,4 +744,5 @@ RUNNERS: dict[str, Callable[[dict[str, Any], Emit], Any]] = {
     "scan": run_scan,
     "research_refresh": run_research_refresh,
     "sentinel": run_sentinel,
+    "deep_research": deep_research.run_deep_research,
 }

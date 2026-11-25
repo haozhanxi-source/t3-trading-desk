@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import ROOT_DIR, __version__
+from . import ROOT_DIR, __version__, deep_research
 from .cache import (
     CACHE,
     TTL_MARKET_SECONDS,
@@ -281,6 +281,14 @@ class DataHealthCheckReq(_Strict):
 
 class ResearchRefreshTaskReq(_ArchiveMarketReq):
     symbol: str
+    include_macro: bool = True
+
+
+class DeepResearchTaskReq(_ArchiveMarketReq):
+    symbol: str = Field(..., min_length=1)
+    mode: Literal["standard", "adversarial"] = "standard"
+    engine: Literal["claude", "codex"] = "claude"
+    focus_prompt: str = Field("", max_length=1200)
     include_macro: bool = True
 
 
@@ -955,6 +963,10 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         )
         return ok(res)
 
+    @app.get("/api/research/engines")
+    def research_engines_get():
+        return ok(deep_research.detect_available_engines())
+
     @app.get("/api/research/data")
     def research_data_get(symbol: str = Query(..., min_length=1), include_macro: bool = True, refresh: bool = False):
         def fetch() -> dict[str, Any]:
@@ -1008,6 +1020,36 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             "market": req.resolved_market(),
         }
         return ok(tasks.start("research_refresh", params).summary(), status_code=202)
+
+    @app.post("/api/tasks/deep-research", status_code=202)
+    async def task_deep_research(req: DeepResearchTaskReq):
+        if not req.symbol.strip():
+            raise HTTPException(status_code=422, detail="symbol must be non-empty")
+        try:
+            _, resolved_market, norm_symbol, _ = ra.resolve_archive_dir(
+                req.symbol.strip(),
+                market_override=req.resolved_market(),
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        if not deep_research.resolve_engine_binary(req.engine):
+            raise HTTPException(
+                status_code=503,
+                detail=f"本机未检测到可用的 `{req.engine}` 研究引擎，请在弹窗中切换其他可用引擎或检查 CLI 安装。",
+            )
+
+        params = {
+            "symbol": norm_symbol,
+            "market": resolved_market,
+            "mode": req.mode,
+            "engine": req.engine,
+            "focus_prompt": req.focus_prompt.strip(),
+            "include_macro": req.include_macro,
+        }
+        task, already_running = tasks.start_deep_research(params)
+        summary = {**task.summary(), "already_running": already_running}
+        return ok(summary, status_code=202)
 
     @app.post("/api/tasks/sentinel", status_code=202)
     async def task_sentinel(req: SentinelTaskReq):

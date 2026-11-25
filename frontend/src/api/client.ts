@@ -4,6 +4,7 @@ import type {
   ArchiveListItem,
   ArchiveState,
   CloseBody,
+  DeepResearchRequest,
   EvidenceItem,
   FxReferenceResponse,
   HealthResponse,
@@ -13,6 +14,7 @@ import type {
   PortfolioSummaryResponse,
   PersistedScanRun,
   ResearchDataResponse,
+  ResearchEnginesResponse,
   RotatePositionBody,
   SentinelResponse,
   SymbolSearchItem,
@@ -207,6 +209,7 @@ export const api = {
         ...(market ? { market } : {}),
       },
     }),
+  researchEngines: (signal?: AbortSignal) => get<ResearchEnginesResponse>("/research/engines", undefined, signal),
   researchData: (q: { symbol: string; include_macro?: boolean; refresh?: boolean }, signal?: AbortSignal) =>
     get<ResearchDataResponse>(
       "/research/data",
@@ -241,6 +244,17 @@ export const api = {
         ...(body.market ? { market: body.market } : {}),
       }),
     ),
+  startDeepResearch: async (body: DeepResearchRequest) => {
+    const raw = await post<TaskRecord & { already_running?: boolean }>("/tasks/deep-research", {
+      symbol: body.symbol,
+      mode: body.mode ?? "standard",
+      engine: body.engine ?? "claude",
+      focus_prompt: body.focus_prompt ?? "",
+      include_macro: body.include_macro ?? true,
+      ...(body.market ? { market: body.market } : {}),
+    });
+    return { ...normalizeTask(raw), already_running: Boolean(raw.already_running) };
+  },
   startSentinelTask: async (body: { include_watchlist: boolean; skip_research: boolean; event_window_days: number }) =>
     normalizeTask(await post<TaskRecord>("/tasks/sentinel", body)),
   tasks: async (signal?: AbortSignal) => {

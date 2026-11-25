@@ -790,8 +790,35 @@ export interface ScanRow {
   error?: string;
 }
 
-export type TaskKind = "scan" | "research_refresh" | "research-refresh" | "sentinel" | string;
+export type TaskKind = "scan" | "research_refresh" | "research-refresh" | "deep_research" | "sentinel" | string;
 export type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | string;
+
+export type DeepResearchMode = "standard" | "adversarial";
+export type DeepResearchEngine = "claude" | "codex";
+
+export interface ResearchEngineInfo {
+  id: DeepResearchEngine;
+  label: string;
+  description: string;
+  available: boolean;
+  binary?: string | null;
+}
+
+export interface ResearchEnginesResponse {
+  engines: ResearchEngineInfo[];
+  default_engine: DeepResearchEngine | null;
+  any_available: boolean;
+  adversarial_cross_model: boolean;
+}
+
+export interface DeepResearchRequest {
+  symbol: string;
+  market?: string | null;
+  mode?: DeepResearchMode;
+  engine?: DeepResearchEngine;
+  focus_prompt?: string;
+  include_macro?: boolean;
+}
 
 export interface TaskProgress {
   done: number;

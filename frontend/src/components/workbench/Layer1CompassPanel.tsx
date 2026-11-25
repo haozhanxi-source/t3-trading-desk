@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import {
   AlertTriangle,
   ArrowRight,
-  BookmarkPlus,
   BookOpen,
   CheckCircle2,
   Compass,
@@ -10,7 +9,6 @@ import {
   ExternalLink,
   History,
   Loader2,
-  Play,
   RefreshCw,
   Scale,
   ShieldAlert,
@@ -32,12 +30,13 @@ import type {
   ResearchEnginesResponse,
   TaskEventEnvelope,
   TaskRecord,
+  UniversePool,
 } from "../../api/types";
 import { ModalDialog } from "../ui/ModalDialog";
 import { signedToneClass } from "../ui/StatusBadge";
 import { SymbolLabel } from "../ui/SymbolLabel";
 import { fmtPct, shortTime } from "../../lib/format";
-import { getUniverseLabel } from "../../lib/universes";
+import { Layer1LeaderPickerModal } from "./Layer1LeaderPickerModal";
 
 type DirectionFilter = "all" | "long" | "short" | "pair";
 
@@ -191,59 +190,23 @@ function safeExternalUrl(raw: string | undefined | null): string | null {
   }
 }
 
-function buildCompassScanContext(
-  runId: string | undefined,
-  card: CompassDirectionCard,
-): CompassScanContext {
-  const expected: Record<string, "long" | "short"> = {};
-  for (const leader of card.leaders) {
-    const sym = leader.symbol.trim().toUpperCase();
-    if (!sym) continue;
-    expected[sym] = leader.leg === "short" ? "short" : "long";
-  }
-  /* For unidirectional cards, bind explicit reference anchors only — NEVER broadcast to unrelated pool members */
-  if (card.direction === "long" || card.direction === "short") {
-    for (const anc of card.reference_anchors ?? []) {
-      const sym = anc.trim().toUpperCase();
-      if (sym && !expected[sym]) {
-        expected[sym] = card.direction;
-      }
-    }
-  }
-  return {
-    run_id: runId || "",
-    direction_id: card.id,
-    direction_title: card.title,
-    direction: card.direction,
-    value_chain_focus: card.value_chain_focus || "",
-    expected_directions: expected,
-  };
-}
-
 export interface Layer1CompassPanelProps {
+  universes: Record<string, UniversePool>;
   scanBusy?: boolean;
-  onSelectSectorForLayer2: (opts: {
-    universes: string[];
-    referenceSymbols: string[];
-    label: string;
-    compassContext: CompassScanContext;
-  }) => void;
-  onScanLeaders: (opts: {
+  onLaunchCompassScan: (opts: {
     symbols: string[];
-    universes?: string[];
-    label: string;
     compassContext: CompassScanContext;
-  }) => void;
-  onSaveTheme: (prefill: { name: string; description: string; symbols: string[] }) => void;
+  }) => Promise<void> | void;
+  onUniverseSaved?: () => void;
   onJumpWarRoom: (symbol: string) => void;
   onJumpArchive: (symbol: string) => void;
 }
 
 export function Layer1CompassPanel({
+  universes,
   scanBusy = false,
-  onSelectSectorForLayer2,
-  onScanLeaders,
-  onSaveTheme,
+  onLaunchCompassScan,
+  onUniverseSaved,
   onJumpWarRoom,
   onJumpArchive,
 }: Layer1CompassPanelProps) {
@@ -269,6 +232,7 @@ export function Layer1CompassPanel({
   const [refreshMacroOnRun, setRefreshMacroOnRun] = useState(true);
   const [launching, setLaunching] = useState(false);
   const [launchErr, setLaunchErr] = useState<string | null>(null);
+  const [pickerCard, setPickerCard] = useState<CompassDirectionCard | null>(null);
 
   /* Live SSE task progress & concurrency/unmount guards */
   const [activeRun, setActiveRun] = useState<ActiveCompassRun | null>(null);
@@ -1065,7 +1029,7 @@ export function Layer1CompassPanel({
                 ))}
               </div>
               <span className="text-[11px] text-muted">
-                Layer 1 只定最优多空板块与产业链切入点 · 点击「带入 Layer 2 自选龙头」在下方自由挑池或填龙头
+                点击卡片「自选标的过筛」即可为该 L1 逻辑挑选专属小池标的，与下方手动大类池扫描完全隔离
               </span>
             </div>
 
@@ -1074,7 +1038,6 @@ export function Layer1CompassPanel({
               {filteredDirections.map((card) => {
                 const dm = directionMeta(card.direction);
                 const DirIcon = dm.Icon;
-                const leaderSymbols = card.leaders.map((l) => l.symbol);
 
                 return (
                   <article
@@ -1313,73 +1276,21 @@ export function Layer1CompassPanel({
                       ) : null}
                     </div>
 
-                    {/* Card Action Footer: Sector-First Handoff into Manual Layer 2 Selection */}
+                    {/* Card Action Footer: Dedicated L1 Mini-Pool Leader Picker */}
                     <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline-soft pt-2.5">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <button
-                          type="button"
-                          className="btn btn-sm btn-primary"
-                          onClick={() =>
-                            onSelectSectorForLayer2({
-                              universes: card.recommended_universes,
-                              referenceSymbols:
-                                leaderSymbols.length > 0 ? leaderSymbols : card.reference_anchors ?? [],
-                              label: card.title,
-                              compassContext: buildCompassScanContext(currentRun?.run_id, card),
-                            })
-                          }
-                          title="带着本板块的 Layer 1 方向校验进入下方 Layer 2，由你自行选池或输入心仪的真龙头"
-                        >
-                          <span>带入 Layer 2 自选龙头</span>
-                          <ArrowRight className="h-3 w-3" aria-hidden="true" />
-                        </button>
-
-                        {card.recommended_universes.length > 0 ? (
-                          <button
-                            type="button"
-                            className="btn btn-sm"
-                            disabled={scanBusy}
-                            onClick={() =>
-                              onScanLeaders({
-                                symbols: leaderSymbols,
-                                universes: card.recommended_universes,
-                                label: card.recommended_universes.map((u) => getUniverseLabel(u)).join("、"),
-                                compassContext: buildCompassScanContext(currentRun?.run_id, card),
-                              })
-                            }
-                            title={`直接扫描后端匹配到的本地板块池：${card.recommended_universes.map((u) => getUniverseLabel(u)).join("、")}`}
-                          >
-                            <Play className="h-3 w-3" aria-hidden="true" />
-                            <span>
-                              {scanBusy
-                                ? "启动中…"
-                                : `直接扫池：${getUniverseLabel(card.recommended_universes[0])}${
-                                    card.recommended_universes.length > 1
-                                      ? ` +${card.recommended_universes.length - 1}`
-                                      : ""
-                                  }`}
-                            </span>
-                          </button>
-                        ) : null}
-                      </div>
-
-                      {card.is_new_theme ? (
-                        <button
-                          type="button"
-                          className="btn btn-sm border-accent/35 text-accent"
-                          onClick={() =>
-                            onSaveTheme({
-                              name: card.suggested_pool_name,
-                              description: card.suggested_pool_description,
-                              symbols:
-                                leaderSymbols.length > 0 ? leaderSymbols : card.reference_anchors ?? [],
-                            })
-                          }
-                        >
-                          <BookmarkPlus className="h-3 w-3" aria-hidden="true" />
-                          <span>沉淀新板块池</span>
-                        </button>
-                      ) : null}
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-primary"
+                        disabled={scanBusy}
+                        onClick={() => setPickerCard(card)}
+                        title="在专属小池中自主挑选符合本 L1 逻辑的 1~3 只标的并做日线缠论联立过筛"
+                      >
+                        <span>自选标的过筛</span>
+                        <ArrowRight className="h-3 w-3" aria-hidden="true" />
+                      </button>
+                      <span className="text-[10.5px] text-muted">
+                        专属小池独立校验 · 不混入大类杂池
+                      </span>
                     </div>
                   </article>
                 );
@@ -1561,6 +1472,18 @@ export function Layer1CompassPanel({
           </div>
         </form>
       </ModalDialog>
+
+      {/* Dedicated L1 Mini-Pool Leader Picker Modal */}
+      <Layer1LeaderPickerModal
+        open={pickerCard !== null}
+        card={pickerCard}
+        runId={currentRun?.run_id}
+        universes={universes}
+        scanBusy={scanBusy}
+        onClose={() => setPickerCard(null)}
+        onLaunchScan={onLaunchCompassScan}
+        onUniverseSaved={onUniverseSaved}
+      />
     </section>
   );
 }

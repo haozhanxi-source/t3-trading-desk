@@ -242,12 +242,8 @@ export function WorkbenchView({
     symbols: string[];
   } | null>(null);
 
-  /* Staged Layer 1 sector context carried into manual Layer 2 leader selection */
-  const [stagedCompassContext, setStagedCompassContext] = useState<CompassScanContext | null>(null);
-
   const esRef = useRef<EventSource | null>(null);
   const layer2Ref = useRef<HTMLDivElement | null>(null);
-  const customInputRef = useRef<HTMLInputElement | null>(null);
   const launchingRef = useRef(false);
   const scanReqSeqRef = useRef(0);
 
@@ -580,60 +576,25 @@ export function WorkbenchView({
   const handleLaunch = async (e: FormEvent) => {
     e.preventDefault();
     const customSyms = parseSymbolList(customSymbolsText);
+    /* Manual scan stays strictly manual (no L1 thesis coupling) */
     await launchScanRequest({
       universes: selectedPools,
       symbols: customSyms,
-      compassContext: stagedCompassContext,
+      compassContext: null,
     });
   };
 
-  const handleSelectSectorForLayer2 = useCallback(
-    (opts: {
-      universes: string[];
-      referenceSymbols: string[];
-      label: string;
-      compassContext: CompassScanContext;
-    }) => {
-      setStagedCompassContext(opts.compassContext);
-      setSelectedPools(opts.universes);
-      setCustomSymbolsText(opts.universes.length === 0 ? opts.referenceSymbols.join(", ") : "");
-      setPickerExpanded(true);
-      setErr(null);
-      window.setTimeout(() => {
-        layer2Ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-        if (opts.universes.length === 0) {
-          customInputRef.current?.focus();
-        }
-      }, 60);
-    },
-    [],
-  );
-
-  const handleCompassScanLeaders = useCallback(
-    (opts: {
-      symbols: string[];
-      universes?: string[];
-      label: string;
-      compassContext: CompassScanContext;
-    }) => {
-      setStagedCompassContext(opts.compassContext);
-      void launchScanRequest({
-        universes: opts.universes ?? [],
-        symbols: opts.symbols ?? [],
+  const handleLaunchCompassScan = useCallback(
+    async (opts: { symbols: string[]; compassContext: CompassScanContext }) => {
+      await launchScanRequest({
+        universes: [],
+        symbols: opts.symbols,
         compassContext: opts.compassContext,
-        syncInputs: true,
+        syncInputs: false,
         scrollToResults: true,
       });
     },
     [launchScanRequest],
-  );
-
-  const handleCompassSaveTheme = useCallback(
-    (prefill: { name: string; description: string; symbols: string[] }) => {
-      setSavePoolPrefill(prefill);
-      setSavePoolOpen(true);
-    },
-    [],
   );
 
   const handleCancelActiveTask = async () => {
@@ -851,10 +812,10 @@ export function WorkbenchView({
 
       {/* Layer 1: Top-Down Macro Dual-Core + 7-Dimension Strategic Compass */}
       <Layer1CompassPanel
+        universes={universes}
         scanBusy={launching}
-        onSelectSectorForLayer2={handleSelectSectorForLayer2}
-        onScanLeaders={handleCompassScanLeaders}
-        onSaveTheme={handleCompassSaveTheme}
+        onLaunchCompassScan={handleLaunchCompassScan}
+        onUniverseSaved={() => void loadUniverses()}
         onJumpWarRoom={onJumpWarRoom}
         onJumpArchive={onJumpArchive}
       />
@@ -866,9 +827,9 @@ export function WorkbenchView({
             <span className="inline-flex items-center rounded border border-hairline bg-elevated px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-ink-2">
               Layer 2
             </span>
-            <h2 className="m-0 text-sm font-semibold text-ink">日线缠论龙头过筛台</h2>
+            <h2 className="m-0 text-sm font-semibold text-ink">日线缠论过筛结果 & 手动扫描台</h2>
             <span className="text-xs text-muted">
-              选定上方 Layer 1 板块后，在此自主勾选板块池或输入你认可的真龙头执行日线缠论过筛
+              上方 L1 专属小池过筛与下方手动大类池扫描完全独立，互不干扰
             </span>
           </div>
         </div>
@@ -925,45 +886,6 @@ export function WorkbenchView({
                 ) : null}
               </div>
             </div>
-
-            {stagedCompassContext ? (
-              <div className="flex flex-col gap-1 rounded-md border border-accent/30 bg-accent/8 px-3 py-2 text-xs">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="rounded border border-accent/35 bg-surface px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent">
-                      已带入 L1 板块
-                    </span>
-                    <span className="font-semibold text-ink">
-                      {stagedCompassContext.direction_title || "Layer 1 板块"}
-                    </span>
-                    <span className="text-muted">
-                      · 预定方向：
-                      {stagedCompassContext.direction === "short"
-                        ? "做空 SHORT"
-                        : stagedCompassContext.direction === "pair"
-                          ? "多空配对 PAIR"
-                          : "做多 LONG"}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    className="cursor-pointer border-0 bg-transparent p-0 text-[11px] text-muted hover:text-ink"
-                    onClick={() => setStagedCompassContext(null)}
-                  >
-                    取消绑定
-                  </button>
-                </div>
-                {stagedCompassContext.value_chain_focus ? (
-                  <div className="text-[11px] text-ink-2">
-                    <span className="font-semibold text-accent">选龙头抓手：</span>
-                    <span>{stagedCompassContext.value_chain_focus}</span>
-                  </div>
-                ) : null}
-                <div className="text-[11px] text-muted">
-                  提示：请在下方「临时切入新细分板块真龙头」中输入确认符合该 L1 逻辑的标的，系统才会自动判定 L1 同向/冲突；顺带扫出的综合大池无关品种不会自动盖章。
-                </div>
-              </div>
-            ) : null}
 
             {pickerExpanded ? (
               <form onSubmit={handleLaunch} className="flex flex-col gap-3 border-t border-hairline-soft pt-3">
@@ -1030,7 +952,6 @@ export function WorkbenchView({
                   <label className="field md:col-span-5">
                     <span>临时切入新细分板块真龙头（空格或逗号分隔）</span>
                     <input
-                      ref={customInputRef}
                       className="input"
                       placeholder="如 NVDA, PWR, CU0, AUDUSD=X"
                       value={customSymbolsText}

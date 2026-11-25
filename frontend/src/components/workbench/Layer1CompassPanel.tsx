@@ -68,11 +68,33 @@ const COMPASS_STAGES = [
   { key: "validate_and_persist", label: "校验板块并自动映池" },
 ];
 
-const FOCUS_PRESETS = [
-  { label: "全市场盲推演（推荐）", text: "" },
-  { label: "侧重大宗商品供需多空", text: "重点深挖全球大宗商品未来 1Q~1Y 供需平衡与产能投产预期，兼顾供给收缩做多与过剩弱预期做空/配对板块" },
-  { label: "侧重中美产业与景气拐点", text: "重点聚焦美股与 A 股具备 1~3 年远期预期差的产业迭代与制造业出海板块（仅限做多方向）" },
-  { label: "侧重宏观利率与外汇周期", text: "重点围绕中美及主要央行货币政策分化、汇率周期与全球流动性传导推演多空方向" },
+const FOCUS_SCOPE_GROUPS: {
+  group: string;
+  items: { id: string; label: string; hint: string }[];
+}[] = [
+  {
+    group: "大宗商品（多空对称）",
+    items: [
+      { id: "commodities_energy_shipping", label: "能源与航运", hint: "原油/成品油裂解/天然气/航运" },
+      { id: "commodities_metals", label: "有色与贵金属", hint: "铜/铝/镍/锡/金/银/铂钯" },
+      { id: "commodities_ferrous_chem", label: "黑色与新能源化工", hint: "铁矿/双焦/钢铁/碳酸锂/硅/化工" },
+      { id: "commodities_agri", label: "农产油脂与畜牧", hint: "大豆/棕榈油/糖/咖啡/生猪" },
+    ],
+  },
+  {
+    group: "宏观汇率与加密（多空对称）",
+    items: [
+      { id: "fx_rates", label: "外汇与利率周期", hint: "美元/日元/欧元/澳元/加元/人民币" },
+      { id: "crypto_liquidity", label: "加密货币与流动性", hint: "BTC/ETH/ETF流/稳定币" },
+    ],
+  },
+  {
+    group: "权益市场（仅做多）",
+    items: [
+      { id: "us_equities", label: "美股板块与产业迭代", hint: "科技/电力/军工/医药/矿业股" },
+      { id: "a_shares", label: "A 股主线与出海", hint: "红利/周期资源/制造出海/科技" },
+    ],
+  },
 ];
 
 function assetScopeLabel(scope: string): string {
@@ -232,6 +254,7 @@ export function Layer1CompassPanel({
   const [launchOpen, setLaunchOpen] = useState(false);
   const [selectedEngine, setSelectedEngine] = useState<DeepResearchEngine>("claude");
   const [effort, setEffort] = useState<"low" | "medium" | "high">("medium");
+  const [selectedFocusScopes, setSelectedFocusScopes] = useState<string[]>([]);
   const [focusPrompt, setFocusPrompt] = useState("");
   const [refreshMacroOnRun, setRefreshMacroOnRun] = useState(true);
   const [launching, setLaunching] = useState(false);
@@ -544,6 +567,12 @@ export function Layer1CompassPanel({
     }
   };
 
+  const toggleFocusScope = (scopeId: string) => {
+    setSelectedFocusScopes((prev) =>
+      prev.includes(scopeId) ? prev.filter((x) => x !== scopeId) : [...prev, scopeId],
+    );
+  };
+
   const handleStartCompass = async (e: FormEvent) => {
     e.preventDefault();
     if (launching) return;
@@ -553,6 +582,7 @@ export function Layer1CompassPanel({
       const task = await api.startMacroCompass({
         engine: selectedEngine,
         effort,
+        focus_scopes: selectedFocusScopes,
         focus_prompt: focusPrompt.trim(),
         refresh_macro: refreshMacroOnRun,
       });
@@ -1430,28 +1460,61 @@ export function Layer1CompassPanel({
             </div>
           </div>
 
-          {/* Optional Focus Prompt with Quick Presets */}
-          <div className="flex flex-col gap-1.5">
-            <label htmlFor="compass-focus-prompt" className="text-xs font-medium text-ink">
-              本次推演聚焦偏好（可选）
-            </label>
-            <div className="flex flex-wrap gap-1">
-              {FOCUS_PRESETS.map((p) => (
+          {/* Multi-select Target Battlefields */}
+          <div className="flex flex-col gap-2">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-xs font-medium text-ink">
+                重点深挖战场（可多选；不选则全市场均衡）
+              </span>
+              {selectedFocusScopes.length > 0 ? (
                 <button
-                  key={p.label}
                   type="button"
-                  className="chip text-[11px]"
-                  onClick={() => setFocusPrompt(p.text)}
+                  className="cursor-pointer border-0 bg-transparent p-0 text-[11px] text-accent hover:underline"
+                  onClick={() => setSelectedFocusScopes([])}
                 >
-                  {p.label}
+                  清空（恢复全市场）
                 </button>
+              ) : (
+                <span className="text-[11px] text-muted">当前：全市场均衡</span>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-2 rounded-md border border-hairline-soft bg-sunken/50 p-2.5">
+              {FOCUS_SCOPE_GROUPS.map((grp) => (
+                <div key={grp.group} className="flex flex-col gap-1">
+                  <span className="text-[10.5px] font-medium text-muted">{grp.group}</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {grp.items.map((item) => {
+                      const active = selectedFocusScopes.includes(item.id);
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          className="chip text-[11px]"
+                          aria-pressed={active}
+                          title={item.hint}
+                          onClick={() => toggleFocusScope(item.id)}
+                        >
+                          {item.label}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
               ))}
             </div>
+          </div>
+
+          {/* Optional Free-Text Supplement */}
+          <div className="flex flex-col gap-1">
+            <label htmlFor="compass-focus-prompt" className="text-xs font-medium text-ink">
+              补充推演要求（可选）
+            </label>
             <textarea
               id="compass-focus-prompt"
-              rows={3}
+              rows={2}
               className="input resize-none text-xs"
-              placeholder="留空则全市场均衡推演；也可输入如：重点评估中东地缘对原油航运的冲击，以及有色/新能源过剩做空机会"
+              placeholder="如：重点对比铜/铝/镍内部强弱，以及商品货币澳元/加元是否具备右侧做空条件"
               value={focusPrompt}
               onChange={(e) => setFocusPrompt(e.target.value)}
             />

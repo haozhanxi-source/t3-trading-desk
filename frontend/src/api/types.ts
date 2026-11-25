@@ -1105,6 +1105,7 @@ export interface CompassLatestResponse {
 export interface MacroCompassRequest {
   engine?: DeepResearchEngine | "";
   effort?: "low" | "medium" | "high";
+  focus_scopes?: string[];
   focus_prompt?: string;
   refresh_macro?: boolean;
 }

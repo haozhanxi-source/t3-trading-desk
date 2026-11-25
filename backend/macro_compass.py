@@ -79,10 +79,86 @@ CROSS_ASSET_ANCHORS: tuple[dict[str, str], ...] = (
     # A-shares, FX & Crypto
     {"symbol": "510300.SS", "name": "沪深300", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
     {"symbol": "510880.SS", "name": "A股红利", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
+    {"symbol": "EURUSD=X", "name": "欧元/美元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
     {"symbol": "USDJPY=X", "name": "美元/日元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
+    {"symbol": "AUDUSD=X", "name": "澳元/美元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
     {"symbol": "USDCNY=X", "name": "美元/人民币", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
     {"symbol": "BTC-USD", "name": "比特币", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
 )
+
+FOCUS_SCOPES_CATALOG: tuple[dict[str, str], ...] = (
+    {
+        "id": "commodities_energy_shipping",
+        "label": "能源与航运",
+        "group": "大宗商品（多空对称）",
+        "prompt_hint": "全球原油、成品油裂解价差、天然气及集运/油轮/干散货航运的供需投产、地缘咽喉与运价周期（多空对称）",
+    },
+    {
+        "id": "commodities_metals",
+        "label": "有色与贵金属",
+        "group": "大宗商品（多空对称）",
+        "prompt_hint": "铜、铝、镍、锡、锌、黄金、白银、铂钯等金属的矿端投产/资源国政策、显隐性库存、强现实弱预期劈叉及跨金属配对（多空对称）",
+    },
+    {
+        "id": "commodities_ferrous_chem",
+        "label": "黑色与新能源化工",
+        "group": "大宗商品（多空对称）",
+        "prompt_hint": "铁矿石、钢铁双焦、碳酸锂/硅料及能化产业链的中国信用需求、新增产能爬坡过剩或产能出清逻辑（多空对称）",
+    },
+    {
+        "id": "commodities_agri",
+        "label": "农产油脂与畜牧",
+        "group": "大宗商品（多空对称）",
+        "prompt_hint": "大豆/棕榈油/谷物/糖/咖啡/可可/棉花及生猪养殖的天气气候、生物柴油政策与产能周期（多空对称）",
+    },
+    {
+        "id": "fx_rates",
+        "label": "外汇与利率周期",
+        "group": "宏观汇率与加密（多空对称）",
+        "prompt_hint": "美元指数及主要非美货币（日元、欧元、英镑、商品货币澳元/加元、人民币）的央行政策拐点、国债利差、贸易条件与套息拥挤度（多空对称）",
+    },
+    {
+        "id": "crypto_liquidity",
+        "label": "加密货币与流动性",
+        "group": "宏观汇率与加密（多空对称）",
+        "prompt_hint": "全球美元流动性、现货 ETF 资金流、稳定币扩容/收缩及监管法案驱动的加密多空周期（多空对称）",
+    },
+    {
+        "id": "us_equities",
+        "label": "美股板块与产业迭代",
+        "group": "权益市场（仅做多）",
+        "prompt_hint": "美股具备 1~3 年远期预期差的产业迭代与瓶颈赛道（科技算力、电力电网、军工航天、医药、资源矿业股等，严格仅做多）",
+    },
+    {
+        "id": "a_shares",
+        "label": "A 股主线与出海",
+        "group": "权益市场（仅做多）",
+        "prompt_hint": "A 股高股息红利、制造业出海、资源周期与国内产业政策催化主线（严格仅做多）",
+    },
+)
+
+_FOCUS_SCOPE_MAP: dict[str, dict[str, str]] = {item["id"]: item for item in FOCUS_SCOPES_CATALOG}
+
+
+def normalize_focus_scopes(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        sid = str(item or "").strip().lower()
+        if sid in _FOCUS_SCOPE_MAP and sid not in out:
+            out.append(sid)
+    return out
+
+
+def format_focus_scopes_summary(scopes: list[str], focus_prompt: str = "") -> str:
+    labels = [_FOCUS_SCOPE_MAP[s]["label"] for s in scopes if s in _FOCUS_SCOPE_MAP]
+    parts: list[str] = []
+    if labels:
+        parts.append("专挖：" + " + ".join(labels))
+    if focus_prompt.strip():
+        parts.append(focus_prompt.strip())
+    return " ｜ ".join(parts)
 
 _POOL_SLUG_RE = re.compile(r"[^a-z0-9_]+")
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -758,11 +834,17 @@ def build_compass_brief(
     *,
     macro_overview: dict[str, Any],
     focus_prompt: str = "",
+    focus_scopes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Assemble a strictly unanchored macro brief (NO existing_universes, NO current holdings)."""
+    clean_scopes = normalize_focus_scopes(focus_scopes or [])
     return sanitize(
         {
             "generated_at_utc": _utc_iso(),
+            "focus_scopes": [
+                {"id": sid, "label": _FOCUS_SCOPE_MAP[sid]["label"]}
+                for sid in clean_scopes
+            ],
             "focus_prompt": focus_prompt.strip(),
             "seven_dimensions": list(SEVEN_DIMENSIONS),
             "macro_overview": {
@@ -778,17 +860,35 @@ def build_compass_brief(
     )
 
 
-def build_compass_prompt(*, brief_path: str, focus_prompt: str = "") -> str:
+def build_compass_prompt(
+    *,
+    brief_path: str,
+    focus_prompt: str = "",
+    focus_scopes: list[str] | None = None,
+) -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    focus_block = f"\n【用户指定的本次推演侧重点】\n{focus_prompt.strip()}\n" if focus_prompt.strip() else ""
+    clean_scopes = normalize_focus_scopes(focus_scopes or [])
+    scopes_block = ""
+    if clean_scopes:
+        lines = [
+            f"- **{ _FOCUS_SCOPE_MAP[sid]['label'] }**：{_FOCUS_SCOPE_MAP[sid]['prompt_hint']}"
+            for sid in clean_scopes
+        ]
+        scopes_block = (
+            "\n【用户锁定的重点深挖战场（多选 · 必须严格聚焦）】\n"
+            "用户本次明确指定只深挖以下战场，请将全部 4~6 张方向卡片集中分配在这些战场内（确保每个勾选战场至少产出 1 张高质量方向卡，对比战场内部强弱分化与多空/配对机会，不要把名额浪费在未勾选市场）：\n"
+            + "\n".join(lines)
+            + "\n"
+        )
+    focus_block = f"\n【用户补充说明】\n{focus_prompt.strip()}\n" if focus_prompt.strip() else ""
     return (
         f"你是 T3 Trading Desk（中低频多智能体投研台 · 缠论版）的第一层（Layer 1）全球自上而下首席策略师。今天是 {today}。\n"
-        f"请先使用 Read 工具读取当前目录下的纯宏观简报文件 `{brief_path}`，再以**空白大脑（无任何预设标的池锚定）**执行实时 WebSearch / WebFetch，\n"
+        f"请先使用 Read 工具读取当前目录下的简报文件 `{brief_path}`，再以**空白大脑（无任何预设标的池锚定）**执行实时 WebSearch / WebFetch，\n"
         "从当下真实世界正在发生的最大级别宏观、地缘、政策、供需与产业变化出发，只回答第一层最核心的战略问题：\n"
         "**“在当前环境下，未来 1 个季度至 1 年（1Q~1Y）最有逻辑的多空方向和核心板块（Sector / Theme）是什么？产业链该切哪个环节？又该回避哪些逆风板块？”**\n\n"
         "【Layer 1 职责边界与铁律（严格遵守）】\n"
-        "1. **只选方向与板块，不代用户硬选具体个股/唯一龙头**：Layer 1 负责把宏观大局、多空方向、核心板块及产业链选龙头抓手（`value_chain_focus`）讲透；具体挑哪只真龙头并做日线缠论验证，交由用户在下方 Layer 2 自主完成。你可以可选填 0~2 个板块基准定价锚（如一级行业 ETF 或主流商品/汇率基准代码），但绝不要越俎代庖替用户锁定某一只个股。\n"
-        "2. **彻底去锚定、先看全球最大矛盾**：严禁盯着固定老题材打转。先广泛检索当下全球流动性与央行路径、中国宏观政策脉动、地缘冲突与主产国政策变化、全球主要大宗商品未来 1Q~1Y 投产/过剩/缺口预期、以及科技/制造业正在发生的真实景气拐点，按逻辑强弱自然浮现板块。\n"
+        "1. **数据时效优先（警惕滞后月度宏观统计）**：简报中的月度宏观数据（如 `CN_PMI`、`FEDFUNDS`、`PCOPPUSDM`）天然滞后 1~2 个月，仅作背景参考；**实时市场定价（`cross_asset_anchors` 近 5D/20D/60D 异动、`VIX`/`US10Y`/`DXY`）与你通过 WebSearch 检索到的近 1~2 周最新政策/库存/会议/市场定价变化享有绝对最高优先级**。严禁因为简报里的 19 个定价锚恰好列了某几个品种就只搜那几个，必须主动覆盖目标战场内所有核心品种（如铜/铝/镍/铁矿、商品货币澳元/加元/日元/欧元等）。\n"
+        "2. **只选方向与板块，不代用户硬选具体个股/唯一龙头**：Layer 1 负责把宏观大局、多空方向、核心板块及产业链选龙头抓手（`value_chain_focus`）讲透；具体挑哪只真龙头并做日线缠论验证，交由用户在下方 Layer 2 自主完成。你可以可选填 0~2 个板块基准定价锚（如一级行业 ETF 或主流商品/汇率基准代码），但绝不要越俎代庖替用户锁定某一只个股。\n"
         "3. **大逻辑先行（严禁凭短线涨跌或超买超卖倒推逻辑）**：不使用 RSI/布林带/均值回归作为推荐依据，只做真正具备 1Q~1Y 基本面预期差、供需失衡或宏观流动性共振的板块。\n"
         "4. **7 维驱动共振门槛（强制 ≥2 个不同维度共振，且均须有非空摘要）**：每个板块必须明确标注主驱动维度 + 不同的次驱动维度，规范名限定为：\n"
         "   - `宏观双核`（美国利率/美债/美元流动性 + 中国财政/地产/信用周期）\n"
@@ -801,7 +901,8 @@ def build_compass_prompt(*, brief_path: str, focus_prompt: str = "") -> str:
         "5. **跨资产多空非对称 + 大 B 结构不否决做空**：\n"
         "   - **股票板块（美股 / A股）严格禁止做空（包括配对中的空头腿）**，仅允许做多（`long`）或配对中的多头板块腿；\n"
         "   - **大宗商品、外汇（FX）、加密货币**多空完全对称，`short` 做空与 `pair` 同产业链多空配对与 `long` 同等重要！若某商品存在明确的未来供需过剩/弱预期（即使当下低库存呈大 B 结构），必须敢于给出做空或配对方向，绝不只堆砌清一色做多。\n"
-        "6. **0-编造红线**：引用宏观数据必须与 `brief.json` 一致；每个板块必须给出 **≥2 条**真实联网证据，含精确 `YYYY-MM-DD` 日期、来源机构名、`L1~L4` 证据等级与可验证的 `https://` 链接。\n"
+        "6. **0-编造红线**：引用宏观数据必须与 `brief.json` 或最新联网来源一致（且标明日期）；每个板块必须给出 **≥2 条**真实联网证据，含精确 `YYYY-MM-DD` 日期、来源机构名、`L1~L4` 证据等级与可验证的 `https://` 链接。\n"
+        f"{scopes_block}"
         f"{focus_block}\n"
         "【输出格式铁律】\n"
         "你的最终回复必须**仅包含一个合法的 JSON 对象**（可用 ```json ... ``` 包裹，JSON 外不要输出任何额外说明文字），严格遵循以下 schema：\n"
@@ -1344,6 +1445,8 @@ def run_macro_compass(
     if effort not in ("low", "medium", "high"):
         effort = "medium"
     focus_prompt = str(params.get("focus_prompt") or "").strip()
+    focus_scopes = normalize_focus_scopes(params.get("focus_scopes") or [])
+    focus_summary = format_focus_scopes_summary(focus_scopes, focus_prompt)
     refresh_macro = bool(params.get("refresh_macro", True))
 
     created_at = _utc_iso()
@@ -1355,16 +1458,17 @@ def run_macro_compass(
 
     _check_cancel()
     emit("progress", {"done": 0, "total": total_steps})
-    emit("step", {"stage": "collect_macro", "message": "采集全球中美宏观双核与 17 个跨资产定价锚…"})
+    emit("step", {"stage": "collect_macro", "message": "采集实时市场定价锚与宏观双核背景数据…"})
 
     macro_overview = collect_macro_overview(refresh=refresh_macro)
     _check_cancel()
     emit("progress", {"done": 1, "total": total_steps})
 
-    emit("step", {"stage": "build_brief", "message": "封装纯宏观双核简报（去标的池/持仓锚定）…"})
+    emit("step", {"stage": "build_brief", "message": "封装无锚定推演简报与多选战场范围…"})
     brief = build_compass_brief(
         macro_overview=macro_overview,
         focus_prompt=focus_prompt,
+        focus_scopes=focus_scopes,
     )
     _check_cancel()
     emit("progress", {"done": 2, "total": total_steps})
@@ -1373,7 +1477,7 @@ def run_macro_compass(
         "step",
         {
             "stage": "agent_synthesize",
-            "message": f"启动 {engine.upper()} 盲推演联网检索，按 7 维框架筛选 1Q~1Y 最优多空板块…",
+            "message": f"启动 {engine.upper()} 联网检索，聚焦{focus_summary or '全市场 7 维框架'}推演 1Q~1Y 板块…",
         },
     )
 
@@ -1382,7 +1486,11 @@ def run_macro_compass(
         with open(brief_path, "w", encoding="utf-8") as fh:
             json.dump(brief, fh, ensure_ascii=False, indent=2)
 
-        prompt = build_compass_prompt(brief_path=brief_path, focus_prompt=focus_prompt)
+        prompt = build_compass_prompt(
+            brief_path=brief_path,
+            focus_prompt=focus_prompt,
+            focus_scopes=focus_scopes,
+        )
         raw_text, run_meta = deep_research._run_agent_cli(
             engine=engine,
             prompt=prompt,
@@ -1415,7 +1523,9 @@ def run_macro_compass(
             "generated_at_utc": finished_at,
             "engine": engine,
             "effort": effort,
-            "focus_prompt": focus_prompt,
+            "focus_scopes": focus_scopes,
+            "focus_prompt": focus_summary,
+            "raw_focus_prompt": focus_prompt,
             "macro_snapshot_summary": {
                 "fetched_at_utc": macro_overview.get("fetched_at_utc"),
                 "regime_tags": macro_overview.get("regime_tags") or [],
@@ -1433,7 +1543,7 @@ def run_macro_compass(
             finished_at_utc=finished_at,
             engine=engine,
             effort=effort,
-            focus_prompt=focus_prompt,
+            focus_prompt=focus_summary,
             result=full_result,
         )
 

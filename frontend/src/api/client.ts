@@ -235,6 +235,7 @@ export const api = {
     const raw = await post<TaskRecord & { already_running?: boolean }>("/tasks/macro-compass", {
       engine: body.engine ?? "",
       effort: body.effort ?? "medium",
+      focus_scopes: body.focus_scopes ?? [],
       focus_prompt: body.focus_prompt ?? "",
       refresh_macro: body.refresh_macro ?? true,
     });

@@ -333,6 +333,7 @@ class TriggerVerifyTaskReq(_ArchiveMarketReq):
 class MacroCompassTaskReq(_Strict):
     engine: Literal["claude", "codex", ""] = ""
     effort: Literal["low", "medium", "high"] = "medium"
+    focus_scopes: list[str] = Field(default_factory=list, max_length=12)
     focus_prompt: str = Field("", max_length=1200)
     refresh_macro: bool = True
 
@@ -1154,6 +1155,7 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         params = {
             "engine": chosen_engine,
             "effort": req.effort,
+            "focus_scopes": macro_compass.normalize_focus_scopes(req.focus_scopes),
             "focus_prompt": req.focus_prompt.strip(),
             "refresh_macro": req.refresh_macro,
         }

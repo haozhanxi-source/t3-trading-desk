@@ -222,6 +222,22 @@ def test_blind_brief_and_prompt_contain_zero_universe_or_portfolio_anchoring():
     for anchor_token in ("existing_universes", "NI0", "AUDUSD", "RKAB", "霍尔木兹", "GEV", "XLU", "PWR"):
         assert anchor_token not in prompt, f"Prompt should not anchor AI with {anchor_token!r}"
     assert "不代用户硬选具体个股" in prompt
+    assert "滞后 1~2 个月" in prompt
+
+    # Multi-select focus_scopes: deduped, unknown dropped, injected into prompt
+    clean_scopes = macro_compass.normalize_focus_scopes(
+        ["commodities_metals", "fx_rates", "commodities_metals", "bogus_scope"]
+    )
+    assert clean_scopes == ["commodities_metals", "fx_rates"]
+    scoped_prompt = macro_compass.build_compass_prompt(
+        brief_path="/tmp/brief.json",
+        focus_scopes=clean_scopes,
+        focus_prompt="重点看商品货币与铜铝分化",
+    )
+    assert "用户锁定的重点深挖战场（多选" in scoped_prompt
+    assert "有色与贵金属" in scoped_prompt
+    assert "外汇与利率周期" in scoped_prompt
+    assert macro_compass.format_focus_scopes_summary(clean_scopes, "测试补充") == "专挖：有色与贵金属 + 外汇与利率周期 ｜ 测试补充"
 
 
 def test_sector_first_cards_without_leaders_and_posthoc_universe_portfolio_mapping():

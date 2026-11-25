@@ -14,6 +14,7 @@ Runs a structured 5-stage pipeline inside the backend TaskManager:
 """
 from __future__ import annotations
 
+import codecs
 import inspect
 import json
 import os
@@ -603,8 +604,8 @@ def _run_agent_cli(
         env=_subprocess_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        text=False,
+        bufsize=0,
         start_new_session=True,
     )
 
@@ -619,8 +620,56 @@ def _run_agent_cli(
 
     sel = selectors.DefaultSelector()
     assert proc.stdout is not None and proc.stderr is not None
+    os.set_blocking(proc.stdout.fileno(), False)
+    os.set_blocking(proc.stderr.fileno(), False)
     sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
     sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+
+    decoders = {
+        "stdout": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+        "stderr": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+    }
+    line_buffers = {"stdout": "", "stderr": ""}
+
+    def _consume_line(stream_name: str, line: str) -> None:
+        nonlocal stderr_size, last_text, result_text, cli_error, last_heartbeat
+        if stream_name == "stderr":
+            if stderr_size < MAX_STDERR_BYTES:
+                stderr_chunks.append(line)
+                stderr_size += len(line)
+            return
+
+        if engine == "claude":
+            parsed = parse_claude_stream_line(line)
+            if not parsed:
+                return
+            if parsed["kind"] == "assistant":
+                for act in parsed.get("activities") or []:
+                    last_heartbeat = time.monotonic()
+                    emit("log", {"stage": stage, "engine": engine, "message": act})
+                if parsed.get("text"):
+                    last_text = parsed["text"]
+            elif parsed["kind"] == "result":
+                result_meta["duration_ms"] = parsed.get("duration_ms")
+                result_meta["total_cost_usd"] = parsed.get("total_cost_usd")
+                if parsed.get("is_error"):
+                    cli_error = parsed.get("result") or f"Claude CLI error ({parsed.get('subtype')})"
+                else:
+                    result_text = parsed.get("result") or ""
+        else:
+            parsed = parse_codex_stream_line(line)
+            if not parsed:
+                return
+            if parsed["kind"] == "activity":
+                for act in parsed.get("activities") or []:
+                    last_heartbeat = time.monotonic()
+                    emit("log", {"stage": stage, "engine": engine, "message": act})
+            elif parsed["kind"] == "agent_message":
+                if parsed.get("text"):
+                    last_text = parsed["text"]
+                    result_text = parsed["text"]
+            elif parsed["kind"] == "error":
+                cli_error = parsed.get("message") or "Codex execution failed"
 
     try:
         while sel.get_map():
@@ -628,13 +677,15 @@ def _run_agent_cli(
                 _terminate_process_group(proc)
                 raise DeepResearchCancelledError("用户已终止深度研究任务")
 
-            elapsed = time.monotonic() - start_ts
-            if elapsed > timeout_seconds:
+            now_ts = time.monotonic()
+            elapsed = now_ts - start_ts
+            remaining = timeout_seconds - elapsed
+            if remaining <= 0:
                 _terminate_process_group(proc)
                 raise TimeoutError(f"研究引擎 `{engine}` 执行超过 {timeout_seconds}s 超时")
 
-            if time.monotonic() - last_heartbeat >= 12.0:
-                last_heartbeat = time.monotonic()
+            if now_ts - last_heartbeat >= 12.0:
+                last_heartbeat = now_ts
                 emit(
                     "log",
                     {
@@ -644,50 +695,35 @@ def _run_agent_cli(
                     },
                 )
 
-            events = sel.select(timeout=0.25)
+            events = sel.select(timeout=min(0.1, remaining))
             for key, _ in events:
                 stream = key.fileobj
-                line = stream.readline()  # type: ignore[union-attr]
-                if not line:
-                    sel.unregister(stream)
-                    continue
-                if key.data == "stderr":
-                    if stderr_size < MAX_STDERR_BYTES:
-                        stderr_chunks.append(line)
-                        stderr_size += len(line)
-                    continue
+                sname = str(key.data)
+                fd = stream.fileno()  # type: ignore[union-attr]
+                eof = False
+                while True:
+                    try:
+                        chunk = os.read(fd, 8192)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        eof = True
+                        break
+                    decoded = decoders[sname].decode(chunk, final=False)
+                    if decoded:
+                        line_buffers[sname] += decoded
+                        while "\n" in line_buffers[sname]:
+                            one_line, line_buffers[sname] = line_buffers[sname].split("\n", 1)
+                            _consume_line(sname, one_line + "\n")
 
-                if engine == "claude":
-                    parsed = parse_claude_stream_line(line)
-                    if not parsed:
-                        continue
-                    if parsed["kind"] == "assistant":
-                        for act in parsed.get("activities") or []:
-                            last_heartbeat = time.monotonic()
-                            emit("log", {"stage": stage, "engine": engine, "message": act})
-                        if parsed.get("text"):
-                            last_text = parsed["text"]
-                    elif parsed["kind"] == "result":
-                        result_meta["duration_ms"] = parsed.get("duration_ms")
-                        result_meta["total_cost_usd"] = parsed.get("total_cost_usd")
-                        if parsed.get("is_error"):
-                            cli_error = parsed.get("result") or f"Claude CLI error ({parsed.get('subtype')})"
-                        else:
-                            result_text = parsed.get("result") or ""
-                else:
-                    parsed = parse_codex_stream_line(line)
-                    if not parsed:
-                        continue
-                    if parsed["kind"] == "activity":
-                        for act in parsed.get("activities") or []:
-                            last_heartbeat = time.monotonic()
-                            emit("log", {"stage": stage, "engine": engine, "message": act})
-                    elif parsed["kind"] == "agent_message":
-                        if parsed.get("text"):
-                            last_text = parsed["text"]
-                            result_text = parsed["text"]
-                    elif parsed["kind"] == "error":
-                        cli_error = parsed.get("message") or "Codex execution failed"
+                if eof:
+                    tail = decoders[sname].decode(b"", final=True)
+                    if tail:
+                        line_buffers[sname] += tail
+                    if line_buffers[sname]:
+                        _consume_line(sname, line_buffers[sname])
+                        line_buffers[sname] = ""
+                    sel.unregister(stream)
 
         rc = proc.wait(timeout=5)
     finally:

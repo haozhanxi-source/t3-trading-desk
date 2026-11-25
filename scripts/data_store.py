@@ -1544,6 +1544,7 @@ class DeskDataStore:
         symbols: list[str] | None = None,
         period: str = "3y",
         rows: list[dict[str, Any]],
+        compass_context: dict[str, Any] | None = None,
     ) -> str:
         rid = run_id or task_id or uuid.uuid4().hex[:12]
         now_s = utc_iso()
@@ -1615,7 +1616,13 @@ class DeskDataStore:
                     deg_cnt,
                     act_cnt,
                     json.dumps(
-                        {"count": len(rows), "errors": err_cnt, "degraded": deg_cnt, "actionable": act_cnt},
+                        {
+                            "count": len(rows),
+                            "errors": err_cnt,
+                            "degraded": deg_cnt,
+                            "actionable": act_cnt,
+                            **({"compass_context": compass_context} if compass_context else {}),
+                        },
                         ensure_ascii=False,
                     ),
                 ),
@@ -1662,6 +1669,10 @@ class DeskDataStore:
             conn.close()
         out: list[dict[str, Any]] = []
         for r in rows:
+            try:
+                summary_obj = json.loads(r["summary_json"] or "{}")
+            except ValueError:
+                summary_obj = {}
             out.append({
                 "run_id": r["run_id"],
                 "task_id": r["task_id"],
@@ -1675,6 +1686,7 @@ class DeskDataStore:
                 "error_count": int(r["error_count"]),
                 "degraded_count": int(r["degraded_count"]),
                 "actionable_count": int(r["actionable_count"]),
+                "compass_context": summary_obj.get("compass_context") if isinstance(summary_obj, dict) else None,
             })
         return out
 
@@ -1690,6 +1702,10 @@ class DeskDataStore:
             ).fetchall()
         finally:
             conn.close()
+        try:
+            summary_obj = json.loads(meta["summary_json"] or "{}")
+        except ValueError:
+            summary_obj = {}
         return {
             "run_id": meta["run_id"],
             "task_id": meta["task_id"],
@@ -1697,6 +1713,7 @@ class DeskDataStore:
             "finished_at_utc": meta["finished_at_utc"],
             "status": meta["status"],
             "universes": json.loads(meta["universes_json"] or "[]"),
+            "compass_context": summary_obj.get("compass_context") if isinstance(summary_obj, dict) else None,
             "symbols": json.loads(meta["symbols_json"] or "[]"),
             "period": meta["period"],
             "total_count": int(meta["total_count"]),

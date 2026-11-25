@@ -42,6 +42,10 @@ class TaskCancelledError(RuntimeError):
     """Raised internally when a running task observes user cancellation."""
 
 
+class TaskStoppingConflictError(RuntimeError):
+    """Raised when a single-flight task is still winding down after cancellation."""
+
+
 def utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -116,6 +120,8 @@ class Task:
         self.result: Any = None
         self.error: str | None = None
         self.cancel_event = threading.Event()
+        self.committed = False
+        self.worker_done = False
         self.subscribers: list[tuple[asyncio.AbstractEventLoop, asyncio.Queue]] = []
 
     @property
@@ -413,13 +419,13 @@ class TaskManager:
             task.subscribers = [(lp, q) for lp, q in task.subscribers if q is not queue]
 
     def cancel(self, task_id: str) -> dict[str, Any] | None:
-        """Atomically request cancellation and transition a non-terminal task to ``cancelled``."""
+        """Atomically request cancellation and transition a non-terminal, uncommitted task to ``cancelled``."""
         with self._lock:
             self._ensure_hydrated_unlocked()
             task = self.get(task_id)
             if task is None:
                 return None
-            if task.terminal:
+            if task.terminal or task.committed:
                 return task.summary()
             task.cancel_event.set()
             task.status = "cancelled"
@@ -483,15 +489,22 @@ class TaskManager:
         return None
 
     def start_macro_compass(self, params: dict[str, Any]) -> tuple[Task, bool]:
-        """Single-flight starter for Layer 1 macro compass synthesis."""
+        """Single-flight starter for Layer 1 macro compass synthesis (holds slot until worker exits)."""
         with self._lock:
             self._ensure_hydrated_unlocked()
             for existing in self._tasks.values():
-                if existing.kind == "macro_compass" and not existing.terminal:
+                if existing.kind != "macro_compass":
+                    continue
+                if not existing.terminal:
                     return existing, True
+                if not existing.worker_done:
+                    raise TaskStoppingConflictError("上一轮 Layer 1 战略推演正在安全终止，请稍后再试")
             task = Task("macro_compass", params)
             while len(self._tasks) >= self.max_tasks:
-                victim = next((tid for tid, t in self._tasks.items() if t.terminal), next(iter(self._tasks)))
+                victim = next(
+                    (tid for tid, t in self._tasks.items() if t.terminal and t.worker_done),
+                    next((tid for tid, t in self._tasks.items() if t.terminal), next(iter(self._tasks))),
+                )
                 self._tasks.pop(victim)
             self._tasks[task.id] = task
         bg = asyncio.get_running_loop().create_task(self._run(task))
@@ -503,6 +516,7 @@ class TaskManager:
         runner = RUNNERS[task.kind]
         with self._lock:
             if task.terminal:
+                task.worker_done = True
                 return
             task.status = "running"
             task.started_at = utc_iso()
@@ -514,6 +528,15 @@ class TaskManager:
                     return
                 self._emit(task, etype, data)
 
+        def commit_result(persist_fn: Callable[[], Any]) -> Any:
+            """Atomic commit boundary shared with ``cancel()``: winner takes all."""
+            with self._lock:
+                if task.terminal or task.cancel_event.is_set():
+                    raise TaskCancelledError("用户已终止该任务")
+                committed_val = persist_fn()
+                task.committed = True
+                return committed_val
+
         runner_kwargs: dict[str, Any] = {}
         try:
             sig = inspect.signature(runner)
@@ -521,6 +544,8 @@ class TaskManager:
                 runner_kwargs["cancel_event"] = task.cancel_event
             if "task_id" in sig.parameters:
                 runner_kwargs["task_id"] = task.id
+            if "commit_result" in sig.parameters:
+                runner_kwargs["commit_result"] = commit_result
         except (TypeError, ValueError):
             pass
 
@@ -534,22 +559,25 @@ class TaskManager:
                     task.finished_at = utc_iso()
                     task.finished_ns = time.time_ns()
                     self._emit(task, "cancelled", {"message": "用户已终止该任务"})
+                task.worker_done = True
             return
         except Exception as exc:  # noqa: BLE001
             message = f"{type(exc).__name__}: {exc}"
             # Status flip and terminal event are one atomic step so late subscribers never miss it.
             with self._lock:
-                if task.terminal:
-                    return
-                task.status = "failed"
-                task.error = message
-                task.finished_at = utc_iso()
-                task.finished_ns = time.time_ns()
-                self._emit(task, "error", {"message": message})
+                if not task.terminal:
+                    task.status = "failed"
+                    task.error = message
+                    task.finished_at = utc_iso()
+                    task.finished_ns = time.time_ns()
+                    self._emit(task, "error", {"message": message})
+                task.worker_done = True
             return
         with self._lock:
             if task.terminal:
+                task.worker_done = True
                 return
+            task.committed = True
             task.status = "completed"
             task.result = sanitize(result)
             task.finished_at = utc_iso()
@@ -569,9 +597,11 @@ class TaskManager:
                             symbols=task.params.get("symbols") or [],
                             period=str(task.params.get("period") or "3y"),
                             rows=task.result.get("rows") if isinstance(task.result, dict) else [],
+                            compass_context=task.params.get("compass_context"),
                         )
                     except Exception:
                         pass
+            task.worker_done = True
 
 
 # ---------------------------------------------------------------------- runners

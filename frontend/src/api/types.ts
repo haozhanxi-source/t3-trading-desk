@@ -940,6 +940,14 @@ export interface WarehouseSummary {
   }[];
 }
 
+export interface CompassScanContext {
+  run_id?: string;
+  direction_id?: string;
+  direction_title?: string;
+  direction: "long" | "short" | "pair";
+  expected_directions: Record<string, "long" | "short">;
+}
+
 export interface PersistedScanRun {
   run_id: string;
   task_id?: string | null;
@@ -953,6 +961,7 @@ export interface PersistedScanRun {
   error_count: number;
   degraded_count: number;
   actionable_count: number;
+  compass_context?: CompassScanContext | null;
   rows?: ScanRow[];
 }
 
@@ -990,6 +999,7 @@ export interface CompassMacroOverview {
   fetched_at_utc: string;
   cache_hit?: boolean;
   sources_status: Record<string, string>;
+  stale_sources?: Record<string, { last_good_at_utc?: string | null; error?: string }>;
   regime_tags: MacroRegimeTag[];
   headline_metrics: MacroHeadlineMetric[];
   anchors?: {
@@ -1007,6 +1017,7 @@ export interface CompassDriverItem {
 
 export interface CompassLeaderItem {
   symbol: string;
+  asset_class?: string;
   name: string;
   leg: "long" | "short";
   role: "sole_leader" | "co_leader" | string;
@@ -1019,6 +1030,7 @@ export interface CompassEvidenceItem {
   date?: string;
   source?: string;
   url?: string;
+  verification_status?: string;
 }
 
 export interface CompassDirectionCard {

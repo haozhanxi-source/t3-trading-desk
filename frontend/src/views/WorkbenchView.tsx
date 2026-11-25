@@ -16,8 +16,16 @@ import {
   Square,
   XCircle,
 } from "lucide-react";
-import { api, errorMessage, parseTaskEvent } from "../api/client";
-import type { PersistedScanRun, ScanRow, TaskEventEnvelope, TaskRecord, UniversePool, WarehouseSummary } from "../api/types";
+import { api, ApiError, errorMessage, parseTaskEvent } from "../api/client";
+import type {
+  CompassScanContext,
+  PersistedScanRun,
+  ScanRow,
+  TaskEventEnvelope,
+  TaskRecord,
+  UniversePool,
+  WarehouseSummary,
+} from "../api/types";
 import { ModalDialog } from "../components/ui/ModalDialog";
 import { signedToneClass, StatusBadge } from "../components/ui/StatusBadge";
 import { SymbolLabel } from "../components/ui/SymbolLabel";
@@ -34,7 +42,67 @@ import {
 import { formatSymbolWithCode, getSymbolName } from "../lib/symbols";
 import { formatTaskStatus, getUniverseLabel, groupUniverses } from "../lib/universes";
 
-type RowFilter = "all" | "long" | "short" | "watch";
+type RowFilter = "all" | "long" | "short" | "watch" | "aligned" | "counter" | "degraded";
+type CompassRowAlignment = "aligned" | "counter" | "watch" | "degraded";
+
+function extractCompassContext(task: TaskRecord | null): CompassScanContext | null {
+  const raw = task?.params?.compass_context;
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw as Record<string, unknown>;
+  const dir = String(obj.direction || "").toLowerCase();
+  if (dir !== "long" && dir !== "short" && dir !== "pair") return null;
+  const expRaw = obj.expected_directions;
+  const expected: Record<string, "long" | "short"> = {};
+  if (expRaw && typeof expRaw === "object") {
+    for (const [k, v] of Object.entries(expRaw as Record<string, unknown>)) {
+      if (v === "long" || v === "short") {
+        expected[k.trim().toUpperCase()] = v;
+      }
+    }
+  }
+  return {
+    run_id: typeof obj.run_id === "string" ? obj.run_id : "",
+    direction_id: typeof obj.direction_id === "string" ? obj.direction_id : "",
+    direction_title: typeof obj.direction_title === "string" ? obj.direction_title : "",
+    direction: dir,
+    expected_directions: expected,
+  };
+}
+
+function resolveExpectedDirection(
+  row: ScanRow,
+  ctx: CompassScanContext,
+): "long" | "short" | null {
+  const sym = (row.symbol || "").trim().toUpperCase();
+  if (sym && ctx.expected_directions[sym]) {
+    return ctx.expected_directions[sym];
+  }
+  if (ctx.direction === "long") return "long";
+  if (ctx.direction === "short") return "short";
+  return null;
+}
+
+function classifyRowWithCompass(
+  row: ScanRow,
+  ctx: CompassScanContext,
+): { status: CompassRowAlignment; expected: "long" | "short" | null; actual: "long" | "short" | "watch" } {
+  const expected = resolveExpectedDirection(row, ctx);
+  const sigType = (row.signal_type || "").trim().toLowerCase();
+  if (row.error || row.quality_grade === "degraded" || sigType === "data_quality_degraded") {
+    return { status: "degraded", expected, actual: "watch" };
+  }
+  const actual = classifyScanRow(row);
+  if (!expected) {
+    return { status: "watch", expected: null, actual };
+  }
+  if (actual === expected) {
+    return { status: "aligned", expected, actual };
+  }
+  if ((actual === "long" && expected === "short") || (actual === "short" && expected === "long")) {
+    return { status: "counter", expected, actual };
+  }
+  return { status: "watch", expected, actual };
+}
 
 function isTerminalTaskStatus(status: string | null | undefined): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
@@ -171,6 +239,8 @@ export function WorkbenchView({
 
   const esRef = useRef<EventSource | null>(null);
   const layer2Ref = useRef<HTMLDivElement | null>(null);
+  const launchingRef = useRef(false);
+  const scanReqSeqRef = useRef(0);
 
   const loadUniverses = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -214,7 +284,12 @@ export function WorkbenchView({
           task_id: r.run_id,
           kind: "scan",
           status: r.status || "completed",
-          params: { universes: r.universes, symbols: r.symbols, period: r.period },
+          params: {
+            universes: r.universes,
+            symbols: r.symbols,
+            period: r.period,
+            ...(r.compass_context ? { compass_context: r.compass_context } : {}),
+          },
           created_at: r.created_at_utc,
           finished_at: r.finished_at_utc,
           progress: { done: r.total_count, total: r.total_count },
@@ -392,7 +467,12 @@ export function WorkbenchView({
             task_id: archived.run_id,
             kind: "scan",
             status: archived.status || "completed",
-            params: { universes: archived.universes, symbols: archived.symbols, period: archived.period },
+            params: {
+              universes: archived.universes,
+              symbols: archived.symbols,
+              period: archived.period,
+              ...(archived.compass_context ? { compass_context: archived.compass_context } : {}),
+            },
             created_at: archived.created_at_utc,
             finished_at: archived.finished_at_utc,
             progress: { done: archived.total_count, total: archived.total_count },
@@ -434,11 +514,20 @@ export function WorkbenchView({
   };
 
   const launchScanRequest = useCallback(
-    async (opts: { universes: string[]; symbols: string[] }) => {
+    async (opts: {
+      universes: string[];
+      symbols: string[];
+      compassContext?: CompassScanContext | null;
+      syncInputs?: boolean;
+      scrollToResults?: boolean;
+    }) => {
+      if (launchingRef.current) return;
       if (opts.universes.length === 0 && opts.symbols.length === 0) {
         setErr("请至少勾选 1 个板块龙头池，或输入自定义龙头标的代码");
         return;
       }
+      launchingRef.current = true;
+      const reqSeq = ++scanReqSeqRef.current;
       setLaunching(true);
       setErr(null);
       try {
@@ -448,15 +537,32 @@ export function WorkbenchView({
           sort: sortMode,
           period: "3y",
           refresh: forceRefresh,
+          compass_context: opts.compassContext ?? null,
         });
+        if (scanReqSeqRef.current !== reqSeq) return;
+        if (opts.syncInputs) {
+          setSelectedPools(opts.universes);
+          setCustomSymbolsText(opts.symbols.join(", "));
+        }
+        setRowFilter("all");
         setActiveTask(created);
         setActiveTaskId(created.id);
         setPickerExpanded(false);
         void loadTasks();
+        if (opts.scrollToResults) {
+          window.setTimeout(() => {
+            layer2Ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+          }, 60);
+        }
       } catch (ex) {
-        setErr(errorMessage(ex));
+        if (scanReqSeqRef.current === reqSeq) {
+          setErr(errorMessage(ex));
+        }
       } finally {
-        setLaunching(false);
+        if (scanReqSeqRef.current === reqSeq) {
+          launchingRef.current = false;
+          setLaunching(false);
+        }
       }
     },
     [sortMode, forceRefresh, loadTasks],
@@ -465,20 +571,23 @@ export function WorkbenchView({
   const handleLaunch = async (e: FormEvent) => {
     e.preventDefault();
     const customSyms = parseSymbolList(customSymbolsText);
-    await launchScanRequest({ universes: selectedPools, symbols: customSyms });
+    await launchScanRequest({ universes: selectedPools, symbols: customSyms, compassContext: null });
   };
 
   const handleCompassScanLeaders = useCallback(
-    (opts: { symbols: string[]; universes?: string[]; label: string }) => {
-      const nextPools = opts.universes ?? [];
-      const nextSyms = opts.symbols ?? [];
-      setSelectedPools(nextPools);
-      setCustomSymbolsText(nextSyms.join(", "));
-      setRowFilter("all");
-      void launchScanRequest({ universes: nextPools, symbols: nextSyms });
-      window.setTimeout(() => {
-        layer2Ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-      }, 60);
+    (opts: {
+      symbols: string[];
+      universes?: string[];
+      label: string;
+      compassContext: CompassScanContext;
+    }) => {
+      void launchScanRequest({
+        universes: opts.universes ?? [],
+        symbols: opts.symbols ?? [],
+        compassContext: opts.compassContext,
+        syncInputs: true,
+        scrollToResults: true,
+      });
     },
     [launchScanRequest],
   );
@@ -552,23 +661,100 @@ export function WorkbenchView({
     [groupedPools, activeGroupKey],
   );
 
+  const activeCompassContext = useMemo(() => extractCompassContext(activeTask), [activeTask]);
+
+  /* Reset incompatible filter when switching between Compass-guided and manual scans */
+  useEffect(() => {
+    if (activeCompassContext && (rowFilter === "long" || rowFilter === "short")) {
+      setRowFilter("all");
+    } else if (!activeCompassContext && (rowFilter === "aligned" || rowFilter === "counter" || rowFilter === "degraded")) {
+      setRowFilter("all");
+    }
+  }, [activeCompassContext, rowFilter]);
+
   const filterCounts = useMemo(() => {
     let longCount = 0;
     let shortCount = 0;
     let watchCount = 0;
+    let alignedCount = 0;
+    let counterCount = 0;
+    let degradedCount = 0;
     for (const r of scanRows) {
-      const c = classifyScanRow(r);
-      if (c === "long") longCount += 1;
-      else if (c === "short") shortCount += 1;
-      else watchCount += 1;
+      if (activeCompassContext) {
+        const res = classifyRowWithCompass(r, activeCompassContext);
+        if (res.status === "aligned") alignedCount += 1;
+        else if (res.status === "counter") counterCount += 1;
+        else if (res.status === "degraded") degradedCount += 1;
+        else watchCount += 1;
+      } else {
+        const c = classifyScanRow(r);
+        if (c === "long") longCount += 1;
+        else if (c === "short") shortCount += 1;
+        else watchCount += 1;
+      }
     }
-    return { all: scanRows.length, long: longCount, short: shortCount, watch: watchCount };
-  }, [scanRows]);
+    return {
+      all: scanRows.length,
+      long: longCount,
+      short: shortCount,
+      watch: watchCount,
+      aligned: alignedCount,
+      counter: counterCount,
+      degraded: degradedCount,
+    };
+  }, [scanRows, activeCompassContext]);
+
+  const pairVerdict = useMemo(() => {
+    if (!activeCompassContext || activeCompassContext.direction !== "pair" || scanRows.length === 0) {
+      return null;
+    }
+    let longAligned = 0;
+    let shortAligned = 0;
+    let longTotal = 0;
+    let shortTotal = 0;
+    let counterAny = 0;
+    let degradedAny = 0;
+    for (const r of scanRows) {
+      const res = classifyRowWithCompass(r, activeCompassContext);
+      if (res.expected === "long") {
+        longTotal += 1;
+        if (res.status === "aligned") longAligned += 1;
+      } else if (res.expected === "short") {
+        shortTotal += 1;
+        if (res.status === "aligned") shortAligned += 1;
+      }
+      if (res.status === "counter") counterAny += 1;
+      if (res.status === "degraded") degradedAny += 1;
+    }
+    if (longTotal === 0 || shortTotal === 0) return null;
+    if (longAligned > 0 && shortAligned > 0) {
+      return {
+        tone: "good" as const,
+        label: "配对双腿同向通过",
+        detail: `多头腿 ${longAligned}/${longTotal}、空头腿 ${shortAligned}/${shortTotal} 均获日线同向确认，可进入 Layer 3/4 联立。`,
+      };
+    }
+    if (counterAny > 0) {
+      return {
+        tone: "critical" as const,
+        label: "配对方向冲突 · 严禁强行配对",
+        detail: `检测到 ${counterAny} 只腿出现与 Layer 1 反向的日线信号，先留待观察。`,
+      };
+    }
+    return {
+      tone: "warning" as const,
+      label: degradedAny > 0 ? "配对数据降级/未齐 · 待观察" : "配对单腿未成熟 · 待观察",
+      detail: `多头腿同向 ${longAligned}/${longTotal} · 空头腿同向 ${shortAligned}/${shortTotal}，等待双腿日线结构共振。`,
+    };
+  }, [activeCompassContext, scanRows]);
 
   const filteredScanRows = useMemo(() => {
     if (rowFilter === "all") return scanRows;
+    if (activeCompassContext) {
+      return scanRows.filter((r) => classifyRowWithCompass(r, activeCompassContext).status === rowFilter);
+    }
     return scanRows.filter((r) => classifyScanRow(r) === rowFilter);
-  }, [scanRows, rowFilter]);
+  }, [scanRows, rowFilter, activeCompassContext]);
 
   const selectedSummaryText = useMemo(() => {
     const poolLabels = selectedPools.map((k) => getUniverseLabel(k));
@@ -623,6 +809,7 @@ export function WorkbenchView({
 
       {/* Layer 1: Top-Down Macro Dual-Core + 7-Dimension Strategic Compass */}
       <Layer1CompassPanel
+        scanBusy={launching}
         onScanLeaders={handleCompassScanLeaders}
         onSaveTheme={handleCompassSaveTheme}
         onJumpWarRoom={onJumpWarRoom}
@@ -857,33 +1044,102 @@ export function WorkbenchView({
                   >
                     全部 ({filterCounts.all})
                   </button>
-                  <button
-                    type="button"
-                    className="chip chip-bull"
-                    aria-pressed={rowFilter === "long"}
-                    onClick={() => setRowFilter("long")}
-                  >
-                    多头候选 ({filterCounts.long})
-                  </button>
-                  <button
-                    type="button"
-                    className="chip chip-bear"
-                    aria-pressed={rowFilter === "short"}
-                    onClick={() => setRowFilter("short")}
-                  >
-                    空头候选 ({filterCounts.short})
-                  </button>
-                  <button
-                    type="button"
-                    className="chip"
-                    aria-pressed={rowFilter === "watch"}
-                    onClick={() => setRowFilter("watch")}
-                  >
-                    逻辑观察 ({filterCounts.watch})
-                  </button>
+                  {activeCompassContext ? (
+                    <>
+                      <button
+                        type="button"
+                        className="chip chip-bull"
+                        aria-pressed={rowFilter === "aligned"}
+                        onClick={() => setRowFilter("aligned")}
+                      >
+                        同向通过 ({filterCounts.aligned})
+                      </button>
+                      <button
+                        type="button"
+                        className="chip chip-bear"
+                        aria-pressed={rowFilter === "counter"}
+                        onClick={() => setRowFilter("counter")}
+                      >
+                        反向冲突 ({filterCounts.counter})
+                      </button>
+                      <button
+                        type="button"
+                        className="chip"
+                        aria-pressed={rowFilter === "watch"}
+                        onClick={() => setRowFilter("watch")}
+                      >
+                        待成熟观察 ({filterCounts.watch})
+                      </button>
+                      {filterCounts.degraded > 0 ? (
+                        <button
+                          type="button"
+                          className="chip"
+                          aria-pressed={rowFilter === "degraded"}
+                          onClick={() => setRowFilter("degraded")}
+                        >
+                          数据不足 ({filterCounts.degraded})
+                        </button>
+                      ) : null}
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="chip chip-bull"
+                        aria-pressed={rowFilter === "long"}
+                        onClick={() => setRowFilter("long")}
+                      >
+                        多头候选 ({filterCounts.long})
+                      </button>
+                      <button
+                        type="button"
+                        className="chip chip-bear"
+                        aria-pressed={rowFilter === "short"}
+                        onClick={() => setRowFilter("short")}
+                      >
+                        空头候选 ({filterCounts.short})
+                      </button>
+                      <button
+                        type="button"
+                        className="chip"
+                        aria-pressed={rowFilter === "watch"}
+                        onClick={() => setRowFilter("watch")}
+                      >
+                        逻辑观察 ({filterCounts.watch})
+                      </button>
+                    </>
+                  )}
                 </div>
               ) : null}
             </div>
+
+            {/* Layer 1 Directional Alignment Context Banner */}
+            {activeCompassContext ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-accent/30 bg-accent/8 px-3 py-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded border border-accent/35 bg-surface px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent">
+                    Layer 1 联立校验
+                  </span>
+                  <span className="font-semibold text-ink">
+                    {activeCompassContext.direction_title || "战略方向过筛"}
+                  </span>
+                  <span className="text-muted">
+                    预定方向：
+                    {activeCompassContext.direction === "short"
+                      ? "做空 SHORT"
+                      : activeCompassContext.direction === "pair"
+                        ? "多空配对 PAIR"
+                        : "做多 LONG"}
+                  </span>
+                </div>
+                {pairVerdict ? (
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <StatusBadge tone={pairVerdict.tone} label={pairVerdict.label} />
+                    <span className="text-[11px] text-ink-2">{pairVerdict.detail}</span>
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
 
             {activeTask && !isTerminalTaskStatus(activeTask.status) ? (
               <div className="progress-bar h-1 w-full overflow-hidden rounded-full bg-sunken">
@@ -924,6 +1180,9 @@ export function WorkbenchView({
                         ? getUniverseLabel(row.market, universes[row.market]?.description)
                         : null;
                       const rowClass = classifyScanRow(row);
+                      const compassAlign = activeCompassContext
+                        ? classifyRowWithCompass(row, activeCompassContext)
+                        : null;
 
                       return (
                         <tr
@@ -975,6 +1234,28 @@ export function WorkbenchView({
                               </td>
                               <td data-label="信号与方向建议">
                                 <div className="flex flex-wrap items-center gap-1.5">
+                                  {compassAlign ? (
+                                    <StatusBadge
+                                      tone={
+                                        compassAlign.status === "aligned"
+                                          ? "good"
+                                          : compassAlign.status === "counter"
+                                            ? "critical"
+                                            : compassAlign.status === "degraded"
+                                              ? "warning"
+                                              : "neutral"
+                                      }
+                                      label={
+                                        compassAlign.status === "aligned"
+                                          ? `L1同向通过 (${compassAlign.expected === "short" ? "空" : "多"})`
+                                          : compassAlign.status === "counter"
+                                            ? `L1反向冲突 (预期${compassAlign.expected === "short" ? "空" : "多"})`
+                                            : compassAlign.status === "degraded"
+                                              ? "数据不足"
+                                              : `L1待成熟 (预期${compassAlign.expected === "short" ? "空" : compassAlign.expected === "long" ? "多" : "—"})`
+                                      }
+                                    />
+                                  ) : null}
                                   {row.signal_tier ? (
                                     <StatusBadge
                                       tone={
@@ -1197,6 +1478,8 @@ function SaveUniverseDialog({
   const [name, setName] = useState("");
   const [desc, setDesc] = useState("");
   const [symbolsText, setSymbolsText] = useState("");
+  const [allowOverwrite, setAllowOverwrite] = useState(false);
+  const [conflictDetected, setConflictDetected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -1205,6 +1488,8 @@ function SaveUniverseDialog({
     setName(defaultName || "");
     setDesc(defaultDescription || "");
     setSymbolsText(defaultSymbols.join(", "));
+    setAllowOverwrite(false);
+    setConflictDetected(false);
     setErr(null);
   }, [open, defaultName, defaultDescription, defaultSymbols]);
 
@@ -1222,10 +1507,14 @@ function SaveUniverseDialog({
         name: name.trim(),
         description: desc.trim(),
         symbols: syms,
+        overwrite: allowOverwrite,
       });
       onSaved();
       onClose();
     } catch (ex) {
+      if (ex instanceof ApiError && ex.status === 409) {
+        setConflictDetected(true);
+      }
       setErr(errorMessage(ex));
     } finally {
       setBusy(false);
@@ -1237,7 +1526,7 @@ function SaveUniverseDialog({
       open={open}
       onClose={onClose}
       title="沉淀新主题龙头池（universes.json）"
-      subtitle="每个细分环节只保留真正龙头（或双寡头最多 2 只）"
+      subtitle="默认仅新建不覆盖已有池；每个细分环节只保留真正龙头（或双寡头最多 2 只）"
     >
       <form onSubmit={submit} className="flex flex-col gap-3.5 p-5">
         <label className="field">
@@ -1248,7 +1537,11 @@ function SaveUniverseDialog({
             autoFocus
             placeholder="如 cn_grid_export / us_glp1_leaders"
             value={name}
-            onChange={(e) => setName(e.target.value)}
+            onChange={(e) => {
+              setName(e.target.value);
+              setConflictDetected(false);
+              setAllowOverwrite(false);
+            }}
           />
         </label>
 
@@ -1274,6 +1567,18 @@ function SaveUniverseDialog({
           />
         </label>
 
+        {conflictDetected ? (
+          <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
+            <input
+              type="checkbox"
+              checked={allowOverwrite}
+              onChange={(e) => setAllowOverwrite(e.target.checked)}
+              className="accent-warning"
+            />
+            <span>确认覆盖已存在的同名主题池「{name.trim()}」</span>
+          </label>
+        ) : null}
+
         {err ? (
           <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
             {err}
@@ -1285,7 +1590,7 @@ function SaveUniverseDialog({
             取消
           </button>
           <button type="submit" className="btn btn-primary" disabled={busy}>
-            {busy ? "正在保存…" : "保存至 universes.json"}
+            {busy ? "正在保存…" : allowOverwrite ? "确认覆盖已有池" : "保存至 universes.json"}
           </button>
         </div>
       </form>

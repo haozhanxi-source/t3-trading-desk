@@ -39,6 +39,7 @@ from .symbols import search_symbols
 from .tasks import (
     TERMINAL_EVENT_TYPES,
     TaskManager,
+    TaskStoppingConflictError,
     compute_current_sentinel_fingerprint,
     research_cache_key,
     run_sentinel_sync,
@@ -263,6 +264,15 @@ class UniverseReq(_Strict):
     name: str
     description: str = ""
     symbols: list[str]
+    overwrite: bool = True
+
+
+class CompassScanContextReq(_Strict):
+    run_id: str = ""
+    direction_id: str = ""
+    direction_title: str = ""
+    direction: Literal["long", "short", "pair"] = "long"
+    expected_directions: dict[str, Direction] = Field(default_factory=dict)
 
 
 class ScanTaskReq(_Strict):
@@ -271,6 +281,7 @@ class ScanTaskReq(_Strict):
     period: str = Field("3y", pattern=PERIOD_PATTERN)
     sort: Literal["tier", "none"] = Field("tier", validation_alias=AliasChoices("sort_mode", "sort"))
     refresh: bool = False
+    compass_context: CompassScanContextReq | None = None
 
 
 class DataHealthCheckReq(_Strict):
@@ -1084,7 +1095,14 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     @app.post("/api/universes")
     def universes_save(req: UniverseReq):
         try:
-            saved = so.save_universe(req.name, req.symbols, description=req.description)
+            saved = so.save_universe(
+                req.name,
+                req.symbols,
+                description=req.description,
+                allow_overwrite=req.overwrite,
+            )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return ok({"name": req.name.strip(), **saved})
@@ -1133,7 +1151,10 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             "focus_prompt": req.focus_prompt.strip(),
             "refresh_macro": req.refresh_macro,
         }
-        task, already_running = tasks.start_macro_compass(params)
+        try:
+            task, already_running = tasks.start_macro_compass(params)
+        except TaskStoppingConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         summary = {**task.summary(), "already_running": already_running}
         return ok(summary, status_code=202)
 
@@ -1145,7 +1166,25 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not targets:
             raise HTTPException(status_code=422, detail="No scan targets resolved")
-        params = {**req.model_dump(), "targets": [list(t) for t in targets]}
+        dumped = req.model_dump()
+        if req.compass_context is not None:
+            # Canonicalize expected_directions keys so Layer 2 rows match aliases reliably
+            norm_expected: dict[str, str] = {}
+            for raw_sym, exp_dir in req.compass_context.expected_directions.items():
+                s = str(raw_sym or "").strip()
+                if not s:
+                    continue
+                norm_expected[s.upper()] = exp_dir
+                try:
+                    canon_sym, _ = market_snapshot.normalize_symbol(s)
+                    norm_expected[canon_sym.upper()] = exp_dir
+                except Exception:
+                    pass
+            dumped["compass_context"] = {
+                **req.compass_context.model_dump(),
+                "expected_directions": norm_expected,
+            }
+        params = {**dumped, "targets": [list(t) for t in targets]}
         return ok(tasks.start("scan", params).summary(), status_code=202)
 
     @app.post("/api/tasks/research-refresh", status_code=202)

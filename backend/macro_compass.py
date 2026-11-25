@@ -1,13 +1,12 @@
 """Layer 1 Top-Down Strategic Compass (Macro Dual-Core + 7-Dimension AI Synthesis).
 
-Bridges the gap between raw universe scanning (Layer 2) and the project's top-down
-investment philosophy:
+Bridges raw universe scanning (Layer 2) and the project's top-down philosophy:
 1. Free hard-data foundation (zero AI cost): US-China macro dual-core (FRED + NBS/Customs +
-   live VIX/US10Y/DXY) plus 17 cross-asset pricing anchors (5D / 20D / 60D relative strength).
+   live VIX/US10Y/DXY) plus 17 cross-asset pricing anchors (strict 5D / 20D / 60D returns).
 2. On-demand headless AI 7-dimension top-down synthesis (Claude Code / Codex with live web
-   search) that outputs structured 1Q~1Y directional thesis cards (Long / Short / Pair),
-   explicit adverse sectors to avoid, single-sector true leaders, and one-click handoff into
-   Layer 2 daily Chanlun scanning or saving newly discovered themes into ``universes.json``.
+   search) producing validated 1Q~1Y directional thesis cards (Long / Short / Pair),
+   explicit adverse sectors to avoid, normalized single-sector true leaders, and
+   direction-aware one-click handoff into Layer 2 daily Chanlun screening.
 """
 from __future__ import annotations
 
@@ -17,8 +16,9 @@ import os
 import re
 import tempfile
 import threading
+import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 import data_store
@@ -38,8 +38,11 @@ except ImportError:  # pragma: no cover
     yf = None
 
 Emit = Callable[[str, dict[str, Any]], None]
+CommitResultFn = Callable[[Callable[[], Any]], Any]
 
 TTL_COMPASS_MACRO_SECONDS = 600.0
+TTL_COMPASS_MACRO_DEGRADED_SECONDS = 30.0
+DEFAULT_MACRO_DEADLINE_SECONDS = 18.0
 COMPASS_STAGE_TIMEOUT_SECONDS = 480
 
 SEVEN_DIMENSIONS: tuple[str, ...] = (
@@ -56,6 +59,7 @@ VALID_COMPASS_DIRECTIONS = frozenset({"long", "short", "pair"})
 VALID_CONVICTIONS = frozenset({"high", "medium"})
 VALID_HORIZONS = frozenset({"1Q", "1Q~2Q", "2Q~1Y", "1Q~1Y"})
 VALID_ASSET_SCOPES = frozenset({"commodities", "us_equities", "a_shares", "fx", "crypto", "cross_asset"})
+EQUITY_ASSET_CLASSES = frozenset({"us_stock_or_etf", "a_share"})
 
 CROSS_ASSET_ANCHORS: tuple[dict[str, str], ...] = (
     # US Equities & Sector Pricing Anchors
@@ -81,6 +85,14 @@ CROSS_ASSET_ANCHORS: tuple[dict[str, str], ...] = (
 )
 
 _POOL_SLUG_RE = re.compile(r"[^a-z0-9_]+")
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Bounded non-blocking executor & single-flight state for free macro overview fetches
+_MACRO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="compass-macro")
+_MACRO_INFLIGHT_LOCK = threading.Lock()
+_MACRO_INFLIGHT_FUTURE: concurrent.futures.Future[dict[str, Any]] | None = None
+_LAST_GOOD_LOCK = threading.Lock()
+_LAST_GOOD_MACRO_SOURCES: dict[str, dict[str, Any]] = {}
 
 # Fallback memory ring buffer used when SQLite data_store is disabled (e.g., pytest)
 _FALLBACK_LOCK = threading.RLock()
@@ -113,17 +125,34 @@ def _safe_pct_change(last: float | None, prev: float | None) -> float | None:
     return round((last / prev - 1.0) * 100.0, 2)
 
 
+def _is_valid_iso_date(raw: Any) -> bool:
+    s = str(raw or "").strip()[:10]
+    if not _ISO_DATE_RE.match(s):
+        return False
+    try:
+        date.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
+
+
+def clear_macro_source_cache() -> None:
+    """Reset per-source last-known-good macro cache (primarily for isolated tests)."""
+    with _LAST_GOOD_LOCK:
+        _LAST_GOOD_MACRO_SOURCES.clear()
+
+
 # ---------------------------------------------------------------------------
 # Free Hard-Data Foundation (US-China Macro Dual-Core + Cross-Asset Anchors)
 # ---------------------------------------------------------------------------
 def fetch_cross_asset_anchors() -> dict[str, Any]:
-    """Batch-fetch 5D / 20D / 60D relative returns for 17 global pricing anchors via yfinance."""
+    """Batch-fetch strict 5D / 20D / 60D relative returns for 17 global pricing anchors via yfinance."""
     if yf is None:
         return {"status": "error", "error": "yfinance is not installed", "items": []}
 
     tickers = [a["symbol"] for a in CROSS_ASSET_ANCHORS]
     try:
-        with data_store.scoped_http_timeout((5.0, 15.0)):
+        with data_store.scoped_http_timeout((4.0, 12.0)):
             df = yf.download(
                 tickers,
                 period="6mo",
@@ -166,10 +195,12 @@ def fetch_cross_asset_anchors() -> dict[str, Any]:
             )
             continue
 
+        n_bars = len(close_series)
         last = _to_float(close_series.iloc[-1])
-        p5 = _to_float(close_series.iloc[-6]) if len(close_series) >= 6 else _to_float(close_series.iloc[0])
-        p20 = _to_float(close_series.iloc[-21]) if len(close_series) >= 21 else _to_float(close_series.iloc[0])
-        p60 = _to_float(close_series.iloc[-61]) if len(close_series) >= 61 else _to_float(close_series.iloc[0])
+        # Strict lookback windows: never substitute shorter history into a longer return window
+        p5 = _to_float(close_series.iloc[-6]) if n_bars >= 6 else None
+        p20 = _to_float(close_series.iloc[-21]) if n_bars >= 21 else None
+        p60 = _to_float(close_series.iloc[-61]) if n_bars >= 61 else None
         as_of_raw = close_series.index[-1]
         as_of = as_of_raw.strftime("%Y-%m-%d") if hasattr(as_of_raw, "strftime") else str(as_of_raw)[:10]
 
@@ -217,7 +248,11 @@ def _extract_china_pmi_headline(china_macro: dict[str, Any]) -> dict[str, Any] |
                     non_mfg_val = cand
     if mfg_val is None:
         return None
-    return {"value": round(mfg_val, 1), "non_mfg": round(non_mfg_val, 1) if non_mfg_val is not None else None, "period": month}
+    return {
+        "value": round(mfg_val, 1),
+        "non_mfg": round(non_mfg_val, 1) if non_mfg_val is not None else None,
+        "period": month,
+    }
 
 
 def _build_headline_metrics_and_tags(
@@ -225,7 +260,7 @@ def _build_headline_metrics_and_tags(
     fred_macro: dict[str, Any],
     china_macro: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
-    """Assemble compact headline KPI tiles and deterministic objective regime tags (zero guessing)."""
+    """Assemble compact headline KPI tiles with single-source observation provenance."""
     series = fred_macro.get("series") if isinstance(fred_macro.get("series"), dict) else {}
 
     def _fred_val(sid: str) -> tuple[float | None, float | None, str | None]:
@@ -247,7 +282,30 @@ def _build_headline_metrics_and_tags(
     live_dxy = live_ctx.get("DXY_USD_Index") if isinstance(live_ctx.get("DXY_USD_Index"), dict) else {}
     live_vix = live_ctx.get("VIX") if isinstance(live_ctx.get("VIX"), dict) else {}
 
-    us10y_val = _to_float(live_us10y.get("last")) or dgs10
+    live_us10y_val = _to_float(live_us10y.get("last"))
+    if live_us10y_val is not None:
+        us10y_metric = {
+            "key": "US10Y",
+            "label": "美债10Y名义",
+            "value": round(live_us10y_val, 2),
+            "unit": "%",
+            "delta": _to_float(live_us10y.get("chg_1d_pct")),
+            "delta_unit": "%",
+            "as_of": live_us10y.get("as_of"),
+            "source": "yfinance",
+        }
+    else:
+        us10y_metric = {
+            "key": "US10Y",
+            "label": "美债10Y名义",
+            "value": round(dgs10, 2) if dgs10 is not None else None,
+            "unit": "%",
+            "delta": round(dgs10_chg, 2) if dgs10_chg is not None else None,
+            "delta_unit": "pp",
+            "as_of": dgs10_dt,
+            "source": "FRED",
+        }
+
     dxy_val = _to_float(live_dxy.get("last"))
     vix_val = _to_float(live_vix.get("last"))
     cn_pmi = _extract_china_pmi_headline(china_macro)
@@ -273,16 +331,7 @@ def _build_headline_metrics_and_tags(
             "as_of": t10yie_dt,
             "source": "FRED",
         },
-        {
-            "key": "US10Y",
-            "label": "美债10Y名义",
-            "value": round(us10y_val, 2) if us10y_val is not None else None,
-            "unit": "%",
-            "delta": _to_float(live_us10y.get("chg_1d_pct")) if live_us10y else (round(dgs10_chg, 2) if dgs10_chg is not None else None),
-            "delta_unit": "%" if live_us10y else "pp",
-            "as_of": dgs10_dt,
-            "source": "yfinance" if live_us10y else "FRED",
-        },
+        us10y_metric,
         {
             "key": "DXY",
             "label": "美元指数 DXY",
@@ -290,7 +339,7 @@ def _build_headline_metrics_and_tags(
             "unit": "",
             "delta": _to_float(live_dxy.get("chg_1d_pct")),
             "delta_unit": "%",
-            "as_of": None,
+            "as_of": live_dxy.get("as_of"),
             "source": "yfinance",
         },
         {
@@ -300,7 +349,7 @@ def _build_headline_metrics_and_tags(
             "unit": "",
             "delta": _to_float(live_vix.get("chg_1d_pct")),
             "delta_unit": "%",
-            "as_of": None,
+            "as_of": live_vix.get("as_of"),
             "source": "yfinance",
         },
         {
@@ -367,67 +416,105 @@ def _build_headline_metrics_and_tags(
     return metrics, tags
 
 
-def collect_macro_overview(*, refresh: bool = False) -> dict[str, Any]:
-    """Collect and cache free US-China macro dual-core + 17 cross-asset pricing anchors."""
-    cache_key = ("compass_macro_overview",)
-    if not refresh:
-        hit, cached = CACHE.get(cache_key)
-        if hit and isinstance(cached, dict):
-            return {**cached, "cache_hit": True}
+def _fetch_macro_overview_uncached(deadline_seconds: float) -> dict[str, Any]:
+    """Execute one bounded parallel macro overview fetch without blocking on timed-out threads."""
+    now_iso = _utc_iso()
+    http_read_timeout = max(0.5, min(12.0, deadline_seconds))
 
-    live_ctx: dict[str, Any] = {}
-    fred_macro: dict[str, Any] = {"status": "error", "error": "not fetched"}
-    china_macro: dict[str, Any] = {"status": "error", "error": "not fetched"}
-    anchors: dict[str, Any] = {"status": "error", "items": []}
+    def _wrapped(fn: Callable[[], Any]) -> Any:
+        with data_store.scoped_http_timeout((min(4.0, http_read_timeout), http_read_timeout)):
+            return fn()
 
-    def _run_live() -> dict[str, Any]:
-        return market_snapshot.fetch_macro_context()
+    fut_map: dict[concurrent.futures.Future[Any], str] = {
+        _MACRO_EXECUTOR.submit(_wrapped, market_snapshot.fetch_macro_context): "live_macro",
+        _MACRO_EXECUTOR.submit(_wrapped, research_data.fetch_fred_macro): "us_fred",
+        _MACRO_EXECUTOR.submit(_wrapped, research_data.fetch_china_macro_core): "cn_macro",
+        _MACRO_EXECUTOR.submit(_wrapped, fetch_cross_asset_anchors): "cross_asset_anchors",
+    }
 
-    def _run_fred() -> dict[str, Any]:
-        return research_data.fetch_fred_macro()
+    done, not_done = concurrent.futures.wait(
+        list(fut_map.keys()),
+        timeout=max(0.01, deadline_seconds),
+    )
 
-    def _run_china() -> dict[str, Any]:
-        return research_data.fetch_china_macro_core()
+    raw_results: dict[str, Any] = {}
+    errors: dict[str, str] = {}
 
-    def _run_anchors() -> dict[str, Any]:
-        return fetch_cross_asset_anchors()
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        f_live = pool.submit(_run_live)
-        f_fred = pool.submit(_run_fred)
-        f_china = pool.submit(_run_china)
-        f_anc = pool.submit(_run_anchors)
+    for fut in done:
+        name = fut_map[fut]
         try:
-            live_ctx = f_live.result(timeout=20) or {}
-        except Exception:
-            live_ctx = {}
-        try:
-            fred_macro = f_fred.result(timeout=25) or {"status": "error"}
-        except Exception as exc:
-            fred_macro = {"status": "error", "error": str(exc)}
-        try:
-            china_macro = f_china.result(timeout=25) or {"status": "error"}
-        except Exception as exc:
-            china_macro = {"status": "error", "error": str(exc)}
-        try:
-            anchors = f_anc.result(timeout=25) or {"status": "error", "items": []}
-        except Exception as exc:
-            anchors = {"status": "error", "error": str(exc), "items": []}
+            raw_results[name] = fut.result(timeout=0)
+        except Exception as exc:  # noqa: BLE001
+            errors[name] = str(exc)
+
+    for fut in not_done:
+        name = fut_map[fut]
+        fut.cancel()
+        errors[name] = f"timeout after {deadline_seconds:.2f}s"
+
+    def _resolve_source(name: str, default_empty: Any, ok_check: Callable[[Any], bool]) -> tuple[Any, str, dict[str, Any] | None]:
+        val = raw_results.get(name)
+        if name not in errors and ok_check(val):
+            with _LAST_GOOD_LOCK:
+                _LAST_GOOD_MACRO_SOURCES[name] = {"data": val, "fetched_at_utc": now_iso}
+            st = str(val.get("status") or "ok") if isinstance(val, dict) and "status" in val else "ok"
+            return val, st, None
+
+        err_msg = errors.get(name) or (str(val.get("error")) if isinstance(val, dict) and val.get("error") else "fetch failed")
+        with _LAST_GOOD_LOCK:
+            prior = _LAST_GOOD_MACRO_SOURCES.get(name)
+        if prior is not None:
+            return prior["data"], "stale", {"last_good_at_utc": prior["fetched_at_utc"], "error": err_msg}
+        return default_empty, "error", {"last_good_at_utc": None, "error": err_msg}
+
+    live_ctx, st_live, stale_live = _resolve_source(
+        "live_macro",
+        {},
+        lambda v: isinstance(v, dict) and len(v) > 0,
+    )
+    fred_macro, st_fred, stale_fred = _resolve_source(
+        "us_fred",
+        {"status": "error", "error": errors.get("us_fred", "unavailable")},
+        lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
+    )
+    china_macro, st_cn, stale_cn = _resolve_source(
+        "cn_macro",
+        {"status": "error", "error": errors.get("cn_macro", "unavailable")},
+        lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
+    )
+    anchors, st_anc, stale_anc = _resolve_source(
+        "cross_asset_anchors",
+        {"status": "error", "items": [], "error": errors.get("cross_asset_anchors", "unavailable")},
+        lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
+    )
+
+    sources_status = {
+        "live_macro": st_live,
+        "us_fred": st_fred,
+        "cn_macro": st_cn,
+        "cross_asset_anchors": st_anc,
+    }
+    stale_sources = {
+        k: info
+        for k, info in (
+            ("live_macro", stale_live),
+            ("us_fred", stale_fred),
+            ("cn_macro", stale_cn),
+            ("cross_asset_anchors", stale_anc),
+        )
+        if info is not None
+    }
 
     headline_metrics, regime_tags = _build_headline_metrics_and_tags(live_ctx, fred_macro, china_macro)
-    sources_status = {
-        "live_macro": "ok" if live_ctx else "error",
-        "us_fred": str(fred_macro.get("status") or "error"),
-        "cn_macro": str(china_macro.get("status") or "error"),
-        "cross_asset_anchors": str(anchors.get("status") or "error"),
-    }
-    any_ok = any(v in ("ok", "partial") for v in sources_status.values())
+    all_fresh = all(v in ("ok", "partial") for v in sources_status.values())
+    ttl = TTL_COMPASS_MACRO_SECONDS if all_fresh else TTL_COMPASS_MACRO_DEGRADED_SECONDS
 
     bundle = sanitize(
         {
-            "fetched_at_utc": _utc_iso(),
+            "fetched_at_utc": now_iso,
             "cache_hit": False,
             "sources_status": sources_status,
+            "stale_sources": stale_sources,
             "regime_tags": regime_tags,
             "headline_metrics": headline_metrics,
             "live_macro": live_ctx,
@@ -436,8 +523,54 @@ def collect_macro_overview(*, refresh: bool = False) -> dict[str, Any]:
             "anchors": anchors,
         }
     )
-    CACHE.set(cache_key, bundle, TTL_COMPASS_MACRO_SECONDS if any_ok else 30.0)
+    CACHE.set(("compass_macro_overview",), bundle, ttl)
     return bundle
+
+
+def collect_macro_overview(
+    *,
+    refresh: bool = False,
+    deadline_seconds: float = DEFAULT_MACRO_DEADLINE_SECONDS,
+) -> dict[str, Any]:
+    """Collect and cache free US-China macro dual-core + 17 cross-asset anchors with single-flight coalescing."""
+    global _MACRO_INFLIGHT_FUTURE
+    cache_key = ("compass_macro_overview",)
+    if not refresh:
+        hit, cached = CACHE.get(cache_key)
+        if hit and isinstance(cached, dict):
+            return {**cached, "cache_hit": True}
+
+    leader = False
+    with _MACRO_INFLIGHT_LOCK:
+        if _MACRO_INFLIGHT_FUTURE is not None and not _MACRO_INFLIGHT_FUTURE.done():
+            shared_future = _MACRO_INFLIGHT_FUTURE
+        else:
+            shared_future = concurrent.futures.Future()
+            _MACRO_INFLIGHT_FUTURE = shared_future
+            leader = True
+
+    if not leader:
+        try:
+            res = shared_future.result(timeout=max(0.5, deadline_seconds + 2.0))
+            return {**res, "cache_hit": True}
+        except Exception:
+            hit, cached = CACHE.get(cache_key)
+            if hit and isinstance(cached, dict):
+                return {**cached, "cache_hit": True}
+            raise
+
+    try:
+        bundle = _fetch_macro_overview_uncached(deadline_seconds=deadline_seconds)
+        shared_future.set_result(bundle)
+        return bundle
+    except BaseException as exc:
+        if not shared_future.done():
+            shared_future.set_exception(exc)
+        raise
+    finally:
+        with _MACRO_INFLIGHT_LOCK:
+            if _MACRO_INFLIGHT_FUTURE is shared_future:
+                _MACRO_INFLIGHT_FUTURE = None
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +638,7 @@ def build_compass_brief(
             "macro_overview": {
                 "fetched_at_utc": macro_overview.get("fetched_at_utc"),
                 "sources_status": macro_overview.get("sources_status"),
+                "stale_sources": macro_overview.get("stale_sources") or {},
                 "regime_tags": macro_overview.get("regime_tags"),
                 "headline_metrics": macro_overview.get("headline_metrics"),
                 "china_macro": macro_overview.get("china_macro"),
@@ -525,7 +659,7 @@ def build_compass_prompt(*, brief_path: str, focus_prompt: str = "") -> str:
         "严格遵循本系统的自上而下投资哲学，为用户回答：**“在当下真实宏观环境下，未来 1 个季度至 1 年（1Q~1Y）最有逻辑、最值得优先聚焦的多空方向和核心板块是什么？该重点盯哪只真龙头？又该回避哪些逆风板块？”**\n\n"
         "【不可违背的第一层交易哲学铁律】\n"
         "1. **大逻辑先行（严禁凭短线涨跌或超买超卖倒推逻辑）**：不使用 RSI/布林带/均值回归作为推荐依据，只做真正具备 1Q~1Y 基本面预期差、供需失衡或宏观流动性共振的方向。\n"
-        "2. **7 维驱动共振门槛（强制 ≥2 维共振）**：每个推荐方向必须明确标注主驱动维度 + 次驱动维度，且必须从以下 7 维规范名中选取：\n"
+        "2. **7 维驱动共振门槛（强制 ≥2 个不同维度共振，且均须有非空摘要）**：每个推荐方向必须明确标注主驱动维度 + 不同的次驱动维度，且必须从以下 7 维规范名中选取：\n"
         "   - `宏观双核`（美国利率/美债/美元流动性 + 中国财政/地产/信用周期）\n"
         "   - `地缘与资源国政策`（地缘冲突、航运咽喉、资源国出口禁令/配额/矿业税/收储、关税壁垒）\n"
         "   - `技术与产业迭代`（AI算力/存储代际切换、电力电网瓶颈、机器人/智驾、新能源迭代）\n"
@@ -534,13 +668,13 @@ def build_compass_prompt(*, brief_path: str, focus_prompt: str = "") -> str:
         "   - `资金流与市场结构`（ETF申赎、CFTC极端持仓、套息平仓、资金费率极值）\n"
         "   - `突发供给冲击`（矿难、罢工、港口封锁、疫病、主产国突发禁令）\n"
         "3. **跨资产多空非对称 + 大 B 结构不否决做空**：\n"
-        "   - **股票（美股 / A股）**仅允许做多（`long`）或配对中的多头腿，交易未来 1~3 年远期预期折现；\n"
+        "   - **股票（美股 / A股）严格禁止做空（包括配对中的空头腿）**，仅允许做多（`long`）或配对中的多头腿；\n"
         "   - **大宗商品（海外+国内期货）、外汇（FX）、加密货币**多空完全对称，`short` 做空与 `pair` 同板块多空配对与 `long` 同等重要！若当前存在明确的供需过剩/弱预期品种（即使当下低库存呈大 B 结构），必须敢于给出做空或配对方向，绝不只堆砌清一色做多。\n"
         "4. **单一板块龙头独占制（源头控制相关性）**：\n"
-        "   - 每个推荐方向下只给 **1~2 只真正龙头/引领标的**（定价权最强、逻辑最纯；`pair` 配对方向给多头腿 1 只 + 空头腿 1 只），绝不罗列 5~8 只二三线跟风股。\n"
+        "   - 单向方向（`long` / `short`）只给 **1 只唯一龙头或最多 2 只双寡头**（且必须全同向）；`pair` 配对必须严格包含**多头腿 1 只 + 非股票空头腿 1 只**。\n"
         "   - 标的代码必须使用本系统可执行的真实代码格式（美股如 `PWR`/`NVDA`/`COPX`，A股如 `601899.SS`/`300750.SZ`，国内期货主力连续如 `CU0`/`LC0`/`RB0`/`EC0`/`SC0`，海外期货如 `GC=F`/`HG=F`/`CL=F`，外汇如 `USDJPY=X`/`AUDUSD=X`，加密如 `BTC/USDT`）。\n"
-        "   - 优先映射 `brief.json` 中 `existing_universes` 的准确池名到 `recommended_universes`；**若你推演出极具价值但 `existing_universes` 尚未收录的新细分板块（如 A股电网出海、美股LNG、煤化工、医药GLP-1等），请将 `is_new_theme` 设为 `true`，并提供英文下划线 `suggested_pool_name` 和中文 `suggested_pool_description`，让用户一键沉淀**。\n"
-        "5. **0-编造红线**：引用宏观数据必须与 `brief.json` 一致；联网事实必须给出真实来源日期、出处与 `L1~L4` 证据等级（L1=官方/统计局/央行/EIA/USDA/CFTC/财报，L2=行业协会/公司指引，L3=卖方，L4=主流媒体快讯）。\n"
+        "   - 优先映射 `brief.json` 中 `existing_universes` 的准确池名到 `recommended_universes`；**若推演出极具价值但 `existing_universes` 尚未收录的新细分板块，将 `is_new_theme` 设为 `true`，并提供不与已有池重名的英文下划线 `suggested_pool_name` 和中文 `suggested_pool_description`**。\n"
+        "5. **0-编造红线**：引用宏观数据必须与 `brief.json` 一致；每个方向必须给出 **≥2 条**真实证据，含精确 `YYYY-MM-DD` 日期、来源机构名称、`L1~L4` 证据等级与可验证的 `https://` 链接。\n"
         f"{focus_block}\n"
         "【输出格式铁律】\n"
         "你的最终回复必须**仅包含一个合法的 JSON 对象**（可用 ```json ... ``` 包裹，JSON 外不要输出任何额外说明文字），严格遵循以下 schema：\n"
@@ -566,8 +700,8 @@ def build_compass_prompt(*, brief_path: str, focus_prompt: str = "") -> str:
         '      "horizon": "1Q | 1Q~2Q | 2Q~1Y | 1Q~1Y",\n'
         '      "conviction": "high | medium",\n'
         '      "asset_scope": "commodities | us_equities | a_shares | fx | crypto | cross_asset",\n'
-        '      "primary_driver": {"dimension": "7维规范名之一", "summary": "主驱动逻辑核心要点（1句）"},\n'
-        '      "secondary_driver": {"dimension": "另1个7维规范名", "summary": "次驱动共振要点（1句）"},\n'
+        '      "primary_driver": {"dimension": "7维规范名之一", "summary": "主驱动逻辑核心要点（1句，必填）"},\n'
+        '      "secondary_driver": {"dimension": "另1个不同的7维规范名", "summary": "次驱动共振要点（1句，必填）"},\n'
         '      "thesis": "2~3句讲透未来1Q~1Y核心预期差、供需/盈利传导链与为什么现在是最优方向",\n'
         '      "key_catalyst": "未来1~3个月具体催化事件与时间节点",\n'
         '      "invalidation": "明确可证伪红线（什么数据/政策/事件出现即放弃此方向）",\n'
@@ -598,16 +732,18 @@ def build_compass_prompt(*, brief_path: str, focus_prompt: str = "") -> str:
         '  "risk_warnings": ["1~3条当前宏观与跨资产层面最需警惕的尾部风险或因子重叠提醒"]\n'
         "}\n"
         "```\n"
-        "要求：`directions` 输出 **4~6 个**按优先级排序（`rank` 1..N）的高共振方向，务必体现全球跨资产视野（覆盖真正有逻辑的做多、商品/外汇做空或同板块多空配对），每个方向至少 2 条带日期与来源的真实证据，且每个方向明确提示下一步送入 Layer 2 日线缠论过筛的核心龙头。"
+        "要求：`directions` 输出 **4~6 个**按优先级排序（`rank` 1..N）的高共振方向，务必体现全球跨资产视野（覆盖真正有逻辑的做多、商品/外汇做空或同板块多空配对），每个方向至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据，且严格遵守股票禁空与单一板块龙头独占制。"
     )
 
 
-def _normalize_dimension(raw: Any) -> str:
+def _match_canonical_dimension(raw: Any) -> str | None:
     s = str(raw or "").strip()
+    if not s:
+        return None
     if s in SEVEN_DIMENSIONS:
         return s
     for dim in SEVEN_DIMENSIONS:
-        if dim in s or s in dim:
+        if dim in s:
             return dim
     if any(k in s for k in ("宏观", "利率", "美元", "中国", "流动性", "财政")):
         return "宏观双核"
@@ -623,20 +759,25 @@ def _normalize_dimension(raw: Any) -> str:
         return "资金流与市场结构"
     if any(k in s for k in ("矿难", "罢工", "封锁", "突发", "冲击", "疫病")):
         return "突发供给冲击"
-    return s or "宏观双核"
+    return None
 
 
-def _normalize_driver(raw: Any, fallback_dim: str) -> dict[str, str]:
+def _parse_strict_driver(raw: Any) -> dict[str, str] | None:
     if isinstance(raw, dict):
-        dim = _normalize_dimension(raw.get("dimension") or raw.get("dim") or fallback_dim)
+        dim = _match_canonical_dimension(raw.get("dimension") or raw.get("dim"))
         summary = str(raw.get("summary") or raw.get("detail") or raw.get("note") or "").strip()
+        if not dim or not summary:
+            return None
         return {"dimension": dim, "summary": summary}
     text = str(raw or "").strip()
     if "：" in text or ":" in text:
         sep = "：" if "：" in text else ":"
         head, tail = text.split(sep, 1)
-        return {"dimension": _normalize_dimension(head), "summary": tail.strip()}
-    return {"dimension": _normalize_dimension(text or fallback_dim), "summary": text}
+        dim = _match_canonical_dimension(head)
+        summary = tail.strip()
+        if dim and summary:
+            return {"dimension": dim, "summary": summary}
+    return None
 
 
 def _sanitize_pool_slug(raw: str) -> str:
@@ -644,12 +785,24 @@ def _sanitize_pool_slug(raw: str) -> str:
     return s[:48]
 
 
+def _make_non_colliding_slug(base_slug: str, existing_keys: set[str]) -> str:
+    slug = _sanitize_pool_slug(base_slug) or "new_theme"
+    if slug not in existing_keys:
+        return slug
+    cand = f"{slug[:40]}_theme"
+    idx = 2
+    while cand in existing_keys:
+        cand = f"{slug[:36]}_theme_{idx}"
+        idx += 1
+    return cand
+
+
 def normalize_compass_output(
     payload: dict[str, Any],
     *,
     valid_universes: set[str],
 ) -> dict[str, Any]:
-    """Validate and sanitize parsed AI output into strict Layer 1 Compass schema."""
+    """Strictly validate and sanitize parsed AI output against CLAUDE.md Layer 1 iron rules."""
     if not isinstance(payload, dict):
         raise ValueError("战略推演输出必须是 JSON 对象")
 
@@ -681,13 +834,146 @@ def normalize_compass_output(
         raise ValueError("战略推演未输出任何有效方向卡片（directions 为空）")
 
     directions: list[dict[str, Any]] = []
+    rejected_reasons: list[str] = []
     seen_ids: set[str] = set()
-    for idx, raw_d in enumerate(raw_dirs[:8], start=1):
+
+    for idx, raw_d in enumerate(raw_dirs[:10], start=1):
         if not isinstance(raw_d, dict):
             continue
         title = str(raw_d.get("title") or "").strip()
         thesis = str(raw_d.get("thesis") or "").strip()
         if not title or not thesis:
+            rejected_reasons.append(f"#{idx}: 缺少标题或核心论点")
+            continue
+
+        raw_dir = str(raw_d.get("direction") or "").strip().lower()
+        if raw_dir not in VALID_COMPASS_DIRECTIONS:
+            rejected_reasons.append(f"{title}: 非法方向 {raw_dir!r}")
+            continue
+        direction = raw_dir
+
+        raw_scope = str(raw_d.get("asset_scope") or "cross_asset").strip().lower()
+        asset_scope = raw_scope if raw_scope in VALID_ASSET_SCOPES else "cross_asset"
+
+        # Equities (US / A-shares) NEVER allowed as pure short direction
+        if direction == "short" and asset_scope in ("us_equities", "a_shares"):
+            rejected_reasons.append(f"{title}: 违反股票禁空铁律")
+            continue
+
+        # Enforce 2 DISTINCT valid driving dimensions with non-empty summaries
+        primary_driver = _parse_strict_driver(raw_d.get("primary_driver"))
+        secondary_driver = _parse_strict_driver(raw_d.get("secondary_driver"))
+        if not primary_driver or not secondary_driver:
+            rejected_reasons.append(f"{title}: 缺少合法的 7 维主/次驱动或摘要为空")
+            continue
+        if primary_driver["dimension"] == secondary_driver["dimension"]:
+            rejected_reasons.append(f"{title}: 主次驱动维度相同（未达成 >=2 维共振）")
+            continue
+
+        # Normalize & validate leaders by canonical (asset_class, normalized_symbol)
+        long_leaders: list[dict[str, str]] = []
+        short_leaders: list[dict[str, str]] = []
+        seen_canonical: set[tuple[str, str]] = set()
+        for raw_l in raw_d.get("leaders") or []:
+            if not isinstance(raw_l, dict):
+                continue
+            raw_sym = str(raw_l.get("symbol") or "").strip()
+            if not raw_sym:
+                continue
+            try:
+                norm_sym, ac = market_snapshot.normalize_symbol(raw_sym)
+            except Exception:
+                continue
+            canonical_key = (ac, norm_sym.upper())
+            if canonical_key in seen_canonical:
+                continue
+
+            leg_raw = str(raw_l.get("leg") or ("short" if direction == "short" else "long")).strip().lower()
+            if leg_raw not in ("long", "short"):
+                continue
+
+            # CLAUDE.md iron rule: stocks (US / A-share) strictly prohibited on short legs
+            if leg_raw == "short" and ac in EQUITY_ASSET_CLASSES:
+                continue
+
+            # Unidirectional cards only accept matching-direction leaders
+            if direction == "long" and leg_raw != "long":
+                continue
+            if direction == "short" and leg_raw != "short":
+                continue
+
+            role_raw = str(raw_l.get("role") or "sole_leader").strip().lower()
+            role = "co_leader" if role_raw == "co_leader" else "sole_leader"
+            entry = {
+                "symbol": norm_sym,
+                "asset_class": ac,
+                "name": str(raw_l.get("name") or norm_sym).strip(),
+                "leg": leg_raw,
+                "role": role,
+                "reason": str(raw_l.get("reason") or "").strip(),
+            }
+            if leg_raw == "long":
+                if len(long_leaders) >= 2:
+                    continue
+                if len(long_leaders) == 1 and role != "co_leader":
+                    # Second leader in same direction is only allowed as co-leader
+                    entry["role"] = "co_leader"
+                seen_canonical.add(canonical_key)
+                long_leaders.append(entry)
+            else:
+                if len(short_leaders) >= 2:
+                    continue
+                if len(short_leaders) == 1 and role != "co_leader":
+                    entry["role"] = "co_leader"
+                seen_canonical.add(canonical_key)
+                short_leaders.append(entry)
+
+        if direction == "long":
+            if not long_leaders:
+                rejected_reasons.append(f"{title}: 做多方向无有效多头龙头")
+                continue
+            leaders = long_leaders
+        elif direction == "short":
+            if not short_leaders:
+                rejected_reasons.append(f"{title}: 做空方向无有效非股票空头龙头")
+                continue
+            leaders = short_leaders
+        else:  # pair
+            if not long_leaders or not short_leaders:
+                rejected_reasons.append(f"{title}: 配对方向缺少多头或非股票空头腿")
+                continue
+            leaders = [*long_leaders[:1], *short_leaders[:1]]
+
+        # Enforce >=2 valid evidence items with ISO date + non-empty source + strict URL hygiene
+        evidence: list[dict[str, str]] = []
+        for raw_e in raw_d.get("evidence") or []:
+            if not isinstance(raw_e, dict):
+                continue
+            fact = str(raw_e.get("fact") or raw_e.get("metric") or "").strip()
+            source = str(raw_e.get("source") or "").strip()
+            ev_date = str(raw_e.get("date") or raw_e.get("published_at") or "").strip()[:10]
+            if not fact or not source or not _is_valid_iso_date(ev_date):
+                continue
+            level = str(raw_e.get("level") or "").strip().upper()
+            if level not in research_archive.VALID_EVIDENCE_LEVELS:
+                continue
+            raw_url = str(raw_e.get("url") or raw_e.get("source_url") or "").strip()
+            clean_url = raw_url if research_archive.is_valid_http_url(raw_url) else ""
+            evidence.append(
+                {
+                    "fact": fact,
+                    "level": level,
+                    "date": ev_date,
+                    "source": source,
+                    "url": clean_url,
+                    "verification_status": "ai_cited_unverified",
+                }
+            )
+            if len(evidence) >= 5:
+                break
+
+        if len(evidence) < 2:
+            rejected_reasons.append(f"{title}: 有效证据不足 2 条（需含有效日期、来源与 L1~L4 等级）")
             continue
 
         did = _sanitize_pool_slug(str(raw_d.get("id") or f"dir_{idx}")) or f"dir_{idx}"
@@ -695,20 +981,11 @@ def normalize_compass_output(
             did = f"{did}_{idx}"
         seen_ids.add(did)
 
-        raw_dir = str(raw_d.get("direction") or "long").strip().lower()
-        direction = raw_dir if raw_dir in VALID_COMPASS_DIRECTIONS else "long"
-
         raw_hor = str(raw_d.get("horizon") or "1Q~2Q").strip().upper()
         horizon = raw_hor if raw_hor in VALID_HORIZONS else "1Q~2Q"
 
         raw_conv = str(raw_d.get("conviction") or "medium").strip().lower()
         conviction = raw_conv if raw_conv in VALID_CONVICTIONS else "medium"
-
-        raw_scope = str(raw_d.get("asset_scope") or "cross_asset").strip().lower()
-        asset_scope = raw_scope if raw_scope in VALID_ASSET_SCOPES else "cross_asset"
-
-        primary_driver = _normalize_driver(raw_d.get("primary_driver"), "宏观双核")
-        secondary_driver = _normalize_driver(raw_d.get("secondary_driver"), "商品供需平衡与库存周期")
 
         # Recommended universes: strictly keep existing valid keys
         rec_univs: list[str] = []
@@ -717,61 +994,13 @@ def normalize_compass_output(
             if us and us in valid_universes and us not in rec_univs:
                 rec_univs.append(us)
 
-        # Leaders: enforce single-sector sole leader / co-leader hygiene (max 3; pair has long+short legs)
-        leaders: list[dict[str, str]] = []
-        seen_syms: set[str] = set()
-        for raw_l in raw_d.get("leaders") or []:
-            if not isinstance(raw_l, dict):
-                continue
-            sym = str(raw_l.get("symbol") or "").strip().upper()
-            if not sym or sym in seen_syms:
-                continue
-            seen_syms.add(sym)
-            leg_raw = str(raw_l.get("leg") or ("short" if direction == "short" else "long")).strip().lower()
-            leg = "short" if leg_raw == "short" else "long"
-            role_raw = str(raw_l.get("role") or "sole_leader").strip().lower()
-            role = "co_leader" if role_raw == "co_leader" else "sole_leader"
-            leaders.append(
-                {
-                    "symbol": sym,
-                    "name": str(raw_l.get("name") or sym).strip(),
-                    "leg": leg,
-                    "role": role,
-                    "reason": str(raw_l.get("reason") or "").strip(),
-                }
-            )
-            if len(leaders) >= (4 if direction == "pair" else 2):
-                break
-
-        # Evidence items with strict URL hygiene
-        evidence: list[dict[str, str]] = []
-        for raw_e in raw_d.get("evidence") or []:
-            if not isinstance(raw_e, dict):
-                continue
-            fact = str(raw_e.get("fact") or raw_e.get("metric") or "").strip()
-            if not fact:
-                continue
-            level = str(raw_e.get("level") or "L3").strip().upper()
-            if level not in research_archive.VALID_EVIDENCE_LEVELS:
-                level = "L4"
-            raw_url = str(raw_e.get("url") or raw_e.get("source_url") or "").strip()
-            clean_url = raw_url if research_archive.is_valid_http_url(raw_url) else ""
-            evidence.append(
-                {
-                    "fact": fact,
-                    "level": level,
-                    "date": str(raw_e.get("date") or raw_e.get("published_at") or "").strip()[:10],
-                    "source": str(raw_e.get("source") or "").strip(),
-                    "url": clean_url,
-                }
-            )
-            if len(evidence) >= 5:
-                break
-
-        is_new_theme = bool(raw_d.get("is_new_theme")) or (len(rec_univs) == 0 and len(leaders) > 0)
-        suggested_pool_name = _sanitize_pool_slug(str(raw_d.get("suggested_pool_name") or ""))
-        if is_new_theme and not suggested_pool_name:
-            suggested_pool_name = f"theme_{did}"
+        is_new_theme = bool(raw_d.get("is_new_theme")) or len(rec_univs) == 0
+        raw_slug = str(raw_d.get("suggested_pool_name") or "").strip()
+        suggested_pool_name = (
+            _make_non_colliding_slug(raw_slug or f"theme_{did}", valid_universes)
+            if is_new_theme
+            else ""
+        )
         suggested_pool_description = str(raw_d.get("suggested_pool_description") or "").strip()
         if is_new_theme and not suggested_pool_description:
             suggested_pool_description = f"{title}（{primary_driver['dimension']} + {secondary_driver['dimension']}）"
@@ -803,7 +1032,8 @@ def normalize_compass_output(
         )
 
     if not directions:
-        raise ValueError("战略推演方向卡片校验后为空，请重试")
+        detail = "；".join(rejected_reasons[:4]) if rejected_reasons else "无合法方向卡片"
+        raise ValueError(f"战略推演输出未通过纪律校验：{detail}")
 
     directions.sort(key=lambda d: (d["rank"], d["id"]))
     for i, d in enumerate(directions, start=1):
@@ -822,6 +1052,7 @@ def normalize_compass_output(
             "macro_signals": macro_signals,
             "avoid_sectors": avoid_sectors[:6],
             "directions": directions,
+            "rejected_cards_count": len(rejected_reasons),
             "risk_warnings": risk_warnings,
         }
     )
@@ -841,7 +1072,7 @@ def persist_compass_run(
     focus_prompt: str,
     result: dict[str, Any],
 ) -> dict[str, Any]:
-    rid = run_id or task_id or f"cmp_{int(datetime.now(timezone.utc).timestamp())}"
+    rid = run_id or task_id or f"cmp_{int(time.time())}"
     record = sanitize(
         {
             "run_id": rid,
@@ -919,6 +1150,7 @@ def run_macro_compass(
     *,
     cancel_event: threading.Event | None = None,
     task_id: str | None = None,
+    commit_result: CommitResultFn | None = None,
 ) -> dict[str, Any]:
     """Execute Layer 1 Top-Down Strategic Compass synthesis inside TaskManager."""
     engine = str(params.get("engine") or "claude").strip().lower()
@@ -982,7 +1214,7 @@ def run_macro_compass(
 
     _check_cancel()
     emit("progress", {"done": 3, "total": total_steps})
-    emit("step", {"stage": "validate_and_persist", "message": "校验 7 维共振结构、真龙头代码并落盘…"})
+    emit("step", {"stage": "validate_and_persist", "message": "校验 7 维共振结构、股票禁空与真龙头代码并落盘…"})
 
     raw_payload = deep_research.extract_json_payload(raw_text)
     normalized = normalize_compass_output(
@@ -1007,16 +1239,23 @@ def run_macro_compass(
         }
     )
 
-    saved = persist_compass_run(
-        run_id=task_id,
-        task_id=task_id,
-        created_at_utc=created_at,
-        finished_at_utc=finished_at,
-        engine=engine,
-        effort=effort,
-        focus_prompt=focus_prompt,
-        result=full_result,
-    )
+    def _do_persist() -> dict[str, Any]:
+        return persist_compass_run(
+            run_id=task_id,
+            task_id=task_id,
+            created_at_utc=created_at,
+            finished_at_utc=finished_at,
+            engine=engine,
+            effort=effort,
+            focus_prompt=focus_prompt,
+            result=full_result,
+        )
+
+    if commit_result is not None:
+        saved = commit_result(_do_persist)
+    else:
+        _check_cancel()
+        saved = _do_persist()
 
     emit("progress", {"done": total_steps, "total": total_steps})
     emit(

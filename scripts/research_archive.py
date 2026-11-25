@@ -153,11 +153,13 @@ def is_trigger_auto_metric(trig: dict[str, Any]) -> bool:
 
 
 def is_valid_http_url(url: Any) -> bool:
-    """Strictly validate an HTTP(S) URL with a non-empty hostname and no control/whitespace chars."""
+    """Strictly validate an HTTP(S) URL with a non-empty hostname and no control/whitespace/userinfo/backslash chars."""
     if not isinstance(url, str):
         return False
     s = url.strip()
     if not s or len(s) > 2000:
+        return False
+    if "\\" in s:
         return False
     if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in s):
         return False
@@ -167,6 +169,8 @@ def is_valid_http_url(url: Any) -> bool:
     except ValueError:
         return False
     if parsed.scheme.lower() not in {"http", "https"}:
+        return False
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         return False
     host = parsed.hostname
     if not host or host.startswith(".") or host.endswith("."):

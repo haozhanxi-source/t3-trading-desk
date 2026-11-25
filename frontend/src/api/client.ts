@@ -8,6 +8,7 @@ import type {
   CompassMacroOverview,
   CompassRunRecord,
   CompassRunSummary,
+  CompassScanContext,
   DeepResearchRequest,
   EvidenceItem,
   FxReferenceResponse,
@@ -240,13 +241,15 @@ export const api = {
     return { ...normalizeTask(raw), already_running: Boolean(raw.already_running) };
   },
   universes: (signal?: AbortSignal) => get<{ universes: Record<string, UniversePool> }>("/universes", undefined, signal),
-  saveUniverse: (body: { name: string; description: string; symbols: string[] }) => post<unknown>("/universes", body),
+  saveUniverse: (body: { name: string; description: string; symbols: string[]; overwrite?: boolean }) =>
+    post<unknown>("/universes", body),
   startScan: async (body: {
     universes?: string[];
     symbols?: string[];
     sort?: "tier" | "none";
     period?: string;
     refresh?: boolean;
+    compass_context?: CompassScanContext | null;
   }) =>
     normalizeTask(
       await post<TaskRecord>("/tasks/scan", {
@@ -255,6 +258,7 @@ export const api = {
         sort: body.sort ?? "tier",
         period: body.period ?? "3y",
         refresh: body.refresh ?? false,
+        ...(body.compass_context ? { compass_context: body.compass_context } : {}),
       }),
     ),
   startResearchRefresh: async (body: { symbol: string; include_macro: boolean; market?: string | null }) =>

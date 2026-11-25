@@ -807,9 +807,12 @@ def fetch_macro_context() -> dict:
                 if len(df) >= 2:
                     last = float(df["Close"].iloc[-1])
                     prev = float(df["Close"].iloc[-2])
+                    idx_last = df.index[-1]
+                    as_of = idx_last.strftime("%Y-%m-%d") if hasattr(idx_last, "strftime") else str(idx_last)[:10]
                     ctx[label] = {
                         "last": round(last, 2),
                         "chg_1d_pct": round((last / prev - 1) * 100, 2),
+                        "as_of": as_of,
                     }
             except Exception:
                 pass

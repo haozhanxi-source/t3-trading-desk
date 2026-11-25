@@ -20,12 +20,13 @@ import {
   TrendingUp,
   XCircle,
 } from "lucide-react";
-import { api, errorMessage, parseTaskEvent } from "../../api/client";
+import { api, ApiError, errorMessage, parseTaskEvent } from "../../api/client";
 import type {
   CompassDirectionCard,
   CompassMacroOverview,
   CompassRunRecord,
   CompassRunSummary,
+  CompassScanContext,
   CrossAssetAnchorItem,
   DeepResearchEngine,
   ResearchEnginesResponse,
@@ -154,14 +155,54 @@ function directionMeta(direction: CompassDirectionCard["direction"]) {
   };
 }
 
+function safeExternalUrl(raw: string | undefined | null): string | null {
+  const s = (raw || "").trim();
+  if (!s || s.includes("\\") || s.length > 2000) return null;
+  try {
+    const parsed = new URL(s);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (parsed.username || parsed.password) return null;
+    if (!parsed.hostname) return null;
+    return parsed.href;
+  } catch {
+    return null;
+  }
+}
+
+function buildCompassScanContext(
+  runId: string | undefined,
+  card: CompassDirectionCard,
+): CompassScanContext {
+  const expected: Record<string, "long" | "short"> = {};
+  for (const leader of card.leaders) {
+    const sym = leader.symbol.trim().toUpperCase();
+    if (!sym) continue;
+    expected[sym] = leader.leg === "short" ? "short" : "long";
+  }
+  return {
+    run_id: runId || "",
+    direction_id: card.id,
+    direction_title: card.title,
+    direction: card.direction,
+    expected_directions: expected,
+  };
+}
+
 export interface Layer1CompassPanelProps {
-  onScanLeaders: (opts: { symbols: string[]; universes?: string[]; label: string }) => void;
+  scanBusy?: boolean;
+  onScanLeaders: (opts: {
+    symbols: string[];
+    universes?: string[];
+    label: string;
+    compassContext: CompassScanContext;
+  }) => void;
   onSaveTheme: (prefill: { name: string; description: string; symbols: string[] }) => void;
   onJumpWarRoom: (symbol: string) => void;
   onJumpArchive: (symbol: string) => void;
 }
 
 export function Layer1CompassPanel({
+  scanBusy = false,
   onScanLeaders,
   onSaveTheme,
   onJumpWarRoom,
@@ -189,28 +230,34 @@ export function Layer1CompassPanel({
   const [launching, setLaunching] = useState(false);
   const [launchErr, setLaunchErr] = useState<string | null>(null);
 
-  /* Live SSE task progress */
+  /* Live SSE task progress & concurrency/unmount guards */
   const [activeRun, setActiveRun] = useState<ActiveCompassRun | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const esRef = useRef<EventSource | null>(null);
+  const mountedRef = useRef(true);
+  const selectionReqSeqRef = useRef(0);
+  const historyAbortRef = useRef<AbortController | null>(null);
+  const latestRunIdRef = useRef<string>("");
+  const viewingLatestRef = useRef<boolean>(true);
 
   const loadMacro = useCallback(async (refresh = false, signal?: AbortSignal) => {
     setMacroLoading(true);
     setMacroErr(null);
     try {
       const data = await api.compassMacroOverview(refresh, signal);
+      if (!mountedRef.current || signal?.aborted) return;
       setMacro(data);
     } catch (ex) {
-      if (!(ex instanceof DOMException && ex.name === "AbortError")) {
-        setMacroErr(errorMessage(ex));
-      }
+      if (!mountedRef.current || (ex instanceof DOMException && ex.name === "AbortError")) return;
+      setMacroErr(errorMessage(ex));
     } finally {
-      setMacroLoading(false);
+      if (mountedRef.current) setMacroLoading(false);
     }
   }, []);
 
   const attachTaskStream = useCallback((task: TaskRecord) => {
+    if (!mountedRef.current) return;
     if (esRef.current) {
       esRef.current.close();
       esRef.current = null;
@@ -232,10 +279,48 @@ export function Layer1CompassPanel({
     });
 
     const seenSeq = new Set<number>();
+    let closed = false;
+    let probingError = false;
     const es = new EventSource(api.taskEventsUrl(taskId));
     esRef.current = es;
 
+    const closeStream = () => {
+      if (closed) return;
+      closed = true;
+      es.close();
+      if (esRef.current === es) {
+        esRef.current = null;
+      }
+    };
+
+    const syncCompletedRun = (saved?: CompassRunRecord) => {
+      const reqAtDone = selectionReqSeqRef.current;
+      if (saved && saved.result && Array.isArray(saved.result.directions)) {
+        latestRunIdRef.current = saved.run_id;
+        if (viewingLatestRef.current && selectionReqSeqRef.current === reqAtDone) {
+          setCurrentRun(saved);
+          setSelectedRunId(saved.run_id);
+        }
+      }
+      void api
+        .compassLatest()
+        .then((res) => {
+          if (!mountedRef.current) return;
+          setHistory(res.history ?? []);
+          if (res.latest) {
+            latestRunIdRef.current = res.latest.run_id;
+            if (viewingLatestRef.current && selectionReqSeqRef.current === reqAtDone) {
+              setCurrentRun(res.latest);
+              setSelectedRunId(res.latest.run_id);
+            }
+          }
+        })
+        .catch(() => undefined);
+      void loadMacro(false);
+    };
+
     const applyEvents = (events: TaskEventEnvelope[]) => {
+      if (!mountedRef.current) return;
       for (const ev of events) {
         if (typeof ev.seq === "number") {
           if (seenSeq.has(ev.seq)) continue;
@@ -270,28 +355,13 @@ export function Layer1CompassPanel({
           );
         } else if (t === "done") {
           const saved = (d.result ?? ev.result) as CompassRunRecord | undefined;
-          if (saved && saved.result && Array.isArray(saved.result.directions)) {
-            setCurrentRun(saved);
-            setSelectedRunId(saved.run_id);
-          }
           setActiveRun((prev) =>
             prev && prev.taskId === taskId
               ? { ...prev, status: "completed", done: prev.total, finishedAtMs: Date.now() }
               : prev,
           );
-          es.close();
-          esRef.current = null;
-          void api
-            .compassLatest()
-            .then((res) => {
-              setHistory(res.history ?? []);
-              if (res.latest) {
-                setCurrentRun(res.latest);
-                setSelectedRunId(res.latest.run_id);
-              }
-            })
-            .catch(() => undefined);
-          void loadMacro(false);
+          closeStream();
+          syncCompletedRun(saved);
         } else if (t === "error" || t === "cancelled") {
           const nextStatus = t === "cancelled" ? "cancelled" : "failed";
           const errMsg = String(d.message || ev.message || (t === "cancelled" ? "已终止推演" : "推演失败"));
@@ -300,14 +370,13 @@ export function Layer1CompassPanel({
               ? { ...prev, status: nextStatus, error: errMsg, finishedAtMs: Date.now() }
               : prev,
           );
-          es.close();
-          esRef.current = null;
+          closeStream();
         }
       }
     };
 
     const handler = (evType: string) => (msg: MessageEvent) => {
-      if (typeof msg.data !== "string") return;
+      if (closed || !mountedRef.current || typeof msg.data !== "string") return;
       const parsed = parseTaskEvent(msg.data, evType);
       if (parsed) applyEvents([parsed]);
     };
@@ -315,15 +384,90 @@ export function Layer1CompassPanel({
     for (const evtName of ["step", "log", "progress", "done", "error", "cancelled", "message"]) {
       es.addEventListener(evtName, handler(evtName) as EventListener);
     }
+
+    /* Native transport error recovery (e.g. backend restart -> SSE 404 without data payload) */
+    es.onerror = () => {
+      if (closed || probingError || !mountedRef.current) return;
+      probingError = true;
+      void api
+        .task(taskId)
+        .then((detail) => {
+          if (!mountedRef.current || closed) return;
+          if (detail.status === "completed") {
+            setActiveRun((prev) =>
+              prev && prev.taskId === taskId
+                ? { ...prev, status: "completed", done: prev.total, finishedAtMs: Date.now() }
+                : prev,
+            );
+            closeStream();
+            syncCompletedRun(detail.result as CompassRunRecord | undefined);
+          } else if (detail.status === "failed" || detail.status === "cancelled") {
+            const errMsg = detail.error || (detail.status === "cancelled" ? "已终止推演" : "推演失败");
+            setActiveRun((prev) =>
+              prev && prev.taskId === taskId
+                ? {
+                    ...prev,
+                    status: detail.status === "cancelled" ? "cancelled" : "failed",
+                    error: errMsg,
+                    finishedAtMs: Date.now(),
+                  }
+                : prev,
+            );
+            closeStream();
+          }
+        })
+        .catch(async (ex) => {
+          if (!mountedRef.current || closed) return;
+          const isMissing = ex instanceof ApiError && ex.status === 404;
+          if (isMissing || es.readyState === EventSource.CLOSED) {
+            closeStream();
+            try {
+              const latestRes = await api.compassLatest();
+              if (!mountedRef.current) return;
+              setHistory(latestRes.history ?? []);
+              const matched = latestRes.latest && latestRes.latest.run_id === taskId ? latestRes.latest : null;
+              if (matched) {
+                setActiveRun((prev) =>
+                  prev && prev.taskId === taskId
+                    ? { ...prev, status: "completed", done: prev.total, finishedAtMs: Date.now() }
+                    : prev,
+                );
+                syncCompletedRun(matched);
+                return;
+              }
+            } catch {
+              /* fall through to disconnect state */
+            }
+            setActiveRun((prev) =>
+              prev && prev.taskId === taskId
+                ? {
+                    ...prev,
+                    status: "failed",
+                    error: isMissing ? "推演任务连接已失联（服务可能已重启），可重新运行" : "SSE 连接中断，请重试",
+                    finishedAtMs: Date.now(),
+                  }
+                : prev,
+            );
+          }
+        })
+        .finally(() => {
+          probingError = false;
+        });
+    };
   }, [loadMacro]);
 
   const loadLatest = useCallback(async (signal?: AbortSignal) => {
+    const reqSeq = ++selectionReqSeqRef.current;
     try {
       const res = await api.compassLatest(signal);
+      if (!mountedRef.current || signal?.aborted) return;
       setHistory(res.history ?? []);
       if (res.latest) {
-        setCurrentRun(res.latest);
-        setSelectedRunId(res.latest.run_id);
+        latestRunIdRef.current = res.latest.run_id;
+        if (selectionReqSeqRef.current === reqSeq && viewingLatestRef.current) {
+          setCurrentRun(res.latest);
+          setSelectedRunId(res.latest.run_id);
+        }
       }
       if (res.active_task && (res.active_task.status === "queued" || res.active_task.status === "running")) {
         attachTaskStream(res.active_task);
@@ -334,18 +478,25 @@ export function Layer1CompassPanel({
   }, [attachTaskStream]);
 
   useEffect(() => {
+    mountedRef.current = true;
     const ctrl = new AbortController();
     void loadMacro(false, ctrl.signal);
     void loadLatest(ctrl.signal);
     void api
       .researchEngines(ctrl.signal)
       .then((info) => {
+        if (!mountedRef.current || ctrl.signal.aborted) return;
         setEnginesInfo(info);
         if (info.default_engine) setSelectedEngine(info.default_engine);
       })
       .catch(() => undefined);
     return () => {
+      mountedRef.current = false;
       ctrl.abort();
+      if (historyAbortRef.current) {
+        historyAbortRef.current.abort();
+        historyAbortRef.current = null;
+      }
       if (esRef.current) {
         esRef.current.close();
         esRef.current = null;
@@ -361,22 +512,34 @@ export function Layer1CompassPanel({
   }, [isRunActive]);
 
   const handleSelectHistory = async (runId: string) => {
-    setSelectedRunId(runId);
     if (!runId) return;
+    if (historyAbortRef.current) {
+      historyAbortRef.current.abort();
+    }
+    const ctrl = new AbortController();
+    historyAbortRef.current = ctrl;
+    const reqSeq = ++selectionReqSeqRef.current;
+    viewingLatestRef.current = runId === latestRunIdRef.current;
+    setSelectedRunId(runId);
     setLoadingRun(true);
     try {
-      const detail = await api.compassHistoryDetail(runId);
+      const detail = await api.compassHistoryDetail(runId, ctrl.signal);
+      if (!mountedRef.current || ctrl.signal.aborted || selectionReqSeqRef.current !== reqSeq) return;
       setCurrentRun(detail);
+      setSelectedRunId(detail.run_id);
       setDirFilter("all");
     } catch {
-      /* ignore */
+      /* ignore aborted/stale history fetches */
     } finally {
-      setLoadingRun(false);
+      if (mountedRef.current && selectionReqSeqRef.current === reqSeq) {
+        setLoadingRun(false);
+      }
     }
   };
 
   const handleStartCompass = async (e: FormEvent) => {
     e.preventDefault();
+    if (launching) return;
     setLaunching(true);
     setLaunchErr(null);
     try {
@@ -386,12 +549,15 @@ export function Layer1CompassPanel({
         focus_prompt: focusPrompt.trim(),
         refresh_macro: refreshMacroOnRun,
       });
+      if (!mountedRef.current) return;
+      viewingLatestRef.current = true;
       setLaunchOpen(false);
       attachTaskStream(task);
     } catch (ex) {
+      if (!mountedRef.current) return;
       setLaunchErr(errorMessage(ex));
     } finally {
-      setLaunching(false);
+      if (mountedRef.current) setLaunching(false);
     }
   };
 
@@ -456,6 +622,17 @@ export function Layer1CompassPanel({
                 {tag.label}
               </span>
             ))}
+            {macro?.stale_sources && Object.keys(macro.stale_sources).length > 0 ? (
+              <span
+                className="inline-flex items-center gap-1 rounded border border-warning/35 bg-warning/10 px-1.5 py-0.5 text-[10px] text-warning"
+                title={Object.entries(macro.stale_sources)
+                  .map(([k, v]) => `${k}: ${v.error || "stale"}${v.last_good_at_utc ? ` (沿用 ${shortTime(v.last_good_at_utc)})` : ""}`)
+                  .join(" | ")}
+              >
+                <AlertTriangle className="h-2.5 w-2.5" aria-hidden="true" />
+                <span>{Object.keys(macro.stale_sources).length} 源降级/陈旧</span>
+              </span>
+            ) : null}
           </div>
           <div className="flex items-center gap-2 text-[11px] text-muted">
             {macro?.fetched_at_utc ? (
@@ -991,34 +1168,42 @@ export function Layer1CompassPanel({
                             查看 L1~L4 联网证据溯源（{card.evidence.length} 条）
                           </summary>
                           <ul className="m-0 mt-1.5 flex list-none flex-col gap-1.5 pl-0">
-                            {card.evidence.map((ev, i) => (
-                              <li
-                                key={`${card.id}-ev-${i}`}
-                                className="rounded border border-hairline-soft bg-sunken/50 px-2 py-1.5 text-ink-2"
-                              >
-                                <div className="flex items-start gap-1.5">
-                                  <span className="shrink-0 rounded border border-hairline bg-surface px-1 font-mono text-[10px] font-semibold text-accent">
-                                    {ev.level}
-                                  </span>
-                                  <span className="flex-1">{ev.fact}</span>
-                                </div>
-                                <div className="mt-1 flex flex-wrap items-center gap-2 pl-6 font-mono text-[10px] text-muted">
-                                  {ev.date ? <span>{ev.date}</span> : null}
-                                  {ev.source ? <span className="font-sans">{ev.source}</span> : null}
-                                  {ev.url ? (
-                                    <a
-                                      href={ev.url}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      className="inline-flex items-center gap-0.5 text-accent hover:underline"
-                                    >
-                                      <span>原文</span>
-                                      <ExternalLink className="h-2.5 w-2.5" aria-hidden="true" />
-                                    </a>
-                                  ) : null}
-                                </div>
-                              </li>
-                            ))}
+                            {card.evidence.map((ev, i) => {
+                              const href = safeExternalUrl(ev.url);
+                              return (
+                                <li
+                                  key={`${card.id}-ev-${i}`}
+                                  className="rounded border border-hairline-soft bg-sunken/50 px-2 py-1.5 text-ink-2"
+                                >
+                                  <div className="flex items-start gap-1.5">
+                                    <span className="shrink-0 rounded border border-hairline bg-surface px-1 font-mono text-[10px] font-semibold text-accent">
+                                      {ev.level}
+                                    </span>
+                                    <span className="flex-1">{ev.fact}</span>
+                                  </div>
+                                  <div className="mt-1 flex flex-wrap items-center gap-2 pl-6 font-mono text-[10px] text-muted">
+                                    {ev.date ? <span>{ev.date}</span> : null}
+                                    {ev.source ? <span className="font-sans">{ev.source}</span> : null}
+                                    {ev.verification_status === "ai_cited_unverified" ? (
+                                      <span className="rounded bg-elevated px-1 font-sans text-[9.5px] text-muted">
+                                        AI 引用·待核验
+                                      </span>
+                                    ) : null}
+                                    {href ? (
+                                      <a
+                                        href={href}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center gap-0.5 text-accent hover:underline"
+                                      >
+                                        <span>原文</span>
+                                        <ExternalLink className="h-2.5 w-2.5" aria-hidden="true" />
+                                      </a>
+                                    ) : null}
+                                  </div>
+                                </li>
+                              );
+                            })}
                           </ul>
                         </details>
                       ) : null}
@@ -1031,16 +1216,18 @@ export function Layer1CompassPanel({
                           <button
                             type="button"
                             className="btn btn-sm btn-primary"
+                            disabled={scanBusy}
                             onClick={() =>
                               onScanLeaders({
                                 symbols: leaderSymbols,
                                 universes: [],
                                 label: `${card.title} 真龙头`,
+                                compassContext: buildCompassScanContext(currentRun?.run_id, card),
                               })
                             }
                           >
                             <Play className="h-3 w-3" aria-hidden="true" />
-                            <span>送入日线过筛 ({leaderSymbols.length})</span>
+                            <span>{scanBusy ? "扫描启动中…" : `送入日线过筛 (${leaderSymbols.length})`}</span>
                             <ArrowRight className="h-3 w-3" aria-hidden="true" />
                           </button>
                         ) : null}
@@ -1049,11 +1236,13 @@ export function Layer1CompassPanel({
                           <button
                             type="button"
                             className="btn btn-sm"
+                            disabled={scanBusy}
                             onClick={() =>
                               onScanLeaders({
                                 symbols: leaderSymbols,
                                 universes: card.recommended_universes,
                                 label: card.recommended_universes.map((u) => getUniverseLabel(u)).join("、"),
+                                compassContext: buildCompassScanContext(currentRun?.run_id, card),
                               })
                             }
                             title={`扫描对应本地池：${card.recommended_universes.map((u) => getUniverseLabel(u)).join("、")}`}

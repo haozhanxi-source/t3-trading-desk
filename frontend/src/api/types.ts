@@ -1062,6 +1062,14 @@ export interface CompassDirectionCard {
   evidence: CompassEvidenceItem[];
 }
 
+export interface CompassAvoidSectorItem {
+  sector: string;
+  reason: string;
+  derived_strategy?: string;
+  short_proxy_possible?: boolean;
+  short_proxy_hint?: string;
+}
+
 export interface CompassResultPayload {
   regime_title: string;
   regime_summary: string;
@@ -1071,7 +1079,7 @@ export interface CompassResultPayload {
     geopolitics_supply?: string;
     tech_industry?: string;
   };
-  avoid_sectors?: { sector: string; reason: string }[];
+  avoid_sectors?: CompassAvoidSectorItem[];
   directions: CompassDirectionCard[];
   risk_warnings?: string[];
   generated_at_utc?: string;

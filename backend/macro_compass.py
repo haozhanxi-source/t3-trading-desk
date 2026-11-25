@@ -899,9 +899,10 @@ def build_compass_prompt(
         "   - `产业政策与监管`（财政补贴、限产/反内卷与产能整合、行业监管或法案审批）\n"
         "   - `资金流与市场结构`（机构配置/ETF申赎、衍生品持仓拥挤度、套息交易平仓）\n"
         "   - `突发供给冲击`（主产区不可抗力、停产、物流封锁或突发禁令）\n"
-        "5. **跨资产多空非对称 + 大 B 结构不否决做空**：\n"
+        "5. **跨资产多空非对称 + 逆风转化为交易策略（严禁把商品/外汇/加密的极佳空头机会浪费在纯回避栏！）**：\n"
         "   - **股票板块（美股 / A股）严格禁止做空（包括配对中的空头腿）**，仅允许做多（`long`）或配对中的多头板块腿；\n"
-        "   - **大宗商品、外汇（FX）、加密货币**多空完全对称，`short` 做空与 `pair` 同产业链多空配对与 `long` 同等重要！若某商品存在明确的未来供需过剩/弱预期（即使当下低库存呈大 B 结构），必须敢于给出做空或配对方向，绝不只堆砌清一色做多。\n"
+        "   - **大宗商品、外汇（FX）、加密货币**多空完全对称，`short` 做空与 `pair` 同产业链多空配对与 `long` 同等重要！若商品（如过剩金属/原油/黑色）、外汇或加密存在硬核逆风（即使当下低库存呈大 B 结构），**优先直接升格进 `directions` 作为 `short` 或 `pair` 空头腿**，绝不只写一句“建议回避”就丢掉！\n"
+        "   - **每一条 `avoid_sectors` 逆风点都必须延伸出可落地策略（`derived_strategy`）**：若是股票逆风，严禁空正股，但必须指出能否通过**跨资产非股票代理做空**（如中国地产链逆风 → 延伸做空黑色系期货或商品货币澳元）或转向**产业链反向受益轮动**；若是未挤进前 6 张卡的商品/外汇/加密次优空头，直接标明 `short_proxy_possible: true` 并写清 `short_proxy_hint`，供用户在 UI 一键选标做空！\n"
         "6. **0-编造红线**：引用宏观数据必须与 `brief.json` 或最新联网来源一致（且标明日期）；每个板块必须给出 **≥2 条**真实联网证据，含精确 `YYYY-MM-DD` 日期、来源机构名、`L1~L4` 证据等级与可验证的 `https://` 链接。\n"
         f"{scopes_block}"
         f"{focus_block}\n"
@@ -918,7 +919,13 @@ def build_compass_prompt(
         '    "tech_industry": "当前科技与制造业产业链最核心的景气迭代主线（1句）"\n'
         "  },\n"
         '  "avoid_sectors": [\n'
-        '    {"sector": "当下最应回避的逆风板块/方向", "reason": "1句讲清为何处于逆风或预期证伪，避免白费精力"}\n'
+        "    {\n"
+        '      "sector": "当下处于逆风的板块/方向",\n'
+        '      "reason": "1句讲清为何处于逆风或预期证伪",\n'
+        '      "derived_strategy": "1~2句延伸策略：股票仅规避/止盈或切向反向受益环节，同时说明能否通过非股票（商品期货/外汇/加密）做空或代理表达",\n'
+        '      "short_proxy_possible": true,\n'
+        '      "short_proxy_hint": "若存在合规非股票空头/代理（严禁为股票），简写工具方向（如 黑色系期货/商品货币空头、加密永续空头、过剩金属期货空头）；无则空字符串"\n'
+        "    }\n"
         "  ],\n"
         '  "directions": [\n'
         "    {\n"
@@ -1042,15 +1049,38 @@ def normalize_compass_output(
         "tech_industry": str(raw_signals.get("tech_industry") or "").strip(),
     }
 
-    avoid_sectors: list[dict[str, str]] = []
+    avoid_sectors: list[dict[str, Any]] = []
     for item in payload.get("avoid_sectors") or []:
         if isinstance(item, dict):
             sec = str(item.get("sector") or item.get("name") or "").strip()
             rsn = str(item.get("reason") or "").strip()
+            derived = str(item.get("derived_strategy") or "").strip()
+            proxy_hint = str(item.get("short_proxy_hint") or "").strip()
+            # Never allow equity short hints inside proxy hints
+            if any(tok in proxy_hint.lower() for tok in ("做空股票", "空美股", "空a股", "short stock", "short equity")):
+                proxy_hint = ""
+            raw_poss = item.get("short_proxy_possible")
+            short_proxy_possible = bool(raw_poss) if isinstance(raw_poss, bool) else bool(proxy_hint)
             if sec:
-                avoid_sectors.append({"sector": sec, "reason": rsn})
+                avoid_sectors.append(
+                    {
+                        "sector": sec,
+                        "reason": rsn,
+                        "derived_strategy": derived,
+                        "short_proxy_possible": short_proxy_possible,
+                        "short_proxy_hint": proxy_hint,
+                    }
+                )
         elif isinstance(item, str) and item.strip():
-            avoid_sectors.append({"sector": item.strip(), "reason": ""})
+            avoid_sectors.append(
+                {
+                    "sector": item.strip(),
+                    "reason": "",
+                    "derived_strategy": "",
+                    "short_proxy_possible": False,
+                    "short_proxy_hint": "",
+                }
+            )
 
     raw_dirs = payload.get("directions")
     if not isinstance(raw_dirs, list) or len(raw_dirs) == 0:

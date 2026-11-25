@@ -20,6 +20,7 @@ import {
 } from "lucide-react";
 import { api, ApiError, errorMessage, parseTaskEvent } from "../../api/client";
 import type {
+  CompassAvoidSectorItem,
   CompassDirectionCard,
   CompassMacroOverview,
   CompassRunRecord,
@@ -188,6 +189,42 @@ function safeExternalUrl(raw: string | undefined | null): string | null {
   } catch {
     return null;
   }
+}
+
+function isLegacyHeadwindShortable(item: CompassAvoidSectorItem): boolean {
+  if (typeof item.short_proxy_possible === "boolean") {
+    return item.short_proxy_possible;
+  }
+  const text = `${item.sector} ${item.reason}`.toLowerCase();
+  return /(原油|石油|金属|锂|铝|铜|镍|铁矿|黑色|地产|加密|比特币|btc|eth|外汇|汇率|商品|农产品|生猪)/.test(text);
+}
+
+function buildShortCardFromHeadwind(item: CompassAvoidSectorItem, index: number): CompassDirectionCard {
+  const hint =
+    item.short_proxy_hint ||
+    item.derived_strategy ||
+    "限选用对应商品期货、外汇或加密货币空头/跨资产代理工具（严禁做空美股或 A 股正股）";
+  return {
+    id: `headwind_short_${index + 1}`,
+    rank: index + 1,
+    title: `逆风衍生做空：${item.sector}`,
+    direction: "short",
+    horizon: "1Q~2Q",
+    conviction: "medium",
+    asset_scope: "cross_asset",
+    primary_driver: { dimension: "宏观双核", summary: item.reason || item.sector },
+    secondary_driver: { dimension: "商品供需平衡与库存周期", summary: "逆风逻辑延伸非股票空头/代理表达" },
+    thesis: item.reason || item.sector,
+    value_chain_focus: hint,
+    key_catalyst: "",
+    invalidation: "",
+    recommended_universes: [],
+    is_new_theme: true,
+    suggested_pool_name: `short_headwind_${index + 1}`,
+    suggested_pool_description: `逆风衍生做空：${item.sector}`,
+    leaders: [],
+    evidence: [],
+  };
 }
 
 export interface Layer1CompassPanelProps {
@@ -982,23 +1019,59 @@ export function Layer1CompassPanel({
                 ) : null}
               </div>
 
-              {/* Adverse / Avoid Sectors */}
+              {/* Adverse / Avoid Sectors & Derived Short/Rotation Strategies */}
               <div className="flex flex-col gap-1.5 border-t border-hairline-soft pt-2.5 lg:col-span-4 lg:border-l lg:border-t-0 lg:pl-3.5 lg:pt-0">
-                <div className="flex items-center gap-1.5 text-[11px] font-semibold text-warning">
-                  <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
-                  <span>当下逆风 · 建议回避</span>
+                <div className="flex items-center justify-between gap-2 text-[11px] font-semibold text-warning">
+                  <span className="inline-flex items-center gap-1.5">
+                    <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>当下逆风 · 回避与衍生策略</span>
+                  </span>
                 </div>
                 {(payload.avoid_sectors ?? []).length > 0 ? (
                   <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
-                    {(payload.avoid_sectors ?? []).map((av, i) => (
-                      <li
-                        key={`${av.sector}-${i}`}
-                        className="rounded border border-hairline-soft bg-surface/80 px-2 py-1 text-[11px]"
-                      >
-                        <span className="font-semibold text-ink">{av.sector}</span>
-                        {av.reason ? <span className="text-muted"> — {av.reason}</span> : null}
-                      </li>
-                    ))}
+                    {(payload.avoid_sectors ?? []).map((av, i) => {
+                      const canDeriveShort = isLegacyHeadwindShortable(av);
+                      return (
+                        <li
+                          key={`${av.sector}-${i}`}
+                          className="flex flex-col gap-1 rounded border border-hairline-soft bg-surface/80 px-2.5 py-1.5 text-[11px]"
+                        >
+                          <div>
+                            <span className="font-semibold text-ink">{av.sector}</span>
+                            {av.reason ? <span className="text-muted"> — {av.reason}</span> : null}
+                          </div>
+                          {av.derived_strategy ? (
+                            <div className="text-[10.5px] leading-snug text-ink-2">
+                              <span className="font-semibold text-accent">延伸策略：</span>
+                              <span>{av.derived_strategy}</span>
+                            </div>
+                          ) : null}
+                          {canDeriveShort ? (
+                            <div className="flex flex-wrap items-center justify-between gap-1.5 pt-0.5">
+                              {av.short_proxy_hint ? (
+                                <span className="text-[10px] text-bear/90">
+                                  空头代理：{av.short_proxy_hint}
+                                </span>
+                              ) : (
+                                <span className="text-[10px] text-muted">
+                                  可用商品/外汇/加密空头或代理表达（禁空正股）
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                className="btn btn-sm border-bear/35 px-2 py-0.5 text-[10.5px] text-bear"
+                                disabled={scanBusy}
+                                onClick={() => setPickerCard(buildShortCardFromHeadwind(av, i))}
+                                title="按此逆风逻辑挑选非股票空头/代理标的并跑日线缠论过筛"
+                              >
+                                <TrendingDown className="h-2.5 w-2.5" aria-hidden="true" />
+                                <span>衍生做空选标</span>
+                              </button>
+                            </div>
+                          ) : null}
+                        </li>
+                      );
+                    })}
                   </ul>
                 ) : (
                   <div className="text-[11px] text-muted">本期未列出显著逆风板块</div>

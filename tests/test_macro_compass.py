@@ -30,8 +30,20 @@ SAMPLE_AI_JSON = {
         "tech_industry": "AI数据中心资本开支向电力电网设备外溢。",
     },
     "avoid_sectors": [
-        {"sector": "传统地产建材链", "reason": "竣工端需求缺乏弹性，中枢持续下移。"},
-        {"sector": "同质化光伏组件", "reason": "产能出清未完成，价格战压制盈利。"},
+        {
+            "sector": "传统地产建材链",
+            "reason": "竣工端需求缺乏弹性，中枢持续下移。",
+            "derived_strategy": "股票仅规避，可通过黑色系期货（铁矿/螺纹/玻璃）或商品货币澳元表达空头。",
+            "short_proxy_possible": True,
+            "short_proxy_hint": "黑色系期货 / 澳元空头代理",
+        },
+        {
+            "sector": "同质化光伏组件",
+            "reason": "产能出清未完成，价格战压制盈利。",
+            "derived_strategy": "股票仅规避，上游多晶硅期货可关注过剩空头机会。",
+            "short_proxy_possible": True,
+            "short_proxy_hint": "多晶硅期货空头",
+        },
     ],
     "directions": [
         {
@@ -131,6 +143,9 @@ def test_normalize_compass_output_enforces_hygiene_and_alias_dedup():
 
     assert norm["regime_title"] == SAMPLE_AI_JSON["regime_title"]
     assert len(norm["directions"]) == 3
+    assert norm["avoid_sectors"][0]["short_proxy_possible"] is True
+    assert "黑色系期货" in norm["avoid_sectors"][0]["derived_strategy"]
+    assert norm["avoid_sectors"][0]["short_proxy_hint"] == "黑色系期货 / 澳元空头代理"
 
     d1 = norm["directions"][0]
     assert d1["direction"] == "long"

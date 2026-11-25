@@ -21,6 +21,7 @@ import type { PersistedScanRun, ScanRow, TaskEventEnvelope, TaskRecord, Universe
 import { ModalDialog } from "../components/ui/ModalDialog";
 import { signedToneClass, StatusBadge } from "../components/ui/StatusBadge";
 import { SymbolLabel } from "../components/ui/SymbolLabel";
+import { Layer1CompassPanel } from "../components/workbench/Layer1CompassPanel";
 import {
   fmtFractalText,
   fmtMomentumVerdict,
@@ -136,9 +137,9 @@ export function WorkbenchView({
   onArchiveMutated,
 }: WorkbenchViewProps) {
   const [universes, setUniverses] = useState<Record<string, UniversePool>>({});
-  const [selectedPools, setSelectedPools] = useState<string[]>(["commodities_base"]);
+  const [selectedPools, setSelectedPools] = useState<string[]>([]);
   const [activeGroupKey, setActiveGroupKey] = useState<string>("all");
-  const [pickerExpanded, setPickerExpanded] = useState(true);
+  const [pickerExpanded, setPickerExpanded] = useState(false);
   const [customSymbolsText, setCustomSymbolsText] = useState("");
   const [sortMode, setSortMode] = useState<"tier" | "none">("tier");
   const [forceRefresh, setForceRefresh] = useState(false);
@@ -162,8 +163,14 @@ export function WorkbenchView({
 
   /* Save new universe modal */
   const [savePoolOpen, setSavePoolOpen] = useState(false);
+  const [savePoolPrefill, setSavePoolPrefill] = useState<{
+    name: string;
+    description: string;
+    symbols: string[];
+  } | null>(null);
 
   const esRef = useRef<EventSource | null>(null);
+  const layer2Ref = useRef<HTMLDivElement | null>(null);
 
   const loadUniverses = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -426,33 +433,63 @@ export function WorkbenchView({
     setSelectedPools((prev) => (prev.includes(name) ? prev.filter((x) => x !== name) : [...prev, name]));
   };
 
+  const launchScanRequest = useCallback(
+    async (opts: { universes: string[]; symbols: string[] }) => {
+      if (opts.universes.length === 0 && opts.symbols.length === 0) {
+        setErr("请至少勾选 1 个板块龙头池，或输入自定义龙头标的代码");
+        return;
+      }
+      setLaunching(true);
+      setErr(null);
+      try {
+        const created = await api.startScan({
+          universes: opts.universes,
+          symbols: opts.symbols,
+          sort: sortMode,
+          period: "3y",
+          refresh: forceRefresh,
+        });
+        setActiveTask(created);
+        setActiveTaskId(created.id);
+        setPickerExpanded(false);
+        void loadTasks();
+      } catch (ex) {
+        setErr(errorMessage(ex));
+      } finally {
+        setLaunching(false);
+      }
+    },
+    [sortMode, forceRefresh, loadTasks],
+  );
+
   const handleLaunch = async (e: FormEvent) => {
     e.preventDefault();
     const customSyms = parseSymbolList(customSymbolsText);
-    if (selectedPools.length === 0 && customSyms.length === 0) {
-      setErr("请至少勾选 1 个板块龙头池，或输入自定义龙头标的代码");
-      return;
-    }
-    setLaunching(true);
-    setErr(null);
-    try {
-      const created = await api.startScan({
-        universes: selectedPools,
-        symbols: customSyms,
-        sort: sortMode,
-        period: "3y",
-        refresh: forceRefresh,
-      });
-      setActiveTask(created);
-      setActiveTaskId(created.id);
-      setPickerExpanded(false);
-      void loadTasks();
-    } catch (ex) {
-      setErr(errorMessage(ex));
-    } finally {
-      setLaunching(false);
-    }
+    await launchScanRequest({ universes: selectedPools, symbols: customSyms });
   };
+
+  const handleCompassScanLeaders = useCallback(
+    (opts: { symbols: string[]; universes?: string[]; label: string }) => {
+      const nextPools = opts.universes ?? [];
+      const nextSyms = opts.symbols ?? [];
+      setSelectedPools(nextPools);
+      setCustomSymbolsText(nextSyms.join(", "));
+      setRowFilter("all");
+      void launchScanRequest({ universes: nextPools, symbols: nextSyms });
+      window.setTimeout(() => {
+        layer2Ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 60);
+    },
+    [launchScanRequest],
+  );
+
+  const handleCompassSaveTheme = useCallback(
+    (prefill: { name: string; description: string; symbols: string[] }) => {
+      setSavePoolPrefill(prefill);
+      setSavePoolOpen(true);
+    },
+    [],
+  );
 
   const handleCancelActiveTask = async () => {
     if (!activeTaskId || cancelling) return;
@@ -547,9 +584,9 @@ export function WorkbenchView({
       {/* Compact Header */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h1 className="heading-page m-0 text-lg text-ink md:text-xl">板块龙头日线缠论扫描台</h1>
+          <h1 className="heading-page m-0 text-lg text-ink md:text-xl">自上而下机会雷达 · 战略定调与日线过筛</h1>
           <p className="m-0 mt-0.5 text-xs text-muted">
-            自上而下锁定共振板块龙头 → 日线缠论定方向过筛 → 一键收入观察池或下钻 30min 战情室算仓
+            Layer 1 宏观双核与 7 维推演锁定最优多空方向 → 单一板块真龙头 → Layer 2 日线缠论过筛 → 下钻研报档案或 30min 战情室
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -572,7 +609,10 @@ export function WorkbenchView({
           <button
             type="button"
             className="btn"
-            onClick={() => setSavePoolOpen(true)}
+            onClick={() => {
+              setSavePoolPrefill(null);
+              setSavePoolOpen(true);
+            }}
             title="将自上而下推演出的新板块核心龙头沉淀至 universes.json"
           >
             <BookmarkPlus className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
@@ -581,11 +621,33 @@ export function WorkbenchView({
         </div>
       </div>
 
+      {/* Layer 1: Top-Down Macro Dual-Core + 7-Dimension Strategic Compass */}
+      <Layer1CompassPanel
+        onScanLeaders={handleCompassScanLeaders}
+        onSaveTheme={handleCompassSaveTheme}
+        onJumpWarRoom={onJumpWarRoom}
+        onJumpArchive={onJumpArchive}
+      />
+
+      {/* Layer 2 Section Divider & Daily Chanlun Screening */}
+      <div ref={layer2Ref} className="flex flex-col gap-3 scroll-mt-16">
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="inline-flex items-center rounded border border-hairline bg-elevated px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-ink-2">
+              Layer 2
+            </span>
+            <h2 className="m-0 text-sm font-semibold text-ink">日线缠论龙头过筛台</h2>
+            <span className="text-xs text-muted">
+              由上方 Layer 1 方向卡片一键驱动，或展开下方手动选择本地池 / 临时切入标的
+            </span>
+          </div>
+        </div>
+
       <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-12">
         {/* Main Column: Collapsible Pool Launcher + Wide Scan Results Table */}
         <div className="flex flex-col gap-3.5 xl:col-span-9">
-          <section className="card flex flex-col gap-3 p-4" aria-label="板块龙头池选择器">
-            {/* Collapsible Summary Bar when results are visible */}
+          <section className="card flex flex-col gap-3 p-4" aria-label="手动板块龙头池选择器">
+            {/* Collapsible Summary Bar (Collapsed by default so Layer 1 leads) */}
             <div className="flex flex-wrap items-center justify-between gap-2">
               <button
                 type="button"
@@ -598,7 +660,7 @@ export function WorkbenchView({
                 ) : (
                   <ChevronRight className="h-4 w-4 text-muted" aria-hidden="true" />
                 )}
-                <span>扫描范围：{selectedSummaryText}</span>
+                <span>手动选池 / 自定义龙头：{selectedSummaryText}</span>
               </button>
 
               <div className="flex items-center gap-2">
@@ -608,7 +670,7 @@ export function WorkbenchView({
                     className="chip"
                     onClick={() => setPickerExpanded(true)}
                   >
-                    修改板块池
+                    展开 {Object.keys(universes).length || 18} 个本地池
                   </button>
                 ) : selectedPools.length > 0 ? (
                   <button
@@ -620,7 +682,7 @@ export function WorkbenchView({
                   </button>
                 ) : null}
 
-                {!pickerExpanded ? (
+                {!pickerExpanded && (selectedPools.length > 0 || parseSymbolList(customSymbolsText).length > 0) ? (
                   <button
                     type="button"
                     className="btn btn-sm btn-primary"
@@ -1100,11 +1162,17 @@ export function WorkbenchView({
           </div>
         </aside>
       </div>
+      </div>
 
       <SaveUniverseDialog
         open={savePoolOpen}
-        defaultSymbols={candidateSaveSymbols}
-        onClose={() => setSavePoolOpen(false)}
+        defaultName={savePoolPrefill?.name}
+        defaultDescription={savePoolPrefill?.description}
+        defaultSymbols={savePoolPrefill?.symbols ?? candidateSaveSymbols}
+        onClose={() => {
+          setSavePoolOpen(false);
+          setSavePoolPrefill(null);
+        }}
         onSaved={() => void loadUniverses()}
       />
     </div>
@@ -1113,11 +1181,15 @@ export function WorkbenchView({
 
 function SaveUniverseDialog({
   open,
+  defaultName,
+  defaultDescription,
   defaultSymbols,
   onClose,
   onSaved,
 }: {
   open: boolean;
+  defaultName?: string;
+  defaultDescription?: string;
   defaultSymbols: string[];
   onClose: () => void;
   onSaved: () => void;
@@ -1130,11 +1202,11 @@ function SaveUniverseDialog({
 
   useEffect(() => {
     if (!open) return;
-    setName("");
-    setDesc("");
+    setName(defaultName || "");
+    setDesc(defaultDescription || "");
     setSymbolsText(defaultSymbols.join(", "));
     setErr(null);
-  }, [open, defaultSymbols]);
+  }, [open, defaultName, defaultDescription, defaultSymbols]);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();

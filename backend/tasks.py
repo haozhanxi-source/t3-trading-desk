@@ -25,7 +25,7 @@ import research_archive
 import research_data
 import scan_opportunities
 
-from . import deep_research, trigger_verifier
+from . import deep_research, macro_compass, trigger_verifier
 from .cache import CACHE, TTL_RESEARCH_SECONDS, TTL_SENTINEL_SECONDS
 from .serializers import sanitize
 
@@ -33,7 +33,7 @@ MAX_TASKS = 50
 MAX_PERSISTED_SCANS = 10
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 TERMINAL_EVENT_TYPES = frozenset({"done", "error", "cancelled"})
-TASK_KINDS = ("scan", "research_refresh", "sentinel", "deep_research", "trigger_verify")
+TASK_KINDS = ("scan", "research_refresh", "sentinel", "deep_research", "trigger_verify", "macro_compass")
 
 Emit = Callable[[str, dict[str, Any]], None]
 
@@ -473,6 +473,32 @@ class TaskManager:
         bg.add_done_callback(self._background.discard)
         return task, False
 
+    def get_active_macro_compass(self) -> dict[str, Any] | None:
+        """Return summary of an in-progress Layer 1 macro_compass task if any."""
+        with self._lock:
+            self._ensure_hydrated_unlocked()
+            for existing in reversed(list(self._tasks.values())):
+                if existing.kind == "macro_compass" and not existing.terminal:
+                    return existing.summary()
+        return None
+
+    def start_macro_compass(self, params: dict[str, Any]) -> tuple[Task, bool]:
+        """Single-flight starter for Layer 1 macro compass synthesis."""
+        with self._lock:
+            self._ensure_hydrated_unlocked()
+            for existing in self._tasks.values():
+                if existing.kind == "macro_compass" and not existing.terminal:
+                    return existing, True
+            task = Task("macro_compass", params)
+            while len(self._tasks) >= self.max_tasks:
+                victim = next((tid for tid, t in self._tasks.items() if t.terminal), next(iter(self._tasks)))
+                self._tasks.pop(victim)
+            self._tasks[task.id] = task
+        bg = asyncio.get_running_loop().create_task(self._run(task))
+        self._background.add(bg)
+        bg.add_done_callback(self._background.discard)
+        return task, False
+
     async def _run(self, task: Task) -> None:
         runner = RUNNERS[task.kind]
         with self._lock:
@@ -746,4 +772,5 @@ RUNNERS: dict[str, Callable[[dict[str, Any], Emit], Any]] = {
     "sentinel": run_sentinel,
     "deep_research": deep_research.run_deep_research,
     "trigger_verify": trigger_verifier.run_trigger_verification,
+    "macro_compass": macro_compass.run_macro_compass,
 }

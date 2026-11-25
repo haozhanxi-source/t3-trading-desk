@@ -826,6 +826,7 @@ export type TaskKind =
   | "deep_research"
   | "sentinel"
   | "trigger_verify"
+  | "macro_compass"
   | string;
 export type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | string;
 
@@ -939,3 +940,138 @@ export interface PersistedScanRun {
   actionable_count: number;
   rows?: ScanRow[];
 }
+
+/* ---------------- Layer 1 Top-Down Strategic Compass ---------------- */
+export interface MacroHeadlineMetric {
+  key: string;
+  label: string;
+  value: number | null;
+  unit: string;
+  delta?: number | null;
+  delta_unit?: string;
+  as_of?: string | null;
+  source?: string;
+}
+
+export interface MacroRegimeTag {
+  label: string;
+  tone: "good" | "warning" | "critical" | "neutral" | string;
+}
+
+export interface CrossAssetAnchorItem {
+  symbol: string;
+  name: string;
+  group: string;
+  group_label: string;
+  status: "ok" | "unavailable" | string;
+  last: number | null;
+  ret_5d_pct: number | null;
+  ret_20d_pct: number | null;
+  ret_60d_pct: number | null;
+  as_of?: string | null;
+}
+
+export interface CompassMacroOverview {
+  fetched_at_utc: string;
+  cache_hit?: boolean;
+  sources_status: Record<string, string>;
+  regime_tags: MacroRegimeTag[];
+  headline_metrics: MacroHeadlineMetric[];
+  anchors?: {
+    status: string;
+    ok_count?: number;
+    total?: number;
+    items: CrossAssetAnchorItem[];
+  };
+}
+
+export interface CompassDriverItem {
+  dimension: string;
+  summary: string;
+}
+
+export interface CompassLeaderItem {
+  symbol: string;
+  name: string;
+  leg: "long" | "short";
+  role: "sole_leader" | "co_leader" | string;
+  reason: string;
+}
+
+export interface CompassEvidenceItem {
+  fact: string;
+  level: "L1" | "L2" | "L3" | "L4" | string;
+  date?: string;
+  source?: string;
+  url?: string;
+}
+
+export interface CompassDirectionCard {
+  id: string;
+  rank: number;
+  title: string;
+  direction: "long" | "short" | "pair";
+  horizon: string;
+  conviction: "high" | "medium" | string;
+  asset_scope: string;
+  primary_driver: CompassDriverItem;
+  secondary_driver: CompassDriverItem;
+  thesis: string;
+  key_catalyst: string;
+  invalidation: string;
+  recommended_universes: string[];
+  is_new_theme: boolean;
+  suggested_pool_name: string;
+  suggested_pool_description: string;
+  leaders: CompassLeaderItem[];
+  evidence: CompassEvidenceItem[];
+}
+
+export interface CompassResultPayload {
+  regime_title: string;
+  regime_summary: string;
+  macro_signals?: {
+    us_macro?: string;
+    china_macro?: string;
+    geopolitics_supply?: string;
+    tech_industry?: string;
+  };
+  avoid_sectors?: { sector: string; reason: string }[];
+  directions: CompassDirectionCard[];
+  risk_warnings?: string[];
+  generated_at_utc?: string;
+  engine?: string;
+  effort?: string;
+  focus_prompt?: string;
+}
+
+export interface CompassRunSummary {
+  run_id: string;
+  task_id?: string | null;
+  created_at_utc: string;
+  finished_at_utc: string;
+  status: string;
+  engine: string;
+  effort?: string;
+  focus_prompt?: string;
+  regime_title: string;
+  directions_count: number;
+}
+
+export interface CompassRunRecord extends CompassRunSummary {
+  result: CompassResultPayload;
+}
+
+export interface CompassLatestResponse {
+  latest: CompassRunRecord | null;
+  history: CompassRunSummary[];
+  active_task: TaskRecord | null;
+}
+
+export interface MacroCompassRequest {
+  engine?: DeepResearchEngine | "";
+  effort?: "low" | "medium" | "high";
+  focus_prompt?: string;
+  refresh_macro?: boolean;
+}
+

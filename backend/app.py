@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import ROOT_DIR, __version__, deep_research
+from . import ROOT_DIR, __version__, deep_research, macro_compass
 from .cache import (
     CACHE,
     TTL_MARKET_SECONDS,
@@ -317,6 +317,13 @@ class TriggerVerifyTaskReq(_ArchiveMarketReq):
     engine: Literal["claude", "codex", ""] = ""
     force: bool = False
     ttl_days: int = Field(7, ge=1, le=90)
+
+
+class MacroCompassTaskReq(_Strict):
+    engine: Literal["claude", "codex", ""] = ""
+    effort: Literal["low", "medium", "high"] = "medium"
+    focus_prompt: str = Field("", max_length=1200)
+    refresh_macro: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -1081,6 +1088,54 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return ok({"name": req.name.strip(), **saved})
+
+    @app.get("/api/compass/macro-overview")
+    async def compass_macro_overview(refresh: bool = False):
+        bundle = await asyncio.to_thread(macro_compass.collect_macro_overview, refresh=refresh)
+        return ok(bundle, headers=_cache_headers(bool(bundle.get("cache_hit"))))
+
+    @app.get("/api/compass/latest")
+    def compass_latest():
+        latest = macro_compass.get_latest_compass_run()
+        history = macro_compass.list_compass_runs(limit=15)
+        active = tasks.get_active_macro_compass()
+        return ok(
+            {
+                "latest": latest,
+                "history": history,
+                "active_task": active,
+            }
+        )
+
+    @app.get("/api/compass/history")
+    def compass_history(limit: int = Query(20, ge=1, le=60)):
+        return ok({"runs": macro_compass.list_compass_runs(limit=limit)})
+
+    @app.get("/api/compass/history/{run_id}")
+    def compass_history_detail(run_id: str):
+        detail = macro_compass.get_compass_run(run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Compass run not found: {run_id}")
+        return ok(detail)
+
+    @app.post("/api/tasks/macro-compass", status_code=202)
+    async def task_macro_compass(req: MacroCompassTaskReq):
+        eng_info = deep_research.detect_available_engines()
+        chosen_engine = req.engine or (eng_info.get("default_engine") or "")
+        if not chosen_engine or not deep_research.resolve_engine_binary(chosen_engine):
+            raise HTTPException(
+                status_code=503,
+                detail="本机未检测到可用 AI 推演引擎（Claude Code 或 Codex CLI），请检查 CLI 安装与登录状态。",
+            )
+        params = {
+            "engine": chosen_engine,
+            "effort": req.effort,
+            "focus_prompt": req.focus_prompt.strip(),
+            "refresh_macro": req.refresh_macro,
+        }
+        task, already_running = tasks.start_macro_compass(params)
+        summary = {**task.summary(), "already_running": already_running}
+        return ok(summary, status_code=202)
 
     @app.post("/api/tasks/scan", status_code=202)
     async def task_scan(req: ScanTaskReq):

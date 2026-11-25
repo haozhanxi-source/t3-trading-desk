@@ -108,6 +108,8 @@ export function formatTaskKind(kind: string | null | undefined): string {
       return "硬数据刷新";
     case "sentinel":
       return "哨兵巡检";
+    case "macro_compass":
+      return "Layer 1 战略推演";
     default:
       return kind || "任务";
   }

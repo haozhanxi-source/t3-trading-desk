@@ -4,10 +4,15 @@ import type {
   ArchiveListItem,
   ArchiveState,
   CloseBody,
+  CompassLatestResponse,
+  CompassMacroOverview,
+  CompassRunRecord,
+  CompassRunSummary,
   DeepResearchRequest,
   EvidenceItem,
   FxReferenceResponse,
   HealthResponse,
+  MacroCompassRequest,
   MarketDualResponse,
   OpenPositionBody,
   PortfolioInitBody,
@@ -217,7 +222,23 @@ export const api = {
       signal,
     ),
 
-  /* Screen 4: Universes & SSE Tasks */
+  /* Screen 4: Layer 1 Compass, Universes & SSE Tasks */
+  compassMacroOverview: (refresh = false, signal?: AbortSignal) =>
+    get<CompassMacroOverview>("/compass/macro-overview", { refresh }, signal),
+  compassLatest: (signal?: AbortSignal) => get<CompassLatestResponse>("/compass/latest", undefined, signal),
+  compassHistory: (limit = 20, signal?: AbortSignal) =>
+    get<{ runs: CompassRunSummary[] }>("/compass/history", { limit }, signal),
+  compassHistoryDetail: (runId: string, signal?: AbortSignal) =>
+    get<CompassRunRecord>(`/compass/history/${encodeURIComponent(runId)}`, undefined, signal),
+  startMacroCompass: async (body: MacroCompassRequest = {}) => {
+    const raw = await post<TaskRecord & { already_running?: boolean }>("/tasks/macro-compass", {
+      engine: body.engine ?? "",
+      effort: body.effort ?? "medium",
+      focus_prompt: body.focus_prompt ?? "",
+      refresh_macro: body.refresh_macro ?? true,
+    });
+    return { ...normalizeTask(raw), already_running: Boolean(raw.already_running) };
+  },
   universes: (signal?: AbortSignal) => get<{ universes: Record<string, UniversePool> }>("/universes", undefined, signal),
   saveUniverse: (body: { name: string; description: string; symbols: string[] }) => post<unknown>("/universes", body),
   startScan: async (body: {

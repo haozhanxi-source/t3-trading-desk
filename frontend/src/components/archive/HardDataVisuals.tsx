@@ -716,6 +716,25 @@ function FxHardDataCard({ rateDiff, cot }: { rateDiff: Dict | null; cot: Dict | 
 /* ------------------------------------------------------------------
  * 3. Equity Valuation, Consensus & SEC EDGAR GAAP Card
  * ------------------------------------------------------------------ */
+const SEC_GAAP_METRIC_LABELS: Record<string, string> = {
+  revenue: "营业收入 (Revenue)",
+  net_income: "净利润 (Net Income)",
+  eps_diluted: "稀释 EPS (Diluted EPS)",
+  operating_cash_flow: "经营现金流 (OCF)",
+  capex: "资本开支 (CapEx)",
+  remaining_performance_obligation: "剩余履约义务 (RPO)",
+  cash_and_equivalents: "现金及等价物 (Cash)",
+  short_term_investments: "短期投资 (ST Inv)",
+  long_term_debt: "长期债务 (LT Debt)",
+  short_term_debt: "短期/当期债务 (ST Debt)",
+  stock_based_compensation: "股权激励费用 (SBC)",
+  share_repurchases: "实际股票回购 (Buybacks)",
+  shares_outstanding_ending: "期末流通股数 (Ending Shares)",
+  shares_diluted_weighted: "稀释加权股数 (Diluted Shares)",
+  inventory: "存货 (Inventory)",
+  accounts_receivable: "应收账款 (AR)",
+};
+
 function EquityHardDataCard({
   sec,
   yf,
@@ -728,9 +747,21 @@ function EquityHardDataCard({
   thsForecast: Dict | null;
 }) {
   const filings = asArr(sec?.recent_filings);
+  const eightKFilings = asArr(sec?.recent_8k_filings);
+  const post8kSummary = asObj(sec?.post_report_8k_summary);
+  const capSnap = asObj(sec?.capital_structure_snapshot);
   const gaap = asObj(sec?.gaap_metrics);
   const valPos = asObj(yf?.valuation_and_positioning);
   const targets = asObj(yf?.analyst_price_targets);
+  const capCash = asObj(capSnap?.cash_and_equivalents);
+  const capStInv = asObj(capSnap?.short_term_investments);
+  const capLtDebt = asObj(capSnap?.long_term_debt);
+  const capStDebt = asObj(capSnap?.short_term_debt);
+  const capShares = asObj(capSnap?.shares_outstanding_ending);
+  const capSbc = asObj(capSnap?.stock_based_compensation);
+  const capBuyback = asObj(capSnap?.share_repurchases);
+  const sharesYoyPct = toNum(capSnap?.ending_shares_yoy_pct);
+  const hasCapSnap = Boolean(capCash || capLtDebt || capShares || capSbc || capBuyback);
 
   return (
     <div className="card flex flex-col gap-3.5 p-4">
@@ -796,6 +827,41 @@ function EquityHardDataCard({
         </div>
       ) : null}
 
+      {hasCapSnap ? (
+        <div className="flex flex-col gap-1.5">
+          <span className="section-title">
+            SEC L1 资本结构与稀释快照（截至最新 10-Q/10-K，请对照期后 8-K 核验净现金桥）
+          </span>
+          <div className="metric-strip grid-cols-2 sm:grid-cols-4">
+            <div className="metric-cell">
+              <span className="metric-label">现金 / 短期投资</span>
+              <span className="metric-val">
+                {fmtCompact(capCash?.val)} / {fmtCompact(capStInv?.val)}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">长期债务 / 短期债务</span>
+              <span className="metric-val">
+                {fmtCompact(capLtDebt?.val)} / {fmtCompact(capStDebt?.val)}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">期末股数 / YoY 稀释</span>
+              <span className="metric-val">
+                {fmtCompact(capShares?.val)}
+                {sharesYoyPct !== null ? ` (${sharesYoyPct > 0 ? "+" : ""}${sharesYoyPct.toFixed(2)}%)` : ""}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">SBC / 实际回购支出</span>
+              <span className="metric-val">
+                {fmtCompact(capSbc?.val)} / {fmtCompact(capBuyback?.val)}
+              </span>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {thsForecast ? <StructuredDataCard title="同花顺机构盈利预测 (2026~2028)" raw={thsForecast} /> : null}
 
       {filings.length > 0 ? (
@@ -820,34 +886,75 @@ function EquityHardDataCard({
         </div>
       ) : null}
 
+      {eightKFilings.length > 0 ? (
+        <div className="flex flex-col gap-1.5">
+          <span className="section-title">
+            SEC 8-K 重大事件索引
+            {post8kSummary
+              ? `（最新定期报告日 ${String(post8kSummary.latest_periodic_report_date ?? "—")} 后共 ${String(
+                  post8kSummary.post_report_8k_count ?? 0,
+                )} 份，其中资本/并购/融资类 ${String(post8kSummary.material_capital_8k_count ?? 0)} 份）`
+              : ""}
+          </span>
+          <div className="flex flex-wrap gap-2">
+            {eightKFilings.slice(0, 8).map((f, idx) => {
+              const isPost = Boolean(f.post_latest_periodic_report);
+              const isCap = Boolean(f.is_material_capital_event);
+              const items = Array.isArray(f.items) ? (f.items as unknown[]).map(String).join("/") : "";
+              return (
+                <a
+                  key={idx}
+                  href={typeof f.url === "string" ? f.url : "#"}
+                  target="_blank"
+                  rel="noreferrer"
+                  className={`btn btn-sm ${isPost && isCap ? "border-amber-500/60" : ""}`}
+                  title={Array.isArray(f.item_labels) ? (f.item_labels as unknown[]).map(String).join(" · ") : undefined}
+                >
+                  <span className="font-mono">
+                    {isPost ? "[期后] " : ""}
+                    {String(f.form ?? "8-K")} · {String(f.filingDate ?? "")}
+                    {items ? ` (${items})` : ""}
+                  </span>
+                  <ExternalLink className="h-3 w-3 text-muted" aria-hidden="true" />
+                </a>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+
       {gaap && Object.keys(gaap).length > 0 ? (
         <div tabIndex={0} role="region" aria-label="SEC EDGAR GAAP 核心财务指标表" className="table-wrapper">
           <table className="data-table">
             <thead>
               <tr>
-                <th scope="col">GAAP 指标</th>
+                <th scope="col">GAAP / 资本结构指标</th>
                 <th scope="col" className="num">
                   最新披露值
                 </th>
                 <th scope="col">报告期末</th>
-                <th scope="col">表单来源</th>
+                <th scope="col">口径 / 表单</th>
               </tr>
             </thead>
             <tbody>
               {Object.entries(gaap).map(([metric, val]) => {
                 const vObj = asObj(val);
-                const recent = asArr(vObj?.recent ?? vObj?.values)[0] ?? vObj;
+                const recent = asArr(vObj?.records ?? vObj?.recent ?? vObj?.values)[0] ?? vObj;
+                const unitStr = String(recent?.unit ?? vObj?.unit ?? "");
+                const periodType = String(recent?.period_type ?? "");
                 return (
                   <tr key={metric}>
-                    <th scope="row">{metric}</th>
+                    <th scope="row">{SEC_GAAP_METRIC_LABELS[metric] ?? metric}</th>
                     <td data-label="最新披露值" className="num">
                       {fmtCompact(recent?.val ?? recent?.value)}
+                      {unitStr === "USD/shares" ? " /股" : unitStr === "shares" ? " 股" : ""}
                     </td>
                     <td data-label="报告期末" className="font-mono text-xs">
                       {String(recent?.end ?? recent?.period ?? "—")}
                     </td>
-                    <td data-label="表单来源" className="text-muted">
+                    <td data-label="口径 / 表单" className="text-muted">
                       {String(recent?.form ?? "10-K/10-Q")}
+                      {periodType ? ` · ${periodType}` : ""}
                     </td>
                   </tr>
                 );

@@ -103,7 +103,21 @@ CN_FUTURE_META: dict[str, tuple[str, str, str]] = {
     "SC0": ("原油", "SC", "energy"),
 }
 
-INVENTORY_EM_BLACKLIST = {"原油", "燃油", "低硫燃料油", "纯碱"}
+INVENTORY_EM_BLACKLIST = {"原油", "燃油", "低硫燃料油", "集运欧线"}
+INVENTORY_EM_SYMBOL_MAP: dict[str, str] = {
+    "HC": "热卷",
+    "热轧卷板": "热卷",
+    "NI": "镍",
+    "沪镍": "镍",
+    "SN": "锡",
+    "沪锡": "锡",
+    "RU": "橡胶",
+    "天然橡胶": "橡胶",
+    "P": "棕榈",
+    "棕榈油": "棕榈",
+    "CF": "郑棉",
+    "棉花": "郑棉",
+}
 TERM_STRUCTURE_SKIP = {"PTA", "原油"}
 SPOT_BASIS_SKIP = {"SC", "EC"}
 
@@ -544,21 +558,40 @@ def _extract_xbrl_metric(
     limit: int = 8,
     note: str | None = None,
     basis: str | None = None,
+    dei: dict[str, Any] | None = None,
+    preferred_units: tuple[str, ...] | None = None,
 ) -> dict[str, Any] | None:
-    """Merge observations across all matching candidate tags so tag switches never drop newer periods."""
+    """Merge observations across all matching candidate tags so tag switches never drop newer periods.
+
+    Candidate tags may optionally carry a namespace prefix (e.g. ``dei:EntityCommonStockSharesOutstanding``);
+    unprefixed tags look up ``us_gaap``.
+    """
     merged: dict[tuple[str | None, str], dict[str, Any]] = {}
     tags_found: list[str] = []
     primary_unit: str | None = None
+    unit_prefs = preferred_units or ("USD", "USD/shares", "shares")
+    namespaces: dict[str, dict[str, Any]] = {
+        "us-gaap": us_gaap if isinstance(us_gaap, dict) else {},
+        "dei": dei if isinstance(dei, dict) else {},
+    }
 
-    for tag_rank, tag in enumerate(candidate_tags):
-        tag_obj = us_gaap.get(tag)
+    for tag_rank, raw_tag in enumerate(candidate_tags):
+        if ":" in raw_tag:
+            ns_name, tag_name = raw_tag.split(":", 1)
+            ns_dict = namespaces.get(ns_name.strip().lower()) or {}
+            tag_label = raw_tag
+        else:
+            ns_dict = namespaces["us-gaap"]
+            tag_name = raw_tag
+            tag_label = raw_tag
+        tag_obj = ns_dict.get(tag_name)
         if not isinstance(tag_obj, dict):
             continue
         units = tag_obj.get("units") or {}
         if not units:
             continue
         unit_name = next(iter(units.keys()))
-        for preferred_unit in ("USD", "USD/shares", "shares"):
+        for preferred_unit in unit_prefs:
             if preferred_unit in units:
                 unit_name = preferred_unit
                 break
@@ -604,14 +637,14 @@ def _extract_xbrl_metric(
                     "period_type": _classify_xbrl_period_type(period_days),
                     "val": cleaned_val,
                     "unit": unit_name,
-                    "tag": tag,
+                    "tag": tag_label,
                     "form": form,
                     "fy": item.get("fy"),
                     "fp": item.get("fp"),
                     "filed": filed,
                 }
         if tag_had_valid:
-            tags_found.append(tag)
+            tags_found.append(tag_label)
             if primary_unit is None:
                 primary_unit = unit_name
 
@@ -642,16 +675,100 @@ def _extract_xbrl_metric(
     return out
 
 
+def _build_capital_structure_snapshot(metrics: dict[str, Any]) -> dict[str, Any]:
+    """Build a strictly period-tagged capital structure & dilution summary without unsafe cross-date sums."""
+    def _latest(key: str) -> dict[str, Any] | None:
+        m = metrics.get(key)
+        if not isinstance(m, dict):
+            return None
+        recs = m.get("records")
+        if not isinstance(recs, list) or not recs:
+            return None
+        return recs[0] if isinstance(recs[0], dict) else None
+
+    def _entry(rec: dict[str, Any] | None) -> dict[str, Any] | None:
+        if rec is None:
+            return None
+        return {
+            "val": rec.get("val"),
+            "unit": rec.get("unit"),
+            "end": rec.get("end"),
+            "period_type": rec.get("period_type"),
+            "form": rec.get("form"),
+            "tag": rec.get("tag"),
+            "filed": rec.get("filed"),
+        }
+
+    # Ending shares YoY change (same unit, 320~410 calendar days apart)
+    ending_shares_yoy_pct: float | None = None
+    ending_shares_yoy_base_end: str | None = None
+    shares_metric = metrics.get("shares_outstanding_ending")
+    if isinstance(shares_metric, dict):
+        recs = shares_metric.get("records") or []
+        if len(recs) >= 2 and isinstance(recs[0], dict):
+            cur = recs[0]
+            cur_val = _to_float(cur.get("val"))
+            cur_end = str(cur.get("end") or "")
+            cur_unit = cur.get("unit")
+            try:
+                cur_dt = date.fromisoformat(cur_end)
+            except ValueError:
+                cur_dt = None
+            if cur_val is not None and cur_val > 0 and cur_dt is not None:
+                best_prev: tuple[int, dict[str, Any]] | None = None
+                for cand in recs[1:]:
+                    if not isinstance(cand, dict) or cand.get("unit") != cur_unit:
+                        continue
+                    prev_val = _to_float(cand.get("val"))
+                    if prev_val is None or prev_val <= 0:
+                        continue
+                    try:
+                        prev_dt = date.fromisoformat(str(cand.get("end") or ""))
+                    except ValueError:
+                        continue
+                    delta_days = (cur_dt - prev_dt).days
+                    if 320 <= delta_days <= 410:
+                        dist = abs(delta_days - 365)
+                        if best_prev is None or dist < best_prev[0]:
+                            best_prev = (dist, cand)
+                if best_prev is not None:
+                    prev_rec = best_prev[1]
+                    prev_val = float(prev_rec["val"])
+                    ending_shares_yoy_pct = round((cur_val / prev_val - 1.0) * 100.0, 2)
+                    ending_shares_yoy_base_end = str(prev_rec.get("end") or "")
+
+    return {
+        "cash_and_equivalents": _entry(_latest("cash_and_equivalents")),
+        "short_term_investments": _entry(_latest("short_term_investments")),
+        "long_term_debt": _entry(_latest("long_term_debt")),
+        "short_term_debt": _entry(_latest("short_term_debt")),
+        "shares_outstanding_ending": _entry(_latest("shares_outstanding_ending")),
+        "ending_shares_yoy_pct": ending_shares_yoy_pct,
+        "ending_shares_yoy_base_end": ending_shares_yoy_base_end,
+        "shares_diluted_weighted": _entry(_latest("shares_diluted_weighted")),
+        "stock_based_compensation": _entry(_latest("stock_based_compensation")),
+        "share_repurchases": _entry(_latest("share_repurchases")),
+        "inventory": _entry(_latest("inventory")),
+        "accounts_receivable": _entry(_latest("accounts_receivable")),
+        "audit_note": (
+            "Balances reflect the latest 10-Q/10-K report date only; reconcile against post-period 8-K filings "
+            "(acquisitions, new debt, ATM/convertibles, restricted cash) before estimating net cash or runway."
+        ),
+    }
+
+
 def extract_sec_companyfacts(facts_json: dict[str, Any], limit: int = 8) -> dict[str, Any]:
-    """Extract core US-GAAP metrics from SEC EDGAR companyfacts JSON."""
+    """Extract core US-GAAP & capital-structure metrics from SEC EDGAR companyfacts JSON."""
     if not isinstance(facts_json, dict):
         raise ValueError("companyfacts payload must be a JSON object")
-    us_gaap = (facts_json.get("facts") or {}).get("us-gaap") or {}
+    facts_root = facts_json.get("facts") or {}
+    us_gaap = facts_root.get("us-gaap") or {}
+    dei = facts_root.get("dei") or {}
     if not us_gaap:
         raise ValueError("No us-gaap section found in SEC companyfacts")
 
     metrics: dict[str, Any] = {}
-    specs = [
+    specs: list[tuple[str, list[str], str | None, str | None, tuple[str, ...] | None]] = [
         (
             "revenue",
             [
@@ -662,13 +779,15 @@ def extract_sec_companyfacts(facts_json: dict[str, Any], limit: int = 8) -> dict
             ],
             None,
             None,
+            None,
         ),
-        ("net_income", ["NetIncomeLoss"], None, None),
-        ("eps_diluted", ["EarningsPerShareDiluted"], None, None),
+        ("net_income", ["NetIncomeLoss"], None, None, None),
+        ("eps_diluted", ["EarningsPerShareDiluted"], None, None, ("USD/shares", "USD")),
         (
             "operating_cash_flow",
             ["NetCashProvidedByUsedInOperatingActivities"],
             "GAAP_XBRL_reported_may_be_YTD",
+            None,
             None,
         ),
         (
@@ -679,16 +798,131 @@ def extract_sec_companyfacts(facts_json: dict[str, Any], limit: int = 8) -> dict
             ],
             "GAAP_XBRL_reported_may_be_YTD",
             None,
+            None,
         ),
         (
             "remaining_performance_obligation",
             ["RevenueRemainingPerformanceObligation"],
             "Point-in-time contract backlog",
             "Hard contract backlog / RPO reference",
+            None,
+        ),
+        (
+            "cash_and_equivalents",
+            [
+                "CashAndCashEquivalentsAtCarryingValue",
+                "CashCashEquivalentsAndShortTermInvestments",
+                "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+            ],
+            "Point-in-time balance sheet (reconcile post-period 8-K)",
+            "Check tag for combined short-term investments or restricted cash",
+            ("USD",),
+        ),
+        (
+            "short_term_investments",
+            [
+                "MarketableSecuritiesCurrent",
+                "ShortTermInvestments",
+                "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+                "AvailableForSaleSecuritiesCurrent",
+                "AvailableForSaleSecuritiesDebtSecurities",
+            ],
+            "Point-in-time marketable / available-for-sale securities",
+            "Verify maturity split (current vs noncurrent) in 10-Q/10-K notes when using fallback AFS tag",
+            ("USD",),
+        ),
+        (
+            "long_term_debt",
+            [
+                "LongTermDebtNoncurrent",
+                "LongTermDebtAndCapitalLeaseObligations",
+                "LongTermDebt",
+            ],
+            "Point-in-time noncurrent/long-term debt",
+            "Check 8-K for post-period debt issuance or repayment",
+            ("USD",),
+        ),
+        (
+            "short_term_debt",
+            [
+                "ShortTermBorrowings",
+                "LongTermDebtCurrent",
+                "DebtCurrent",
+                "CommercialPaper",
+            ],
+            "Point-in-time current/short-term debt",
+            None,
+            ("USD",),
+        ),
+        (
+            "stock_based_compensation",
+            [
+                "ShareBasedCompensation",
+                "AllocatedShareBasedCompensationExpense",
+            ],
+            "GAAP_XBRL_reported_may_be_YTD",
+            "Non-cash SBC expense; cross-check against share count dilution",
+            ("USD",),
+        ),
+        (
+            "share_repurchases",
+            [
+                "PaymentsForRepurchaseOfCommonStock",
+                "StockRepurchasedAndRetiredDuringPeriodValue",
+                "TreasuryStockValueAcquiredCostMethod",
+            ],
+            "GAAP_XBRL_reported_may_be_YTD",
+            "Actual cash spent on common stock buybacks (not authorization)",
+            ("USD",),
+        ),
+        (
+            "shares_outstanding_ending",
+            [
+                "CommonStockSharesOutstanding",
+                "dei:EntityCommonStockSharesOutstanding",
+            ],
+            "Point-in-time ending common shares outstanding",
+            "Track multi-year share count expansion vs net retirement",
+            ("shares",),
+        ),
+        (
+            "shares_diluted_weighted",
+            ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+            "GAAP_XBRL_weighted_average_diluted_shares",
+            "Note: anti-dilutive securities excluded in GAAP loss periods",
+            ("shares",),
+        ),
+        (
+            "inventory",
+            [
+                "InventoryNet",
+                "InventoryFinishedGoodsAndWorkInProcess",
+            ],
+            "Point-in-time working capital (inventory)",
+            "Compare growth vs revenue to detect channel/warehouse buildup",
+            ("USD",),
+        ),
+        (
+            "accounts_receivable",
+            [
+                "AccountsReceivableNetCurrent",
+                "ReceivablesNetCurrent",
+            ],
+            "Point-in-time working capital (receivables)",
+            "Compare growth vs revenue to verify FCF conversion quality",
+            ("USD",),
         ),
     ]
-    for metric_key, tags, basis, note in specs:
-        extracted = _extract_xbrl_metric(us_gaap, tags, limit=limit, note=note, basis=basis)
+    for metric_key, tags, basis, note, pref_units in specs:
+        extracted = _extract_xbrl_metric(
+            us_gaap,
+            tags,
+            limit=limit,
+            note=note,
+            basis=basis,
+            dei=dei,
+            preferred_units=pref_units,
+        )
         if extracted is not None:
             metrics[metric_key] = extracted
 
@@ -696,6 +930,7 @@ def extract_sec_companyfacts(facts_json: dict[str, Any], limit: int = 8) -> dict
         "entity_name": facts_json.get("entityName"),
         "cik": str(facts_json.get("cik") or "").zfill(10) if facts_json.get("cik") is not None else None,
         "metrics": metrics,
+        "capital_structure_snapshot": _build_capital_structure_snapshot(metrics),
     }
 
 
@@ -915,6 +1150,164 @@ def _get_sec_cik(symbol: str) -> str:
     raise KeyError(f"SEC CIK not found for ticker {symbol}")
 
 
+SEC_8K_ITEM_LABELS: dict[str, str] = {
+    "1.01": "重大协议签署 (Material Agreement)",
+    "1.02": "重大协议终止 (Termination of Agreement)",
+    "1.03": "破产或接管 (Bankruptcy/Receivership)",
+    "2.01": "并购或资产处置交割 (Acquisition/Disposition)",
+    "2.02": "业绩与财务状况公布 (Results of Operations)",
+    "2.03": "新增债务/直接财务义务 (Direct Financial Obligation)",
+    "2.04": "债务加速或触发事件 (Triggering Events)",
+    "2.05": "重组与退出成本 (Exit/Disposal Costs)",
+    "2.06": "重大资产减值 (Material Impairments)",
+    "3.01": "退市/上市规则不合规通知 (Delisting/Non-Compliance)",
+    "3.02": "未注册股权增发/发行 (Unregistered Equity Sales)",
+    "3.03": "股东权利重大变更 (Modification to Rights)",
+    "4.01": "审计机构变更 (Auditor Change)",
+    "4.02": "财报重述/不可依赖声明 (Non-Reliance on Financials)",
+    "5.01": "控制权变更 (Change in Control)",
+    "5.02": "高管/董事变动 (Officer/Director Departure/Election)",
+    "5.03": "公司章程修订 (Amendments to Articles/Bylaws)",
+    "5.07": "股东大会表决结果 (Shareholder Vote)",
+    "7.01": "Reg FD 公开披露 (Regulation FD Disclosure)",
+    "8.01": "其他重大事件 (Other Events)",
+    "9.01": "财务报表与附件 (Financial Statements & Exhibits)",
+}
+
+SEC_8K_MATERIAL_CAPITAL_ITEMS: set[str] = {
+    "1.01",
+    "1.02",
+    "2.01",
+    "2.03",
+    "2.04",
+    "2.05",
+    "2.06",
+    "3.02",
+    "3.03",
+    "4.02",
+}
+
+
+def _normalize_8k_items(raw_items: Any) -> list[str]:
+    if isinstance(raw_items, list):
+        return [str(x).strip() for x in raw_items if str(x).strip()]
+    if isinstance(raw_items, str) and raw_items.strip():
+        return [s.strip() for s in re.split(r"[,;\s]+", raw_items.strip()) if s.strip()]
+    return []
+
+
+def extract_sec_submissions_filings(
+    sub_json: dict[str, Any],
+    cik_int: int,
+    *,
+    periodic_limit: int = 4,
+    eight_k_limit: int = 10,
+) -> dict[str, Any]:
+    """Extract recent 10-K/10-Q filings and 8-K/8-K/A event index with post-period flags."""
+    recent = (sub_json.get("filings") or {}).get("recent") or {}
+    forms = recent.get("form") or []
+    filing_dates = recent.get("filingDate") or []
+    report_dates = recent.get("reportDate") or []
+    accessions = recent.get("accessionNumber") or []
+    primary_docs = recent.get("primaryDocument") or []
+    primary_descs = recent.get("primaryDocDescription") or []
+    items_list = recent.get("items") or []
+
+    filings: list[dict[str, Any]] = []
+    eight_k_filings: list[dict[str, Any]] = []
+
+    for idx, form_raw in enumerate(forms):
+        form = str(form_raw or "").strip()
+        if form in ("10-Q", "10-K", "10-Q/A", "10-K/A") and len(filings) < periodic_limit:
+            acc = accessions[idx] if idx < len(accessions) else ""
+            doc = primary_docs[idx] if idx < len(primary_docs) else ""
+            acc_nodash = str(acc).replace("-", "")
+            html_url = (
+                f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{doc}"
+                if acc_nodash and doc
+                else None
+            )
+            filings.append(
+                {
+                    "form": form,
+                    "filingDate": filing_dates[idx] if idx < len(filing_dates) else None,
+                    "reportDate": report_dates[idx] if idx < len(report_dates) else None,
+                    "accessionNumber": acc,
+                    "primaryDocument": doc,
+                    "url": html_url,
+                }
+            )
+        elif form in ("8-K", "8-K/A") and len(eight_k_filings) < eight_k_limit:
+            acc = accessions[idx] if idx < len(accessions) else ""
+            doc = primary_docs[idx] if idx < len(primary_docs) else ""
+            acc_nodash = str(acc).replace("-", "")
+            html_url = (
+                f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{doc}"
+                if acc_nodash and doc
+                else None
+            )
+            raw_it = items_list[idx] if idx < len(items_list) else []
+            norm_items = _normalize_8k_items(raw_it)
+            item_labels = [
+                f"{code} {SEC_8K_ITEM_LABELS[code]}" if code in SEC_8K_ITEM_LABELS else code
+                for code in norm_items
+            ]
+            eight_k_filings.append(
+                {
+                    "form": form,
+                    "filingDate": filing_dates[idx] if idx < len(filing_dates) else None,
+                    "reportDate": report_dates[idx] if idx < len(report_dates) else None,
+                    "accessionNumber": acc,
+                    "primaryDocument": doc,
+                    "primaryDocDescription": (primary_descs[idx] if idx < len(primary_descs) else None) or None,
+                    "items": norm_items,
+                    "item_labels": item_labels,
+                    "is_material_capital_event": any(c in SEC_8K_MATERIAL_CAPITAL_ITEMS for c in norm_items),
+                    "url": html_url,
+                }
+            )
+        if len(filings) >= periodic_limit and len(eight_k_filings) >= eight_k_limit:
+            break
+
+    latest_periodic = (
+        max(
+            filings,
+            key=lambda x: (str(x.get("reportDate") or ""), str(x.get("filingDate") or "")),
+        )
+        if filings
+        else None
+    )
+    latest_report_date = str(latest_periodic.get("reportDate") or "").strip() if latest_periodic else ""
+    latest_filing_date = str(latest_periodic.get("filingDate") or "").strip() if latest_periodic else ""
+
+    post_count = 0
+    post_capital_count = 0
+    for item in eight_k_filings:
+        ev_date = str(item.get("reportDate") or "").strip()
+        fil_date = str(item.get("filingDate") or "").strip()
+        is_post = bool(
+            (latest_report_date and ev_date and ev_date > latest_report_date)
+            or (latest_filing_date and fil_date and fil_date > latest_filing_date)
+        )
+        item["post_latest_periodic_report"] = is_post
+        if is_post:
+            post_count += 1
+            if item["is_material_capital_event"]:
+                post_capital_count += 1
+
+    return {
+        "recent_filings": filings,
+        "recent_8k_filings": eight_k_filings,
+        "post_report_8k_summary": {
+            "latest_periodic_form": latest_periodic.get("form") if latest_periodic else None,
+            "latest_periodic_report_date": latest_report_date or None,
+            "latest_periodic_filing_date": latest_filing_date or None,
+            "post_report_8k_count": post_count,
+            "material_capital_8k_count": post_capital_count,
+        },
+    }
+
+
 def fetch_sec_edgar(symbol: str) -> dict[str, Any]:
     cik = _get_sec_cik(symbol)
     cik_int = int(cik)
@@ -926,37 +1319,7 @@ def fetch_sec_edgar(symbol: str) -> dict[str, Any]:
     )
     sub_resp.raise_for_status()
     sub_json = sub_resp.json()
-    recent = (sub_json.get("filings") or {}).get("recent") or {}
-    forms = recent.get("form") or []
-    filing_dates = recent.get("filingDate") or []
-    report_dates = recent.get("reportDate") or []
-    accessions = recent.get("accessionNumber") or []
-    primary_docs = recent.get("primaryDocument") or []
-
-    filings: list[dict[str, Any]] = []
-    for idx, form in enumerate(forms):
-        if form not in ("10-Q", "10-K"):
-            continue
-        acc = accessions[idx] if idx < len(accessions) else ""
-        doc = primary_docs[idx] if idx < len(primary_docs) else ""
-        acc_nodash = str(acc).replace("-", "")
-        html_url = (
-            f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/{doc}"
-            if acc_nodash and doc
-            else None
-        )
-        filings.append(
-            {
-                "form": form,
-                "filingDate": filing_dates[idx] if idx < len(filing_dates) else None,
-                "reportDate": report_dates[idx] if idx < len(report_dates) else None,
-                "accessionNumber": acc,
-                "primaryDocument": doc,
-                "url": html_url,
-            }
-        )
-        if len(filings) >= 4:
-            break
+    sub_extracted = extract_sec_submissions_filings(sub_json, cik_int, periodic_limit=4, eight_k_limit=10)
 
     facts_resp = requests.get(
         f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json",
@@ -970,8 +1333,11 @@ def fetch_sec_edgar(symbol: str) -> dict[str, Any]:
         "cik": cik,
         "entity_name": sub_json.get("name") or facts_summary.get("entity_name"),
         "sic_description": sub_json.get("sicDescription"),
-        "recent_filings": filings,
+        "recent_filings": sub_extracted["recent_filings"],
+        "recent_8k_filings": sub_extracted["recent_8k_filings"],
+        "post_report_8k_summary": sub_extracted["post_report_8k_summary"],
         "gaap_metrics": facts_summary.get("metrics", {}),
+        "capital_structure_snapshot": facts_summary.get("capital_structure_snapshot", {}),
     }
 
 
@@ -1181,14 +1547,43 @@ def fetch_ashare_hsgt_flow() -> dict[str, Any]:
     return out
 
 
-def fetch_cn_future_inventory(cn_name: str) -> dict[str, Any]:
+def fetch_cn_future_inventory(cn_name: str, spot_code: str | None = None) -> dict[str, Any]:
     if ak is None:
         raise RuntimeError("akshare is not installed")
-    if cn_name in INVENTORY_EM_BLACKLIST:
+    code_up = (spot_code or "").strip().upper()
+    em_symbol = (
+        INVENTORY_EM_SYMBOL_MAP.get(code_up)
+        or INVENTORY_EM_SYMBOL_MAP.get(cn_name)
+        or cn_name
+    )
+    if cn_name in INVENTORY_EM_BLACKLIST or em_symbol in INVENTORY_EM_BLACKLIST:
         return {"status": "skipped", "reason": f"Blacklisted inventory symbol: {cn_name}"}
-    df = _run_with_timeout(lambda: ak.futures_inventory_em(symbol=cn_name), timeout_s=HTTP_TIMEOUT)
-    if df is None or df.empty:
+
+    candidates: list[str] = [em_symbol]
+    if code_up:
+        for alt in (code_up, code_up.lower()):
+            if alt not in candidates:
+                candidates.append(alt)
+
+    df = None
+    last_exc: Exception | None = None
+    used_symbol = em_symbol
+    for idx, cand in enumerate(candidates):
+        try:
+            df = _run_with_timeout(lambda c=cand: ak.futures_inventory_em(symbol=c), timeout_s=HTTP_TIMEOUT)
+            used_symbol = cand
+            break
+        except ValueError as exc:
+            last_exc = exc
+            if idx + 1 < len(candidates) and "请输入正确的 symbol" in str(exc):
+                continue
+            raise
+    if df is None:
+        if last_exc is not None:
+            raise last_exc
         raise ValueError(f"Empty futures_inventory_em for {cn_name}")
+    if df.empty:
+        raise ValueError(f"Empty futures_inventory_em for {cn_name} ({used_symbol})")
     df = df.copy()
     date_col = "日期" if "日期" in df.columns else df.columns[0]
     inv_col = "库存" if "库存" in df.columns else df.columns[1]
@@ -1213,6 +1608,7 @@ def fetch_cn_future_inventory(cn_name: str) -> dict[str, Any]:
     chg_20d, chg_20d_pct = _chg(20)
     return {
         "symbol_cn": cn_name,
+        "em_symbol": used_symbol,
         "latest_date": latest_date,
         "latest_inventory": round(latest_inv, 4),
         "chg_5d": chg_5d,
@@ -1778,7 +2174,9 @@ def collect_research_data(
         if meta is not None:
             cn_name, spot_code, macro_sector = meta
             fundamentals_and_supply["inventory_em"] = _run_source(
-                "inventory_em", lambda: fetch_cn_future_inventory(cn_name), sources_status
+                "inventory_em",
+                lambda: fetch_cn_future_inventory(cn_name, spot_code=spot_code),
+                sources_status,
             )
             fundamentals_and_supply["spot_and_basis"] = _run_source(
                 "spot_and_basis", lambda: fetch_cn_future_spot_basis(spot_code), sources_status

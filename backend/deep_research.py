@@ -14,6 +14,7 @@ Runs a structured 5-stage pipeline inside the backend TaskManager:
 """
 from __future__ import annotations
 
+import codecs
 import inspect
 import json
 import os
@@ -28,6 +29,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+import daily_sentinel
 import market_snapshot
 import research_archive
 import research_data
@@ -286,9 +288,13 @@ def _asset_specific_rules(asset_class: str, market: str) -> str:
         )
     return (
         "【美股 / A 股专属研究要求（以做多为主，卖点用于止盈/风控/对冲）】\n"
-        "- 先定型（A 成长 / B 强周期 / C 稳定现金流 / D 困境反转），严格按未来 1~3 年远期预期折现定价，严禁死板套用静态当期 PE（强周期股牢记“买在高 PE/微利拐点、卖在低 PE/暴利顶点”）。\n"
-        "- 拆解收入驱动树与 1~3 年预期差，执行牛 / 基准 / 熊1（EPS 持平 + PE 回 5 年中枢）/ 熊2（EPS -10% + PE 压缩）压力测试，区分 GAAP 与 Adjusted 口径。\n"
-        "- 反方红蓝对抗必答 7 问：① EPS 持平、PE 回历史中枢跌多少？② 剔除软订单/框架预估后真实增速剩多少？③ 利润率 -1pp 对 EPS 冲击多大？④ 预期差是否已被定价？⑤ 最大单一客户/需求链断供后果？⑥ 核心证伪指标与结构失效阈值？⑦ 历史最近一次证伪案例？\n"
+        "- 先定型（A 成长 / B 强周期 / C 稳定现金流 / D 困境反转）并量化**受益纯度**（核心主逻辑贡献的真实收入占比，伪概念直接否决）与**瓶颈久期**（底层材料/工艺 5~10 年、客户验证 2~5 年且警惕大客户自研绕过、纯产能缺货 1~3 年一律按 B 型周期股处理，不可把短期缺货暴利乘以成长股 PE）。\n"
+        "- 严格按未来 1~3 年远期预期折现定价，严禁死板套用静态当期 PE（强周期股牢记“买在高 PE/微利拐点、卖在低 PE/暴利顶点”）。\n"
+        "- **订单与收入兑现审计**：将公告/合作按七阶段严格分级（科学验证 / 产品导入[多数战略合作止步于此] / 客户验证 / 具法律约束力采购订单 PO / 量产爬坡 / 稳定复购 / 未证实传闻），仅 PO 及以后阶段计入确定性收入预测；明确剥离一次性工程收入（NRE）与可规模化产品收入。\n"
+        "- **分部拆解与周期顶部双面核验**：拆分高毛利新业务结构改善（Mix Shift）、衰退老业务单独按悲观扣减（Drag Segment）及下半年集中放量陷阱（H2 Weighting：按 H1 实绩倒推 H2 隐含环比增速）；核查存货与应收账款增速是否快于营收；对半导体/硬科技的交期拉长、Book-to-Bill > 1、长协与配给状态做**双面核验**（警惕 2021~22 式重复下单周期顶，同步追踪月度营收、现货价与“利好兑现不创新高”信号）。\n"
+        "- **期后 8-K 流动性桥与稀释/回购审计**：结合 `brief.json` 中最新 10-Q/10-K 与期后 `8-K` 重大事件编制带截止日的净现金/净债务桥（扣减已交割收购现金对价、计入新增债务与受限现金）；审计 3~5 年期末流通股数变动、SBC、ATM 增发、可转债/Warrants 稀释；核验真实回购弹药（按美股 Rule 10b-18 单日 ≤ 日均成交额 25% 折算，且 CFO 最新资本配置表态高于历史回购规律）。\n"
+        "- **情景压力测试与现价隐含预期拆解**：执行牛 / 基准 / 熊1（EPS 持平 + PE 回 5 年中枢）/ 熊2（EPS -10% + PE 压缩）/ 叙事崩塌五情景压力测试，严禁混算 GAAP 与 Adjusted 口径；可反推现价中的“常态基础价值 + 有限期周期增量折现 + 叙事/期权残差区间”用于刻画风险暴露，**严禁用主观概率加权目标价或 30% 溢价线直接决定买卖/仓位，严禁主张“因果链完好时杀估值就逆势加仓”**。\n"
+        "- **反方红蓝对抗必答 7 问 + 红队 Pre-Mortem**：① EPS 持平、PE 回历史中枢跌多少？② 按订单七阶段剔除软订单/框架预估与 NRE 后，真实可放量增速剩多少（含 H2 放量与衰退老业务拖累）？③ 利润率 -1pp 对 EPS 冲击多大？④ 预期差与叙事溢价是否已被当前股价充分定价？⑤ 最大单一客户/需求链断供或自研替代后果？⑥ 资本结构、期后现金消耗或 ATM/SBC 稀释风险有多大？⑦ 历史最近一次证伪案例与核心领先证伪指标？**另附 3~5 句具体可证伪的红队 Pre-Mortem 失败路径**（假设 6 个月后大亏，写出具体触发链并映射可监控指标）。\n"
     )
 
 
@@ -345,9 +351,10 @@ def build_research_prompt(
         '  "valuation_or_balance": {\n'
         '    "regime": "简短定性（如：强现实弱预期劈叉 / 过剩压制 / 戴维斯双击 / 周期底部）",\n'
         '    "key_anchor": "核心锚定指标与数值（带单位）",\n'
-        '    "upside_vs_downside": "牛/基准/熊情景空间简述"\n'
+        '    "upside_vs_downside": "牛/基准/熊情景空间简述",\n'
+        '    "implied_expectation_breakdown": "可选（仅股票）：常态基础价值 + 周期折现 + 叙事残差区间（纯风险刻画，不作为入场门槛）"\n'
         "  },\n"
-        '  "thesis_md": "完整的简体中文 Markdown 研报正文（不要包含底部『## 增量修订日志』章节，系统会自动保留并追加）。必须包含：\\n# 标题与核心信息卡\\n## 第三层：1Q~1Y 纯深度研究（含 7 维共振逻辑、供需平衡表/估值预期差、硬数据验真、情景分析）\\n## 第三层：红蓝对抗（逐条回答反方必答问并量化反向情景）\\n## 第三层研究裁决（方向、置信度、核心证伪条件）\\n## 第四层：交易表达与 30min 缠论执行框架（四象限终裁、日线主中枢 vs 30min 触发点、合约/工具与展期劈叉权衡、双层止损与撤离红线）",\n'
+        '  "thesis_md": "完整的简体中文 Markdown 研报正文（不要包含底部『## 增量修订日志』章节，系统会自动保留并追加）。必须包含：\\n# 标题与核心信息卡\\n## 第三层：1Q~1Y 纯深度研究（含 7 维共振逻辑、供需平衡表/估值预期差、硬数据验真、情景分析）\\n## 第三层：红蓝对抗（逐条回答反方必答问、红队 Pre-Mortem 3~5 条具体失败路径并量化反向情景）\\n## 第三层研究裁决（方向、置信度、核心证伪条件）\\n## 第四层：交易表达与 30min 缠论执行框架（四象限终裁、日线主中枢 vs 30min 触发点、合约/工具与展期劈叉权衡、双层止损与撤离红线）",\n'
         '  "evidence": [\n'
         "    {\n"
         '      "metric": "指标或事实名称（清晰中文）",\n'
@@ -367,12 +374,13 @@ def build_research_prompt(
         "    {\n"
         '      "id": "trig_unique_snake_case",\n'
         '      "kind": "chanlun | supply_demand | term_structure | rate_diff | fundamental | policy | spread | freight | macro",\n'
-        '      "metric": "优先使用哨兵自动化键名，如 close / daily_zd / daily_zg / basis_pct / inventory_latest / roll_yield_near_pct / rate_diff_10y_bp 等",\n'
+        '      "evaluation_mode": "auto（标准机审键）| ai_web（政策/事件等需AI联网核验的非标指标）",\n'
+        '      "metric": "机审触发器必须精确使用哨兵标准键名（如 close / daily_zd / daily_zg / basis_pct / inventory_latest / roll_yield_near_pct / rate_diff_10y_bp）；政策/定性项可自定义英文snake_case并标 evaluation_mode=ai_web",\n'
         '      "operator": "> | >= | < | <= | == | contains | event",\n'
         '      "threshold": 12345,\n'
         '      "action": "exit_review | trim_or_exit | alert",\n'
         '      "status": "armed",\n'
-        '      "description": "触发后的明确含义与动作"\n'
+        '      "description": "触发后的明确含义、数据核验口径与动作"\n'
         "    }\n"
         "  ],\n"
         '  "events": [\n'
@@ -383,7 +391,7 @@ def build_research_prompt(
         "}\n"
         "```\n"
         f"提示：哨兵自动支持的标准化 metric 键名包括：{SENTINEL_METRIC_HINTS}。"
-        "请至少提供 5~10 条高质量 L1~L4 证据、3~6 条可执行撤离红线/监控触发器（优先使用上述标准化 metric 键名与合理数值阈值）以及 2~5 条未来催化/移仓事件。"
+        "请至少提供 5~10 条高质量 L1~L4 证据、3~6 条可执行撤离红线/监控触发器（量化价格/结构/库存/基差/曲线/利差类必须精确选用上述标准键名并标 evaluation_mode=auto；政策或突发事件类非标指标可标 evaluation_mode=ai_web 并写清核验口径）以及 2~5 条未来催化/移仓事件。"
     )
 
 
@@ -410,7 +418,8 @@ def build_adversarial_prompt(
         "【你的任务】\n"
         "1. 站在严格反方立场，逐条攻击主研论点中最脆弱的假设、数据缺口、隐性库存/预期差陷阱或缠论结构冲突。\n"
         "2. 必须逐条回答上述对应资产类别的「反方必答问」，并给出至少 1 个**可量化的反向情景**（给出具体下跌/反向幅度估算与触发机制）。\n"
-        "3. 指出哪些关键撤离红线阈值设得过宽或遗漏。\n"
+        "3. **红队 Pre-Mortem（事前验尸）**：假设 6 个月后这笔研究/头寸亏了大钱，写出 3~5 条具体、可证伪的失败路径（写明具体哪家客户砍单/哪个验证卡壳/哪项政策或供需逆转/哪笔期后融资稀释导致失败），每条绑定一个可监控的领先证伪指标。\n"
+        "4. 指出哪些关键撤离红线阈值设得过宽或遗漏。\n"
         "请直接输出清晰、犀利、结构化的简体中文 Markdown 反方质询报告（不需要 JSON，800~1500 字）。"
     )
 
@@ -595,8 +604,8 @@ def _run_agent_cli(
         env=_subprocess_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        bufsize=1,
+        text=False,
+        bufsize=0,
         start_new_session=True,
     )
 
@@ -611,8 +620,56 @@ def _run_agent_cli(
 
     sel = selectors.DefaultSelector()
     assert proc.stdout is not None and proc.stderr is not None
+    os.set_blocking(proc.stdout.fileno(), False)
+    os.set_blocking(proc.stderr.fileno(), False)
     sel.register(proc.stdout, selectors.EVENT_READ, data="stdout")
     sel.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+
+    decoders = {
+        "stdout": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+        "stderr": codecs.getincrementaldecoder("utf-8")(errors="replace"),
+    }
+    line_buffers = {"stdout": "", "stderr": ""}
+
+    def _consume_line(stream_name: str, line: str) -> None:
+        nonlocal stderr_size, last_text, result_text, cli_error, last_heartbeat
+        if stream_name == "stderr":
+            if stderr_size < MAX_STDERR_BYTES:
+                stderr_chunks.append(line)
+                stderr_size += len(line)
+            return
+
+        if engine == "claude":
+            parsed = parse_claude_stream_line(line)
+            if not parsed:
+                return
+            if parsed["kind"] == "assistant":
+                for act in parsed.get("activities") or []:
+                    last_heartbeat = time.monotonic()
+                    emit("log", {"stage": stage, "engine": engine, "message": act})
+                if parsed.get("text"):
+                    last_text = parsed["text"]
+            elif parsed["kind"] == "result":
+                result_meta["duration_ms"] = parsed.get("duration_ms")
+                result_meta["total_cost_usd"] = parsed.get("total_cost_usd")
+                if parsed.get("is_error"):
+                    cli_error = parsed.get("result") or f"Claude CLI error ({parsed.get('subtype')})"
+                else:
+                    result_text = parsed.get("result") or ""
+        else:
+            parsed = parse_codex_stream_line(line)
+            if not parsed:
+                return
+            if parsed["kind"] == "activity":
+                for act in parsed.get("activities") or []:
+                    last_heartbeat = time.monotonic()
+                    emit("log", {"stage": stage, "engine": engine, "message": act})
+            elif parsed["kind"] == "agent_message":
+                if parsed.get("text"):
+                    last_text = parsed["text"]
+                    result_text = parsed["text"]
+            elif parsed["kind"] == "error":
+                cli_error = parsed.get("message") or "Codex execution failed"
 
     try:
         while sel.get_map():
@@ -620,13 +677,15 @@ def _run_agent_cli(
                 _terminate_process_group(proc)
                 raise DeepResearchCancelledError("用户已终止深度研究任务")
 
-            elapsed = time.monotonic() - start_ts
-            if elapsed > timeout_seconds:
+            now_ts = time.monotonic()
+            elapsed = now_ts - start_ts
+            remaining = timeout_seconds - elapsed
+            if remaining <= 0:
                 _terminate_process_group(proc)
                 raise TimeoutError(f"研究引擎 `{engine}` 执行超过 {timeout_seconds}s 超时")
 
-            if time.monotonic() - last_heartbeat >= 12.0:
-                last_heartbeat = time.monotonic()
+            if now_ts - last_heartbeat >= 12.0:
+                last_heartbeat = now_ts
                 emit(
                     "log",
                     {
@@ -636,50 +695,35 @@ def _run_agent_cli(
                     },
                 )
 
-            events = sel.select(timeout=0.25)
+            events = sel.select(timeout=min(0.1, remaining))
             for key, _ in events:
                 stream = key.fileobj
-                line = stream.readline()  # type: ignore[union-attr]
-                if not line:
-                    sel.unregister(stream)
-                    continue
-                if key.data == "stderr":
-                    if stderr_size < MAX_STDERR_BYTES:
-                        stderr_chunks.append(line)
-                        stderr_size += len(line)
-                    continue
+                sname = str(key.data)
+                fd = stream.fileno()  # type: ignore[union-attr]
+                eof = False
+                while True:
+                    try:
+                        chunk = os.read(fd, 8192)
+                    except BlockingIOError:
+                        break
+                    if not chunk:
+                        eof = True
+                        break
+                    decoded = decoders[sname].decode(chunk, final=False)
+                    if decoded:
+                        line_buffers[sname] += decoded
+                        while "\n" in line_buffers[sname]:
+                            one_line, line_buffers[sname] = line_buffers[sname].split("\n", 1)
+                            _consume_line(sname, one_line + "\n")
 
-                if engine == "claude":
-                    parsed = parse_claude_stream_line(line)
-                    if not parsed:
-                        continue
-                    if parsed["kind"] == "assistant":
-                        for act in parsed.get("activities") or []:
-                            last_heartbeat = time.monotonic()
-                            emit("log", {"stage": stage, "engine": engine, "message": act})
-                        if parsed.get("text"):
-                            last_text = parsed["text"]
-                    elif parsed["kind"] == "result":
-                        result_meta["duration_ms"] = parsed.get("duration_ms")
-                        result_meta["total_cost_usd"] = parsed.get("total_cost_usd")
-                        if parsed.get("is_error"):
-                            cli_error = parsed.get("result") or f"Claude CLI error ({parsed.get('subtype')})"
-                        else:
-                            result_text = parsed.get("result") or ""
-                else:
-                    parsed = parse_codex_stream_line(line)
-                    if not parsed:
-                        continue
-                    if parsed["kind"] == "activity":
-                        for act in parsed.get("activities") or []:
-                            last_heartbeat = time.monotonic()
-                            emit("log", {"stage": stage, "engine": engine, "message": act})
-                    elif parsed["kind"] == "agent_message":
-                        if parsed.get("text"):
-                            last_text = parsed["text"]
-                            result_text = parsed["text"]
-                    elif parsed["kind"] == "error":
-                        cli_error = parsed.get("message") or "Codex execution failed"
+                if eof:
+                    tail = decoders[sname].decode(b"", final=True)
+                    if tail:
+                        line_buffers[sname] += tail
+                    if line_buffers[sname]:
+                        _consume_line(sname, line_buffers[sname])
+                        line_buffers[sname] = ""
+                    sel.unregister(stream)
 
         rc = proc.wait(timeout=5)
     finally:
@@ -840,9 +884,17 @@ def normalize_research_output(
         action = str(raw_trig.get("action") or "alert").strip()
         if not action:
             action = "alert"
+        raw_mode = str(raw_trig.get("evaluation_mode") or "").strip().lower()
+        if daily_sentinel.is_known_auto_metric(metric):
+            eval_mode = "auto"
+        elif raw_mode in {"ai_web", "manual"}:
+            eval_mode = raw_mode
+        else:
+            eval_mode = "ai_web"
         trig_obj: dict[str, Any] = {
             "id": tid,
             "kind": kind,
+            "evaluation_mode": eval_mode,
             "metric": metric,
             "operator": operator,
             "threshold": raw_trig["threshold"],

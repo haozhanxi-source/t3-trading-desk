@@ -26,7 +26,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import ROOT_DIR, __version__, deep_research
+from . import ROOT_DIR, __version__, deep_research, macro_compass
 from .cache import (
     CACHE,
     TTL_MARKET_SECONDS,
@@ -39,6 +39,7 @@ from .symbols import search_symbols
 from .tasks import (
     TERMINAL_EVENT_TYPES,
     TaskManager,
+    TaskStoppingConflictError,
     compute_current_sentinel_fingerprint,
     research_cache_key,
     run_sentinel_sync,
@@ -263,6 +264,15 @@ class UniverseReq(_Strict):
     name: str
     description: str = ""
     symbols: list[str]
+    overwrite: bool = True
+
+
+class CompassScanContextReq(_Strict):
+    run_id: str = ""
+    direction_id: str = ""
+    direction_title: str = ""
+    direction: Literal["long", "short", "pair"] = "long"
+    expected_directions: dict[str, Direction] = Field(default_factory=dict)
 
 
 class ScanTaskReq(_Strict):
@@ -271,6 +281,7 @@ class ScanTaskReq(_Strict):
     period: str = Field("3y", pattern=PERIOD_PATTERN)
     sort: Literal["tier", "none"] = Field("tier", validation_alias=AliasChoices("sort_mode", "sort"))
     refresh: bool = False
+    compass_context: CompassScanContextReq | None = None
 
 
 class DataHealthCheckReq(_Strict):
@@ -296,6 +307,34 @@ class SentinelTaskReq(_Strict):
     include_watchlist: bool = False
     skip_research: bool = False
     event_window_days: int = Field(14, ge=1, le=90)
+
+
+class TriggerManualVerifyReq(_ArchiveMarketReq):
+    symbol: str = Field(..., min_length=1)
+    trigger_id: str = Field(..., min_length=1)
+    status: Literal["clear", "fired", "uncertain"]
+    observed: Any = None
+    observed_text: str = Field("", max_length=300)
+    summary: str = Field(..., min_length=1, max_length=400)
+    source_title: str = Field("", max_length=200)
+    source_url: str = Field("", max_length=500)
+    evidence_tier: Literal["L1", "L2", "L3", "L4"] = "L2"
+    ttl_days: int = Field(7, ge=1, le=90)
+
+
+class TriggerVerifyTaskReq(_ArchiveMarketReq):
+    symbol: str = ""
+    trigger_ids: list[str] = Field(default_factory=list)
+    engine: Literal["claude", "codex", ""] = ""
+    force: bool = False
+    ttl_days: int = Field(7, ge=1, le=90)
+
+
+class MacroCompassTaskReq(_Strict):
+    engine: Literal["claude", "codex", ""] = ""
+    effort: Literal["low", "medium", "high"] = "medium"
+    focus_prompt: str = Field("", max_length=1200)
+    refresh_macro: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -905,14 +944,33 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         ):
             raise HTTPException(status_code=422, detail="Conflicting market and market_override query parameters")
         resolved_market = market if market is not None else market_override
-        return ok(
-            archive_call(
-                ra.load_archive,
-                raw_symbol=symbol,
-                market_override=resolved_market,
-                evidence_limit=0,
-            )
+        loaded = archive_call(
+            ra.load_archive,
+            raw_symbol=symbol,
+            market_override=resolved_market,
+            evidence_limit=0,
         )
+        # Attach authoritative server-side verification evaluation per trigger ID
+        state_obj = loaded.get("state") if isinstance(loaded, dict) else None
+        triggers = state_obj.get("triggers") if isinstance(state_obj, dict) else None
+        trig_evals: dict[str, dict[str, Any]] = {}
+        if isinstance(triggers, list):
+            now_dt = datetime.now(timezone.utc)
+            for item in ra.evaluate_triggers({"triggers": triggers}, {}, now_utc=now_dt):
+                tid = str(item.get("id") or "").strip()
+                if not tid:
+                    continue
+                trig_evals[tid] = {
+                    "is_auto": ra.is_trigger_auto_metric(item),
+                    "evaluated": bool(item.get("evaluated")),
+                    "fired": bool(item.get("fired")),
+                    "verification_stale": bool(item.get("verification_stale")),
+                    "verification_status": item.get("verification_status"),
+                    "error": item.get("error"),
+                }
+        if isinstance(loaded, dict):
+            loaded = {**loaded, "trigger_evaluations": trig_evals}
+        return ok(loaded)
 
     @app.post("/api/research/archive/init")
     def research_archive_init(req: ArchiveInitReq):
@@ -969,6 +1027,49 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         )
         return ok(res)
 
+    @app.post("/api/research/archive/trigger-verify-manual")
+    def research_archive_trigger_verify_manual(req: TriggerManualVerifyReq):
+        src_url = req.source_url.strip()
+        if src_url and not ra.is_valid_http_url(src_url):
+            raise HTTPException(
+                status_code=422,
+                detail="source_url must be a valid http:// or https:// URL with a hostname",
+            )
+        summary_clean = req.summary.strip()
+        if not summary_clean:
+            raise HTTPException(status_code=422, detail="summary must be non-empty")
+        ver_payload: dict[str, Any] = {
+            "method": "manual",
+            "status": req.status,
+            "verified_at_utc": ra.utc_now_iso_seconds(),
+            "ttl_days": req.ttl_days,
+            "evidence_tier": req.evidence_tier,
+            "summary": summary_clean,
+        }
+        if req.observed is not None and req.observed != "":
+            ver_payload["observed"] = req.observed
+        if req.observed_text.strip():
+            ver_payload["observed_text"] = req.observed_text.strip()
+        if req.source_title.strip():
+            ver_payload["source_title"] = req.source_title.strip()
+        if src_url:
+            ver_payload["source_url"] = src_url
+
+        res = archive_call(
+            ra.record_trigger_verifications,
+            invalidate_sentinel=True,
+            raw_symbol=req.symbol.strip(),
+            verifications={req.trigger_id.strip(): ver_payload},
+            market_override=req.resolved_market(),
+            reject_auto_metrics=True,
+            enforce_clear_gate=True,
+        )
+        if not res.get("updated_ids"):
+            conflicts = res.get("skipped_conflicts") or []
+            reason = conflicts[0].get("reason") if conflicts else "未找到可更新的目标触发器"
+            raise HTTPException(status_code=422, detail=reason)
+        return ok(res)
+
     @app.get("/api/research/engines")
     def research_engines_get():
         return ok(deep_research.detect_available_engines())
@@ -1000,10 +1101,68 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     @app.post("/api/universes")
     def universes_save(req: UniverseReq):
         try:
-            saved = so.save_universe(req.name, req.symbols, description=req.description)
+            saved = so.save_universe(
+                req.name,
+                req.symbols,
+                description=req.description,
+                allow_overwrite=req.overwrite,
+            )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return ok({"name": req.name.strip(), **saved})
+
+    @app.get("/api/compass/macro-overview")
+    async def compass_macro_overview(refresh: bool = False):
+        bundle = await asyncio.to_thread(macro_compass.collect_macro_overview, refresh=refresh)
+        return ok(bundle, headers=_cache_headers(bool(bundle.get("cache_hit"))))
+
+    @app.get("/api/compass/latest")
+    def compass_latest():
+        latest = macro_compass.get_latest_compass_run()
+        history = macro_compass.list_compass_runs(limit=15)
+        active = tasks.get_active_macro_compass()
+        return ok(
+            {
+                "latest": latest,
+                "history": history,
+                "active_task": active,
+            }
+        )
+
+    @app.get("/api/compass/history")
+    def compass_history(limit: int = Query(20, ge=1, le=60)):
+        return ok({"runs": macro_compass.list_compass_runs(limit=limit)})
+
+    @app.get("/api/compass/history/{run_id}")
+    def compass_history_detail(run_id: str):
+        detail = macro_compass.get_compass_run(run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Compass run not found: {run_id}")
+        return ok(detail)
+
+    @app.post("/api/tasks/macro-compass", status_code=202)
+    async def task_macro_compass(req: MacroCompassTaskReq):
+        eng_info = deep_research.detect_available_engines()
+        chosen_engine = req.engine or (eng_info.get("default_engine") or "")
+        if not chosen_engine or not deep_research.resolve_engine_binary(chosen_engine):
+            raise HTTPException(
+                status_code=503,
+                detail="本机未检测到可用 AI 推演引擎（Claude Code 或 Codex CLI），请检查 CLI 安装与登录状态。",
+            )
+        params = {
+            "engine": chosen_engine,
+            "effort": req.effort,
+            "focus_prompt": req.focus_prompt.strip(),
+            "refresh_macro": req.refresh_macro,
+        }
+        try:
+            task, already_running = tasks.start_macro_compass(params)
+        except TaskStoppingConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        summary = {**task.summary(), "already_running": already_running}
+        return ok(summary, status_code=202)
 
     @app.post("/api/tasks/scan", status_code=202)
     async def task_scan(req: ScanTaskReq):
@@ -1013,7 +1172,25 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not targets:
             raise HTTPException(status_code=422, detail="No scan targets resolved")
-        params = {**req.model_dump(), "targets": [list(t) for t in targets]}
+        dumped = req.model_dump()
+        if req.compass_context is not None:
+            # Canonicalize expected_directions keys so Layer 2 rows match aliases reliably
+            norm_expected: dict[str, str] = {}
+            for raw_sym, exp_dir in req.compass_context.expected_directions.items():
+                s = str(raw_sym or "").strip()
+                if not s:
+                    continue
+                norm_expected[s.upper()] = exp_dir
+                try:
+                    canon_sym, _ = market_snapshot.normalize_symbol(s)
+                    norm_expected[canon_sym.upper()] = exp_dir
+                except Exception:
+                    pass
+            dumped["compass_context"] = {
+                **req.compass_context.model_dump(),
+                "expected_directions": norm_expected,
+            }
+        params = {**dumped, "targets": [list(t) for t in targets]}
         return ok(tasks.start("scan", params).summary(), status_code=202)
 
     @app.post("/api/tasks/research-refresh", status_code=202)
@@ -1060,6 +1237,35 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     @app.post("/api/tasks/sentinel", status_code=202)
     async def task_sentinel(req: SentinelTaskReq):
         return ok(tasks.start("sentinel", req.model_dump()).summary(), status_code=202)
+
+    @app.post("/api/tasks/verify-triggers", status_code=202)
+    async def task_verify_triggers(req: TriggerVerifyTaskReq):
+        eng_info = deep_research.detect_available_engines()
+        chosen_engine = req.engine or (eng_info.get("default_engine") or "")
+        if not chosen_engine or not deep_research.resolve_engine_binary(chosen_engine):
+            raise HTTPException(
+                status_code=503,
+                detail="本机未检测到可用 AI 核验引擎（Claude Code 或 Codex CLI），请先检查 CLI 安装或使用手动核验。",
+            )
+        norm_symbol = ""
+        resolved_market = req.resolved_market()
+        if req.symbol.strip():
+            try:
+                _, resolved_market, norm_symbol, _ = ra.resolve_archive_dir(
+                    req.symbol.strip(),
+                    market_override=resolved_market,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        params = {
+            "symbol": norm_symbol,
+            "market": resolved_market,
+            "trigger_ids": [t.strip() for t in req.trigger_ids if t.strip()],
+            "engine": chosen_engine,
+            "force": req.force,
+            "ttl_days": req.ttl_days,
+        }
+        return ok(tasks.start("trigger_verify", params).summary(), status_code=202)
 
     @app.get("/api/tasks")
     def task_list():

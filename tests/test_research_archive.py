@@ -39,8 +39,9 @@ class TestResearchArchive(unittest.TestCase):
             loaded_eq = load_archive("PWR", research_root=tmpdir)
             self.assertEqual(loaded_eq["market"], "US")
             self.assertEqual(loaded_eq["state"]["revision"], 1)
-            self.assertIn("三情景估值与压缩压力测试", loaded_eq["thesis_md"])
-            self.assertIn("红蓝辩论反方必答 7 问", loaded_eq["thesis_md"])
+            self.assertIn("情景压力测试与现价隐含预期拆解", loaded_eq["thesis_md"])
+            self.assertIn("一手财报与订单核验清单（10 项", loaded_eq["thesis_md"])
+            self.assertIn("红蓝辩论反方必答 7 问 + 红队 Pre-Mortem", loaded_eq["thesis_md"])
 
             # Re-initializing without overwrite should not clobber
             res_dup = init_archive("PWR", thesis_summary="should not overwrite", research_root=tmpdir)

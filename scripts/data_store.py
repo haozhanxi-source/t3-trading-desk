@@ -60,6 +60,7 @@ MAX_INTRADAY_RETENTION_DAYS = 180
 MAX_RESEARCH_SNAPSHOTS_PER_KEY = 10
 MAX_SCAN_RUNS_RETENTION = 300
 MAX_SENTINEL_RUNS_RETENTION = 300
+MAX_COMPASS_RUNS_RETENTION = 60
 
 # ---------------------------------------------------------------------------
 # Scoped, context-local HTTP timeout wrapper (no global default side effects)
@@ -651,6 +652,23 @@ CREATE TABLE IF NOT EXISTS research_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_research_snapshots_lookup
     ON research_snapshots (asset_class, symbol, include_macro, id DESC);
+
+CREATE TABLE IF NOT EXISTS macro_compass_runs (
+    run_id TEXT PRIMARY KEY,
+    task_id TEXT,
+    created_at_utc TEXT NOT NULL,
+    finished_at_utc TEXT NOT NULL,
+    status TEXT NOT NULL,
+    engine TEXT NOT NULL DEFAULT 'claude',
+    effort TEXT NOT NULL DEFAULT 'medium',
+    focus_prompt TEXT NOT NULL DEFAULT '',
+    regime_title TEXT NOT NULL DEFAULT '',
+    directions_count INTEGER NOT NULL DEFAULT 0,
+    result_json TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_macro_compass_finished
+    ON macro_compass_runs (finished_at_utc DESC, run_id DESC);
 """
 
 
@@ -1806,6 +1824,7 @@ class DeskDataStore:
         symbols: list[str] | None = None,
         period: str = "3y",
         rows: list[dict[str, Any]],
+        compass_context: dict[str, Any] | None = None,
     ) -> str:
         rid = run_id or task_id or uuid.uuid4().hex[:12]
         now_s = utc_iso()
@@ -1877,7 +1896,13 @@ class DeskDataStore:
                     deg_cnt,
                     act_cnt,
                     json.dumps(
-                        {"count": len(rows), "errors": err_cnt, "degraded": deg_cnt, "actionable": act_cnt},
+                        {
+                            "count": len(rows),
+                            "errors": err_cnt,
+                            "degraded": deg_cnt,
+                            "actionable": act_cnt,
+                            **({"compass_context": compass_context} if compass_context else {}),
+                        },
                         ensure_ascii=False,
                     ),
                 ),
@@ -1924,6 +1949,10 @@ class DeskDataStore:
             conn.close()
         out: list[dict[str, Any]] = []
         for r in rows:
+            try:
+                summary_obj = json.loads(r["summary_json"] or "{}")
+            except ValueError:
+                summary_obj = {}
             out.append({
                 "run_id": r["run_id"],
                 "task_id": r["task_id"],
@@ -1937,6 +1966,7 @@ class DeskDataStore:
                 "error_count": int(r["error_count"]),
                 "degraded_count": int(r["degraded_count"]),
                 "actionable_count": int(r["actionable_count"]),
+                "compass_context": summary_obj.get("compass_context") if isinstance(summary_obj, dict) else None,
             })
         return out
 
@@ -1952,6 +1982,10 @@ class DeskDataStore:
             ).fetchall()
         finally:
             conn.close()
+        try:
+            summary_obj = json.loads(meta["summary_json"] or "{}")
+        except ValueError:
+            summary_obj = {}
         return {
             "run_id": meta["run_id"],
             "task_id": meta["task_id"],
@@ -1959,6 +1993,7 @@ class DeskDataStore:
             "finished_at_utc": meta["finished_at_utc"],
             "status": meta["status"],
             "universes": json.loads(meta["universes_json"] or "[]"),
+            "compass_context": summary_obj.get("compass_context") if isinstance(summary_obj, dict) else None,
             "symbols": json.loads(meta["symbols_json"] or "[]"),
             "period": meta["period"],
             "total_count": int(meta["total_count"]),
@@ -2231,6 +2266,147 @@ class DeskDataStore:
             raise
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------ Layer 1 Macro Compass Runs
+    def record_compass_run(
+        self,
+        *,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        created_at_utc: str | None = None,
+        finished_at_utc: str | None = None,
+        status: str = "completed",
+        engine: str = "claude",
+        effort: str = "medium",
+        focus_prompt: str = "",
+        result: dict[str, Any],
+    ) -> str:
+        rid = run_id or task_id or uuid.uuid4().hex[:12]
+        now_s = utc_iso()
+        c_at = created_at_utc or now_s
+        f_at = finished_at_utc or now_s
+        regime_title = str(result.get("regime_title") or "")
+        dirs = result.get("directions")
+        dir_count = len(dirs) if isinstance(dirs, list) else 0
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE;")
+            conn.execute(
+                """
+                INSERT INTO macro_compass_runs (
+                    run_id, task_id, created_at_utc, finished_at_utc, status,
+                    engine, effort, focus_prompt, regime_title, directions_count, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                    finished_at_utc = excluded.finished_at_utc,
+                    status = excluded.status,
+                    engine = excluded.engine,
+                    effort = excluded.effort,
+                    focus_prompt = excluded.focus_prompt,
+                    regime_title = excluded.regime_title,
+                    directions_count = excluded.directions_count,
+                    result_json = excluded.result_json
+                """,
+                (
+                    rid,
+                    task_id,
+                    c_at,
+                    f_at,
+                    status,
+                    engine,
+                    effort,
+                    focus_prompt,
+                    regime_title,
+                    dir_count,
+                    json.dumps(result, ensure_ascii=False),
+                ),
+            )
+            conn.execute(
+                """
+                DELETE FROM macro_compass_runs WHERE run_id NOT IN (
+                    SELECT run_id FROM macro_compass_runs ORDER BY finished_at_utc DESC, run_id DESC LIMIT ?
+                )
+                """,
+                (MAX_COMPASS_RUNS_RETENTION,),
+            )
+            conn.execute("COMMIT;")
+            return rid
+        except BaseException:
+            with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK;")
+            raise
+        finally:
+            conn.close()
+
+    def list_compass_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """
+                SELECT run_id, task_id, created_at_utc, finished_at_utc, status,
+                       engine, effort, focus_prompt, regime_title, directions_count
+                FROM macro_compass_runs
+                ORDER BY finished_at_utc DESC, run_id DESC LIMIT ?
+                """,
+                (max(1, min(limit, 60)),),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(r) for r in rows]
+
+    def get_compass_run(self, run_id: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM macro_compass_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "task_id": row["task_id"],
+            "created_at_utc": row["created_at_utc"],
+            "finished_at_utc": row["finished_at_utc"],
+            "status": row["status"],
+            "engine": row["engine"],
+            "effort": row["effort"],
+            "focus_prompt": row["focus_prompt"],
+            "regime_title": row["regime_title"],
+            "directions_count": int(row["directions_count"]),
+            "result": json.loads(row["result_json"]),
+        }
+
+    def get_latest_compass_run(self) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT * FROM macro_compass_runs
+                WHERE status = 'completed'
+                ORDER BY finished_at_utc DESC, run_id DESC LIMIT 1
+                """
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {
+            "run_id": row["run_id"],
+            "task_id": row["task_id"],
+            "created_at_utc": row["created_at_utc"],
+            "finished_at_utc": row["finished_at_utc"],
+            "status": row["status"],
+            "engine": row["engine"],
+            "effort": row["effort"],
+            "focus_prompt": row["focus_prompt"],
+            "regime_title": row["regime_title"],
+            "directions_count": int(row["directions_count"]),
+            "result": json.loads(row["result_json"]),
+        }
 
     # ------------------------------------------------------------------ Warehouse Overview & Diagnostics
     def warehouse_summary(self) -> dict[str, Any]:

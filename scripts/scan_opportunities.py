@@ -151,6 +151,8 @@ def save_universe(
     symbols: list[str],
     description: str = "",
     universes_path: str | None = None,
+    *,
+    allow_overwrite: bool = True,
 ) -> dict:
     """Persist or update a top-down discovered sector universe in universes.json atomically."""
     pool_name = (name or "").strip()
@@ -174,6 +176,8 @@ def save_universe(
     path = os.path.abspath(universes_path or DEFAULT_UNIVERSES_PATH)
     with _universes_lock(path):
         universes = load_universes(path) if os.path.exists(path) else {}
+        if not allow_overwrite and pool_name in universes:
+            raise FileExistsError(f"主题池 '{pool_name}' 已存在，请更换代号或显式确认覆盖")
         existing_desc = universes.get(pool_name, {}).get("description", "")
         final_desc = description.strip() or existing_desc or f"自上而下投研沉淀标的池 ({pool_name})"
         universes[pool_name] = {

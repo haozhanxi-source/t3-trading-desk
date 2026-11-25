@@ -13,6 +13,8 @@ import type {
   SignalMeta,
   SignalSummary,
   Zhongshu,
+  ZhongshuExtensionStage,
+  ZhongshuRelation,
 } from "../../api/types";
 import type { ChartPalette } from "../../lib/theme";
 import type { ZhongshuBoxDrawItem } from "./ZhongshuBoxesPrimitive";
@@ -201,6 +203,61 @@ function toSortedLine(points: { idx: number; time: Time; value: number }[]): Lin
     .map((p) => ({ time: p.time, value: p.value }));
 }
 
+const VALID_RELATIONS = new Set<ZhongshuRelation>([
+  "initial",
+  "new_up",
+  "new_down",
+  "expansion_up",
+  "expansion_down",
+  "overlap",
+]);
+
+function resolveZhongshuRelation(curr: Zhongshu, prev: Zhongshu | undefined): ZhongshuRelation {
+  if (curr.relation_to_prev && VALID_RELATIONS.has(curr.relation_to_prev as ZhongshuRelation)) {
+    return curr.relation_to_prev as ZhongshuRelation;
+  }
+  if (!prev) return "initial";
+  const prevDD = prev.oscillation_dd ?? prev.dd ?? prev.zd;
+  const prevGG = prev.oscillation_gg ?? prev.gg ?? prev.zg;
+  const currDD = curr.oscillation_dd ?? curr.dd ?? curr.zd;
+  const currGG = curr.oscillation_gg ?? curr.gg ?? curr.zg;
+  if (curr.zd > prev.zg) {
+    return currDD > prevGG ? "new_up" : "expansion_up";
+  }
+  if (curr.zg < prev.zd) {
+    return currGG < prevDD ? "new_down" : "expansion_down";
+  }
+  return "overlap";
+}
+
+function resolveExtensionStage(zs: Zhongshu): ZhongshuExtensionStage {
+  if (zs.extension_stage === "core" || zs.extension_stage === "extended" || zs.extension_stage === "upgraded_9") {
+    return zs.extension_stage;
+  }
+  if (zs.is_nine_upgrade || (zs.oscillation_strokes ?? 0) >= 6) return "upgraded_9";
+  if (zs.is_extended || (zs.oscillation_strokes ?? 0) > 0) return "extended";
+  return "core";
+}
+
+/**
+ * Compute price position relative to a Zhongshu [ZD, ZG] matching backend `chanlun.py` format:
+ * `above_zg(+X.XX%)` | `below_zd(-X.XX%)` | `inside_zs(XX%)`.
+ */
+export function computePosVsZs(lastClose: number | null | undefined, zs: Zhongshu | null | undefined): string | null {
+  if (lastClose === null || lastClose === undefined || !Number.isFinite(lastClose) || !zs) return null;
+  if (lastClose > zs.zg && zs.zg > 0) {
+    const pct = (lastClose / zs.zg - 1) * 100;
+    return `above_zg(+${pct.toFixed(2)}%)`;
+  }
+  if (lastClose < zs.zd && zs.zd > 0) {
+    const pct = (lastClose / zs.zd - 1) * 100;
+    return `below_zd(${pct.toFixed(2)}%)`;
+  }
+  const span = zs.zg - zs.zd;
+  const rel = span > 0 ? (lastClose - zs.zd) / span : 0.5;
+  return `inside_zs(${Math.round(rel * 100)}%)`;
+}
+
 function mapZhongshus(
   list: Zhongshu[] | undefined,
   kind: "stroke" | "segment",
@@ -214,48 +271,108 @@ function mapZhongshus(
   const lastCmp = comparableTimestampKey(lastBar.label, intraday);
   const out: ZhongshuBoxDrawItem[] = [];
 
-  for (const zs of list) {
-    let startBar = resolve(zs.start_date);
-    const endRaw = zs.oscillation_end_date || zs.end_date;
-    let endBar = resolve(endRaw);
+  for (let idx = 0; idx < list.length; idx++) {
+    const zs = list[idx];
+    const prev = idx > 0 ? list[idx - 1] : undefined;
+    const relationToPrev = resolveZhongshuRelation(zs, prev);
+    const extensionStage = resolveExtensionStage(zs);
+
+    const sCmp = comparableTimestampKey(zs.start_date, intraday);
+    const cCmp = comparableTimestampKey(zs.end_date, intraday);
+    const hasExtDate = Boolean(zs.oscillation_end_date && zs.oscillation_end_date !== zs.end_date);
+    const eCmp = hasExtDate ? comparableTimestampKey(zs.oscillation_end_date, intraday) : null;
+
+    let coreStartBar = resolve(zs.start_date);
+    let coreEndBar = resolve(zs.end_date);
+    let extEndBar = hasExtDate ? resolve(zs.oscillation_end_date) : null;
+    const nineBar = zs.nine_upgrade_date ? resolve(zs.nine_upgrade_date) : null;
+
     let clampedLeft = false;
     let clampedRight = false;
 
-    /* Clamp ONLY when the Zhongshu genuinely spans across the visible bar window boundary */
-    if (!startBar && endBar && firstCmp) {
-      const sCmp = comparableTimestampKey(zs.start_date, intraday);
-      if (sCmp && sCmp < firstCmp && endBar.idx >= firstBar.idx) {
-        startBar = firstBar;
-        clampedLeft = true;
-      }
+    /* Clamp core [start_date, end_date] strictly only when it genuinely crosses the visible bar window */
+    const coreBeforeLeft = Boolean(sCmp && firstCmp && sCmp < firstCmp);
+    const coreEndBeforeLeft = Boolean(cCmp && firstCmp && cCmp < firstCmp);
+    const coreAfterRight = Boolean(cCmp && lastCmp && cCmp > lastCmp);
+
+    if (!coreStartBar && coreEndBar && coreBeforeLeft && coreEndBar.idx > firstBar.idx) {
+      coreStartBar = firstBar;
+      clampedLeft = true;
     }
-    if (startBar && !endBar && lastCmp) {
-      const eCmp = comparableTimestampKey(endRaw, intraday);
-      if (eCmp && eCmp > lastCmp && startBar.idx <= lastBar.idx) {
-        endBar = lastBar;
-        clampedRight = true;
+    if (coreStartBar && !coreEndBar && coreAfterRight && coreStartBar.idx < lastBar.idx) {
+      coreEndBar = lastBar;
+      clampedRight = true;
+    }
+    if (!coreStartBar && !coreEndBar && coreBeforeLeft && coreAfterRight) {
+      coreStartBar = firstBar;
+      coreEndBar = lastBar;
+      clampedLeft = true;
+      clampedRight = true;
+    }
+
+    const hasCore = Boolean(coreStartBar && coreEndBar);
+    const [cb1, cb2] =
+      coreStartBar && coreEndBar
+        ? coreStartBar.idx <= coreEndBar.idx
+          ? [coreStartBar, coreEndBar]
+          : [coreEndBar, coreStartBar]
+        : [null, null];
+
+    /* Resolve extension tail [end_date, oscillation_end_date] independently without fabricating a core */
+    let extStartBar: IndexedBar | null = null;
+    if (hasExtDate) {
+      if (!extEndBar && eCmp && lastCmp && eCmp > lastCmp) {
+        if (cb2 || (coreEndBeforeLeft && firstCmp && eCmp >= firstCmp)) {
+          extEndBar = lastBar;
+          clampedRight = true;
+        }
+      }
+      if (extEndBar) {
+        if (cb2) {
+          extStartBar = cb2;
+        } else if (coreEndBeforeLeft && extEndBar.idx >= firstBar.idx) {
+          extStartBar = firstBar;
+          clampedLeft = true;
+        }
       }
     }
 
-    if (!startBar || !endBar) continue;
-    const [b1, b2] = startBar.idx <= endBar.idx ? [startBar, endBar] : [endBar, startBar];
-    const prefix = kind === "segment" ? `线段中枢 S${zs.zs_id}` : `笔中枢 Z${zs.zs_id}`;
-    const suffix = zs.is_nine_upgrade ? "·九段" : zs.is_extended ? "·延伸" : "";
-    const truncTag = clampedLeft ? "·左截断" : clampedRight ? "·右截断" : "";
+    const hasExt = Boolean(extStartBar && extEndBar && extEndBar.idx > extStartBar.idx);
+    if (!hasCore && !hasExt) continue;
+
+    const anchorIdx = cb1 ? cb1.idx : (extStartBar?.idx ?? firstBar.idx);
+    const compactCode = kind === "segment" ? `S${zs.zs_id}` : `Z${zs.zs_id}`;
+    const fullPrefix = kind === "segment" ? `线段中枢 ${compactCode}` : `笔中枢 ${compactCode}`;
+    const truncTag = clampedLeft && clampedRight ? "·双端截断" : clampedLeft ? "·左截断" : clampedRight ? "·右截断" : "";
+
     out.push({
-      key: `${kind}-${zs.zs_id}-${b1.idx}`,
+      key: `${kind}-${zs.zs_id}-${anchorIdx}`,
+      zsId: zs.zs_id,
       kind,
-      label: `${prefix}${suffix}${truncTag}`,
-      startTime: b1.time,
-      endTime: b2.time,
-      startLabel: b1.label,
-      endLabel: b2.label,
+      label: `${fullPrefix}${truncTag}`,
+      compactCode,
+      coreStartTime: cb1 ? cb1.time : null,
+      coreEndTime: cb2 ? cb2.time : null,
+      extStartTime: hasExt && extStartBar ? extStartBar.time : null,
+      extEndTime: hasExt && extEndBar ? extEndBar.time : null,
+      nineUpgradeTime: nineBar ? nineBar.time : null,
+      startLabel: cb1 ? cb1.label : zs.start_date,
+      coreEndLabel: cb2 ? cb2.label : zs.end_date,
+      extEndLabel: hasExt && extEndBar ? extEndBar.label : (zs.oscillation_end_date ?? null),
+      nineUpgradeLabel: zs.nine_upgrade_date ?? null,
+      clampedLeft,
+      clampedRight,
       zd: zs.zd,
       zg: zs.zg,
       dd: zs.dd,
       gg: zs.gg,
-      isExtended: zs.is_extended,
-      isNineUpgrade: zs.is_nine_upgrade,
+      oscillationStrokes: zs.oscillation_strokes ?? 0,
+      isExtended: Boolean(zs.is_extended),
+      isNineUpgrade: Boolean(zs.is_nine_upgrade),
+      status: zs.status,
+      trendZsIndex: zs.trend_zs_index,
+      relationToPrev,
+      extensionStage,
     });
   }
   return out;

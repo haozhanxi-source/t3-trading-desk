@@ -39,9 +39,13 @@ export function fmtNum(v: unknown, dp = 2): string {
   return n === null ? "—" : fmtr(0, dp).format(n);
 }
 
-export function fmtFixed(v: unknown, dp = 2): string {
+export function fmtFixed(v: unknown, dp = 2, signed = false): string {
   const n = toNum(v);
-  return n === null ? "—" : fmtr(dp, dp).format(n);
+  if (n === null) return "—";
+  if (!signed) return fmtr(dp, dp).format(n);
+  const absFormatted = fmtr(dp, dp).format(Math.abs(n));
+  if (!/[1-9]/.test(absFormatted)) return `+${absFormatted}`;
+  return `${n < 0 ? "-" : "+"}${absFormatted}`;
 }
 
 export function fmtPct(v: unknown, dp = 2, signed = false): string {

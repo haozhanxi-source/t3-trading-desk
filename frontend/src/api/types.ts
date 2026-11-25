@@ -263,6 +263,7 @@ export interface SentinelHolding {
   info_notes: string[];
   suggested_trail_stop?: SuggestedTrailStop | null;
   trigger_results?: Dict[];
+  verifiable_trigger_ids?: string[];
   upcoming_events?: UpcomingEvent[];
   data_warnings?: unknown[];
   checked_at_utc?: string;
@@ -348,9 +349,19 @@ export interface ChanlunSegment {
   is_confirmed: boolean;
 }
 
+export type ZhongshuRelation =
+  | "initial"
+  | "new_up"
+  | "new_down"
+  | "expansion_up"
+  | "expansion_down"
+  | "overlap";
+
+export type ZhongshuExtensionStage = "core" | "extended" | "upgraded_9";
+
 export interface Zhongshu {
   zs_id: number;
-  direction: "up" | "down";
+  direction: "up" | "down" | "neutral" | string;
   zd: number;
   zg: number;
   dd?: number;
@@ -362,8 +373,13 @@ export interface Zhongshu {
   status?: string;
   oscillation_strokes?: number;
   oscillation_end_date?: string | null;
+  oscillation_dd?: number | null;
+  oscillation_gg?: number | null;
   is_nine_upgrade?: boolean;
   trend_zs_index?: number;
+  relation_to_prev?: ZhongshuRelation | string | null;
+  extension_stage?: ZhongshuExtensionStage | string | null;
+  nine_upgrade_date?: string | null;
 }
 
 export interface SignalMeta {
@@ -668,10 +684,28 @@ export interface ArchiveListItem {
   archive_dir?: string;
 }
 
+export interface TriggerVerification {
+  method: "ai_web" | "manual" | string;
+  status: "clear" | "fired" | "uncertain" | string;
+  observed?: number | string | boolean | null;
+  observed_text?: string;
+  summary?: string;
+  evidence_tier?: "L1" | "L2" | "L3" | "L4" | string;
+  source_title?: string;
+  source_url?: string;
+  verified_at_utc?: string;
+  ttl_days?: number;
+}
+
 export interface ArchiveTrigger {
   id?: string;
   category?: string;
   kind?: string;
+  evaluation_mode?: "auto" | "ai_web" | "manual" | string;
+  verification_ttl_days?: number;
+  verification?: TriggerVerification | null;
+  last_checked_at?: string | null;
+  last_value?: unknown;
   metric?: string;
   operator?: string;
   threshold?: number | string | null;
@@ -722,6 +756,15 @@ export interface EvidenceItem {
   [k: string]: unknown;
 }
 
+export interface TriggerServerEvaluation {
+  is_auto?: boolean;
+  evaluated?: boolean;
+  fired?: boolean;
+  verification_stale?: boolean;
+  verification_status?: string | null;
+  error?: string | null;
+}
+
 export interface ArchiveDetail {
   market: string;
   symbol: string;
@@ -730,6 +773,7 @@ export interface ArchiveDetail {
   evidence_count: number;
   recent_evidence: EvidenceItem[];
   thesis_md: string;
+  trigger_evaluations?: Record<string, TriggerServerEvaluation>;
 }
 
 export interface ArchiveInitBody {
@@ -791,7 +835,15 @@ export interface ScanRow {
   error?: string;
 }
 
-export type TaskKind = "scan" | "research_refresh" | "research-refresh" | "deep_research" | "sentinel" | string;
+export type TaskKind =
+  | "scan"
+  | "research_refresh"
+  | "research-refresh"
+  | "deep_research"
+  | "sentinel"
+  | "trigger_verify"
+  | "macro_compass"
+  | string;
 export type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | string;
 
 export type DeepResearchMode = "standard" | "adversarial";
@@ -889,6 +941,14 @@ export interface WarehouseSummary {
   }[];
 }
 
+export interface CompassScanContext {
+  run_id?: string;
+  direction_id?: string;
+  direction_title?: string;
+  direction: "long" | "short" | "pair";
+  expected_directions: Record<string, "long" | "short">;
+}
+
 export interface PersistedScanRun {
   run_id: string;
   task_id?: string | null;
@@ -902,5 +962,150 @@ export interface PersistedScanRun {
   error_count: number;
   degraded_count: number;
   actionable_count: number;
+  compass_context?: CompassScanContext | null;
   rows?: ScanRow[];
 }
+
+/* ---------------- Layer 1 Top-Down Strategic Compass ---------------- */
+export interface MacroHeadlineMetric {
+  key: string;
+  label: string;
+  value: number | null;
+  unit: string;
+  delta?: number | null;
+  delta_unit?: string;
+  as_of?: string | null;
+  source?: string;
+}
+
+export interface MacroRegimeTag {
+  label: string;
+  tone: "good" | "warning" | "critical" | "neutral" | string;
+}
+
+export interface CrossAssetAnchorItem {
+  symbol: string;
+  name: string;
+  group: string;
+  group_label: string;
+  status: "ok" | "unavailable" | string;
+  last: number | null;
+  ret_5d_pct: number | null;
+  ret_20d_pct: number | null;
+  ret_60d_pct: number | null;
+  as_of?: string | null;
+}
+
+export interface CompassMacroOverview {
+  fetched_at_utc: string;
+  cache_hit?: boolean;
+  sources_status: Record<string, string>;
+  stale_sources?: Record<string, { last_good_at_utc?: string | null; error?: string }>;
+  regime_tags: MacroRegimeTag[];
+  headline_metrics: MacroHeadlineMetric[];
+  anchors?: {
+    status: string;
+    ok_count?: number;
+    total?: number;
+    items: CrossAssetAnchorItem[];
+  };
+}
+
+export interface CompassDriverItem {
+  dimension: string;
+  summary: string;
+}
+
+export interface CompassLeaderItem {
+  symbol: string;
+  asset_class?: string;
+  name: string;
+  leg: "long" | "short";
+  role: "sole_leader" | "co_leader" | string;
+  reason: string;
+}
+
+export interface CompassEvidenceItem {
+  fact: string;
+  level: "L1" | "L2" | "L3" | "L4" | string;
+  date?: string;
+  source?: string;
+  url?: string;
+  verification_status?: string;
+}
+
+export interface CompassDirectionCard {
+  id: string;
+  rank: number;
+  title: string;
+  direction: "long" | "short" | "pair";
+  horizon: string;
+  conviction: "high" | "medium" | string;
+  asset_scope: string;
+  primary_driver: CompassDriverItem;
+  secondary_driver: CompassDriverItem;
+  thesis: string;
+  value_chain_focus?: string;
+  long_leg_sector?: string;
+  short_leg_sector?: string;
+  sector_keywords?: string[];
+  reference_anchors?: string[];
+  key_catalyst: string;
+  invalidation: string;
+  recommended_universes: string[];
+  is_new_theme: boolean;
+  suggested_pool_name: string;
+  suggested_pool_description: string;
+  portfolio_overlap?: string[];
+  leaders: CompassLeaderItem[];
+  evidence: CompassEvidenceItem[];
+}
+
+export interface CompassResultPayload {
+  regime_title: string;
+  regime_summary: string;
+  macro_signals?: {
+    us_macro?: string;
+    china_macro?: string;
+    geopolitics_supply?: string;
+    tech_industry?: string;
+  };
+  avoid_sectors?: { sector: string; reason: string }[];
+  directions: CompassDirectionCard[];
+  risk_warnings?: string[];
+  generated_at_utc?: string;
+  engine?: string;
+  effort?: string;
+  focus_prompt?: string;
+}
+
+export interface CompassRunSummary {
+  run_id: string;
+  task_id?: string | null;
+  created_at_utc: string;
+  finished_at_utc: string;
+  status: string;
+  engine: string;
+  effort?: string;
+  focus_prompt?: string;
+  regime_title: string;
+  directions_count: number;
+}
+
+export interface CompassRunRecord extends CompassRunSummary {
+  result: CompassResultPayload;
+}
+
+export interface CompassLatestResponse {
+  latest: CompassRunRecord | null;
+  history: CompassRunSummary[];
+  active_task: TaskRecord | null;
+}
+
+export interface MacroCompassRequest {
+  engine?: DeepResearchEngine | "";
+  effort?: "low" | "medium" | "high";
+  focus_prompt?: string;
+  refresh_macro?: boolean;
+}
+

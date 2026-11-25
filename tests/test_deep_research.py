@@ -338,3 +338,61 @@ def test_api_deep_research_single_flight_and_cancel(tmp_path: Path, monkeypatch:
         assert rc.status_code == 200
         assert rc.json()["status"] == "cancelled"
         release.set()
+
+
+def test_equity_prompt_and_template_include_upgraded_l3_audit_and_premortem(tmp_path: Path) -> None:
+    prompt = deep_research.build_research_prompt(
+        brief_path="brief.json",
+        symbol="NVDA",
+        market="US",
+        asset_class="us_stock_or_etf",
+        name="NVIDIA",
+    )
+    for required_phrase in (
+        "受益纯度",
+        "瓶颈久期",
+        "NRE",
+        "Mix Shift",
+        "Drag Segment",
+        "H2 Weighting",
+        "Rule 10b-18",
+        "红队 Pre-Mortem",
+        "严禁用主观概率加权目标价",
+        "严禁主张“因果链完好时杀估值就逆势加仓”",
+    ):
+        assert required_phrase in prompt, f"Missing expected stock Layer 3 rule: {required_phrase}"
+
+    adv_prompt = deep_research.build_adversarial_prompt(
+        brief_path="brief.json",
+        symbol="NVDA",
+        market="US",
+        asset_class="us_stock_or_etf",
+        name="NVIDIA",
+        draft_summary="AI 算力龙头",
+        draft_direction="long",
+        draft_thesis_md="初稿正文",
+    )
+    assert "红队 Pre-Mortem" in adv_prompt
+    assert "3~5 条具体、可证伪的失败路径" in adv_prompt
+
+    # Commodity prompt stays clean (no stock-specific NRE/10b-18 pollution)
+    comm_prompt = deep_research.build_research_prompt(
+        brief_path="brief.json",
+        symbol="NI0",
+        market="CN_FUTURES",
+        asset_class="cn_future",
+        name="沪镍",
+    )
+    assert "Rule 10b-18" not in comm_prompt
+    assert "强现实 vs 弱预期" in comm_prompt
+
+    # Equity archive template upgraded with 10-item checklist & Pre-Mortem
+    init_res = ra.init_archive("NVDA", name="NVIDIA", research_root=str(tmp_path))
+    assert init_res["status"] == "created"
+    loaded = ra.load_archive("NVDA", research_root=str(tmp_path))
+    md = loaded["thesis_md"]
+    assert "一手财报与订单核验清单（10 项" in md
+    assert "期后 8-K 净现金与净债务桥" in md
+    assert "红队 Pre-Mortem" in md
+    assert "现价隐含预期拆解" in md
+

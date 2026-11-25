@@ -787,6 +787,14 @@ _CONTRACT_PRICE_OBS_KEYS: tuple[str, ...] = (
 )
 
 
+KNOWN_AUTO_METRICS: frozenset[str] = ra_mod.KNOWN_AUTO_METRICS
+
+
+def is_known_auto_metric(metric: str | None) -> bool:
+    """Return True if ``metric`` is populated automatically by ``extract_sentinel_observations``."""
+    return ra_mod.is_known_auto_metric(metric)
+
+
 def extract_sentinel_observations(
     research_bundle: dict[str, Any] | None,
     snapshot: dict[str, Any] | None,
@@ -1712,6 +1720,101 @@ def _looks_like_futures_contract(code: str | None, asset_class: str | None = Non
             or re.fullmatch(r"[A-Z]{1,4}[FGHJKMNQUVXZ]\d{2}(?:\.[A-Z]{2,4})?", s)
         )
     )
+
+
+def _continuous_futures_root(code: str | None) -> str | None:
+    if not code or not isinstance(code, str):
+        return None
+    s = code.strip().upper()
+    if s.endswith("=F") and len(s) > 2:
+        root = s[:-2]
+        return root if root.isalpha() else None
+    m = re.fullmatch(r"([A-Z]{1,3})0", s)
+    return m.group(1) if m else None
+
+
+def _is_continuous_futures_code(code: str | None, asset_class: str | None = None) -> bool:
+    """Return True if ``code`` represents a continuous futures symbol (e.g. ``NI0``, ``CL=F``)."""
+    del asset_class
+    return _continuous_futures_root(code) is not None
+
+
+def _infer_dominant_contract_from_bundle(
+    raw_contract_sym: str,
+    research_bundle: dict[str, Any] | None,
+    ref_date: date,
+) -> dict[str, Any] | None:
+    """Infer reference active dominant dated contract from fresh ``term_structure`` for the same commodity root.
+
+    Strictly filters out:
+    - stale term-structure quotes (>7 days old or >1 day in the future),
+    - contracts belonging to a different commodity root,
+    - already-expired contracts (est_last_trading_day < ref_date),
+    - rows without positive open_interest or volume (never blindly picks row 0 with 0 OI/vol).
+    """
+    if not isinstance(research_bundle, dict):
+        return None
+    target_root = _continuous_futures_root(raw_contract_sym)
+    if not target_root:
+        return None
+    _, ts = _get_source_block(research_bundle, "term_structure")
+    if not _is_usable_source(ts) or not isinstance(ts, dict):
+        return None
+
+    raw_qd = ts.get("quote_date")
+    if not isinstance(raw_qd, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_qd.strip()):
+        return None
+    try:
+        quote_date = date.fromisoformat(raw_qd.strip())
+    except ValueError:
+        return None
+    age = (ref_date - quote_date).days
+    if age > 7 or age < -1:
+        return None
+
+    def _valid_candidate(sym_str: str) -> dict[str, Any] | None:
+        parsed = _extract_futures_contracts(sym_str, ref_date=ref_date)
+        for info in parsed:
+            if str(info.get("root") or "").upper() != target_root:
+                continue
+            ltd = info.get("est_last_trading_day")
+            if isinstance(ltd, date) and ltd >= ref_date:
+                return info
+        return None
+
+    best_by_oi: tuple[tuple[float, float], dict[str, Any]] | None = None
+    best_by_vol: tuple[float, dict[str, Any]] | None = None
+    raw_contracts = ts.get("contracts")
+    if isinstance(raw_contracts, list):
+        for row in raw_contracts:
+            if not isinstance(row, dict):
+                continue
+            sym = str(row.get("symbol") or row.get("contract") or "").strip()
+            if not sym:
+                continue
+            cinfo = _valid_candidate(sym)
+            if cinfo is None:
+                continue
+            oi = _to_float(row.get("open_interest")) or 0.0
+            vol = _to_float(row.get("volume")) or 0.0
+            if oi > 0.0:
+                rank = (oi, vol)
+                if best_by_oi is None or rank > best_by_oi[0]:
+                    best_by_oi = (
+                        rank,
+                        {**cinfo, "inferred_from": raw_contract_sym, "selection_basis": "open_interest"},
+                    )
+            elif vol > 0.0:
+                if best_by_vol is None or vol > best_by_vol[0]:
+                    best_by_vol = (
+                        vol,
+                        {**cinfo, "inferred_from": raw_contract_sym, "selection_basis": "volume"},
+                    )
+    if best_by_oi is not None:
+        return best_by_oi[1]
+    if best_by_vol is not None:
+        return best_by_vol[1]
+    return None
 
 
 def _resolve_traded_contract(
@@ -3343,15 +3446,31 @@ def evaluate_holding_health(
 
     trigger_results: list[dict[str, Any]] = []
     unevaluated_triggers: list[str] = []
+    verifiable_trigger_ids: list[str] = []
     if armed_triggers:
-        trigger_results = ra_mod.evaluate_triggers({"triggers": armed_triggers}, observations)
+        eval_now_utc = now_utc if now_utc is not None else (None if ref_date is not None else datetime.now(timezone.utc))
+        trigger_results = ra_mod.evaluate_triggers(
+            {"triggers": armed_triggers},
+            observations,
+            ref_date=anchor,
+            now_utc=eval_now_utc,
+        )
         for tr in trigger_results:
             tid = str(tr.get("id") or "?")
             metric = tr.get("metric")
+            is_auto = ra_mod.is_trigger_auto_metric(tr)
             if tr.get("error"):
-                data_warnings.append(f"trigger[{tid}]: {tr['error']}")
+                # Only surface hard evaluation errors as upstream data warnings when auto metric failed;
+                # stale/uncertain policy verifications are handled cleanly under unevaluated_triggers.
+                if is_auto and not tr.get("verification_stale"):
+                    data_warnings.append(f"trigger[{tid}]: {tr['error']}")
             if tr.get("evaluated") is not True:
-                err_txt = f": {tr['error']}" if tr.get("error") else ": 指标缺失"
+                if not is_auto:
+                    if tid != "?" and tid not in verifiable_trigger_ids:
+                        verifiable_trigger_ids.append(tid)
+                    err_txt = f": {tr['error']}" if tr.get("error") else ": 需 AI 联网或人工核验"
+                else:
+                    err_txt = f": {tr['error']}" if tr.get("error") else ": 指标缺失"
                 unevaluated_triggers.append(f"{tid}({metric}{err_txt})")
                 continue
             if not tr.get("fired"):
@@ -3540,12 +3659,58 @@ def evaluate_holding_health(
         and _looks_like_futures_contract(raw_contract_sym, asset_class)
         and not _extract_futures_contracts(raw_contract_sym, ref_date=anchor)
     ):
-        ltd_warn = (
-            f"futures_roll_window: 无法解析持仓合约 {raw_contract_sym!r} 的最后交易日(LTD)，"
-            "请填写具体交割合约代码并人工核对移仓窗口"
+        is_cont = _is_continuous_futures_code(raw_contract_sym, asset_class)
+        inferred_dom = (
+            _infer_dominant_contract_from_bundle(raw_contract_sym, research_bundle, anchor)
+            if is_cont
+            else None
         )
-        if ltd_warn not in data_warnings:
-            data_warnings.append(ltd_warn)
+        if is_cont:
+            # Never add inferred contract to extracted_contracts_map (don't fake real-position expiry alerts)
+            # and never silently grant GREEN for an unmapped continuous holding.
+            ref_hint = (
+                f"当前曲线参考主力 {inferred_dom['contract']}（预计最后交易日 "
+                f"{inferred_dom['est_last_trading_day'].isoformat()}，依据 {inferred_dom['selection_basis']}）；"
+                "若实盘持有近月交割合约，需以实际合约到期日为准"
+                if inferred_dom is not None
+                else "当前未能从有效期限曲线推断参考主力，请在账本填写具体交割月合约代码以盯防移仓"
+            )
+            yellow_alerts.append({
+                "layer": "roll_window",
+                "code": "continuous_contract_unmapped",
+                "message": f"持仓登记为连续合约 {raw_contract_sym}，请补充具体交割月合约以精确盯防移仓",
+                "detail": ref_hint,
+            })
+            if inferred_dom is None:
+                ltd_warn = (
+                    f"futures_roll_window: 无法解析持仓合约 {raw_contract_sym!r} 的最后交易日(LTD)，"
+                    "请填写具体交割合约代码并人工核对移仓窗口"
+                )
+                if ltd_warn not in data_warnings:
+                    data_warnings.append(ltd_warn)
+        else:
+            ltd_warn = (
+                f"futures_roll_window: 无法解析持仓合约 {raw_contract_sym!r} 的最后交易日(LTD)，"
+                "请填写具体交割合约代码并人工核对移仓窗口"
+            )
+            if ltd_warn not in data_warnings:
+                data_warnings.append(ltd_warn)
+    elif (
+        not extracted_contracts_map
+        and asset_class in {"commodity", "cn_future"}
+        and _is_continuous_futures_code(norm_sym, asset_class)
+    ):
+        inferred_dom = _infer_dominant_contract_from_bundle(norm_sym, research_bundle, anchor)
+        if inferred_dom is not None:
+            info_notes.append(
+                f"期货持仓 {norm_sym} 未登记具体交割月合约（参考当前曲线主力 {inferred_dom['contract']}，"
+                f"预计最后交易日 {inferred_dom['est_last_trading_day'].isoformat()}），"
+                "建议在账本补充实盘交割合约代码以启用移仓红线"
+            )
+        else:
+            info_notes.append(
+                f"期货持仓 {norm_sym} 未登记具体交割月合约，建议在账本补充实盘合约代码以启用移仓红线"
+            )
 
     roll_lookahead = max(ROLL_INFO_WINDOW_DAYS, event_window_days)
     for cinfo in extracted_contracts_map.values():
@@ -3679,6 +3844,7 @@ def evaluate_holding_health(
         "info_notes": info_notes,
         "suggested_trail_stop": suggested_trail_stop,
         "trigger_results": trigger_results,
+        "verifiable_trigger_ids": verifiable_trigger_ids,
         "upcoming_events": upcoming_events,
         "data_warnings": data_warnings,
         "green_preconditions": green_preconditions,
@@ -3848,14 +4014,20 @@ def _build_surgical_trigger_patch(
                     t_copy["last_value"] = _sanitize_for_json(obs_val)
                     # Re-evaluate against fresh threshold/operator in case they changed concurrently
                     try:
+                        eval_src = matched.get("evaluation_source")
+                        fresh_obs = (
+                            {str(t_copy.get("metric") or ""): obs_val}
+                            if eval_src in (None, "live")
+                            else {}
+                        )
                         fresh_eval = ra_mod.evaluate_triggers(
                             {"triggers": [t_copy]},
-                            {str(t_copy.get("metric") or ""): obs_val},
+                            fresh_obs,
                         )
                         if fresh_eval and fresh_eval[0].get("evaluated") is True:
                             t_copy["status"] = "fired" if fresh_eval[0].get("fired") else "armed"
                         else:
-                            t_copy["status"] = "fired" if matched.get("fired") else "armed"
+                            t_copy["status"] = "fired" if matched.get("fired") else "unevaluated"
                     except Exception:  # noqa: BLE001
                         t_copy["status"] = "fired" if matched.get("fired") else "armed"
                 else:

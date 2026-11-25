@@ -20,8 +20,9 @@ import re
 import sys
 import tempfile
 import threading
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(__file__))
 from market_snapshot import normalize_symbol
@@ -56,6 +57,174 @@ VALID_TRIGGER_KINDS = {
     "spread",
     "rate_diff",
 }
+VALID_EVALUATION_MODES = {"auto", "ai_web", "manual"}
+VALID_VERIFICATION_METHODS = {"ai_web", "manual"}
+VALID_VERIFICATION_STATUSES = {"clear", "fired", "uncertain"}
+DEFAULT_VERIFICATION_TTL_DAYS = 7
+MAX_FUTURE_CLOCK_SKEW_SECONDS = 0
+
+KNOWN_AUTO_METRICS: frozenset[str] = frozenset({
+    # Price / Technicals / Chanlun
+    "close",
+    "contract_close",
+    "continuous_close",
+    "atr14",
+    "atr14_30m",
+    "return_1d_pct",
+    "return_5d_pct",
+    "return_1bar_30m_pct",
+    "return_5bar_30m_pct",
+    "daily_zd",
+    "daily_zg",
+    "intraday_30m_zd",
+    "intraday_30m_zg",
+    "daily_signal",
+    "intraday_30m_signal",
+    # Commodities
+    "curve_structure",
+    "roll_yield_near_pct",
+    "roll_yield_curve_pct",
+    "front_far_spread",
+    "basis_pct",
+    "spot_price",
+    "inventory_latest",
+    "inventory_chg_pct",
+    "bdti",
+    "bcti",
+    "bdi",
+    "bci",
+    "bsi",
+    "cftc_mm_net",
+    "cftc_mm_net_pct_oi",
+    # FX
+    "rate_diff_10y_bp",
+    "rate_diff_2y_bp",
+    "tff_lev_money_net",
+    "tff_pair_aligned_net",
+    # Equities
+    "pe_ttm_pctile_5y",
+    "pb_pctile_5y",
+    "pe_ttm",
+    "pb",
+    "forward_pe",
+    "short_pct_float",
+    "target_mean_price",
+    "next_earnings_date",
+    "days_to_earnings",
+    # Crypto
+    "etf_flow_5d_m",
+    "etf_flow_20d_m",
+    "stablecoin_chg_7d_pct",
+    "perp_oi_usd",
+    "perp_oi_contracts",
+    "perp_funding_ann_pct",
+    # Generic cross-market spread keys
+    "cross_spread",
+    "cross_spread_pct",
+    "cross_ratio",
+})
+
+_UTC_SPACE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?\s+UTC$")
+_ISO_TZ_TS_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def is_known_auto_metric(metric: Any) -> bool:
+    """Return True if ``metric`` is populated automatically by sentinel live observations."""
+    if not isinstance(metric, str):
+        return False
+    key = metric.strip()
+    if not key:
+        return False
+    if key in KNOWN_AUTO_METRICS:
+        return True
+    if "_vs_" in key or key.endswith(("_spread", "_spread_pct", "_ratio", "_import_margin")):
+        return True
+    return False
+
+
+def is_trigger_auto_metric(trig: dict[str, Any]) -> bool:
+    """Return True if ``trig`` represents a live machine-evaluated metric (never overridable by AI/manual)."""
+    metric = trig.get("metric")
+    if is_known_auto_metric(metric):
+        return True
+    return str(trig.get("evaluation_mode") or "").strip().lower() == "auto"
+
+
+def is_valid_http_url(url: Any) -> bool:
+    """Strictly validate an HTTP(S) URL with a non-empty hostname and no control/whitespace/userinfo/backslash chars."""
+    if not isinstance(url, str):
+        return False
+    s = url.strip()
+    if not s or len(s) > 2000:
+        return False
+    if "\\" in s:
+        return False
+    if any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in s):
+        return False
+    try:
+        parsed = urlsplit(s)
+        _ = parsed.port  # raises ValueError on invalid port like :nope or out-of-range
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return False
+    if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
+        return False
+    host = parsed.hostname
+    if not host or host.startswith(".") or host.endswith("."):
+        return False
+    return True
+
+
+def parse_strict_utc_timestamp(ts: Any) -> datetime | None:
+    """Parse strict timezone-aware UTC/ISO-8601 timestamp into aware UTC ``datetime``; reject garbage/naive."""
+    if not isinstance(ts, str):
+        return None
+    s = ts.strip()
+    if not s:
+        return None
+    m_utc = _UTC_SPACE_TS_RE.fullmatch(s)
+    if m_utc:
+        d_part, hm_part, sec_part = m_utc.group(1), m_utc.group(2), m_utc.group(3) or "00"
+        try:
+            return datetime.fromisoformat(f"{d_part}T{hm_part}:{sec_part}+00:00").astimezone(timezone.utc)
+        except ValueError:
+            return None
+    m_iso = _ISO_TZ_TS_RE.fullmatch(s)
+    if m_iso:
+        iso_norm = s.replace(" ", "T")
+        if iso_norm.endswith("Z"):
+            iso_norm = iso_norm[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(iso_norm)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return None
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def trigger_definition_fingerprint(trig: dict[str, Any]) -> dict[str, Any]:
+    """Return canonical definition snapshot used for optimistic conflict detection during async verification."""
+    return {
+        "kind": str(trig.get("kind") or "").strip().lower(),
+        "evaluation_mode": str(trig.get("evaluation_mode") or "").strip().lower(),
+        "metric": str(trig.get("metric") or "").strip(),
+        "operator": str(trig.get("operator") or "").strip(),
+        "threshold": trig.get("threshold"),
+        "action": str(trig.get("action") or "").strip(),
+        "status": str(trig.get("status") or "armed").strip().lower(),
+        "verification_ttl_days": trig.get("verification_ttl_days"),
+        "description": str(trig.get("description") or "").strip(),
+    }
+
+
+def utc_now_iso_seconds() -> str:
+    """Return second-precision UTC ISO-8601 timestamp (e.g. '2026-11-25T06:50:12Z')."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 _INPROC_LOCKS_GUARD = threading.Lock()
 _INPROC_LOCKS: dict[str, threading.RLock] = {}
@@ -334,35 +503,47 @@ def _build_equity_template(
 > 定位：纯研究层——确立 1~3 年远期盈利与估值预期差，完成一手财报核验与独立红蓝对抗，输出客观研究裁决，**不决定入场价、表达方式与仓位大小**。
 
 ### 1~3 年远期预期拆解与预期差
+- **定型、受益纯度与瓶颈久期**：待定（A 成长 / B 强周期 / C 稳定现金流 / D 困境反转；量化核心逻辑真实收入占比；区分材料/工艺 5~10 年、客户验证 2~5 年[防大客户自研绕过]、纯产能缺货 1~3 年[按 B 型周期股处理]）
 - **估值锚选择**：（成长看前瞻 1~3Y EPS×PE 与二阶增速；强周期看中周期正常化盈利与产能拐点，严禁景气顶峰因静态低 PE 接飞刀；A 股结合 5 年 PE(TTM)/PB 分位，美股结合一致预期修正与空头比例）
-- **收入驱动树**：待拆解（量 × 价 × 结构）
+- **收入驱动树与分部三拆**：待拆解（量 × 价 × 高毛利 Mix Shift − 衰退老业务 Drag Segment；如指引压向 H2 放量须按 H1 实绩倒推 H2 隐含环比增速）
 - **预期差来源**：一致预期 vs 我们的判断 vs 验证时间点（说不出预期差最多进观察池）
 
-#### 三情景估值与压缩压力测试（EPS × PE，强制标注 GAAP / Adjusted 口径）
+#### 情景压力测试与现价隐含预期拆解（EPS × PE，强制标注 GAAP / Adjusted 口径）
 | 情景 | 盈利假设 (EPS / 口径) | 估值倍数 (PE) | 目标价 | 相对现价空间 |
 | :--- | :--- | :---: | :---: | :---: |
 | **牛情景** | 待核验 | 待核验 | 待算 | |
 | **基准情景** | 待核验 | 待核验 | 待算 | |
 | **熊1（估值回归）** | EPS 持平 | 回到 5 年中枢 | 待算 | |
 | **熊2（戴维斯双杀）** | EPS -10% | 进一步压缩 | 待算 | |
+| **叙事崩塌** | 逻辑证伪/订单取消 | 周期谷底估值 | 待算 | |
 
-### 一手财报核验清单（7 项，缺项标“待核验”）
+- **现价隐含预期拆解（仅作风险暴露描述，非入场门槛，严禁替代第四层缠论决策）**：常态基础价值区间 + 有限期周期超额利润折现（不可乘成长股 PE） + 叙事/期权残差区间。
+
+### 一手财报与订单核验清单（10 项，缺项标“待核验”）
 1. **指引与 EPS 口径（GAAP vs Adjusted）**：待核验
-2. **在手订单 / RPO 硬合同 vs 框架预估拆分**：待核验
-3. **合同类型（固定总价占比与利润率 ±1pp 敏感度）**：待核验
-4. **客户与单一需求链集中度**：待核验
-5. **现金流质量（FCF/净利、应收与合同资产变化）**：待核验
-6. **并购商誉与股权稀释（SBC）**：待核验
-7. **债务到期结构与利率敏感度**：待核验
+2. **订单七阶段审计与 NRE 剥离**：待核验（科学验证 / 产品导入 / 客户验证 / 具约束力 PO / 量产爬坡 / 稳定复购 / 未证实传闻；剥离一次性工程费 NRE 与可放量产品收入；拆分硬 RPO 与框架预估）
+3. **分部结构（Mix Shift / Drag Segment）与 H2 放量指引桥**：待核验
+4. **合同类型（固定总价占比与利润率 ±1pp 敏感度）**：待核验
+5. **客户/单一需求链集中度与自研替代风险**：待核验
+6. **现金流质量与营运资金（FCF/净利、存货与应收相对营收增速）**：待核验
+7. **期后 8-K 净现金与净债务桥**：待核验（核对季报截止日后的并购交割、新增债务、受限现金与流动性跑道）
+8. **股本稀释与真实回购弹药**：待核验（3~5 年期末股数趋势、SBC、ATM/可转债/Warrants；回购按 Rule 10b-18 日均成交额 ≤25% 折算，CFO 最新表态高于历史规律）
+9. **周期顶部双面核验（如适用）**：待核验（交期/Book-to-Bill/长协/配给是否隐含重复下单，交叉核对月度营收、现货价与“利好不创新高”）
+10. **债务到期结构与利率敏感度**：待核验
 
-### 红蓝辩论反方必答 7 问（核心论据须有 L1/L2 证据）
+### 红蓝辩论反方必答 7 问 + 红队 Pre-Mortem（核心论据须有 L1/L2 证据）
 1. EPS 持平、PE 回归历史中枢跌多少？
-2. 剔除软订单/框架预估后真实增速剩多少？
+2. 按订单七阶段剔除软订单/框架预估与 NRE 后，真实可放量增速剩多少（含衰退老业务与 H2 放量风险）？
 3. 利润率压缩 1pp 对 EPS 冲击多大？
-4. 预期差是否已被当前股价/一致目标价充分定价？
-5. 最大单一客户或需求链断供会怎样？
-6. 核心基本面/估值证伪指标与预期差失效阈值在哪？（具体日线/30min 止损位交由第四层设定）
-7. 该论点历史上最近一次被证伪的案例是什么？
+4. 预期差与现价叙事溢价是否已被当前股价充分定价？
+5. 最大单一客户或需求链断供/自研替代会怎样？
+6. 期后现金消耗、债务或 ATM/SBC 股本稀释是否侵蚀股东权益？
+7. 该论点历史上最近一次被证伪的案例是什么？核心领先证伪指标与预期差失效阈值在哪？（具体日线/30min 止损位交由第四层设定）
+
+#### 红队 Pre-Mortem（假设 6 个月后此笔头寸大亏，提前写死 3~5 条具体失败路径）
+- 失败路径 1：待填写（具体触发事件 → 传导后果 → 对应领先监控指标）
+- 失败路径 2：待填写
+- 失败路径 3：待填写
 
 ### 第三层客观研究结论（不含下单与仓位决策）
 - **研究方向与置信度**：待定（中长线以做多为主；列明 `L1/L2` 证据支撑与待核验项）
@@ -697,6 +878,7 @@ def _validate_state_patch(patch: dict[str, Any]) -> None:
         if list_key in patch and not isinstance(patch[list_key], list):
             raise ValueError(f"Field {list_key!r} must be a JSON array")
     if "triggers" in patch:
+        seen_trig_ids: set[str] = set()
         for trig in patch["triggers"]:
             if not isinstance(trig, dict):
                 raise ValueError("Each trigger must be a JSON object")
@@ -704,6 +886,10 @@ def _validate_state_patch(patch: dict[str, Any]) -> None:
                 val = trig.get(req)
                 if not isinstance(val, str) or not val.strip():
                     raise ValueError(f"Trigger field {req!r} must be a non-empty string")
+            tid_clean = trig["id"].strip()
+            if tid_clean in seen_trig_ids:
+                raise ValueError(f"Duplicate trigger id {tid_clean!r} in triggers list")
+            seen_trig_ids.add(tid_clean)
             if trig["operator"] not in VALID_OPERATORS:
                 raise ValueError(f"Invalid trigger operator {trig['operator']!r}; expected one of {sorted(VALID_OPERATORS)}")
             if "kind" in trig:
@@ -713,6 +899,41 @@ def _validate_state_patch(patch: dict[str, Any]) -> None:
                     )
             if "threshold" not in trig:
                 raise ValueError("Trigger missing required field 'threshold'")
+            if "evaluation_mode" in trig and trig["evaluation_mode"] is not None:
+                if trig["evaluation_mode"] not in VALID_EVALUATION_MODES:
+                    raise ValueError(
+                        f"Invalid trigger evaluation_mode {trig['evaluation_mode']!r}; "
+                        f"expected one of {sorted(VALID_EVALUATION_MODES)}"
+                    )
+            if "verification_ttl_days" in trig and trig["verification_ttl_days"] is not None:
+                ttl = trig["verification_ttl_days"]
+                if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 1:
+                    raise ValueError("Trigger field 'verification_ttl_days' must be a positive integer")
+            if "verification" in trig and trig["verification"] is not None:
+                ver = trig["verification"]
+                if not isinstance(ver, dict):
+                    raise ValueError("Trigger field 'verification' must be a JSON object or null")
+                if ver.get("method") not in VALID_VERIFICATION_METHODS:
+                    raise ValueError(
+                        f"Invalid verification.method {ver.get('method')!r}; "
+                        f"expected one of {sorted(VALID_VERIFICATION_METHODS)}"
+                    )
+                if ver.get("status") not in VALID_VERIFICATION_STATUSES:
+                    raise ValueError(
+                        f"Invalid verification.status {ver.get('status')!r}; "
+                        f"expected one of {sorted(VALID_VERIFICATION_STATUSES)}"
+                    )
+                if parse_strict_utc_timestamp(ver.get("verified_at_utc")) is None:
+                    raise ValueError(
+                        "Trigger verification requires valid timezone-aware UTC 'verified_at_utc' "
+                        "(e.g. 'YYYY-MM-DD HH:MM UTC' or ISO-8601 with timezone)"
+                    )
+                if "evidence_tier" in ver and ver["evidence_tier"] not in (None, ""):
+                    if ver["evidence_tier"] not in VALID_EVIDENCE_LEVELS:
+                        raise ValueError(f"Invalid verification.evidence_tier {ver['evidence_tier']!r}")
+                if "source_url" in ver and ver["source_url"] not in (None, ""):
+                    if not is_valid_http_url(ver["source_url"]):
+                        raise ValueError(f"Invalid verification.source_url {ver['source_url']!r}")
     if "events" in patch:
         for ev in patch["events"]:
             if not isinstance(ev, dict) or not ev.get("date") or not ev.get("title"):
@@ -934,11 +1155,93 @@ def update_thesis_body(
         return {"market": market, "symbol": norm_sym, "revision": next_rev, "thesis_md": merged_md}
 
 
-def evaluate_triggers(state: dict, observations: dict[str, Any]) -> list[dict]:
-    """Evaluate state['triggers'] against latest metric observations with explicit error separation."""
+def is_numeric_trigger(op: Any, thresh: Any) -> bool:
+    """Return True if trigger performs numeric threshold comparison (including numeric '==')."""
+    if op in (">", ">=", "<", "<="):
+        return True
+    if op == "==" and isinstance(thresh, (int, float)) and not isinstance(thresh, bool):
+        return True
+    return False
+
+
+def _compare_trigger_value(op: Any, obs: Any, thresh: Any) -> tuple[bool, bool, str | None]:
+    """Compare observed value against threshold for operator. Returns (evaluated, fired, error)."""
+    if op in (">", ">=", "<", "<="):
+        try:
+            obs_f = float(obs)
+            thr_f = float(thresh)
+        except (TypeError, ValueError):
+            return False, False, f"Non-numeric comparison for operator {op!r}"
+        if not (math.isfinite(obs_f) and math.isfinite(thr_f)):
+            return False, False, f"Non-finite numeric comparison for operator {op!r}"
+        if op == ">":
+            fired = obs_f > thr_f
+        elif op == ">=":
+            fired = obs_f >= thr_f
+        elif op == "<":
+            fired = obs_f < thr_f
+        else:
+            fired = obs_f <= thr_f
+        return True, fired, None
+
+    if op == "==":
+        def _is_nonfinite_token(v: Any) -> bool:
+            if isinstance(v, float):
+                return not math.isfinite(v)
+            if isinstance(v, str) and v.strip().lower() in {
+                "nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity",
+            }:
+                return True
+            return False
+
+        if _is_nonfinite_token(obs) or _is_nonfinite_token(thresh):
+            return False, False, "Non-finite value rejected for '==' trigger"
+        if is_numeric_trigger(op, thresh):
+            if isinstance(obs, bool):
+                return False, False, "Boolean value rejected for numeric '==' trigger"
+            try:
+                obs_f = float(obs)
+                thr_f = float(thresh)
+            except (TypeError, ValueError):
+                return False, False, "Non-numeric value rejected for numeric '==' trigger"
+            if not (math.isfinite(obs_f) and math.isfinite(thr_f)):
+                return False, False, "Non-finite value rejected for numeric '==' trigger"
+            return True, obs_f == thr_f, None
+        return True, obs == thresh, None
+
+    if op == "contains":
+        return True, str(thresh) in str(obs), None
+
+    if op == "event":
+        if isinstance(obs, bool):
+            fired = obs if (thresh in (None, True, "")) else (obs == bool(thresh))
+        elif thresh in (None, True, ""):
+            fired = bool(obs)
+        else:
+            fired = str(thresh).lower() in str(obs).lower()
+        return True, fired, None
+
+    return False, False, f"Unsupported trigger operator: {op!r}"
+
+
+def evaluate_triggers(
+    state: dict,
+    observations: dict[str, Any],
+    *,
+    ref_date: date | None = None,
+    now_utc: datetime | None = None,
+) -> list[dict]:
+    """Evaluate state['triggers'] against live observations or strictly validated AI/manual verifications."""
     triggers = state.get("triggers")
     if not isinstance(triggers, list):
         raise ValueError("Invalid archive state: 'triggers' must be a list")
+
+    if now_utc is not None:
+        anchor_dt = now_utc.astimezone(timezone.utc) if now_utc.tzinfo else now_utc.replace(tzinfo=timezone.utc)
+    elif ref_date is not None:
+        anchor_dt = datetime(ref_date.year, ref_date.month, ref_date.day, 23, 59, 59, tzinfo=timezone.utc)
+    else:
+        anchor_dt = datetime.now(timezone.utc)
 
     results: list[dict] = []
     for trig in triggers:
@@ -948,79 +1251,347 @@ def evaluate_triggers(state: dict, observations: dict[str, Any]) -> list[dict]:
         if not isinstance(metric, str) or not metric:
             results.append({**trig, "evaluated": False, "fired": False, "observed": None, "error": "Invalid metric name"})
             continue
-        if metric not in observations or observations[metric] is None:
+
+        # 1) Live machine observation always takes precedence
+        if metric in observations and observations[metric] is not None:
+            obs = observations[metric]
+            evaluated, fired, err = _compare_trigger_value(op, obs, thresh)
+            item = {
+                **trig,
+                "evaluated": evaluated,
+                "fired": fired,
+                "observed": obs,
+                "evaluation_source": "live",
+            }
+            if err:
+                item["error"] = err
+            results.append(item)
+            continue
+
+        # 2) Machine-observable auto metrics MUST NEVER be overridden by persisted AI/manual verifications
+        if is_trigger_auto_metric(trig):
             results.append({**trig, "evaluated": False, "fired": False, "observed": None})
             continue
-        obs = observations[metric]
 
-        if op in (">", ">=", "<", "<="):
+        # 3) Persisted AI web-search or manual verification with strict timestamp, provenance & numeric gates
+        ver = trig.get("verification")
+        if isinstance(ver, dict):
+            method = str(ver.get("method") or "manual").strip().lower()
+            v_status = str(ver.get("status") or "uncertain").strip().lower()
+            v_ts = ver.get("verified_at_utc")
+            ver_dt = parse_strict_utc_timestamp(v_ts)
+            raw_ttl = ver.get("ttl_days") or trig.get("verification_ttl_days") or DEFAULT_VERIFICATION_TTL_DAYS
             try:
-                obs_f = float(obs)
-                thr_f = float(thresh)
+                ttl_days = max(1, int(raw_ttl))
             except (TypeError, ValueError):
-                results.append({
-                    **trig,
-                    "evaluated": False,
-                    "fired": False,
-                    "observed": obs,
-                    "error": f"Non-numeric comparison for operator {op!r}",
-                })
-                continue
-            if not (math.isfinite(obs_f) and math.isfinite(thr_f)):
-                results.append({
-                    **trig,
-                    "evaluated": False,
-                    "fired": False,
-                    "observed": obs,
-                    "error": f"Non-finite numeric comparison for operator {op!r}",
-                })
-                continue
-            if op == ">":
-                fired = obs_f > thr_f
-            elif op == ">=":
-                fired = obs_f >= thr_f
-            elif op == "<":
-                fired = obs_f < thr_f
-            else:
-                fired = obs_f <= thr_f
-            results.append({**trig, "evaluated": True, "fired": fired, "observed": obs})
-        elif op == "==":
-            def _is_nonfinite_token(v: Any) -> bool:
-                if isinstance(v, float):
-                    return not math.isfinite(v)
-                if isinstance(v, str) and v.strip().lower() in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}:
-                    return True
-                return False
+                ttl_days = DEFAULT_VERIFICATION_TTL_DAYS
 
-            if _is_nonfinite_token(obs) or _is_nonfinite_token(thresh):
+            if ver_dt is None:
                 results.append({
                     **trig,
                     "evaluated": False,
                     "fired": False,
-                    "observed": obs,
-                    "error": "Non-finite value rejected for '==' trigger",
+                    "observed": ver.get("observed"),
+                    "evaluation_source": method,
+                    "error": "核验时间戳缺失或格式无效，请重新核验",
                 })
                 continue
-            results.append({**trig, "evaluated": True, "fired": obs == thresh, "observed": obs})
-        elif op == "contains":
-            results.append({**trig, "evaluated": True, "fired": str(thresh) in str(obs), "observed": obs})
-        elif op == "event":
-            if isinstance(obs, bool):
-                fired = obs if (thresh in (None, True, "")) else (obs == bool(thresh))
-            elif thresh in (None, True, ""):
-                fired = bool(obs)
-            else:
-                fired = str(thresh).lower() in str(obs).lower()
-            results.append({**trig, "evaluated": True, "fired": fired, "observed": obs})
-        else:
+
+            if ver_dt > anchor_dt + timedelta(seconds=MAX_FUTURE_CLOCK_SKEW_SECONDS):
+                results.append({
+                    **trig,
+                    "evaluated": False,
+                    "fired": False,
+                    "observed": ver.get("observed"),
+                    "evaluation_source": method,
+                    "verified_at_utc": v_ts,
+                    "error": "核验时间戳位于未来，已拒绝放行",
+                })
+                continue
+
+            elapsed = anchor_dt - ver_dt
+            if elapsed > timedelta(days=ttl_days):
+                age_days = max(ttl_days, int(elapsed.total_seconds() // 86400))
+                results.append({
+                    **trig,
+                    "evaluated": False,
+                    "fired": False,
+                    "observed": ver.get("observed"),
+                    "evaluation_source": method,
+                    "verification_stale": True,
+                    "verified_at_utc": v_ts,
+                    "error": f"核验已过期({age_days}天>{ttl_days}天)，请重新核验",
+                })
+                continue
+
+            if v_status not in {"clear", "fired"}:
+                summary_txt = str(ver.get("summary") or ver.get("observed_text") or "待补充一手信源").strip()
+                results.append({
+                    **trig,
+                    "evaluated": False,
+                    "fired": False,
+                    "observed": ver.get("observed"),
+                    "evaluation_source": method,
+                    "verification_status": v_status,
+                    "verified_at_utc": v_ts,
+                    "verification_summary": summary_txt,
+                    "error": f"核验结论不确定：{summary_txt[:80]}",
+                })
+                continue
+
+            ver_obs = ver.get("observed")
+            summary_txt = str(ver.get("summary") or "").strip()
+            obs_txt = str(ver.get("observed_text") or "").strip()
+            src_url = str(ver.get("source_url") or "").strip()
+            src_title = str(ver.get("source_title") or "").strip()
+            has_valid_url = is_valid_http_url(src_url)
+            has_provenance = has_valid_url or bool(src_title)
+            has_conclusion = bool(summary_txt or obs_txt)
+
+            # Fail-closed checks for "clear" (never allow unsubstantiated clear to pass green!)
+            fired_flag = (v_status == "fired")
+            if ver_obs is not None and op in (">", ">=", "<", "<=", "==", "contains"):
+                ok_cmp, cmp_fired, cmp_err = _compare_trigger_value(op, ver_obs, thresh)
+                if ok_cmp:
+                    fired_flag = cmp_fired or fired_flag
+                elif not fired_flag:
+                    results.append({
+                        **trig,
+                        "evaluated": False,
+                        "fired": False,
+                        "observed": ver_obs,
+                        "evaluation_source": method,
+                        "verified_at_utc": v_ts,
+                        "error": f"核验观测值无法与阈值比较({cmp_err})，已拒绝放行",
+                    })
+                    continue
+
+            if not fired_flag:
+                if not has_conclusion:
+                    results.append({
+                        **trig,
+                        "evaluated": False,
+                        "fired": False,
+                        "observed": ver_obs,
+                        "evaluation_source": method,
+                        "verified_at_utc": v_ts,
+                        "error": "核验缺少明确结论摘要，已拒绝放行",
+                    })
+                    continue
+                if method == "ai_web" and not has_provenance:
+                    results.append({
+                        **trig,
+                        "evaluated": False,
+                        "fired": False,
+                        "observed": ver_obs,
+                        "evaluation_source": method,
+                        "verified_at_utc": v_ts,
+                        "error": "AI 核验缺少可追溯来源（标题或URL），已拒绝放行",
+                    })
+                    continue
+                if is_numeric_trigger(op, thresh) and ver_obs is None:
+                    tier = str(ver.get("evidence_tier") or "").strip().upper()
+                    if (not has_provenance) or (tier not in {"L1", "L2"}):
+                        results.append({
+                            **trig,
+                            "evaluated": False,
+                            "fired": False,
+                            "observed": None,
+                            "evaluation_source": method,
+                            "verified_at_utc": v_ts,
+                            "error": "数值触发器未提供可比观测值，且缺少 L1/L2 可追溯来源佐证，已拒绝放行",
+                        })
+                        continue
+
             results.append({
                 **trig,
-                "evaluated": False,
-                "fired": False,
-                "observed": obs,
-                "error": f"Unsupported trigger operator: {op!r}",
+                "evaluated": True,
+                "fired": fired_flag,
+                "observed": ver_obs if ver_obs is not None else (obs_txt or v_status),
+                "evaluation_source": method,
+                "verification_status": "fired" if fired_flag else v_status,
+                "verified_at_utc": v_ts,
+                "verification_summary": summary_txt or obs_txt,
+                "verification_source_url": src_url if has_valid_url else None,
+                "verification_evidence_tier": ver.get("evidence_tier"),
             })
+            continue
+
+        # 4) Neither live observation nor stored verification exists
+        item = {**trig, "evaluated": False, "fired": False, "observed": None}
+        if trig.get("evaluation_mode") in {"ai_web", "manual"}:
+            item["needs_verification"] = True
+        results.append(item)
     return results
+
+
+def record_trigger_verifications(
+    raw_symbol: str,
+    verifications: dict[str, dict[str, Any]],
+    *,
+    research_root: str | None = None,
+    market_override: str | None = None,
+    expected_fingerprints: dict[str, dict[str, Any]] | None = None,
+    expected_prev_verified_at: dict[str, str | None] | None = None,
+    expected_prev_verifications: dict[str, dict[str, Any] | None] | None = None,
+    reject_auto_metrics: bool = True,
+    enforce_clear_gate: bool = False,
+    cancel_check: Any = None,
+) -> dict:
+    """Atomically attach AI/manual verification payloads onto matching triggers with optimistic conflict checks."""
+    if not isinstance(verifications, dict) or not verifications:
+        raise ValueError("verifications must be a non-empty dict keyed by trigger id")
+
+    folder, _, _, _ = resolve_archive_dir(
+        raw_symbol, research_root=research_root, market_override=market_override
+    )
+    state_path = os.path.join(folder, "state.json")
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(f"Archive not initialized at {folder}")
+
+    with _archive_lock(folder):
+        if callable(cancel_check) and cancel_check():
+            raise RuntimeError("Trigger verification cancelled before commit")
+        _apply_wal_unlocked(folder)
+        with open(state_path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+
+        triggers = state.get("triggers")
+        if not isinstance(triggers, list):
+            raise ValueError("Archive state has invalid 'triggers' field")
+
+        updated_ids: list[str] = []
+        skipped_conflicts: list[dict[str, str]] = []
+        matched_ids: set[str] = set()
+        new_triggers: list[dict[str, Any]] = []
+        for trig in triggers:
+            if not isinstance(trig, dict):
+                new_triggers.append(trig)
+                continue
+            tid = str(trig.get("id") or "")
+            if tid in verifications:
+                matched_ids.add(tid)
+                if reject_auto_metrics and is_trigger_auto_metric(trig):
+                    skipped_conflicts.append({
+                        "id": tid,
+                        "reason": "自动机审指标不允许通过 AI/人工核验覆盖",
+                    })
+                    new_triggers.append(trig)
+                    continue
+                if expected_fingerprints and tid in expected_fingerprints:
+                    cur_fp = trigger_definition_fingerprint(trig)
+                    if cur_fp != expected_fingerprints[tid]:
+                        skipped_conflicts.append({
+                            "id": tid,
+                            "reason": "核验期间触发器口径/阈值/状态已被修改，已拒绝覆盖",
+                        })
+                        new_triggers.append(trig)
+                        continue
+                cur_ver = trig.get("verification") if isinstance(trig.get("verification"), dict) else None
+                if expected_prev_verifications is not None and tid in expected_prev_verifications:
+                    if cur_ver != expected_prev_verifications[tid]:
+                        skipped_conflicts.append({
+                            "id": tid,
+                            "reason": "核验期间已有更新的人工/AI 核验记录写入，已拒绝覆盖",
+                        })
+                        new_triggers.append(trig)
+                        continue
+                if expected_prev_verified_at and tid in expected_prev_verified_at:
+                    cur_ts = cur_ver.get("verified_at_utc") if isinstance(cur_ver, dict) else None
+                    if cur_ts != expected_prev_verified_at[tid]:
+                        skipped_conflicts.append({
+                            "id": tid,
+                            "reason": "核验期间已有更新的人工/AI 核验记录写入，已拒绝覆盖",
+                        })
+                        new_triggers.append(trig)
+                        continue
+
+                raw_v = verifications[tid]
+                if not isinstance(raw_v, dict):
+                    raise ValueError(f"Verification for trigger {tid!r} must be a dict")
+                method = str(raw_v.get("method") or "manual").strip()
+                status = str(raw_v.get("status") or "uncertain").strip().lower()
+                verified_at = str(raw_v.get("verified_at_utc") or utc_now_iso_seconds()).strip()
+                if parse_strict_utc_timestamp(verified_at) is None:
+                    raise ValueError(f"Invalid verified_at_utc for trigger {tid!r}: {verified_at!r}")
+                ttl_days = raw_v.get("ttl_days") or trig.get("verification_ttl_days") or DEFAULT_VERIFICATION_TTL_DAYS
+                try:
+                    ttl_days = max(1, int(ttl_days))
+                except (TypeError, ValueError):
+                    ttl_days = DEFAULT_VERIFICATION_TTL_DAYS
+                clean_v: dict[str, Any] = {
+                    "method": method,
+                    "status": status,
+                    "verified_at_utc": verified_at,
+                    "ttl_days": ttl_days,
+                }
+                if "observed" in raw_v and raw_v["observed"] is not None:
+                    clean_v["observed"] = raw_v["observed"]
+                for txt_k in ("observed_text", "summary", "source_title", "evidence_tier"):
+                    val = raw_v.get(txt_k)
+                    if isinstance(val, str) and val.strip():
+                        clean_v[txt_k] = val.strip()
+                raw_url = raw_v.get("source_url")
+                if isinstance(raw_url, str) and raw_url.strip():
+                    if not is_valid_http_url(raw_url):
+                        raise ValueError(f"Invalid source_url for trigger {tid!r}: {raw_url!r}")
+                    clean_v["source_url"] = raw_url.strip()
+
+                if enforce_clear_gate and status == "clear":
+                    op = trig.get("operator")
+                    thresh = trig.get("threshold")
+                    if is_numeric_trigger(op, thresh):
+                        if "observed" in clean_v:
+                            ok_cmp, cmp_fired, cmp_err = _compare_trigger_value(op, clean_v["observed"], thresh)
+                            if not ok_cmp:
+                                raise ValueError(f"数值触发器的观测值无法与阈值比较：{cmp_err}")
+                            if cmp_fired:
+                                raise ValueError("观测值已满足触发阈值条件，请将核验判定选择为 fired（已触发）")
+                        else:
+                            has_prov = bool(clean_v.get("source_url") or clean_v.get("source_title"))
+                            tier = str(clean_v.get("evidence_tier") or "").strip().upper()
+                            if not has_prov or tier not in {"L1", "L2"}:
+                                raise ValueError(
+                                    "数值触发器选择未触发时，必须填写可比数值观测值，或提供 L1/L2 来源标题/URL 佐证"
+                                )
+
+                merged = {
+                    **trig,
+                    "verification": clean_v,
+                    "last_checked_at": verified_at,
+                }
+                if "observed" in clean_v:
+                    merged["last_value"] = clean_v["observed"]
+                elif "observed_text" in clean_v:
+                    merged["last_value"] = clean_v["observed_text"]
+                if not merged.get("evaluation_mode"):
+                    merged["evaluation_mode"] = method
+                new_triggers.append(merged)
+                updated_ids.append(tid)
+            else:
+                new_triggers.append(trig)
+
+        for req_tid in verifications:
+            if req_tid not in matched_ids:
+                skipped_conflicts.append({
+                    "id": req_tid,
+                    "reason": "触发器在核验期间已被删除或重命名",
+                })
+
+        if not updated_ids and not skipped_conflicts:
+            raise ValueError(f"No matching trigger ids found for {raw_symbol}: {sorted(verifications.keys())}")
+        if not updated_ids:
+            return {"state": state, "updated_ids": [], "skipped_conflicts": skipped_conflicts}
+
+        _validate_state_patch({"triggers": new_triggers})
+        cur_rev = int(state.get("revision", 1))
+        state["triggers"] = new_triggers
+        state["revision"] = cur_rev + 1
+        state["updated_at_utc"] = utc_now_str()
+        if callable(cancel_check) and cancel_check():
+            raise RuntimeError("Trigger verification cancelled before commit")
+        _atomic_write_json(state_path, state)
+        return {"state": state, "updated_ids": updated_ids, "skipped_conflicts": skipped_conflicts}
 
 
 def list_archives(research_root: str | None = None) -> list[dict]:

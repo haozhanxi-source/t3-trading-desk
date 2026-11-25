@@ -946,6 +946,7 @@ export interface CompassScanContext {
   direction_id?: string;
   direction_title?: string;
   direction: "long" | "short" | "pair";
+  value_chain_focus?: string;
   expected_directions: Record<string, "long" | "short">;
 }
 

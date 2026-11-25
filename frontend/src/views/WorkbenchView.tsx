@@ -42,8 +42,8 @@ import {
 import { formatSymbolWithCode, getSymbolName } from "../lib/symbols";
 import { formatTaskStatus, getUniverseLabel, groupUniverses } from "../lib/universes";
 
-type RowFilter = "all" | "long" | "short" | "watch" | "aligned" | "counter" | "degraded";
-type CompassRowAlignment = "aligned" | "counter" | "watch" | "degraded";
+type RowFilter = "all" | "long" | "short" | "watch" | "aligned" | "counter" | "pool_unverified" | "degraded";
+type CompassRowAlignment = "aligned" | "counter" | "watch" | "pool_unverified" | "degraded";
 
 function extractCompassContext(task: TaskRecord | null): CompassScanContext | null {
   const raw = task?.params?.compass_context;
@@ -65,6 +65,7 @@ function extractCompassContext(task: TaskRecord | null): CompassScanContext | nu
     direction_id: typeof obj.direction_id === "string" ? obj.direction_id : "",
     direction_title: typeof obj.direction_title === "string" ? obj.direction_title : "",
     direction: dir,
+    value_chain_focus: typeof obj.value_chain_focus === "string" ? obj.value_chain_focus : "",
     expected_directions: expected,
   };
 }
@@ -72,36 +73,40 @@ function extractCompassContext(task: TaskRecord | null): CompassScanContext | nu
 function resolveExpectedDirection(
   row: ScanRow,
   ctx: CompassScanContext,
-): "long" | "short" | null {
+): { expected: "long" | "short" | null; boundToL1: boolean } {
   const sym = (row.symbol || "").trim().toUpperCase();
   if (sym && ctx.expected_directions[sym]) {
-    return ctx.expected_directions[sym];
+    return { expected: ctx.expected_directions[sym], boundToL1: true };
   }
-  if (ctx.direction === "long") return "long";
-  if (ctx.direction === "short") return "short";
-  return null;
+  /* Only treat symbols explicitly entered by the user (market === "adhoc") as bound to the staged L1 sector thesis;
+     do NOT blindly broadcast a narrow L1 thesis (e.g. phosphate/sulfur) onto unrelated members of a broad pool (e.g. rubber RU0)! */
+  const isUserCustom = (row.market || "").trim().toLowerCase() === "adhoc";
+  if (isUserCustom && (ctx.direction === "long" || ctx.direction === "short")) {
+    return { expected: ctx.direction, boundToL1: true };
+  }
+  return { expected: null, boundToL1: false };
 }
 
 function classifyRowWithCompass(
   row: ScanRow,
   ctx: CompassScanContext,
-): { status: CompassRowAlignment; expected: "long" | "short" | null; actual: "long" | "short" | "watch" } {
-  const expected = resolveExpectedDirection(row, ctx);
+): { status: CompassRowAlignment; expected: "long" | "short" | null; actual: "long" | "short" | "watch"; boundToL1: boolean } {
+  const { expected, boundToL1 } = resolveExpectedDirection(row, ctx);
   const sigType = (row.signal_type || "").trim().toLowerCase();
   if (row.error || row.quality_grade === "degraded" || sigType === "data_quality_degraded") {
-    return { status: "degraded", expected, actual: "watch" };
+    return { status: "degraded", expected, actual: "watch", boundToL1 };
   }
   const actual = classifyScanRow(row);
-  if (!expected) {
-    return { status: "watch", expected: null, actual };
+  if (!boundToL1 || !expected) {
+    return { status: "pool_unverified", expected: null, actual, boundToL1: false };
   }
   if (actual === expected) {
-    return { status: "aligned", expected, actual };
+    return { status: "aligned", expected, actual, boundToL1: true };
   }
   if ((actual === "long" && expected === "short") || (actual === "short" && expected === "long")) {
-    return { status: "counter", expected, actual };
+    return { status: "counter", expected, actual, boundToL1: true };
   }
-  return { status: "watch", expected, actual };
+  return { status: "watch", expected, actual, boundToL1: true };
 }
 
 function isTerminalTaskStatus(status: string | null | undefined): boolean {
@@ -698,7 +703,10 @@ export function WorkbenchView({
   useEffect(() => {
     if (activeCompassContext && (rowFilter === "long" || rowFilter === "short")) {
       setRowFilter("all");
-    } else if (!activeCompassContext && (rowFilter === "aligned" || rowFilter === "counter" || rowFilter === "degraded")) {
+    } else if (
+      !activeCompassContext &&
+      (rowFilter === "aligned" || rowFilter === "counter" || rowFilter === "pool_unverified" || rowFilter === "degraded")
+    ) {
       setRowFilter("all");
     }
   }, [activeCompassContext, rowFilter]);
@@ -709,12 +717,14 @@ export function WorkbenchView({
     let watchCount = 0;
     let alignedCount = 0;
     let counterCount = 0;
+    let poolUnverifiedCount = 0;
     let degradedCount = 0;
     for (const r of scanRows) {
       if (activeCompassContext) {
         const res = classifyRowWithCompass(r, activeCompassContext);
         if (res.status === "aligned") alignedCount += 1;
         else if (res.status === "counter") counterCount += 1;
+        else if (res.status === "pool_unverified") poolUnverifiedCount += 1;
         else if (res.status === "degraded") degradedCount += 1;
         else watchCount += 1;
       } else {
@@ -731,6 +741,7 @@ export function WorkbenchView({
       watch: watchCount,
       aligned: alignedCount,
       counter: counterCount,
+      pool_unverified: poolUnverifiedCount,
       degraded: degradedCount,
     };
   }, [scanRows, activeCompassContext]);
@@ -916,31 +927,41 @@ export function WorkbenchView({
             </div>
 
             {stagedCompassContext ? (
-              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-accent/30 bg-accent/8 px-3 py-1.5 text-xs">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span className="rounded border border-accent/35 bg-surface px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent">
-                    已带入 L1 板块
-                  </span>
-                  <span className="font-semibold text-ink">
-                    {stagedCompassContext.direction_title || "Layer 1 板块"}
-                  </span>
-                  <span className="text-muted">
-                    · 方向：
-                    {stagedCompassContext.direction === "short"
-                      ? "做空 SHORT"
-                      : stagedCompassContext.direction === "pair"
-                        ? "多空配对 PAIR"
-                        : "做多 LONG"}
-                    （扫描结果将自动按此方向校验）
-                  </span>
+              <div className="flex flex-col gap-1 rounded-md border border-accent/30 bg-accent/8 px-3 py-2 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="rounded border border-accent/35 bg-surface px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent">
+                      已带入 L1 板块
+                    </span>
+                    <span className="font-semibold text-ink">
+                      {stagedCompassContext.direction_title || "Layer 1 板块"}
+                    </span>
+                    <span className="text-muted">
+                      · 预定方向：
+                      {stagedCompassContext.direction === "short"
+                        ? "做空 SHORT"
+                        : stagedCompassContext.direction === "pair"
+                          ? "多空配对 PAIR"
+                          : "做多 LONG"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    className="cursor-pointer border-0 bg-transparent p-0 text-[11px] text-muted hover:text-ink"
+                    onClick={() => setStagedCompassContext(null)}
+                  >
+                    取消绑定
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  className="cursor-pointer border-0 bg-transparent p-0 text-[11px] text-muted hover:text-ink"
-                  onClick={() => setStagedCompassContext(null)}
-                >
-                  取消绑定
-                </button>
+                {stagedCompassContext.value_chain_focus ? (
+                  <div className="text-[11px] text-ink-2">
+                    <span className="font-semibold text-accent">选龙头抓手：</span>
+                    <span>{stagedCompassContext.value_chain_focus}</span>
+                  </div>
+                ) : null}
+                <div className="text-[11px] text-muted">
+                  提示：请在下方「临时切入新细分板块真龙头」中输入确认符合该 L1 逻辑的标的，系统才会自动判定 L1 同向/冲突；顺带扫出的综合大池无关品种不会自动盖章。
+                </div>
               </div>
             ) : null}
 
@@ -1132,6 +1153,17 @@ export function WorkbenchView({
                       >
                         待成熟观察 ({filterCounts.watch})
                       </button>
+                      {filterCounts.pool_unverified > 0 ? (
+                        <button
+                          type="button"
+                          className="chip"
+                          aria-pressed={rowFilter === "pool_unverified"}
+                          onClick={() => setRowFilter("pool_unverified")}
+                          title="来自综合大池且未显式归属本 L1 细分逻辑的标的，需先人工确认基本面相关性"
+                        >
+                          池内未定归属 ({filterCounts.pool_unverified})
+                        </button>
+                      ) : null}
                       {filterCounts.degraded > 0 ? (
                         <button
                           type="button"
@@ -1177,27 +1209,34 @@ export function WorkbenchView({
 
             {/* Layer 1 Directional Alignment Context Banner */}
             {activeCompassContext ? (
-              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-accent/30 bg-accent/8 px-3 py-2 text-xs">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="rounded border border-accent/35 bg-surface px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent">
-                    Layer 1 联立校验
-                  </span>
-                  <span className="font-semibold text-ink">
-                    {activeCompassContext.direction_title || "战略方向过筛"}
-                  </span>
-                  <span className="text-muted">
-                    预定方向：
-                    {activeCompassContext.direction === "short"
-                      ? "做空 SHORT"
-                      : activeCompassContext.direction === "pair"
-                        ? "多空配对 PAIR"
-                        : "做多 LONG"}
-                  </span>
+              <div className="flex flex-col gap-1 rounded-md border border-accent/30 bg-accent/8 px-3 py-2 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="rounded border border-accent/35 bg-surface px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent">
+                      Layer 1 联立校验
+                    </span>
+                    <span className="font-semibold text-ink">
+                      {activeCompassContext.direction_title || "战略方向过筛"}
+                    </span>
+                    <span className="text-muted">
+                      预定方向：
+                      {activeCompassContext.direction === "short"
+                        ? "做空 SHORT"
+                        : activeCompassContext.direction === "pair"
+                          ? "多空配对 PAIR"
+                          : "做多 LONG"}
+                    </span>
+                  </div>
+                  {pairVerdict ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <StatusBadge tone={pairVerdict.tone} label={pairVerdict.label} />
+                      <span className="text-[11px] text-ink-2">{pairVerdict.detail}</span>
+                    </div>
+                  ) : null}
                 </div>
-                {pairVerdict ? (
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <StatusBadge tone={pairVerdict.tone} label={pairVerdict.label} />
-                    <span className="text-[11px] text-ink-2">{pairVerdict.detail}</span>
+                {filterCounts.pool_unverified > 0 ? (
+                  <div className="text-[11px] text-warning">
+                    已隔离 {filterCounts.pool_unverified} 只综合大池标的：L1 细分逻辑不会自动套用到整池无关品种，仅对你手动填入的真龙头或显式基准锚自动判定「L1同向通过」。
                   </div>
                 ) : null}
               </div>
@@ -1312,9 +1351,11 @@ export function WorkbenchView({
                                           ? `L1同向通过 (${compassAlign.expected === "short" ? "空" : "多"})`
                                           : compassAlign.status === "counter"
                                             ? `L1反向冲突 (预期${compassAlign.expected === "short" ? "空" : "多"})`
-                                            : compassAlign.status === "degraded"
-                                              ? "数据不足"
-                                              : `L1待成熟 (预期${compassAlign.expected === "short" ? "空" : compassAlign.expected === "long" ? "多" : "—"})`
+                                            : compassAlign.status === "pool_unverified"
+                                              ? "池内参考·需核实归属"
+                                              : compassAlign.status === "degraded"
+                                                ? "数据不足"
+                                                : `L1待成熟 (预期${compassAlign.expected === "short" ? "空" : compassAlign.expected === "long" ? "多" : "—"})`
                                       }
                                     />
                                   ) : null}

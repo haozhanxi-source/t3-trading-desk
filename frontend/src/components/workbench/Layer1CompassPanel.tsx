@@ -201,11 +201,21 @@ function buildCompassScanContext(
     if (!sym) continue;
     expected[sym] = leader.leg === "short" ? "short" : "long";
   }
+  /* For unidirectional cards, bind explicit reference anchors only — NEVER broadcast to unrelated pool members */
+  if (card.direction === "long" || card.direction === "short") {
+    for (const anc of card.reference_anchors ?? []) {
+      const sym = anc.trim().toUpperCase();
+      if (sym && !expected[sym]) {
+        expected[sym] = card.direction;
+      }
+    }
+  }
   return {
     run_id: runId || "",
     direction_id: card.id,
     direction_title: card.title,
     direction: card.direction,
+    value_chain_focus: card.value_chain_focus || "",
     expected_directions: expected,
   };
 }

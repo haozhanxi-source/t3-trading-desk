@@ -272,6 +272,7 @@ class CompassScanContextReq(_Strict):
     direction_id: str = ""
     direction_title: str = ""
     direction: Literal["long", "short", "pair"] = "long"
+    value_chain_focus: str = ""
     expected_directions: dict[str, Direction] = Field(default_factory=dict)
 
 

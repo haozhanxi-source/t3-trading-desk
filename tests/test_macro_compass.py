@@ -342,6 +342,34 @@ def test_sector_first_cards_without_leaders_and_posthoc_universe_portfolio_mappi
     assert d3["suggested_pool_name"] == "theme_biotech_glp1_new"
 
 
+def test_phosphate_sulfur_chemical_does_not_false_match_rubber_chem_pool():
+    universes = {
+        "commodities_chem_newenergy": {
+            "description": "化工与新能源金属（PTA/甲醇/PVC/纯碱/玻璃/橡胶/碳酸锂/工业硅/多晶硅）",
+            "symbols": ["TA0", "MA0", "V0", "SA0", "FG0", "RU0", "LC0", "SI0", "PS0"],
+        },
+    }
+    # Phosphate & sulfur fertilizer has nothing to do with rubber/glass/PTA/lithium -> must NOT match!
+    matched_phosphate = macro_compass.map_sector_to_universes(
+        title="非中东一体化磷肥与硫磺资源化工板块",
+        asset_scope="cross_asset",
+        keywords=["磷肥", "硫磺", "资源化工", "fertilizer", "sulfur"],
+        reference_anchors=[],
+        universes=universes,
+    )
+    assert matched_phosphate == []
+
+    # True member of that pool (lithium / rubber) still matches cleanly
+    matched_lithium = macro_compass.map_sector_to_universes(
+        title="碳酸锂与新能源金属过剩做空",
+        asset_scope="commodities",
+        keywords=["碳酸锂", "锂盐", "过剩"],
+        reference_anchors=[],
+        universes=universes,
+    )
+    assert matched_lithium == ["commodities_chem_newenergy"]
+
+
 def test_url_validator_rejects_backslash_and_userinfo():
     assert research_archive.is_valid_http_url("https://icsg.org/report?id=1") is True
     assert research_archive.is_valid_http_url(r"https://elsewhere.example\@official.example/path") is False

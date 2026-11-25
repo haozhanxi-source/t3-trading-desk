@@ -655,15 +655,15 @@ def collect_macro_overview(
 _UNIVERSE_MATCH_RULES: dict[str, tuple[set[str], tuple[str, ...]]] = {
     "commodities_energy": (
         {"commodities", "cross_asset"},
-        ("原油", "石油", "天然气", "成品油", "柴油", "燃料油", "裂解", "能源", "oil", "crude", "gas", "energy", "opec"),
+        ("原油", "石油", "天然气", "成品油", "柴油", "燃料油", "裂解", "oil", "crude", "natural gas", "diesel", "opec"),
     ),
     "commodities_precious": (
         {"commodities", "cross_asset"},
-        ("黄金", "白银", "贵金属", "铂金", "钯金", "gold", "silver", "precious"),
+        ("黄金", "白银", "贵金属", "铂金", "钯金", "gold", "silver", "platinum", "palladium", "precious"),
     ),
     "commodities_base": (
         {"commodities", "cross_asset"},
-        ("铜", "铝", "锌", "镍", "锡", "铅", "有色", "基本金属", "工业金属", "copper", "aluminum", "nickel", "zinc", "tin"),
+        ("铜", "铝", "电解铝", "锌", "镍", "锡", "铅", "有色", "基本金属", "工业金属", "copper", "aluminum", "nickel", "zinc", "tin"),
     ),
     "commodities_ferrous": (
         {"commodities", "cross_asset"},
@@ -671,7 +671,7 @@ _UNIVERSE_MATCH_RULES: dict[str, tuple[set[str], tuple[str, ...]]] = {
     ),
     "commodities_grains_oilseeds": (
         {"commodities", "cross_asset"},
-        ("大豆", "豆粕", "豆油", "棕榈油", "菜油", "玉米", "小麦", "谷物", "油脂", "农产品", "grain", "soy", "palm", "corn", "wheat"),
+        ("大豆", "豆粕", "豆油", "棕榈油", "菜油", "玉米", "小麦", "谷物", "油脂", "grain", "soy", "palm", "corn", "wheat"),
     ),
     "commodities_softs": (
         {"commodities", "cross_asset"},
@@ -681,41 +681,42 @@ _UNIVERSE_MATCH_RULES: dict[str, tuple[set[str], tuple[str, ...]]] = {
         {"commodities", "cross_asset"},
         ("生猪", "猪周期", "活牛", "畜牧", "养殖", "hog", "cattle", "livestock"),
     ),
+    # Strictly specific to commodities actually inside this pool — NEVER match broad "化工"/"chemical" (e.g. phosphate/sulfur/pharma)!
     "commodities_chem_newenergy": (
         {"commodities", "cross_asset"},
-        ("碳酸锂", "锂", "工业硅", "多晶硅", "光伏硅料", "纯碱", "玻璃", "甲醇", "pta", "pvc", "橡胶", "化工", "lithium", "polysilicon", "chemical"),
+        ("碳酸锂", "锂盐", "锂矿", "工业硅", "多晶硅", "光伏硅料", "纯碱", "玻璃", "甲醇", "pta", "pvc", "天然橡胶", "橡胶", "lithium", "polysilicon", "soda ash", "rubber"),
     ),
     "shipping": (
         {"commodities", "cross_asset"},
-        ("航运", "集运", "运价", "油轮", "散货船", "海运", "shipping", "freight", "container", "tanker"),
+        ("集运", "欧线", "集装箱运价", "航运期货", "container freight", "ec0"),
     ),
     "metals_equities": (
         {"us_equities", "a_shares", "cross_asset"},
-        ("矿业股", "铜矿股", "金矿股", "资源股", "有色股", "稀土", "mining", "miners"),
+        ("矿业股", "铜矿股", "金矿股", "有色矿业", "稀土矿", "mining", "miners"),
     ),
     "us_power_grid": (
         {"us_equities", "cross_asset"},
-        ("电力", "电网", "核电", "公用事业", "变压器", "燃气轮机", "power", "grid", "utilities", "nuclear"),
+        ("电力", "电网", "核电", "公用事业", "变压器", "燃气轮机", "power grid", "utilities", "nuclear"),
     ),
     "us_semis_ai": (
         {"us_equities", "cross_asset"},
-        ("半导体", "芯片", "算力", "存储", "光模块", "晶圆", "semiconductor", "chip", "ai", "memory", "hbm"),
+        ("半导体", "芯片", "ai算力", "存储芯片", "光模块", "晶圆", "semiconductor", "memory", "hbm"),
     ),
     "us_megacap_cashflow": (
         {"us_equities", "cross_asset"},
-        ("大型科技", "科技巨头", "云厂商", "超大规模", "megacap", "hyperscaler", "cloud"),
+        ("大型科技", "科技巨头", "云厂商", "超大规模", "megacap", "hyperscaler"),
     ),
     "us_sectors": (
         {"us_equities", "cross_asset"},
-        ("美股", "军工", "航天", "医药", "生物医药", "金融", "工业", "消费", "防御", "defense", "healthcare", "financial", "industrial"),
+        ("美股军工", "航天军工", "美股医药", "美股金融", "美股工业", "defense", "xlu", "xle", "xlk", "xli", "xlb", "xlv", "xlf"),
     ),
     "a_shares_etfs": (
         {"a_shares", "cross_asset"},
-        ("a股", "红利", "高股息", "沪深300", "科创", "券商", "煤炭", "中国股市", "china equity", "dividend"),
+        ("红利", "高股息", "沪深300", "科创50", "券商", "煤炭etf", "dividend"),
     ),
     "a_shares_themes": (
         {"a_shares", "cross_asset"},
-        ("a股主题", "机器人", "国产替代", "新能源车", "中国核心资产"),
+        ("a股机器人", "人形机器人", "国产替代", "宁德时代", "贵州茅台"),
     ),
     "fx_majors": (
         {"fx", "cross_asset"},

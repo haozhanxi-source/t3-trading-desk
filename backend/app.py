@@ -298,6 +298,27 @@ class SentinelTaskReq(_Strict):
     event_window_days: int = Field(14, ge=1, le=90)
 
 
+class TriggerManualVerifyReq(_ArchiveMarketReq):
+    symbol: str = Field(..., min_length=1)
+    trigger_id: str = Field(..., min_length=1)
+    status: Literal["clear", "fired", "uncertain"]
+    observed: Any = None
+    observed_text: str = Field("", max_length=300)
+    summary: str = Field(..., min_length=1, max_length=400)
+    source_title: str = Field("", max_length=200)
+    source_url: str = Field("", max_length=500)
+    evidence_tier: Literal["L1", "L2", "L3", "L4"] = "L2"
+    ttl_days: int = Field(7, ge=1, le=90)
+
+
+class TriggerVerifyTaskReq(_ArchiveMarketReq):
+    symbol: str = ""
+    trigger_ids: list[str] = Field(default_factory=list)
+    engine: Literal["claude", "codex", ""] = ""
+    force: bool = False
+    ttl_days: int = Field(7, ge=1, le=90)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -899,14 +920,33 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         ):
             raise HTTPException(status_code=422, detail="Conflicting market and market_override query parameters")
         resolved_market = market if market is not None else market_override
-        return ok(
-            archive_call(
-                ra.load_archive,
-                raw_symbol=symbol,
-                market_override=resolved_market,
-                evidence_limit=0,
-            )
+        loaded = archive_call(
+            ra.load_archive,
+            raw_symbol=symbol,
+            market_override=resolved_market,
+            evidence_limit=0,
         )
+        # Attach authoritative server-side verification evaluation per trigger ID
+        state_obj = loaded.get("state") if isinstance(loaded, dict) else None
+        triggers = state_obj.get("triggers") if isinstance(state_obj, dict) else None
+        trig_evals: dict[str, dict[str, Any]] = {}
+        if isinstance(triggers, list):
+            now_dt = datetime.now(timezone.utc)
+            for item in ra.evaluate_triggers({"triggers": triggers}, {}, now_utc=now_dt):
+                tid = str(item.get("id") or "").strip()
+                if not tid:
+                    continue
+                trig_evals[tid] = {
+                    "is_auto": ra.is_trigger_auto_metric(item),
+                    "evaluated": bool(item.get("evaluated")),
+                    "fired": bool(item.get("fired")),
+                    "verification_stale": bool(item.get("verification_stale")),
+                    "verification_status": item.get("verification_status"),
+                    "error": item.get("error"),
+                }
+        if isinstance(loaded, dict):
+            loaded = {**loaded, "trigger_evaluations": trig_evals}
+        return ok(loaded)
 
     @app.post("/api/research/archive/init")
     def research_archive_init(req: ArchiveInitReq):
@@ -961,6 +1001,49 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             note=req.note,
             market_override=req.resolved_market(),
         )
+        return ok(res)
+
+    @app.post("/api/research/archive/trigger-verify-manual")
+    def research_archive_trigger_verify_manual(req: TriggerManualVerifyReq):
+        src_url = req.source_url.strip()
+        if src_url and not ra.is_valid_http_url(src_url):
+            raise HTTPException(
+                status_code=422,
+                detail="source_url must be a valid http:// or https:// URL with a hostname",
+            )
+        summary_clean = req.summary.strip()
+        if not summary_clean:
+            raise HTTPException(status_code=422, detail="summary must be non-empty")
+        ver_payload: dict[str, Any] = {
+            "method": "manual",
+            "status": req.status,
+            "verified_at_utc": ra.utc_now_iso_seconds(),
+            "ttl_days": req.ttl_days,
+            "evidence_tier": req.evidence_tier,
+            "summary": summary_clean,
+        }
+        if req.observed is not None and req.observed != "":
+            ver_payload["observed"] = req.observed
+        if req.observed_text.strip():
+            ver_payload["observed_text"] = req.observed_text.strip()
+        if req.source_title.strip():
+            ver_payload["source_title"] = req.source_title.strip()
+        if src_url:
+            ver_payload["source_url"] = src_url
+
+        res = archive_call(
+            ra.record_trigger_verifications,
+            invalidate_sentinel=True,
+            raw_symbol=req.symbol.strip(),
+            verifications={req.trigger_id.strip(): ver_payload},
+            market_override=req.resolved_market(),
+            reject_auto_metrics=True,
+            enforce_clear_gate=True,
+        )
+        if not res.get("updated_ids"):
+            conflicts = res.get("skipped_conflicts") or []
+            reason = conflicts[0].get("reason") if conflicts else "未找到可更新的目标触发器"
+            raise HTTPException(status_code=422, detail=reason)
         return ok(res)
 
     @app.get("/api/research/engines")
@@ -1054,6 +1137,35 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     @app.post("/api/tasks/sentinel", status_code=202)
     async def task_sentinel(req: SentinelTaskReq):
         return ok(tasks.start("sentinel", req.model_dump()).summary(), status_code=202)
+
+    @app.post("/api/tasks/verify-triggers", status_code=202)
+    async def task_verify_triggers(req: TriggerVerifyTaskReq):
+        eng_info = deep_research.detect_available_engines()
+        chosen_engine = req.engine or (eng_info.get("default_engine") or "")
+        if not chosen_engine or not deep_research.resolve_engine_binary(chosen_engine):
+            raise HTTPException(
+                status_code=503,
+                detail="本机未检测到可用 AI 核验引擎（Claude Code 或 Codex CLI），请先检查 CLI 安装或使用手动核验。",
+            )
+        norm_symbol = ""
+        resolved_market = req.resolved_market()
+        if req.symbol.strip():
+            try:
+                _, resolved_market, norm_symbol, _ = ra.resolve_archive_dir(
+                    req.symbol.strip(),
+                    market_override=resolved_market,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        params = {
+            "symbol": norm_symbol,
+            "market": resolved_market,
+            "trigger_ids": [t.strip() for t in req.trigger_ids if t.strip()],
+            "engine": chosen_engine,
+            "force": req.force,
+            "ttl_days": req.ttl_days,
+        }
+        return ok(tasks.start("trigger_verify", params).summary(), status_code=202)
 
     @app.get("/api/tasks")
     def task_list():

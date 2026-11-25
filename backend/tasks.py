@@ -25,7 +25,7 @@ import research_archive
 import research_data
 import scan_opportunities
 
-from . import deep_research
+from . import deep_research, trigger_verifier
 from .cache import CACHE, TTL_RESEARCH_SECONDS, TTL_SENTINEL_SECONDS
 from .serializers import sanitize
 
@@ -33,7 +33,7 @@ MAX_TASKS = 50
 MAX_PERSISTED_SCANS = 10
 TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 TERMINAL_EVENT_TYPES = frozenset({"done", "error", "cancelled"})
-TASK_KINDS = ("scan", "research_refresh", "sentinel", "deep_research")
+TASK_KINDS = ("scan", "research_refresh", "sentinel", "deep_research", "trigger_verify")
 
 Emit = Callable[[str, dict[str, Any]], None]
 
@@ -745,4 +745,5 @@ RUNNERS: dict[str, Callable[[dict[str, Any], Emit], Any]] = {
     "research_refresh": run_research_refresh,
     "sentinel": run_sentinel,
     "deep_research": deep_research.run_deep_research,
+    "trigger_verify": trigger_verifier.run_trigger_verification,
 }

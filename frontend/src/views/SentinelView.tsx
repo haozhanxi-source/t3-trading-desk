@@ -12,10 +12,11 @@ import {
   RotateCcw,
   Scissors,
   Shield,
+  Sparkles,
   TrendingUp,
   XCircle,
 } from "lucide-react";
-import { api, errorMessage } from "../api/client";
+import { api, errorMessage, parseTaskEvent } from "../api/client";
 import type { PortfolioSummaryResponse, Position, SentinelHolding, SentinelResponse, UpcomingEvent } from "../api/types";
 import {
   canVoidMistakenPosition,
@@ -72,6 +73,13 @@ export function SentinelView({
   const [includeWatchlist, setIncludeWatchlist] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [verifyBusy, setVerifyBusy] = useState(false);
+  const [verifyTaskId, setVerifyTaskId] = useState<string | null>(null);
+  const [verifyTargetLabel, setVerifyTargetLabel] = useState<string>("");
+  const [verifyMessage, setVerifyMessage] = useState<string | null>(null);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  const verifyEsRef = useRef<EventSource | null>(null);
+  const mountedRef = useRef(true);
 
   /* Dialog states */
   const [initOpen, setInitOpen] = useState(false);
@@ -208,6 +216,162 @@ export function SentinelView({
     return out;
   }, [sentinel]);
 
+  const totalVerifiableTriggers = useMemo(() => {
+    let n = 0;
+    for (const h of sentinel?.holdings ?? []) {
+      n += h.verifiable_trigger_ids?.length ?? 0;
+    }
+    return n;
+  }, [sentinel]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (verifyEsRef.current) {
+        verifyEsRef.current.close();
+        verifyEsRef.current = null;
+      }
+    };
+  }, []);
+
+  const formatVerifySummary = (res: Record<string, unknown>): string => {
+    const upd = typeof res.updated_count === "number" ? res.updated_count : 0;
+    const fired = typeof res.fired_count === "number" ? res.fired_count : 0;
+    const clear = typeof res.clear_count === "number" ? res.clear_count : 0;
+    const uncertain = typeof res.uncertain_count === "number" ? res.uncertain_count : 0;
+    const conflicts = typeof res.conflict_count === "number" ? res.conflict_count : 0;
+    const missing = typeof res.missing_count === "number" ? res.missing_count : 0;
+    if (upd === 0 && conflicts === 0 && missing === 0) {
+      return "核验完成：暂无需要更新的触发器。";
+    }
+    const parts = [`更新 ${upd} 条`, `命中 ${fired}`, `确认未触发 ${clear}`, `待确认 ${uncertain}`];
+    if (conflicts > 0) parts.push(`冲突跳过 ${conflicts}`);
+    if (missing > 0) parts.push(`未返回 ${missing}`);
+    return `AI 联网核验完成（${parts.join(" · ")}），正在刷新哨兵…`;
+  };
+
+  const runAiTriggerVerify = useCallback(
+    async (opts?: { symbol?: string; market?: string | null; triggerIds?: string[]; label?: string }) => {
+      if (verifyBusy) return;
+      if (verifyEsRef.current) {
+        verifyEsRef.current.close();
+        verifyEsRef.current = null;
+      }
+      setVerifyBusy(true);
+      setVerifyError(null);
+      setVerifyTargetLabel(opts?.label || opts?.symbol || "全部在途持仓");
+      setVerifyMessage("正在启动 AI 联网核验引擎…");
+
+      try {
+        const task = await api.startTriggerVerify({
+          symbol: opts?.symbol ?? "",
+          market: opts?.market ?? null,
+          trigger_ids: opts?.triggerIds ?? [],
+        });
+        if (!mountedRef.current) return;
+        setVerifyTaskId(task.id);
+        const es = new EventSource(api.taskEventsUrl(task.id));
+        verifyEsRef.current = es;
+        let settled = false;
+
+        const finish = (errMsg?: string | null, doneMsg?: string | null, shouldRefresh = false) => {
+          if (settled) return;
+          settled = true;
+          es.close();
+          if (verifyEsRef.current === es) verifyEsRef.current = null;
+          if (!mountedRef.current) return;
+          setVerifyBusy(false);
+          setVerifyTaskId(null);
+          if (errMsg) {
+            setVerifyError(errMsg);
+            setVerifyMessage(null);
+          } else if (doneMsg) {
+            setVerifyMessage(doneMsg);
+          }
+          if (shouldRefresh) {
+            void loadAll(true);
+            onPortfolioMutated?.();
+          }
+        };
+
+        const handleEvent = (type: string) => (ev: MessageEvent) => {
+          if (settled || !mountedRef.current) return;
+          const rawData = typeof ev.data === "string" ? ev.data : "";
+          // Browser transport error emits an 'error' event with empty data; let EventSource auto-reconnect.
+          if (type === "error" && !rawData.trim()) {
+            if (es.readyState === EventSource.CONNECTING) {
+              setVerifyMessage("核验进度流短暂断连，正在自动重连…");
+            }
+            return;
+          }
+          const parsed = parseTaskEvent(rawData, type);
+          const payload = (parsed?.data ?? parsed ?? {}) as Record<string, unknown>;
+          const msg =
+            (typeof payload.message === "string" && payload.message) ||
+            (typeof payload.error === "string" && payload.error) ||
+            (typeof parsed?.message === "string" && parsed.message) ||
+            "";
+          if (type === "step" || type === "log") {
+            if (msg) setVerifyMessage(msg);
+          } else if (type === "done") {
+            const res = ((payload.result ?? parsed?.result) ?? {}) as Record<string, unknown>;
+            finish(null, formatVerifySummary(res), true);
+          } else if (type === "cancelled") {
+            finish("已取消 AI 触发器核验任务（若已有部分落盘已自动刷新）", null, true);
+          } else if (type === "error") {
+            finish(msg || "AI 触发器核验失败", null, true);
+          }
+        };
+
+        for (const t of ["step", "log", "done", "error", "cancelled"]) {
+          es.addEventListener(t, handleEvent(t) as EventListener);
+        }
+        es.onerror = () => {
+          if (settled || !mountedRef.current) return;
+          if (es.readyState === EventSource.CONNECTING) {
+            setVerifyMessage("核验进度流短暂断连，正在自动重连…");
+            return;
+          }
+          if (es.readyState === EventSource.CLOSED) {
+            void api
+              .task(task.id)
+              .then((t) => {
+                if (t.status === "completed") {
+                  finish(null, formatVerifySummary((t.result ?? {}) as Record<string, unknown>), true);
+                } else if (t.status === "cancelled") {
+                  finish("已取消 AI 触发器核验任务", null, true);
+                } else if (t.status === "failed") {
+                  finish(t.error || "AI 触发器核验失败", null, true);
+                } else {
+                  finish("核验进度连接已断开，后台任务可能仍在运行，请稍后刷新哨兵查看结果", null, true);
+                }
+              })
+              .catch(() => {
+                finish("核验进度连接已断开，请稍后刷新哨兵查看结果", null, true);
+              });
+          }
+        };
+      } catch (ex) {
+        if (!mountedRef.current) return;
+        setVerifyBusy(false);
+        setVerifyTaskId(null);
+        setVerifyMessage(null);
+        setVerifyError(errorMessage(ex));
+      }
+    },
+    [loadAll, onPortfolioMutated, verifyBusy],
+  );
+
+  const handleCancelVerify = useCallback(async () => {
+    if (!verifyTaskId) return;
+    try {
+      await api.cancelTask(verifyTaskId);
+    } catch {
+      /* ignore */
+    }
+  }, [verifyTaskId]);
+
   const sectorEntries = Object.entries(summary?.sector_slots ?? {});
   const macroEntries = Object.entries(summary?.macro_factor_concentration ?? {});
 
@@ -248,12 +412,57 @@ export function SentinelView({
               <span>新增持仓</span>
             </button>
           ) : null}
+          {totalVerifiableTriggers > 0 ? (
+            <button
+              type="button"
+              className="btn"
+              disabled={verifyBusy}
+              title="使用本机 AI 联网核验全部持仓中未完成的政策/非标触发器"
+              onClick={() => void runAiTriggerVerify()}
+            >
+              <Sparkles className={`h-3.5 w-3.5 text-accent ${verifyBusy ? "animate-pulse" : ""}`} aria-hidden="true" />
+              <span>{verifyBusy ? "AI 核验中…" : `AI 联网核验 (${totalVerifiableTriggers})`}</span>
+            </button>
+          ) : null}
           <button type="button" className="btn" disabled={loading} onClick={() => void loadAll(true)}>
             <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden="true" />
             <span>{loading ? "巡检中…" : "立即重跑哨兵"}</span>
           </button>
         </div>
       </div>
+
+      {verifyBusy || verifyMessage || verifyError ? (
+        <div
+          role={verifyError ? "alert" : "status"}
+          className={`card flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 text-xs text-ink ${
+            verifyError ? "border-critical/50 bg-critical/10" : "border-accent/40 bg-accent/10"
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            <Sparkles className={`h-3.5 w-3.5 shrink-0 ${verifyError ? "text-critical" : "text-accent"}`} aria-hidden="true" />
+            <span>
+              <strong>{verifyTargetLabel ? `[${verifyTargetLabel}] ` : ""}</strong>
+              {verifyError || verifyMessage}
+            </span>
+          </div>
+          {verifyBusy && verifyTaskId ? (
+            <button type="button" className="btn btn-sm" onClick={() => void handleCancelVerify()}>
+              取消核验
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm text-muted"
+              onClick={() => {
+                setVerifyMessage(null);
+                setVerifyError(null);
+              }}
+            >
+              关闭
+            </button>
+          )}
+        </div>
+      ) : null}
 
       {error ? (
         <div role="alert" className="card border-critical/50 bg-critical/10 px-4 py-2.5 text-xs text-ink">
@@ -454,19 +663,56 @@ export function SentinelView({
                           className="flex items-start gap-1.5 rounded border border-critical/45 bg-critical/10 px-2.5 py-1.5 text-ink"
                         >
                           <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-critical" aria-hidden="true" />
-                          <span>{a.message || a.detail || a.code}</span>
+                          <div className="min-w-0 flex-1">
+                            <div>{a.message || a.detail || a.code}</div>
+                            {a.detail && a.detail !== a.message ? (
+                              <div className="mt-0.5 break-words text-[11px] text-muted">{a.detail}</div>
+                            ) : null}
+                          </div>
                         </div>
                       ))}
-                      {h.yellow_alerts.map((a, i) => (
-                        <div
-                          key={`y-${i}`}
-                          className="flex items-start gap-1.5 rounded border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-ink"
-                        >
-                          <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
-                          <span>{a.message || a.detail || a.code}</span>
-                        </div>
-                      ))}
-                      {h.info_notes.slice(0, 2).map((n, i) => (
+                      {h.yellow_alerts.map((a, i) => {
+                        const canAiVerifyHere =
+                          a.code === "unevaluated_triggers" &&
+                          Array.isArray(h.verifiable_trigger_ids) &&
+                          h.verifiable_trigger_ids.length > 0;
+                        return (
+                          <div
+                            key={`y-${i}`}
+                            className="flex items-start justify-between gap-2 rounded border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-ink"
+                          >
+                            <div className="flex min-w-0 flex-1 items-start gap-1.5">
+                              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+                              <div className="min-w-0 flex-1">
+                                <div>{a.message || a.detail || a.code}</div>
+                                {a.detail && a.detail !== a.message ? (
+                                  <div className="mt-0.5 break-words text-[11px] text-muted">{a.detail}</div>
+                                ) : null}
+                              </div>
+                            </div>
+                            {canAiVerifyHere ? (
+                              <button
+                                type="button"
+                                className="btn btn-sm shrink-0"
+                                disabled={verifyBusy}
+                                title="使用 AI 联网核验未完成的政策/非标触发器"
+                                onClick={() =>
+                                  void runAiTriggerVerify({
+                                    symbol: h.symbol,
+                                    market: h.market ?? null,
+                                    triggerIds: h.verifiable_trigger_ids,
+                                    label: h.name || h.symbol,
+                                  })
+                                }
+                              >
+                                <Sparkles className="h-3 w-3 text-accent" aria-hidden="true" />
+                                <span>{verifyBusy ? "核验中…" : "AI 核验"}</span>
+                              </button>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                      {h.info_notes.slice(0, 3).map((n, i) => (
                         <div key={`i-${i}`} className="text-[11px] text-muted">
                           • {n}
                         </div>

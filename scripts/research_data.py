@@ -103,7 +103,21 @@ CN_FUTURE_META: dict[str, tuple[str, str, str]] = {
     "SC0": ("原油", "SC", "energy"),
 }
 
-INVENTORY_EM_BLACKLIST = {"原油", "燃油", "低硫燃料油", "纯碱"}
+INVENTORY_EM_BLACKLIST = {"原油", "燃油", "低硫燃料油", "集运欧线"}
+INVENTORY_EM_SYMBOL_MAP: dict[str, str] = {
+    "HC": "热卷",
+    "热轧卷板": "热卷",
+    "NI": "镍",
+    "沪镍": "镍",
+    "SN": "锡",
+    "沪锡": "锡",
+    "RU": "橡胶",
+    "天然橡胶": "橡胶",
+    "P": "棕榈",
+    "棕榈油": "棕榈",
+    "CF": "郑棉",
+    "棉花": "郑棉",
+}
 TERM_STRUCTURE_SKIP = {"PTA", "原油"}
 SPOT_BASIS_SKIP = {"SC", "EC"}
 
@@ -1533,14 +1547,43 @@ def fetch_ashare_hsgt_flow() -> dict[str, Any]:
     return out
 
 
-def fetch_cn_future_inventory(cn_name: str) -> dict[str, Any]:
+def fetch_cn_future_inventory(cn_name: str, spot_code: str | None = None) -> dict[str, Any]:
     if ak is None:
         raise RuntimeError("akshare is not installed")
-    if cn_name in INVENTORY_EM_BLACKLIST:
+    code_up = (spot_code or "").strip().upper()
+    em_symbol = (
+        INVENTORY_EM_SYMBOL_MAP.get(code_up)
+        or INVENTORY_EM_SYMBOL_MAP.get(cn_name)
+        or cn_name
+    )
+    if cn_name in INVENTORY_EM_BLACKLIST or em_symbol in INVENTORY_EM_BLACKLIST:
         return {"status": "skipped", "reason": f"Blacklisted inventory symbol: {cn_name}"}
-    df = _run_with_timeout(lambda: ak.futures_inventory_em(symbol=cn_name), timeout_s=HTTP_TIMEOUT)
-    if df is None or df.empty:
+
+    candidates: list[str] = [em_symbol]
+    if code_up:
+        for alt in (code_up, code_up.lower()):
+            if alt not in candidates:
+                candidates.append(alt)
+
+    df = None
+    last_exc: Exception | None = None
+    used_symbol = em_symbol
+    for idx, cand in enumerate(candidates):
+        try:
+            df = _run_with_timeout(lambda c=cand: ak.futures_inventory_em(symbol=c), timeout_s=HTTP_TIMEOUT)
+            used_symbol = cand
+            break
+        except ValueError as exc:
+            last_exc = exc
+            if idx + 1 < len(candidates) and "请输入正确的 symbol" in str(exc):
+                continue
+            raise
+    if df is None:
+        if last_exc is not None:
+            raise last_exc
         raise ValueError(f"Empty futures_inventory_em for {cn_name}")
+    if df.empty:
+        raise ValueError(f"Empty futures_inventory_em for {cn_name} ({used_symbol})")
     df = df.copy()
     date_col = "日期" if "日期" in df.columns else df.columns[0]
     inv_col = "库存" if "库存" in df.columns else df.columns[1]
@@ -1565,6 +1608,7 @@ def fetch_cn_future_inventory(cn_name: str) -> dict[str, Any]:
     chg_20d, chg_20d_pct = _chg(20)
     return {
         "symbol_cn": cn_name,
+        "em_symbol": used_symbol,
         "latest_date": latest_date,
         "latest_inventory": round(latest_inv, 4),
         "chg_5d": chg_5d,
@@ -2130,7 +2174,9 @@ def collect_research_data(
         if meta is not None:
             cn_name, spot_code, macro_sector = meta
             fundamentals_and_supply["inventory_em"] = _run_source(
-                "inventory_em", lambda: fetch_cn_future_inventory(cn_name), sources_status
+                "inventory_em",
+                lambda: fetch_cn_future_inventory(cn_name, spot_code=spot_code),
+                sources_status,
             )
             fundamentals_and_supply["spot_and_basis"] = _run_source(
                 "spot_and_basis", lambda: fetch_cn_future_spot_basis(spot_code), sources_status

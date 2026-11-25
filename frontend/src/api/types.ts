@@ -263,6 +263,7 @@ export interface SentinelHolding {
   info_notes: string[];
   suggested_trail_stop?: SuggestedTrailStop | null;
   trigger_results?: Dict[];
+  verifiable_trigger_ids?: string[];
   upcoming_events?: UpcomingEvent[];
   data_warnings?: unknown[];
   checked_at_utc?: string;
@@ -667,10 +668,28 @@ export interface ArchiveListItem {
   archive_dir?: string;
 }
 
+export interface TriggerVerification {
+  method: "ai_web" | "manual" | string;
+  status: "clear" | "fired" | "uncertain" | string;
+  observed?: number | string | boolean | null;
+  observed_text?: string;
+  summary?: string;
+  evidence_tier?: "L1" | "L2" | "L3" | "L4" | string;
+  source_title?: string;
+  source_url?: string;
+  verified_at_utc?: string;
+  ttl_days?: number;
+}
+
 export interface ArchiveTrigger {
   id?: string;
   category?: string;
   kind?: string;
+  evaluation_mode?: "auto" | "ai_web" | "manual" | string;
+  verification_ttl_days?: number;
+  verification?: TriggerVerification | null;
+  last_checked_at?: string | null;
+  last_value?: unknown;
   metric?: string;
   operator?: string;
   threshold?: number | string | null;
@@ -721,6 +740,15 @@ export interface EvidenceItem {
   [k: string]: unknown;
 }
 
+export interface TriggerServerEvaluation {
+  is_auto?: boolean;
+  evaluated?: boolean;
+  fired?: boolean;
+  verification_stale?: boolean;
+  verification_status?: string | null;
+  error?: string | null;
+}
+
 export interface ArchiveDetail {
   market: string;
   symbol: string;
@@ -729,6 +757,7 @@ export interface ArchiveDetail {
   evidence_count: number;
   recent_evidence: EvidenceItem[];
   thesis_md: string;
+  trigger_evaluations?: Record<string, TriggerServerEvaluation>;
 }
 
 export interface ArchiveInitBody {
@@ -790,7 +819,14 @@ export interface ScanRow {
   error?: string;
 }
 
-export type TaskKind = "scan" | "research_refresh" | "research-refresh" | "deep_research" | "sentinel" | string;
+export type TaskKind =
+  | "scan"
+  | "research_refresh"
+  | "research-refresh"
+  | "deep_research"
+  | "sentinel"
+  | "trigger_verify"
+  | string;
 export type TaskStatus = "queued" | "running" | "completed" | "failed" | "cancelled" | string;
 
 export type DeepResearchMode = "standard" | "adversarial";

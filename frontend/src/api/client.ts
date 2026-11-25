@@ -257,6 +257,50 @@ export const api = {
   },
   startSentinelTask: async (body: { include_watchlist: boolean; skip_research: boolean; event_window_days: number }) =>
     normalizeTask(await post<TaskRecord>("/tasks/sentinel", body)),
+  startTriggerVerify: async (body: {
+    symbol?: string;
+    market?: string | null;
+    trigger_ids?: string[];
+    engine?: "claude" | "codex" | "";
+    force?: boolean;
+    ttl_days?: number;
+  }) =>
+    normalizeTask(
+      await post<TaskRecord>("/tasks/verify-triggers", {
+        symbol: body.symbol ?? "",
+        ...(body.market ? { market: body.market } : {}),
+        trigger_ids: body.trigger_ids ?? [],
+        engine: body.engine ?? "",
+        force: body.force ?? false,
+        ttl_days: body.ttl_days ?? 7,
+      }),
+    ),
+  verifyTriggerManual: (body: {
+    symbol: string;
+    market?: string | null;
+    trigger_id: string;
+    status: "clear" | "fired" | "uncertain";
+    observed?: number | string | boolean | null;
+    observed_text?: string;
+    summary?: string;
+    source_title?: string;
+    source_url?: string;
+    evidence_tier?: "L1" | "L2" | "L3" | "L4";
+    ttl_days?: number;
+  }) =>
+    post<{ state: ArchiveDetail["state"]; updated_ids: string[] }>("/research/archive/trigger-verify-manual", {
+      symbol: body.symbol,
+      ...(body.market ? { market: body.market } : {}),
+      trigger_id: body.trigger_id,
+      status: body.status,
+      observed: body.observed ?? null,
+      observed_text: body.observed_text ?? "",
+      summary: body.summary ?? "",
+      source_title: body.source_title ?? "",
+      source_url: body.source_url ?? "",
+      evidence_tier: body.evidence_tier ?? "L2",
+      ttl_days: body.ttl_days ?? 7,
+    }),
   tasks: async (signal?: AbortSignal) => {
     const r = await get<{ tasks: TaskRecord[] }>("/tasks", undefined, signal);
     return { tasks: (r.tasks ?? []).map(normalizeTask) };

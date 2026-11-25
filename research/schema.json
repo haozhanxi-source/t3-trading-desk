@@ -84,6 +84,24 @@
           "unit": { "type": "string" },
           "status": { "type": "string", "enum": ["armed", "triggered", "resolved"] },
           "action": { "type": "string" },
+          "description": { "type": "string" },
+          "evaluation_mode": { "type": "string", "enum": ["auto", "ai_web", "manual"] },
+          "verification_ttl_days": { "type": "integer", "minimum": 1 },
+          "verification": {
+            "type": ["object", "null"],
+            "properties": {
+              "method": { "type": "string", "enum": ["ai_web", "manual"] },
+              "status": { "type": "string", "enum": ["clear", "fired", "uncertain"] },
+              "observed": {},
+              "observed_text": { "type": "string" },
+              "summary": { "type": "string" },
+              "evidence_tier": { "type": "string", "enum": ["L1", "L2", "L3", "L4"] },
+              "source_title": { "type": "string" },
+              "source_url": { "type": "string" },
+              "verified_at_utc": { "type": "string" },
+              "ttl_days": { "type": "integer", "minimum": 1 }
+            }
+          },
           "last_checked_at": { "type": ["string", "null"] },
           "last_value": {}
         }

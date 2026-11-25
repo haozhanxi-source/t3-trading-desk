@@ -28,6 +28,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+import daily_sentinel
 import market_snapshot
 import research_archive
 import research_data
@@ -372,12 +373,13 @@ def build_research_prompt(
         "    {\n"
         '      "id": "trig_unique_snake_case",\n'
         '      "kind": "chanlun | supply_demand | term_structure | rate_diff | fundamental | policy | spread | freight | macro",\n'
-        '      "metric": "优先使用哨兵自动化键名，如 close / daily_zd / daily_zg / basis_pct / inventory_latest / roll_yield_near_pct / rate_diff_10y_bp 等",\n'
+        '      "evaluation_mode": "auto（标准机审键）| ai_web（政策/事件等需AI联网核验的非标指标）",\n'
+        '      "metric": "机审触发器必须精确使用哨兵标准键名（如 close / daily_zd / daily_zg / basis_pct / inventory_latest / roll_yield_near_pct / rate_diff_10y_bp）；政策/定性项可自定义英文snake_case并标 evaluation_mode=ai_web",\n'
         '      "operator": "> | >= | < | <= | == | contains | event",\n'
         '      "threshold": 12345,\n'
         '      "action": "exit_review | trim_or_exit | alert",\n'
         '      "status": "armed",\n'
-        '      "description": "触发后的明确含义与动作"\n'
+        '      "description": "触发后的明确含义、数据核验口径与动作"\n'
         "    }\n"
         "  ],\n"
         '  "events": [\n'
@@ -388,7 +390,7 @@ def build_research_prompt(
         "}\n"
         "```\n"
         f"提示：哨兵自动支持的标准化 metric 键名包括：{SENTINEL_METRIC_HINTS}。"
-        "请至少提供 5~10 条高质量 L1~L4 证据、3~6 条可执行撤离红线/监控触发器（优先使用上述标准化 metric 键名与合理数值阈值）以及 2~5 条未来催化/移仓事件。"
+        "请至少提供 5~10 条高质量 L1~L4 证据、3~6 条可执行撤离红线/监控触发器（量化价格/结构/库存/基差/曲线/利差类必须精确选用上述标准键名并标 evaluation_mode=auto；政策或突发事件类非标指标可标 evaluation_mode=ai_web 并写清核验口径）以及 2~5 条未来催化/移仓事件。"
     )
 
 
@@ -846,9 +848,17 @@ def normalize_research_output(
         action = str(raw_trig.get("action") or "alert").strip()
         if not action:
             action = "alert"
+        raw_mode = str(raw_trig.get("evaluation_mode") or "").strip().lower()
+        if daily_sentinel.is_known_auto_metric(metric):
+            eval_mode = "auto"
+        elif raw_mode in {"ai_web", "manual"}:
+            eval_mode = raw_mode
+        else:
+            eval_mode = "ai_web"
         trig_obj: dict[str, Any] = {
             "id": tid,
             "kind": kind,
+            "evaluation_mode": eval_mode,
             "metric": metric,
             "operator": operator,
             "threshold": raw_trig["threshold"],

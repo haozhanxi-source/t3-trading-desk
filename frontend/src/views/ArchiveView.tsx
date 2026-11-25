@@ -4,6 +4,7 @@ import remarkGfm from "remark-gfm";
 import {
   Bot,
   CalendarPlus,
+  CheckCircle2,
   Crosshair,
   Database,
   Edit3,
@@ -31,6 +32,7 @@ import type {
   ResearchDataResponse,
   ResearchEnginesResponse,
   TaskRecord,
+  TriggerServerEvaluation,
 } from "../api/types";
 import {
   DeepResearchDialog,
@@ -482,6 +484,86 @@ function formatTriggerMetric(metric: string | undefined): { primary: string; raw
   return { primary: m };
 }
 
+function isSafeHttpUrl(raw: string | undefined | null): boolean {
+  if (!raw || typeof raw !== "string") return false;
+  const s = raw.trim();
+  if (!s || /[\s\x00-\x1f\x7f]/.test(s)) return false;
+  try {
+    const parsed = new URL(s);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:") && Boolean(parsed.hostname);
+  } catch {
+    return false;
+  }
+}
+
+function parseStrictUtcMs(ts: string | undefined | null): number | null {
+  if (!ts || typeof ts !== "string") return null;
+  const s = ts.trim();
+  const mUtc = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2})(?::(\d{2}))?\s+UTC$/.exec(s);
+  if (mUtc) {
+    const iso = `${mUtc[1]}T${mUtc[2]}:${mUtc[3] ?? "00"}Z`;
+    const ms = Date.parse(iso);
+    return Number.isFinite(ms) ? ms : null;
+  }
+  const mIso = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?(Z|[+-]\d{2}:\d{2})$/.exec(s);
+  if (mIso) {
+    const ms = Date.parse(s.replace(" ", "T"));
+    return Number.isFinite(ms) ? ms : null;
+  }
+  return null;
+}
+
+function evaluateVerificationBadge(
+  tr: ArchiveTrigger,
+  mode: string,
+  modeLabel: string,
+  serverEval?: TriggerServerEvaluation,
+): { tone: "critical" | "good" | "warning"; label: string } {
+  if (serverEval) {
+    if (serverEval.is_auto || mode === "auto") {
+      return serverEval.fired
+        ? { tone: "critical", label: "自动机审 · 已触发" }
+        : { tone: "good", label: "自动机审 · 在线" };
+    }
+    if (serverEval.fired) {
+      return { tone: "critical", label: `${modeLabel} · 已触发` };
+    }
+    if (serverEval.evaluated) {
+      return { tone: "good", label: `${modeLabel} · 已确认未触发` };
+    }
+    if (serverEval.verification_stale) {
+      return { tone: "warning", label: `${modeLabel} · 已过期` };
+    }
+    if (serverEval.error) {
+      return { tone: "warning", label: `${modeLabel} · 核验未放行` };
+    }
+    return { tone: "warning", label: `${modeLabel} · 待核验` };
+  }
+
+  const ver = tr.verification;
+  if (!ver) {
+    if (tr.status === "fired") return { tone: "critical", label: "已触发" };
+    if (mode === "auto") return { tone: "good", label: "自动机审 · 在线" };
+    return { tone: "warning", label: `${modeLabel} · 待核验` };
+  }
+  const verifiedMs = parseStrictUtcMs(ver.verified_at_utc);
+  const nowMs = Date.now();
+  const ttlDays = Math.max(1, Number(ver.ttl_days ?? tr.verification_ttl_days ?? 7) || 7);
+  if (verifiedMs === null) {
+    return { tone: "warning", label: `${modeLabel} · 时间戳无效` };
+  }
+  if (verifiedMs > nowMs) {
+    return { tone: "warning", label: `${modeLabel} · 未来时间无效` };
+  }
+  if (nowMs - verifiedMs > ttlDays * 24 * 60 * 60 * 1000) {
+    return { tone: "warning", label: `${modeLabel} · 已过期` };
+  }
+  if (ver.status === "fired" || tr.status === "fired") {
+    return { tone: "critical", label: `${modeLabel} · 已触发` };
+  }
+  return { tone: "warning", label: `${modeLabel} · 待服务端核验` };
+}
+
 const AUDIT_HEADING_LINE_RE =
   /^##\s*(?:增量修订日志|修订与核验日志|修订日志)(?:\s*(?:（[^）]*）|\([^)]*\)))?\s*$/;
 const OPEN_FENCE_RE = /^ {0,3}(`{3,}|~{3,})(.*)$/;
@@ -609,6 +691,30 @@ export function ArchiveView({
   const [trigAction, setTrigAction] = useState("exit_review");
   const [trigDesc, setTrigDesc] = useState("");
   const [trigBusy, setTrigBusy] = useState(false);
+
+  /* Trigger AI web-verification & manual verification states */
+  const [trigVerifyBusy, setTrigVerifyBusy] = useState(false);
+  const [trigVerifyMsg, setTrigVerifyMsg] = useState<string | null>(null);
+  const [trigVerifyErr, setTrigVerifyErr] = useState<string | null>(null);
+  const trigVerifyEsRef = useRef<EventSource | null>(null);
+  const trigMountedRef = useRef(true);
+  const [manualVerifyTarget, setManualVerifyTarget] = useState<ArchiveTrigger | null>(null);
+  const [manualStatus, setManualStatus] = useState<"" | "clear" | "fired" | "uncertain">("");
+  const [manualObserved, setManualObserved] = useState("");
+  const [manualSummary, setManualSummary] = useState("");
+  const [manualSourceUrl, setManualSourceUrl] = useState("");
+  const [manualSaving, setManualSaving] = useState(false);
+
+  useEffect(() => {
+    trigMountedRef.current = true;
+    return () => {
+      trigMountedRef.current = false;
+      if (trigVerifyEsRef.current) {
+        trigVerifyEsRef.current.close();
+        trigVerifyEsRef.current = null;
+      }
+    };
+  }, []);
 
   const activeKindPresets = useMemo(
     () => TRIGGER_METRICS_BY_KIND[trigKind] ?? TRIGGER_METRICS_BY_KIND.chanlun,
@@ -1379,6 +1485,7 @@ export function ArchiveView({
     const newItem: ArchiveTrigger = {
       id: `trig_${Date.now().toString(36)}`,
       kind: trigKind,
+      evaluation_mode: trigCustomMode ? "ai_web" : "auto",
       metric: trigMetric.trim(),
       operator: trigOp,
       threshold: parsedThreshold,
@@ -1426,6 +1533,190 @@ export function ArchiveView({
       if (selectionTokenRef.current === token) setErr(errorMessage(ex));
     } finally {
       setTrigBusy(false);
+    }
+  };
+
+  const handleRunAiVerifyTriggers = async (triggerIds?: string[], force = false) => {
+    if (!detail || trigVerifyBusy) return;
+    if (trigVerifyEsRef.current) {
+      trigVerifyEsRef.current.close();
+      trigVerifyEsRef.current = null;
+    }
+    const targetSym = detail.symbol;
+    const targetMkt = detail.market;
+    const token = selectionTokenRef.current;
+
+    const formatArchiveVerifySummary = (res: Record<string, unknown>): string => {
+      const upd = typeof res.updated_count === "number" ? res.updated_count : 0;
+      const fired = typeof res.fired_count === "number" ? res.fired_count : 0;
+      const clear = typeof res.clear_count === "number" ? res.clear_count : 0;
+      const uncertain = typeof res.uncertain_count === "number" ? res.uncertain_count : 0;
+      const conflicts = typeof res.conflict_count === "number" ? res.conflict_count : 0;
+      const missing = typeof res.missing_count === "number" ? res.missing_count : 0;
+      if (upd === 0 && conflicts === 0 && missing === 0) {
+        return "所有触发器均已由机审覆盖或在核验有效期内。";
+      }
+      const parts = [`更新 ${upd} 条`, `命中 ${fired}`, `确认未触发 ${clear}`, `待确认 ${uncertain}`];
+      if (conflicts > 0) parts.push(`冲突跳过 ${conflicts}`);
+      if (missing > 0) parts.push(`未返回 ${missing}`);
+      return `联网核验完成（${parts.join(" · ")}）`;
+    };
+
+    setTrigVerifyBusy(true);
+    setTrigVerifyErr(null);
+    setTrigVerifyMsg("正在启动 AI 联网核验触发器…");
+
+    try {
+      const task = await api.startTriggerVerify({
+        symbol: targetSym,
+        market: targetMkt,
+        trigger_ids: triggerIds ?? [],
+        force,
+      });
+      if (!trigMountedRef.current) return;
+      const es = new EventSource(api.taskEventsUrl(task.id));
+      trigVerifyEsRef.current = es;
+      let settled = false;
+
+      const finish = (errMsg?: string | null, okMsg?: string | null, shouldReload = false) => {
+        if (settled) return;
+        settled = true;
+        es.close();
+        if (trigVerifyEsRef.current === es) trigVerifyEsRef.current = null;
+        if (!trigMountedRef.current) return;
+        setTrigVerifyBusy(false);
+        if (errMsg) {
+          setTrigVerifyErr(errMsg);
+          setTrigVerifyMsg(null);
+        } else if (okMsg) {
+          setTrigVerifyMsg(okMsg);
+        }
+        if (shouldReload) {
+          if (selectionTokenRef.current === token) {
+            void loadDetail(targetSym, targetMkt, undefined, token);
+          }
+          onArchiveMutated?.();
+        }
+      };
+
+      const onEv = (type: string) => (ev: MessageEvent) => {
+        if (settled || !trigMountedRef.current) return;
+        const rawData = typeof ev.data === "string" ? ev.data : "";
+        if (type === "error" && !rawData.trim()) {
+          if (es.readyState === EventSource.CONNECTING) {
+            setTrigVerifyMsg("核验进度流短暂断连，正在自动重连…");
+          }
+          return;
+        }
+        const parsed = parseTaskEvent(rawData, type);
+        const payload = (parsed?.data ?? parsed ?? {}) as Record<string, unknown>;
+        const msg =
+          (typeof payload.message === "string" && payload.message) ||
+          (typeof payload.error === "string" && payload.error) ||
+          (typeof parsed?.message === "string" && parsed.message) ||
+          "";
+        if (type === "step" || type === "log") {
+          if (msg) setTrigVerifyMsg(msg);
+        } else if (type === "done") {
+          const res = ((payload.result ?? parsed?.result) ?? {}) as Record<string, unknown>;
+          finish(null, formatArchiveVerifySummary(res), true);
+        } else if (type === "cancelled") {
+          finish("已取消核验任务", null, true);
+        } else if (type === "error") {
+          finish(msg || "AI 联网核验失败", null, true);
+        }
+      };
+
+      for (const t of ["step", "log", "done", "error", "cancelled"]) {
+        es.addEventListener(t, onEv(t) as EventListener);
+      }
+      es.onerror = () => {
+        if (settled || !trigMountedRef.current) return;
+        if (es.readyState === EventSource.CONNECTING) {
+          setTrigVerifyMsg("核验进度流短暂断连，正在自动重连…");
+          return;
+        }
+        if (es.readyState === EventSource.CLOSED) {
+          void api
+            .task(task.id)
+            .then((t) => {
+              if (t.status === "completed") {
+                finish(null, formatArchiveVerifySummary((t.result ?? {}) as Record<string, unknown>), true);
+              } else if (t.status === "cancelled") {
+                finish("已取消核验任务", null, true);
+              } else if (t.status === "failed") {
+                finish(t.error || "AI 联网核验失败", null, true);
+              } else {
+                finish("核验进度连接已断开，请刷新页面查看最新档案状态", null, true);
+              }
+            })
+            .catch(() => {
+              finish("核验进度连接断开，请刷新页面查看最新档案状态", null, true);
+            });
+        }
+      };
+    } catch (ex) {
+      if (!trigMountedRef.current) return;
+      setTrigVerifyBusy(false);
+      setTrigVerifyMsg(null);
+      setTrigVerifyErr(errorMessage(ex));
+    }
+  };
+
+  const openManualVerify = (tr: ArchiveTrigger) => {
+    setManualVerifyTarget(tr);
+    const prevSt = tr.verification?.status;
+    setManualStatus(prevSt === "fired" ? "fired" : prevSt === "clear" ? "clear" : "");
+    setManualObserved(
+      tr.verification?.observed != null
+        ? String(tr.verification.observed)
+        : tr.verification?.observed_text || "",
+    );
+    setManualSummary(tr.verification?.summary || "");
+    setManualSourceUrl(tr.verification?.source_url || "");
+  };
+
+  const handleSubmitManualVerify = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!detail || !manualVerifyTarget?.id || !manualStatus) return;
+    const targetSym = detail.symbol;
+    const targetMkt = detail.market;
+    const token = selectionTokenRef.current;
+
+    const rawObs = manualObserved.trim();
+    const numObs = Number(rawObs);
+    const parsedObs =
+      rawObs !== "" &&
+      Number.isFinite(numObs) &&
+      manualVerifyTarget.operator !== "contains" &&
+      manualVerifyTarget.operator !== "event"
+        ? numObs
+        : null;
+
+    setManualSaving(true);
+    setErr(null);
+    try {
+      await api.verifyTriggerManual({
+        symbol: targetSym,
+        market: targetMkt,
+        trigger_id: manualVerifyTarget.id,
+        status: manualStatus,
+        observed: parsedObs,
+        observed_text: rawObs,
+        summary: manualSummary.trim() || (manualStatus === "fired" ? "人工核验确认已触发" : "人工核验确认暂未触发"),
+        source_url: manualSourceUrl.trim(),
+        evidence_tier: "L2",
+        ttl_days: 7,
+      });
+      if (selectionTokenRef.current === token) {
+        setManualVerifyTarget(null);
+        await loadDetail(targetSym, targetMkt, undefined, token);
+      }
+      onArchiveMutated?.();
+    } catch (ex) {
+      if (selectionTokenRef.current === token) setErr(errorMessage(ex));
+    } finally {
+      setManualSaving(false);
     }
   };
 
@@ -2073,10 +2364,45 @@ export function ArchiveView({
           <div className="flex flex-col gap-4">
             {/* Section A: Armed Exit Triggers */}
             <section className="card flex flex-col gap-3 p-4">
-              <div className="flex items-center justify-between">
-                <span className="section-title">撤离红线触发器配置（同步每日哨兵巡检）</span>
-                <span className="font-mono text-[11px] text-muted">共 {detail.state.triggers?.length ?? 0} 条</span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="section-title">撤离红线触发器配置（同步每日哨兵巡检）</span>
+                  <span className="font-mono text-[11px] text-muted">共 {detail.state.triggers?.length ?? 0} 条</span>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={trigVerifyBusy || (detail.state.triggers?.length ?? 0) === 0}
+                  title="自动调用本机 AI 联网检索并核验所有政策/非标触发器"
+                  onClick={() => void handleRunAiVerifyTriggers(undefined, false)}
+                >
+                  <Sparkles className={`h-3.5 w-3.5 text-accent ${trigVerifyBusy ? "animate-pulse" : ""}`} aria-hidden="true" />
+                  <span>{trigVerifyBusy ? "AI 联网核验中…" : "AI 联网核验非标触发器"}</span>
+                </button>
               </div>
+
+              {trigVerifyMsg || trigVerifyErr ? (
+                <div
+                  role={trigVerifyErr ? "alert" : "status"}
+                  className={`flex items-center justify-between gap-2 rounded border px-3 py-2 text-xs text-ink ${
+                    trigVerifyErr ? "border-critical/45 bg-critical/10" : "border-accent/40 bg-accent/10"
+                  }`}
+                >
+                  <span>{trigVerifyErr || trigVerifyMsg}</span>
+                  {!trigVerifyBusy ? (
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm text-muted"
+                      onClick={() => {
+                        setTrigVerifyMsg(null);
+                        setTrigVerifyErr(null);
+                      }}
+                    >
+                      关闭
+                    </button>
+                  ) : null}
+                </div>
+              ) : null}
 
               <form onSubmit={handleAddTrigger} className="grid grid-cols-1 items-end gap-2.5 sm:grid-cols-2 lg:grid-cols-12">
                 <label className="field lg:col-span-2">
@@ -2190,7 +2516,7 @@ export function ArchiveView({
                       <th scope="col">监控指标</th>
                       <th scope="col">条件阈值</th>
                       <th scope="col">触发动作</th>
-                      <th scope="col">状态</th>
+                      <th scope="col">核验方式与最新结论</th>
                       <th scope="col" className="num">
                         操作
                       </th>
@@ -2203,7 +2529,7 @@ export function ArchiveView({
                         <td data-label="监控指标">—</td>
                         <td data-label="条件阈值">—</td>
                         <td data-label="触发动作">—</td>
-                        <td data-label="状态">在上方添加撤离红线后自动纳入每日哨兵</td>
+                        <td data-label="核验方式与最新结论">在上方添加撤离红线后自动纳入每日哨兵</td>
                         <td data-label="操作" className="num">
                           —
                         </td>
@@ -2213,35 +2539,90 @@ export function ArchiveView({
                         const mDisp = formatTriggerMetric(tr.metric || tr.description);
                         const rawKind = String(tr.category || tr.kind || "chanlun");
                         const rawAct = String(tr.action || "alert");
+                        const serverEval = tr.id ? detail.trigger_evaluations?.[tr.id] : undefined;
+                        const mode = serverEval?.is_auto ? "auto" : (tr.evaluation_mode || (mDisp.raw ? "auto" : "ai_web"));
+                        const ver = tr.verification;
+                        const modeLabel =
+                          mode === "auto" ? "自动机审" : mode === "manual" ? "人工核验" : "AI 联网核验";
+                        const badge = evaluateVerificationBadge(tr, mode, modeLabel, serverEval);
+                        const safeSrcUrl = ver?.source_url && isSafeHttpUrl(ver.source_url) ? ver.source_url : null;
                         return (
                           <tr key={tr.id || i}>
                             <th scope="row">{TRIGGER_KIND_ZH[rawKind] || rawKind}</th>
                             <td data-label="监控指标">
-                              <span className="font-medium text-ink">{mDisp.primary}</span>
+                              <div className="font-medium text-ink">{mDisp.primary}</div>
                               {mDisp.raw ? (
-                                <span className="ml-1.5 font-mono text-[11px] text-muted">{mDisp.raw}</span>
+                                <span className="font-mono text-[11px] text-muted">{mDisp.raw}</span>
+                              ) : null}
+                              {tr.description ? (
+                                <div className="mt-0.5 max-w-md text-[11px] text-muted">{tr.description}</div>
                               ) : null}
                             </td>
                             <td data-label="条件阈值" className="tnum font-mono">
                               {tr.operator || ""} {tr.threshold != null ? String(tr.threshold) : ""}
                             </td>
                             <td data-label="触发动作">{TRIGGER_ACTION_ZH[rawAct] || rawAct}</td>
-                            <td data-label="状态">
-                              <StatusBadge
-                                tone={tr.status === "fired" ? "critical" : "good"}
-                                label={tr.status === "fired" ? "已触发" : "在线监控"}
-                              />
+                            <td data-label="核验方式与最新结论">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <StatusBadge tone={badge.tone} label={badge.label} />
+                                {ver?.verified_at_utc ? (
+                                  <span className="font-mono text-[10.5px] text-muted">{ver.verified_at_utc}</span>
+                                ) : null}
+                              </div>
+                              {serverEval?.error ? (
+                                <div className="mt-0.5 max-w-sm text-[11px] text-warning">{serverEval.error}</div>
+                              ) : null}
+                              {ver?.summary || ver?.observed_text ? (
+                                <div className="mt-1 max-w-sm text-[11px] text-muted">
+                                  {ver.summary || ver.observed_text}
+                                  {safeSrcUrl ? (
+                                    <a
+                                      href={safeSrcUrl}
+                                      target="_blank"
+                                      rel="noreferrer"
+                                      className="ml-1.5 inline-flex items-center gap-0.5 text-accent underline"
+                                    >
+                                      <span>来源</span>
+                                      <ExternalLink className="h-2.5 w-2.5" aria-hidden="true" />
+                                    </a>
+                                  ) : null}
+                                </div>
+                              ) : null}
                             </td>
                             <td data-label="操作" className="num">
-                              <button
-                                type="button"
-                                className="btn btn-ghost btn-sm px-1.5 text-muted hover:text-critical"
-                                disabled={trigBusy}
-                                title="移除该触发器"
-                                onClick={() => void handleRemoveTrigger(i)}
-                              >
-                                <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
-                              </button>
+                              <div className="inline-flex items-center gap-1">
+                                {tr.id && mode !== "auto" ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      className="btn btn-ghost btn-sm px-1.5 text-accent"
+                                      disabled={trigVerifyBusy}
+                                      title="使用 AI 联网重新核验此触发器"
+                                      onClick={() => void handleRunAiVerifyTriggers([tr.id as string], true)}
+                                    >
+                                      <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="btn btn-ghost btn-sm px-1.5 text-muted hover:text-ink"
+                                      disabled={manualSaving}
+                                      title="手动录入核验结果"
+                                      onClick={() => openManualVerify(tr)}
+                                    >
+                                      <CheckCircle2 className="h-3.5 w-3.5" aria-hidden="true" />
+                                    </button>
+                                  </>
+                                ) : null}
+                                <button
+                                  type="button"
+                                  className="btn btn-ghost btn-sm px-1.5 text-muted hover:text-critical"
+                                  disabled={trigBusy}
+                                  title="移除该触发器"
+                                  onClick={() => void handleRemoveTrigger(i)}
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         );
@@ -2250,6 +2631,78 @@ export function ArchiveView({
                   </tbody>
                 </table>
               </div>
+
+              {manualVerifyTarget ? (
+                <form
+                  onSubmit={handleSubmitManualVerify}
+                  className="rounded border border-hairline bg-sunken/60 p-3 text-xs"
+                >
+                  <div className="mb-2 flex items-center justify-between">
+                    <span className="font-medium text-ink">
+                      手动核验触发器：<code className="font-mono">{manualVerifyTarget.id}</code>（
+                      {manualVerifyTarget.metric} {manualVerifyTarget.operator} {String(manualVerifyTarget.threshold ?? "")}）
+                    </span>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm text-muted"
+                      onClick={() => setManualVerifyTarget(null)}
+                    >
+                      取消
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-12">
+                    <label className="field lg:col-span-2">
+                      <span>核验判定 *</span>
+                      <select
+                        className="input"
+                        required
+                        value={manualStatus}
+                        onChange={(e) => setManualStatus(e.target.value as "" | "clear" | "fired" | "uncertain")}
+                      >
+                        <option value="" disabled>
+                          请选择判定…
+                        </option>
+                        <option value="clear">未触发（安全）</option>
+                        <option value="fired">已触发（命中红线）</option>
+                        <option value="uncertain">暂不确定（保持警戒）</option>
+                      </select>
+                    </label>
+                    <label className="field lg:col-span-3">
+                      <span>最新观测值（可选）</span>
+                      <input
+                        className="input font-mono"
+                        placeholder="如 275 或 暂未出台"
+                        value={manualObserved}
+                        onChange={(e) => setManualObserved(e.target.value)}
+                      />
+                    </label>
+                    <label className="field lg:col-span-4">
+                      <span>核验摘要说明 *</span>
+                      <input
+                        className="input"
+                        required
+                        placeholder="如：印尼能矿部暂未发布低于2.5亿湿吨的配额文件"
+                        value={manualSummary}
+                        onChange={(e) => setManualSummary(e.target.value)}
+                      />
+                    </label>
+                    <label className="field lg:col-span-2">
+                      <span>来源链接（可选）</span>
+                      <input
+                        className="input"
+                        placeholder="https://..."
+                        value={manualSourceUrl}
+                        onChange={(e) => setManualSourceUrl(e.target.value)}
+                      />
+                    </label>
+                    <div className="flex items-end lg:col-span-1">
+                      <button type="submit" className="btn btn-primary w-full" disabled={manualSaving}>
+                        {manualSaving ? "保存…" : "保存"}
+                      </button>
+                    </div>
+                  </div>
+                </form>
+              ) : null}
             </section>
 
             {/* Section B: Upcoming Catalyst & Rollover Events Calendar */}
@@ -2373,6 +2826,10 @@ export function ArchiveView({
               <ul className="m-0 flex list-none flex-col divide-y divide-hairline-soft p-0">
                 {(detail.state.triggers ?? []).slice(0, 5).map((tr, i) => {
                   const mDisp = formatTriggerMetric(tr.metric || tr.description || tr.category);
+                  const sEval = tr.id ? detail.trigger_evaluations?.[tr.id] : undefined;
+                  const mode = sEval?.is_auto ? "auto" : (tr.evaluation_mode || (mDisp.raw ? "auto" : "ai_web"));
+                  const modeLabel = mode === "auto" ? "自动机审" : mode === "manual" ? "人工核验" : "AI 联网核验";
+                  const badge = evaluateVerificationBadge(tr, mode, modeLabel, sEval);
                   return (
                     <li key={tr.id || i} className="flex items-start justify-between gap-2 py-2 first:pt-0 last:pb-0">
                       <div className="min-w-0">
@@ -2382,10 +2839,7 @@ export function ArchiveView({
                           {tr.operator || ""} {tr.threshold != null ? String(tr.threshold) : "—"}
                         </div>
                       </div>
-                      <StatusBadge
-                        tone={tr.status === "fired" ? "critical" : "good"}
-                        label={tr.status === "fired" ? "已触发" : "在线"}
-                      />
+                      <StatusBadge tone={badge.tone} label={badge.label} />
                     </li>
                   );
                 })}

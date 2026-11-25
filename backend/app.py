@@ -128,6 +128,20 @@ class TrimReq(_Strict):
     idempotency_key: str | None = None
 
 
+class ScaleInPositionRequest(_Strict):
+    add_quantity: float
+    add_price: float
+    new_stop_loss: float | None = Field(
+        None, validation_alias=AliasChoices("new_stop_loss", "new_stop_30m")
+    )
+    fx_rate_to_base: float | None = Field(
+        None, validation_alias=AliasChoices("fx_rate_to_base", "fx_to_account")
+    )
+    note: str = ""
+    enforce_macro_cap: bool = True
+    idempotency_key: str | None = None
+
+
 class CloseReq(_Strict):
     exit_price: float
     exit_reason: str
@@ -210,6 +224,13 @@ class TradePlanReq(_Strict):
     min_rr: float = 2.5
     alignment_status: str | None = None
     live: bool = False
+    research_direction_bias: Literal["long", "short", "neutral", "pair"] | None = Field(
+        None,
+        validation_alias=AliasChoices("research_direction", "research_direction_bias", "direction_bias"),
+    )
+    archive_market: str | None = Field(
+        None, validation_alias=AliasChoices("archive_market", "market", "market_override")
+    )
 
 
 class _ArchiveMarketReq(_Strict):
@@ -233,6 +254,10 @@ class ArchiveInitReq(_ArchiveMarketReq):
     thesis_summary: str = ""
     primary_driver: str = ""
     secondary_driver: str = ""
+    layer1_primary: str | None = None
+    layer1_secondary: str | None = None
+    direction_bias: Literal["long", "short", "neutral", "pair"] | None = None
+    confidence: str | float | None = None
     cik: str | None = None
     overwrite: bool = False
 
@@ -244,8 +269,15 @@ class ArchiveEvidenceReq(_ArchiveMarketReq):
 
 class ArchiveStateReq(_ArchiveMarketReq):
     symbol: str
-    patch: dict[str, Any]
+    patch: dict[str, Any] | None = None
     expected_revision: int | None = None
+    direction_bias: str | None = None
+    thesis_summary: str | None = None
+    layer1_primary: str | None = None
+    layer1_secondary: str | None = None
+    layer1_drivers: dict[str, Any] | None = None
+    status: str | None = None
+    confidence: str | float | None = None
 
 
 class ArchiveLogReq(_ArchiveMarketReq):
@@ -524,7 +556,7 @@ def archive_call(fn: Callable[..., Any], *, invalidate_sentinel: bool = False, *
     return res
 
 
-def _plan_args(req: TradePlanReq) -> tuple[Any, str]:
+def _plan_args(req: TradePlanReq) -> tuple[Any, str, dict[str, Any]]:
     # Validate request-level invariants BEFORE consulting portfolio state so invalid payloads always return 422.
     if req.pair_leg_verified:
         if not req.pair_trade:
@@ -614,27 +646,80 @@ def _plan_args(req: TradePlanReq) -> tuple[Any, str]:
     args.max_margin_pct = req.max_margin_pct
     args.allow_equity_margin = req.allow_equity_margin
     args.horizon_days = req.horizon_days
-    # Server-side research archive on disk is the sole source of truth for L1/L2 evidence & US-short verdict gate
+    # Server-side research archive on disk is the authoritative source of truth for L1/L2 gate, US-short verdict & direction_bias
+    archive_ctx: dict[str, Any] = {
+        "exists": False,
+        "market": None,
+        "status": None,
+        "direction_bias": req.research_direction_bias,
+        "layer1_drivers": None,
+        "has_l1_l2": False,
+    }
     try:
-        arch = ra.load_archive(req.symbol, evidence_limit=0)
-        args.has_l1_l2 = any(
+        arch = ra.load_archive(req.symbol, market_override=req.archive_market, evidence_limit=0)
+        has_l1_l2 = any(
             isinstance(ev, dict) and ev.get("level") in ("L1", "L2")
             for ev in (arch.get("recent_evidence") or [])
         )
-        arch_state = arch.get("state") if isinstance(arch.get("state"), dict) else {}
-        arch_bias = str(arch_state.get("direction_bias") or "").strip().lower()
-        args.us_short_thesis_verified = bool(args.has_l1_l2 and arch_bias == "short")
+        args.has_l1_l2 = has_l1_l2
+        arch_state = arch.get("state") if isinstance(arch, dict) else None
+        raw_bias = (
+            str(arch_state.get("direction_bias") or "").strip().lower()
+            if isinstance(arch_state, dict)
+            else ""
+        )
+        args.us_short_thesis_verified = bool(has_l1_l2 and raw_bias == "short")
+        eff_bias = raw_bias if raw_bias in ra.VALID_DIRECTIONS else req.research_direction_bias
+        archive_ctx = {
+            "exists": True,
+            "market": arch.get("market"),
+            "status": arch_state.get("status") if isinstance(arch_state, dict) else None,
+            "direction_bias": eff_bias,
+            "layer1_drivers": arch_state.get("layer1_drivers") if isinstance(arch_state, dict) else None,
+            "has_l1_l2": has_l1_l2,
+        }
     except (FileNotFoundError, ValueError, OSError):
         args.has_l1_l2 = False
         args.us_short_thesis_verified = False
+
+    eff_direction_bias = archive_ctx["direction_bias"]
+    args.research_direction = eff_direction_bias
+    args.research_root = ra.DEFAULT_RESEARCH_DIR
+    for attr in ("research_direction_bias", "direction_bias", "archive_direction_bias", "thesis_direction_bias"):
+        if hasattr(args, attr) or attr in ("research_direction_bias", "direction_bias"):
+            setattr(args, attr, eff_direction_bias)
     args.pending_verifications = req.pending_verifications
     args.thesis_falsified = req.thesis_falsified
     args.hedge_only = req.hedge_only
     args.pair_trade = req.pair_trade
     args.pair_leg_verified = req.pair_leg_verified
+    args.pair_leg_asset_class = None
+    args.pair_leg_short_thesis_verified = None
+    opp_raw_leg = (req.pair_leg_symbol or "").strip()
+    if req.pair_trade and opp_raw_leg:
+        try:
+            args.pair_leg_asset_class = tp.get_contract_spec(opp_raw_leg)["asset_class"]
+        except ValueError:
+            _, inferred_opp_ac = market_snapshot.normalize_symbol(opp_raw_leg)
+            args.pair_leg_asset_class = inferred_opp_ac
+        try:
+            opp_arch = ra.load_archive(opp_raw_leg, evidence_limit=0)
+            opp_has_l1_l2 = any(
+                isinstance(ev, dict) and ev.get("level") in ("L1", "L2")
+                for ev in (opp_arch.get("recent_evidence") or [])
+            )
+            opp_state = opp_arch.get("state") if isinstance(opp_arch, dict) else None
+            opp_bias = (
+                str(opp_state.get("direction_bias") or "").strip().lower()
+                if isinstance(opp_state, dict)
+                else ""
+            )
+            args.pair_leg_short_thesis_verified = bool(opp_has_l1_l2 and opp_bias == "short")
+        except (FileNotFoundError, ValueError, OSError):
+            args.pair_leg_short_thesis_verified = False
     args.min_rr = req.min_rr
     args.live = req.live
-    return args, equity_source
+    return args, equity_source, archive_ctx
 
 
 def _sse(event: dict[str, Any]) -> str:
@@ -785,7 +870,35 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
 
     @app.post("/api/portfolio/positions/open")
     def portfolio_open(req: OpenPositionReq):
-        return portfolio_call(pm.open_position, **req.model_dump(exclude_none=True))
+        return portfolio_call(
+            pm.open_position,
+            research_dir=ra.DEFAULT_RESEARCH_DIR,
+            **req.model_dump(exclude_none=True),
+        )
+
+    @app.post("/api/portfolio/positions/{position_id}/scale-in")
+    def portfolio_scale_in(position_id: str, req: ScaleInPositionRequest):
+        try:
+            result = pm.scale_in_position(
+                position_id=position_id,
+                add_quantity=req.add_quantity,
+                add_price=req.add_price,
+                new_stop_loss=req.new_stop_loss,
+                fx_rate_to_base=req.fx_rate_to_base,
+                note=req.note,
+                enforce_macro_cap=req.enforce_macro_cap,
+                idempotency_key=req.idempotency_key,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            msg = str(exc)
+            raise HTTPException(status_code=404 if "not found" in msg.lower() else 400, detail=msg) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        CACHE.invalidate_prefix("sentinel")
+        summary = pm.summarize_portfolio()
+        return ok({**result, "summary": summary})
 
     @app.post("/api/portfolio/positions/{position_id}/trail-stop")
     def portfolio_trail_stop(position_id: str, req: TrailStopReq):
@@ -797,11 +910,21 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
 
     @app.post("/api/portfolio/positions/{position_id}/close")
     def portfolio_close(position_id: str, req: CloseReq):
-        return portfolio_call(pm.close_position, position_id=position_id, **req.model_dump(exclude_none=True))
+        return portfolio_call(
+            pm.close_position,
+            position_id=position_id,
+            research_dir=ra.DEFAULT_RESEARCH_DIR,
+            **req.model_dump(exclude_none=True),
+        )
 
     @app.post("/api/portfolio/positions/{position_id}/void")
     def portfolio_void(position_id: str, req: VoidReq):
-        return portfolio_call(pm.void_position, position_id=position_id, **req.model_dump(exclude_none=True))
+        return portfolio_call(
+            pm.void_position,
+            position_id=position_id,
+            research_dir=ra.DEFAULT_RESEARCH_DIR,
+            **req.model_dump(exclude_none=True),
+        )
 
     @app.post("/api/portfolio/positions/{position_id}/rotate")
     def portfolio_rotate(position_id: str, req: RotateReq):
@@ -814,6 +937,7 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             exit_category=req.exit_category,
             enforce_macro_cap=req.enforce_macro_cap,
             idempotency_key=req.idempotency_key,
+            research_dir=ra.DEFAULT_RESEARCH_DIR,
         )
 
     @app.get("/api/sentinel/run")
@@ -918,7 +1042,7 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
 
     @app.post("/api/trade/plan")
     def trade_plan(req: TradePlanReq):
-        args, equity_source = _plan_args(req)
+        args, equity_source, archive_ctx = _plan_args(req)
         try:
             output = tp.build_trade_plan(args)
         except tp.PlanInputError as exc:
@@ -929,6 +1053,8 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         output["equity_source"] = equity_source
+        output["research_direction_bias"] = archive_ctx["direction_bias"]
+        output["archive_context"] = archive_ctx
         output.setdefault("live_warnings", [])
         return ok(output)
 
@@ -981,12 +1107,51 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
     @app.post("/api/research/archive/init")
     def research_archive_init(req: ArchiveInitReq):
         resolved_market = req.resolved_market()
-        data = req.model_dump(exclude_none=True, exclude={"market", "market_override"})
-        data["raw_symbol"] = data.pop("symbol")
-        data["thesis_summary"] = data.get("thesis_summary", "")
+        p_legacy = req.primary_driver.strip()
+        p_alias = req.layer1_primary.strip() if req.layer1_primary is not None else ""
+        if p_legacy and p_alias and p_legacy != p_alias:
+            raise HTTPException(
+                status_code=422,
+                detail="Conflicting primary_driver and layer1_primary fields",
+            )
+        eff_primary = p_alias or p_legacy
+
+        s_legacy = req.secondary_driver.strip()
+        s_alias = req.layer1_secondary.strip() if req.layer1_secondary is not None else ""
+        if s_legacy and s_alias and s_legacy != s_alias:
+            raise HTTPException(
+                status_code=422,
+                detail="Conflicting secondary_driver and layer1_secondary fields",
+            )
+        eff_secondary = s_alias or s_legacy
+
+        init_params = inspect.signature(ra.init_archive).parameters
+        init_kwargs: dict[str, Any] = {
+            "raw_symbol": req.symbol,
+            "name": req.name,
+            "subtype": req.subtype,
+            "thesis_summary": req.thesis_summary,
+            "primary_driver": eff_primary,
+            "secondary_driver": eff_secondary,
+            "overwrite": req.overwrite,
+        }
+        if "layer1_primary" in init_params:
+            init_kwargs["layer1_primary"] = eff_primary
+        if "layer1_secondary" in init_params:
+            init_kwargs["layer1_secondary"] = eff_secondary
+        if req.cik is not None:
+            init_kwargs["cik"] = req.cik
         if resolved_market is not None:
-            data["market_override"] = resolved_market
-        return ok(archive_call(ra.init_archive, invalidate_sentinel=True, **data))
+            init_kwargs["market_override"] = resolved_market
+        if req.direction_bias is not None and "direction_bias" in init_params:
+            init_kwargs["direction_bias"] = req.direction_bias
+        if req.confidence is not None and "confidence" in init_params:
+            init_kwargs["confidence"] = (
+                req.confidence.strip() if isinstance(req.confidence, str) else req.confidence
+            )
+
+        res = archive_call(ra.init_archive, invalidate_sentinel=True, **init_kwargs)
+        return ok(res)
 
     @app.post("/api/research/archive/evidence")
     def research_archive_evidence(req: ArchiveEvidenceReq):
@@ -1000,11 +1165,111 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
 
     @app.patch("/api/research/archive/state")
     def research_archive_state(req: ArchiveStateReq):
+        merged_patch: dict[str, Any] = dict(req.patch) if req.patch is not None else {}
+
+        # Extract & reconcile top-level convenience fields with nested patch keys
+        def _merge_scalar(field: str, top_val: Any) -> None:
+            if top_val is None:
+                return
+            if field in merged_patch and merged_patch[field] is not None and merged_patch[field] != top_val:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Conflicting top-level {field} and patch.{field}",
+                )
+            merged_patch[field] = top_val
+
+        _merge_scalar("direction_bias", req.direction_bias)
+        _merge_scalar("thesis_summary", req.thesis_summary)
+        _merge_scalar("status", req.status)
+        _merge_scalar("confidence", req.confidence)
+
+        # Reconcile layer1_primary / layer1_secondary / layer1_drivers into canonical state.layer1_drivers
+        patch_l1_primary = merged_patch.pop("layer1_primary", None)
+        patch_l1_secondary = merged_patch.pop("layer1_secondary", None)
+        if patch_l1_primary is not None and not isinstance(patch_l1_primary, str):
+            raise HTTPException(status_code=422, detail="layer1_primary 必须为字符串")
+        if patch_l1_secondary is not None and not isinstance(patch_l1_secondary, str):
+            raise HTTPException(status_code=422, detail="layer1_secondary 必须为字符串")
+        if (
+            req.layer1_primary is not None
+            and patch_l1_primary is not None
+            and req.layer1_primary.strip() != patch_l1_primary.strip()
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Conflicting top-level layer1_primary and patch.layer1_primary",
+            )
+        if (
+            req.layer1_secondary is not None
+            and patch_l1_secondary is not None
+            and req.layer1_secondary.strip() != patch_l1_secondary.strip()
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="Conflicting top-level layer1_secondary and patch.layer1_secondary",
+            )
+        eff_l1_primary = req.layer1_primary if req.layer1_primary is not None else patch_l1_primary
+        eff_l1_secondary = req.layer1_secondary if req.layer1_secondary is not None else patch_l1_secondary
+
+        if req.layer1_drivers is not None or eff_l1_primary is not None or eff_l1_secondary is not None:
+            raw_drivers = merged_patch.get("layer1_drivers")
+            if raw_drivers is not None and not isinstance(raw_drivers, dict):
+                raise HTTPException(status_code=422, detail="layer1_drivers 必须为对象")
+            drivers = dict(raw_drivers or {})
+            if req.layer1_drivers is not None:
+                drivers.update(req.layer1_drivers)
+            if eff_l1_primary is not None:
+                drivers["primary"] = eff_l1_primary.strip()
+            if eff_l1_secondary is not None:
+                drivers["secondary"] = eff_l1_secondary.strip()
+            merged_patch["layer1_drivers"] = drivers
+
+        if not merged_patch:
+            raise HTTPException(status_code=422, detail="patch 不能为空，请至少提供一个可更新字段")
+
+        # Explicit normalization & clear validation for key thesis metadata fields
+        if "direction_bias" in merged_patch:
+            if not isinstance(merged_patch["direction_bias"], str):
+                raise HTTPException(status_code=422, detail="direction_bias 必须为字符串（long/short/neutral/pair）")
+            norm_bias = merged_patch["direction_bias"].strip().lower()
+            if norm_bias not in ra.VALID_DIRECTIONS:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"无效的 direction_bias {merged_patch['direction_bias']!r}，仅允许 {sorted(ra.VALID_DIRECTIONS)}",
+                )
+            merged_patch["direction_bias"] = norm_bias
+
+        if "status" in merged_patch:
+            if not isinstance(merged_patch["status"], str):
+                raise HTTPException(status_code=422, detail="status 必须为字符串")
+            norm_status = merged_patch["status"].strip().lower()
+            if norm_status not in ra.VALID_STATUSES:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"无效的 status {merged_patch['status']!r}，仅允许 {sorted(ra.VALID_STATUSES)}",
+                )
+            merged_patch["status"] = norm_status
+
+        if "thesis_summary" in merged_patch:
+            if not isinstance(merged_patch["thesis_summary"], str):
+                raise HTTPException(status_code=422, detail="thesis_summary 必须为字符串")
+            merged_patch["thesis_summary"] = merged_patch["thesis_summary"].strip()
+
+        if "confidence" in merged_patch and merged_patch["confidence"] is not None:
+            conf_val = merged_patch["confidence"]
+            if isinstance(conf_val, str):
+                merged_patch["confidence"] = conf_val.strip().lower()
+            elif isinstance(conf_val, bool) or not isinstance(conf_val, (int, float)):
+                raise HTTPException(
+                    status_code=422,
+                    detail="confidence 必须为 'low'/'medium'/'high' 或 [0.0, 1.0] 数值",
+                )
+
         return ok(archive_call(
             ra.update_state,
             invalidate_sentinel=True,
             raw_symbol=req.symbol,
-            patch=req.patch,
+            patch=merged_patch,
             expected_revision=req.expected_revision,
             market_override=req.resolved_market(),
         ))

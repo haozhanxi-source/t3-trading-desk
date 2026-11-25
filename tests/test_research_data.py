@@ -1339,6 +1339,513 @@ class TestMultiAssetExtensionsAndStrictRouting(unittest.TestCase):
         self.assertEqual(snap["ending_shares_yoy_base_end"], "2025-09-30")
         self.assertIn("8-K", snap["audit_note"])
 
+    def test_extract_sec_companyfacts_utility_bank_tags_latest_q3_and_zombie_prune(self):
+        # Reproduces NEE: discontinued 2013 Revenues tag + active 2026 RegulatedAndUnregulatedOperatingRevenue,
+        # Q1/Q2/Q3 10-Q coexisting, zombie 2014 buybacks (>730d stale), and valid annual 2025 SBC (<=730d).
+        nee_facts = {
+            "cik": 753308,
+            "entityName": "NEXTERA ENERGY INC",
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"start": "2013-07-01", "end": "2013-09-30", "val": 4394000000, "form": "10-Q", "filed": "2013-11-01"},
+                            ]
+                        }
+                    },
+                    "RegulatedAndUnregulatedOperatingRevenue": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-01-01", "end": "2026-03-31", "val": 6701000000, "form": "10-Q", "filed": "2026-04-23"},
+                                {"start": "2026-04-01", "end": "2026-06-30", "val": 7534000000, "form": "10-Q", "filed": "2026-07-24"},
+                                {"start": "2026-01-01", "end": "2026-09-30", "val": 22325000000, "form": "10-Q", "filed": "2026-10-21"},
+                                {"start": "2026-07-01", "end": "2026-09-30", "val": 8090000000, "form": "10-Q", "filed": "2026-10-21"},
+                            ]
+                        }
+                    },
+                    "RevenueFromContractWithCustomerIncludingAssessedTax": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-07-01", "end": "2026-09-30", "val": 8100000000, "form": "10-Q", "filed": "2026-10-21"},
+                            ]
+                        }
+                    },
+                    "NetIncomeLoss": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-01-01", "end": "2026-03-31", "val": 2182000000, "form": "10-Q", "filed": "2026-04-23"},
+                                {"start": "2026-04-01", "end": "2026-06-30", "val": 3144000000, "form": "10-Q", "filed": "2026-07-24"},
+                                {"start": "2026-01-01", "end": "2026-09-30", "val": 10102000000, "form": "10-Q", "filed": "2026-10-21"},
+                                {"start": "2026-07-01", "end": "2026-09-30", "val": 4775000000, "form": "10-Q", "filed": "2026-10-21"},
+                            ]
+                        }
+                    },
+                    "PaymentsForRepurchaseOfCommonStock": {
+                        "units": {
+                            "USD": [
+                                {"start": "2014-01-01", "end": "2014-12-31", "val": 0, "form": "10-K", "filed": "2015-02-20"},
+                            ]
+                        }
+                    },
+                    "AllocatedShareBasedCompensationExpense": {
+                        "units": {
+                            "USD": [
+                                {"start": "2025-01-01", "end": "2025-12-31", "val": 185000000, "form": "10-K", "filed": "2026-02-13"},
+                            ]
+                        }
+                    },
+                }
+            },
+        }
+        res = rd.extract_sec_companyfacts(nee_facts, limit=8)
+        metrics = res["metrics"]
+        self.assertEqual(metrics["revenue"]["tag"], "RegulatedAndUnregulatedOperatingRevenue")
+        self.assertEqual(metrics["revenue"]["records"][0]["end"], "2026-09-30")
+        self.assertEqual(metrics["revenue"]["records"][0]["period_type"], "quarterly")
+        self.assertEqual(metrics["revenue"]["records"][0]["val"], 8090000000)
+
+        self.assertEqual(metrics["net_income"]["records"][0]["end"], "2026-09-30")
+        self.assertEqual(metrics["net_income"]["records"][0]["period_type"], "quarterly")
+        self.assertEqual(metrics["net_income"]["records"][0]["val"], 4775000000)
+
+        # Zombie 2014 buybacks pruned; recent annual 2025 SBC preserved
+        self.assertNotIn("share_repurchases", metrics)
+        self.assertIsNone(res["capital_structure_snapshot"]["share_repurchases"])
+        self.assertIn("share_repurchases", res.get("stale_metrics_omitted", {}))
+        self.assertEqual(metrics["stock_based_compensation"]["records"][0]["end"], "2025-12-31")
+
+        # Bank revenue tag: RevenuesNetOfInterestExpense (2026-09-30) wins over annual-only Revenues (2025-12-31)
+        bank_facts = {
+            "cik": 19617,
+            "entityName": "JPMORGAN CHASE & CO",
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"start": "2025-01-01", "end": "2025-12-31", "val": 182447000000, "form": "10-K", "filed": "2026-02-14"},
+                            ]
+                        }
+                    },
+                    "RevenuesNetOfInterestExpense": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-07-01", "end": "2026-09-30", "val": 52000000000, "form": "10-Q", "filed": "2026-11-03"},
+                            ]
+                        }
+                    },
+                }
+            },
+        }
+        bank_res = rd.extract_sec_companyfacts(bank_facts, limit=6)
+        self.assertEqual(bank_res["metrics"]["revenue"]["tag"], "RevenuesNetOfInterestExpense")
+        self.assertEqual(bank_res["metrics"]["revenue"]["records"][0]["end"], "2026-09-30")
+        self.assertEqual(bank_res["metrics"]["revenue"]["records"][0]["val"], 52000000000)
+
+    def test_fetch_sec_edgar_backfills_unindexed_q2_q3_10q_from_xbrl_instance_xml(self):
+        sub_json = {
+            "name": "NEXTERA ENERGY INC",
+            "sicDescription": "ELECTRIC SERVICES",
+            "filings": {
+                "recent": {
+                    "form": ["10-Q", "10-Q", "10-Q"],
+                    "filingDate": ["2026-10-21", "2026-07-24", "2026-04-23"],
+                    "reportDate": ["2026-09-30", "2026-06-30", "2026-03-31"],
+                    "accessionNumber": [
+                        "0000753308-26-000081",
+                        "0000753308-26-000060",
+                        "0000753308-26-000031",
+                    ],
+                    "primaryDocument": [
+                        "nee-20260930.htm",
+                        "nee-20260630.htm",
+                        "nee-20260331.htm",
+                    ],
+                    "primaryDocDescription": ["10-Q", "10-Q", "10-Q"],
+                    "items": [[], [], []],
+                }
+            },
+        }
+        lagging_companyfacts = {
+            "cik": 753308,
+            "entityName": "NEXTERA ENERGY INC",
+            "facts": {
+                "us-gaap": {
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {"start": "2013-07-01", "end": "2013-09-30", "val": 4394000000, "form": "10-Q", "filed": "2013-11-01"},
+                            ]
+                        }
+                    },
+                    "RegulatedAndUnregulatedOperatingRevenue": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-01-01", "end": "2026-03-31", "val": 6701000000, "form": "10-Q", "filed": "2026-04-23"},
+                            ]
+                        }
+                    },
+                    "NetIncomeLoss": {
+                        "units": {
+                            "USD": [
+                                {"start": "2026-01-01", "end": "2026-03-31", "val": 2182000000, "form": "10-Q", "filed": "2026-04-23"},
+                            ]
+                        }
+                    },
+                    "PaymentsForRepurchaseOfCommonStock": {
+                        "units": {
+                            "USD": [
+                                {"start": "2014-01-01", "end": "2014-12-31", "val": 0, "form": "10-K", "filed": "2015-02-20"},
+                            ]
+                        }
+                    },
+                }
+            },
+        }
+        q3_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <xbrl xmlns="http://www.xbrl.org/2003/instance"
+              xmlns:xbrldi="http://xbrl.org/2006/xbrldi"
+              xmlns:us-gaap="http://fasb.org/us-gaap/2025"
+              xmlns:dei="http://xbrl.sec.gov/dei/2025">
+          <context id="c_q3">
+            <entity><identifier scheme="http://www.sec.gov/CIK">0000753308</identifier></entity>
+            <period><startDate>2026-07-01</startDate><endDate>2026-09-30</endDate></period>
+          </context>
+          <context id="c_ytd">
+            <entity><identifier scheme="http://www.sec.gov/CIK">0000753308</identifier></entity>
+            <period><startDate>2026-01-01</startDate><endDate>2026-09-30</endDate></period>
+          </context>
+          <context id="c_inst">
+            <entity><identifier scheme="http://www.sec.gov/CIK">0000753308</identifier></entity>
+            <period><instant>2026-09-30</instant></period>
+          </context>
+          <context id="c_fpl_dim">
+            <entity>
+              <identifier scheme="http://www.sec.gov/CIK">0000753308</identifier>
+              <segment><xbrldi:explicitMember dimension="dei:LegalEntityAxis">nee:FPLMember</xbrldi:explicitMember></segment>
+            </entity>
+            <period><startDate>2026-07-01</startDate><endDate>2026-09-30</endDate></period>
+          </context>
+          <unit id="usd"><measure>iso4217:USD</measure></unit>
+          <unit id="usdPerShare">
+            <divide>
+              <unitNumerator><measure>iso4217:USD</measure></unitNumerator>
+              <unitDenominator><measure>xbrli:shares</measure></unitDenominator>
+            </divide>
+          </unit>
+          <unit id="shares"><measure>xbrli:shares</measure></unit>
+          <us-gaap:RegulatedAndUnregulatedOperatingRevenue contextRef="c_q3" unitRef="usd">8090000000</us-gaap:RegulatedAndUnregulatedOperatingRevenue>
+          <us-gaap:RegulatedAndUnregulatedOperatingRevenue contextRef="c_fpl_dim" unitRef="usd">4100000000</us-gaap:RegulatedAndUnregulatedOperatingRevenue>
+          <us-gaap:NetIncomeLoss contextRef="c_q3" unitRef="usd">4775000000</us-gaap:NetIncomeLoss>
+          <us-gaap:NetIncomeLoss contextRef="c_ytd" unitRef="usd">10102000000</us-gaap:NetIncomeLoss>
+          <us-gaap:EarningsPerShareDiluted contextRef="c_q3" unitRef="usdPerShare">2.28</us-gaap:EarningsPerShareDiluted>
+          <us-gaap:CashAndCashEquivalentsAtCarryingValue contextRef="c_inst" unitRef="usd">5579000000</us-gaap:CashAndCashEquivalentsAtCarryingValue>
+          <dei:EntityCommonStockSharesOutstanding contextRef="c_inst" unitRef="shares">2097306049</dei:EntityCommonStockSharesOutstanding>
+        </xbrl>"""
+        q2_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <xbrl xmlns="http://www.xbrl.org/2003/instance"
+              xmlns:us-gaap="http://fasb.org/us-gaap/2025">
+          <context id="c_q2">
+            <entity><identifier scheme="http://www.sec.gov/CIK">0000753308</identifier></entity>
+            <period><startDate>2026-04-01</startDate><endDate>2026-06-30</endDate></period>
+          </context>
+          <unit id="usd"><measure>iso4217:USD</measure></unit>
+          <us-gaap:RegulatedAndUnregulatedOperatingRevenue contextRef="c_q2" unitRef="usd">7534000000</us-gaap:RegulatedAndUnregulatedOperatingRevenue>
+          <us-gaap:NetIncomeLoss contextRef="c_q2" unitRef="usd">3144000000</us-gaap:NetIncomeLoss>
+        </xbrl>"""
+
+        class _Resp:
+            def __init__(self, status_code=200, json_data=None, content=b""):
+                self.status_code = status_code
+                self._json = json_data
+                self.content = content
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            def json(self):
+                return self._json
+
+        def _fake_get(url, headers=None, timeout=None):
+            if "submissions/CIK0000753308.json" in url:
+                return _Resp(200, json_data=sub_json)
+            if "companyfacts/CIK0000753308.json" in url:
+                return _Resp(200, json_data=lagging_companyfacts)
+            if url.endswith("nee-20260930_htm.xml"):
+                return _Resp(200, content=q3_xml)
+            if url.endswith("nee-20260630_htm.xml"):
+                return _Resp(200, content=q2_xml)
+            return _Resp(404)
+
+        with (
+            patch.object(rd, "_get_sec_cik", return_value="0000753308"),
+            patch.object(rd.requests, "get", side_effect=_fake_get),
+        ):
+            out = rd.fetch_sec_edgar("NEE")
+
+        gaap = out["gaap_metrics"]
+        self.assertEqual(gaap["revenue"]["records"][0]["end"], "2026-09-30")
+        self.assertEqual(gaap["revenue"]["records"][0]["val"], 8090000000)
+        self.assertEqual(gaap["revenue"]["records"][1]["end"], "2026-06-30")
+        self.assertEqual(gaap["revenue"]["records"][1]["val"], 7534000000)
+        self.assertEqual(gaap["net_income"]["records"][0]["end"], "2026-09-30")
+        self.assertEqual(gaap["net_income"]["records"][0]["val"], 4775000000)
+        self.assertEqual(gaap["eps_diluted"]["records"][0]["val"], 2.28)
+        self.assertEqual(gaap["cash_and_equivalents"]["records"][0]["val"], 5579000000)
+        self.assertEqual(gaap["shares_outstanding_ending"]["records"][0]["val"], 2097306049)
+        self.assertNotIn("share_repurchases", gaap)
+        self.assertIsNone(out["capital_structure_snapshot"]["share_repurchases"])
+
+    def test_fetch_yfinance_consensus_short_percent_none_and_zero_anomaly(self):
+        class _FakeTicker:
+            def __init__(self, info_dict):
+                self.info = info_dict
+                self.calendar = {}
+                self.earnings_estimate = pd.DataFrame()
+                self.revenue_estimate = pd.DataFrame()
+                self.eps_trend = pd.DataFrame()
+                self.analyst_price_targets = {"mean": 95.0, "median": 94.0}
+                self.quarterly_income_stmt = pd.DataFrame()
+                self.quarterly_cashflow = pd.DataFrame()
+
+        # 1) Missing / None shortPercentOfFloat MUST stay None (never coerced to 0.0)
+        with patch.object(rd.yf, "Ticker", return_value=_FakeTicker({"marketCap": 1e11, "forwardPE": 19.3, "shortPercentOfFloat": None})):
+            res_none = rd.fetch_yfinance_consensus("NEE")
+        self.assertIsNone(res_none["valuation_and_positioning"]["short_percent_of_float"])
+
+        # 2) Invalid / negative shortPercentOfFloat MUST become None
+        with patch.object(rd.yf, "Ticker", return_value=_FakeTicker({"marketCap": 1e11, "shortPercentOfFloat": -0.02})):
+            res_neg = rd.fetch_yfinance_consensus("NEE")
+        self.assertIsNone(res_neg["valuation_and_positioning"]["short_percent_of_float"])
+
+        # 3) Yahoo Finance 0/0 anomaly WITHOUT valid sharesShort/floatShares treated as unavailable (None)
+        with patch.object(
+            rd.yf,
+            "Ticker",
+            return_value=_FakeTicker(
+                {
+                    "marketCap": 1.7e11,
+                    "forwardPE": 19.3,
+                    "shortPercentOfFloat": 0.0,
+                    "shortRatio": 0.0,
+                    "sharesShort": 0,
+                    "floatShares": 2092712949,
+                }
+            ),
+        ):
+            res_zero = rd.fetch_yfinance_consensus("NEE")
+        self.assertIsNone(res_zero["valuation_and_positioning"]["short_percent_of_float"])
+        self.assertIsNone(res_zero["valuation_and_positioning"]["short_ratio"])
+
+        # 3b) Legitimate ultra-low short interest: shortPercentOfFloat=0.0, shortRatio=0.0
+        #     with valid sharesShort=30 & floatShares=10_000_000 MUST reconstruct 3e-6 (NOT None / 0.0)
+        with patch.object(
+            rd.yf,
+            "Ticker",
+            return_value=_FakeTicker(
+                {
+                    "marketCap": 1.0e10,
+                    "shortPercentOfFloat": 0.0,
+                    "shortRatio": 0.0,
+                    "sharesShort": 30,
+                    "floatShares": 10_000_000,
+                }
+            ),
+        ):
+            res_rebuilt = rd.fetch_yfinance_consensus("TINY")
+        self.assertAlmostEqual(res_rebuilt["valuation_and_positioning"]["short_percent_of_float"], 3e-6, places=12)
+        self.assertIsNone(res_rebuilt["valuation_and_positioning"]["short_ratio"])
+
+        # 3c) Direct ultra-low positive shortPercentOfFloat=3e-7 MUST preserve precision (NOT rounded to 0.0)
+        with patch.object(
+            rd.yf,
+            "Ticker",
+            return_value=_FakeTicker({"marketCap": 1.0e10, "shortPercentOfFloat": 3e-7, "shortRatio": 0.01}),
+        ):
+            res_tiny = rd.fetch_yfinance_consensus("TINY2")
+        self.assertAlmostEqual(res_tiny["valuation_and_positioning"]["short_percent_of_float"], 3e-7, places=12)
+        self.assertGreater(res_tiny["valuation_and_positioning"]["short_percent_of_float"], 0.0)
+
+        # 4) Valid positive shortPercentOfFloat preserved accurately
+        with patch.object(
+            rd.yf,
+            "Ticker",
+            return_value=_FakeTicker({"marketCap": 1e11, "shortPercentOfFloat": 0.0274, "shortRatio": 4.31}),
+        ):
+            res_ok = rd.fetch_yfinance_consensus("DUK")
+        self.assertAlmostEqual(res_ok["valuation_and_positioning"]["short_percent_of_float"], 0.0274)
+        self.assertAlmostEqual(res_ok["valuation_and_positioning"]["short_ratio"], 4.31)
+
+    def test_fetch_sec_edgar_partial_untracked_q3_ingestion_still_backfills_revenue_from_xml(self):
+        """P1-1: 1 untracked Q3 us-gaap tag in companyfacts must NOT block XML backfill when revenue lags at Q2."""
+        sub_json = {
+            "name": "PARTIAL INGEST CORP",
+            "sicDescription": "ELECTRIC SERVICES",
+            "filings": {
+                "recent": {
+                    "form": ["10-Q", "10-Q"],
+                    "filingDate": ["2026-10-25", "2026-07-25"],
+                    "reportDate": ["2026-09-30", "2026-06-30"],
+                    "accessionNumber": [
+                        "0000999999-26-000081",
+                        "0000999999-26-000060",
+                    ],
+                    "primaryDocument": [
+                        "pic-20260930.htm",
+                        "pic-20260630.htm",
+                    ],
+                    "primaryDocDescription": ["10-Q", "10-Q"],
+                    "items": [[], []],
+                }
+            },
+        }
+        partial_companyfacts = {
+            "cik": 999999,
+            "entityName": "PARTIAL INGEST CORP",
+            "facts": {
+                "us-gaap": {
+                    # Non-tracked tag already ingested for Q3 — previously fooled _latest_companyfacts_dates!
+                    "OtherNonoperatingIncomeExpense": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "start": "2026-07-01",
+                                    "end": "2026-09-30",
+                                    "val": 12000000,
+                                    "form": "10-Q",
+                                    "filed": "2026-10-25",
+                                    "accn": "0000999999-26-000081",
+                                }
+                            ]
+                        }
+                    },
+                    # Core tracked metrics still stuck at Q2
+                    "Revenues": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "start": "2026-04-01",
+                                    "end": "2026-06-30",
+                                    "val": 5000000000,
+                                    "form": "10-Q",
+                                    "filed": "2026-07-25",
+                                    "accn": "0000999999-26-000060",
+                                }
+                            ]
+                        }
+                    },
+                    "NetIncomeLoss": {
+                        "units": {
+                            "USD": [
+                                {
+                                    "start": "2026-04-01",
+                                    "end": "2026-06-30",
+                                    "val": 800000000,
+                                    "form": "10-Q",
+                                    "filed": "2026-07-25",
+                                    "accn": "0000999999-26-000060",
+                                }
+                            ]
+                        }
+                    },
+                }
+            },
+        }
+        q3_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+        <xbrl xmlns="http://www.xbrl.org/2003/instance"
+              xmlns:us-gaap="http://fasb.org/us-gaap/2025">
+          <context id="c_q3">
+            <entity><identifier scheme="http://www.sec.gov/CIK">0000999999</identifier></entity>
+            <period><startDate>2026-07-01</startDate><endDate>2026-09-30</endDate></period>
+          </context>
+          <unit id="usd"><measure>iso4217:USD</measure></unit>
+          <us-gaap:Revenues contextRef="c_q3" unitRef="usd">6250000000</us-gaap:Revenues>
+          <us-gaap:NetIncomeLoss contextRef="c_q3" unitRef="usd">1050000000</us-gaap:NetIncomeLoss>
+        </xbrl>"""
+
+        class _Resp:
+            def __init__(self, status_code=200, json_data=None, content=b""):
+                self.status_code = status_code
+                self._json = json_data
+                self.content = content
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+            def json(self):
+                return self._json
+
+        fetched_urls: list[str] = []
+
+        def _fake_get(url, headers=None, timeout=None):
+            fetched_urls.append(url)
+            if "submissions/CIK0000999999.json" in url:
+                return _Resp(200, json_data=sub_json)
+            if "companyfacts/CIK0000999999.json" in url:
+                return _Resp(200, json_data=partial_companyfacts)
+            if url.endswith("pic-20260930_htm.xml"):
+                return _Resp(200, content=q3_xml)
+            return _Resp(404)
+
+        with (
+            patch.object(rd, "_get_sec_cik", return_value="0000999999"),
+            patch.object(rd.requests, "get", side_effect=_fake_get),
+        ):
+            out = rd.fetch_sec_edgar("PIC")
+
+        self.assertTrue(any(u.endswith("pic-20260930_htm.xml") for u in fetched_urls))
+        self.assertFalse(any(u.endswith("pic-20260630_htm.xml") for u in fetched_urls))
+        self.assertEqual(out["gaap_metrics"]["revenue"]["records"][0]["end"], "2026-09-30")
+        self.assertEqual(out["gaap_metrics"]["revenue"]["records"][0]["val"], 6250000000)
+        self.assertEqual(out["gaap_metrics"]["net_income"]["records"][0]["val"], 1050000000)
+        self.assertIn("xbrl_instance_backfill", out)
+        self.assertIn("revenue", out["xbrl_instance_backfill"][0]["covered_core_after"])
+
+    def test_extract_xbrl_metric_prefers_standard_quarterly_over_later_filed_nonstandard_duration(self):
+        """P1-2: Later-filed multi-year non-standard duration (250) must NOT override standard quarterly (25) / YTD (70)."""
+        us_gaap = {
+            "Revenues": {
+                "units": {
+                    "USD": [
+                        # Standard Q3 quarterly (92d)
+                        {"start": "2026-07-01", "end": "2026-09-30", "val": 25, "form": "10-Q", "filed": "2026-10-21"},
+                        # Standard YTD 9M (273d)
+                        {"start": "2026-01-01", "end": "2026-09-30", "val": 70, "form": "10-Q", "filed": "2026-10-21"},
+                        # Later-filed cross-year non-standard duration (>400d)
+                        {"start": "2024-01-01", "end": "2026-09-30", "val": 250, "form": "10-Q/A", "filed": "2026-11-15"},
+                    ]
+                }
+            }
+        }
+        extracted = rd._extract_xbrl_metric(us_gaap, ["Revenues"], limit=8)
+        self.assertIsNotNone(extracted)
+        recs = extracted["records"]
+        self.assertEqual(recs[0]["val"], 25)
+        self.assertEqual(recs[0]["period_type"], "quarterly")
+        self.assertEqual(recs[1]["val"], 70)
+        self.assertEqual(recs[1]["period_type"], "ytd_or_multi_quarter")
+        self.assertEqual(recs[2]["val"], 250)
+        self.assertEqual(recs[2]["period_type"], "multi_year")
+
+        # Within the same standard quarterly bucket, a later-filed restatement MUST win
+        us_gaap_restated = {
+            "Revenues": {
+                "units": {
+                    "USD": [
+                        {"start": "2026-07-01", "end": "2026-09-30", "val": 25, "form": "10-Q", "filed": "2026-10-21"},
+                        {"start": "2026-07-01", "end": "2026-09-30", "val": 26, "form": "10-Q/A", "filed": "2026-11-10"},
+                        {"start": "2024-01-01", "end": "2026-09-30", "val": 250, "form": "10-Q/A", "filed": "2026-11-20"},
+                    ]
+                }
+            }
+        }
+        restated = rd._extract_xbrl_metric(us_gaap_restated, ["Revenues"], limit=8)
+        self.assertEqual(restated["records"][0]["val"], 26)
+        self.assertEqual(restated["records"][0]["filed"], "2026-11-10")
+
 
 if __name__ == "__main__":
     unittest.main()

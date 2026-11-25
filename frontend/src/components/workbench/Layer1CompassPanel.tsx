@@ -4,6 +4,7 @@ import {
   ArrowRight,
   BookOpen,
   CheckCircle2,
+  Clock,
   Compass,
   Crosshair,
   ExternalLink,
@@ -134,6 +135,113 @@ function formatHeadlineValue(value: number | null, unit: string): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "—";
   if (unit === "$/t") return `$${Math.round(value).toLocaleString("en-US")}/t`;
   return `${value.toFixed(unit === "%" ? 2 : 1)}${unit}`;
+}
+
+const MONTHLY_MACRO_KEYS = new Set(["PCOPPUSDM", "FEDFUNDS", "M2SL", "CN_PMI"]);
+const MACRO_LAG_THRESHOLD_DAYS = 14;
+
+interface MacroAsOfInfo {
+  raw: string | null;
+  shortLabel: string;
+  lagDays: number | null;
+  isLagged: boolean;
+  isMonthly: boolean;
+}
+
+function isValidUtcDate(year: number, month: number, day: number): boolean {
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const maxDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return day <= maxDay;
+}
+
+function parseMacroAsOf(
+  asOf: string | null | undefined,
+  key: string,
+  refNowMs: number,
+): MacroAsOfInfo {
+  const raw = (asOf || "").trim();
+  const keyUpper = (key || "").trim().toUpperCase();
+  const isKnownMonthly = MONTHLY_MACRO_KEYS.has(keyUpper);
+  if (!raw) {
+    return { raw: null, shortLabel: "", lagDays: null, isLagged: false, isMonthly: isKnownMonthly };
+  }
+
+  const refYear = new Date(refNowMs).getUTCFullYear();
+  const isoDay = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(raw);
+  if (isoDay) {
+    const y = Number(isoDay[1]);
+    const m = Number(isoDay[2]);
+    const d = Number(isoDay[3]);
+    if (!isValidUtcDate(y, m, d)) {
+      return {
+        raw,
+        shortLabel: raw.slice(0, 12),
+        lagDays: null,
+        isLagged: false,
+        isMonthly: isKnownMonthly,
+      };
+    }
+    // Known monthly series (e.g. PCOPPUSDM, FEDFUNDS, M2SL, CN_PMI) report month-start dates
+    // representing the whole month; unify lag calculation on month-end to match "YYYY年M月份".
+    const obsMs = isKnownMonthly ? Date.UTC(y, m, 0) : Date.UTC(y, m - 1, d);
+    const lagDays = Number.isFinite(obsMs)
+      ? Math.max(0, Math.floor((refNowMs - obsMs) / 86_400_000))
+      : null;
+    const mm = String(m).padStart(2, "0");
+    const dd = String(d).padStart(2, "0");
+    const shortLabel = isKnownMonthly
+      ? y === refYear
+        ? `${mm}月`
+        : `${y}-${mm}`
+      : y === refYear
+        ? `${mm}-${dd}`
+        : `${y}-${mm}-${dd}`;
+    return {
+      raw,
+      shortLabel,
+      lagDays,
+      isLagged: lagDays !== null && lagDays > MACRO_LAG_THRESHOLD_DAYS,
+      isMonthly: isKnownMonthly,
+    };
+  }
+
+  const ym = /^(\d{4})[年\-/](\d{1,2})(?:月份?)?/.exec(raw);
+  if (ym) {
+    const y = Number(ym[1]);
+    const m = Number(ym[2]);
+    if (!isValidUtcDate(y, m, 1)) {
+      return {
+        raw,
+        shortLabel: raw.slice(0, 12),
+        lagDays: null,
+        isLagged: false,
+        isMonthly: isKnownMonthly,
+      };
+    }
+    // Month-period observations (e.g. NBS PMI "2026年10月份") represent the whole month; measure lag from month-end.
+    const monthEndMs = Date.UTC(y, m, 0);
+    const lagDays = Number.isFinite(monthEndMs)
+      ? Math.max(0, Math.floor((refNowMs - monthEndMs) / 86_400_000))
+      : null;
+    const mm = String(m).padStart(2, "0");
+    const shortLabel = y === refYear ? `${mm}月` : `${y}-${mm}`;
+    return {
+      raw,
+      shortLabel,
+      lagDays,
+      isLagged: lagDays !== null && lagDays > MACRO_LAG_THRESHOLD_DAYS,
+      isMonthly: true,
+    };
+  }
+
+  return {
+    raw,
+    shortLabel: raw.slice(0, 12),
+    lagDays: null,
+    isLagged: false,
+    isMonthly: isKnownMonthly,
+  };
 }
 
 function regimeTagClasses(tone: string): string {
@@ -710,27 +818,56 @@ export function Layer1CompassPanel({
 
         {/* Compact Hairline Metric Strip */}
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
-          {(macro?.headline_metrics ?? []).map((m) => (
-            <div
-              key={m.key}
-              className="flex flex-col justify-between rounded-md border border-hairline-soft bg-sunken/70 px-2.5 py-1.5"
-              title={`${m.label} · 来源 ${m.source || "—"}${m.as_of ? ` · 截至 ${m.as_of}` : ""}`}
-            >
-              <span className="truncate text-[10px] text-muted">{m.label}</span>
-              <div className="mt-0.5 flex items-baseline justify-between gap-1 font-mono tabular-nums">
-                <span className="text-[13px] font-semibold text-ink">
-                  {formatHeadlineValue(m.value, m.unit)}
-                </span>
-                {m.delta !== null && m.delta !== undefined ? (
-                  <span className={`text-[10px] ${signedToneClass(m.delta)}`}>
-                    {m.delta > 0 ? "+" : ""}
-                    {m.delta}
-                    {m.delta_unit || ""}
+          {(macro?.headline_metrics ?? []).map((m) => {
+            const fetchedMs = macro?.fetched_at_utc ? Date.parse(macro.fetched_at_utc) : NaN;
+            const refMs = Number.isFinite(fetchedMs) ? Math.max(Date.now(), fetchedMs) : Date.now();
+            const asOfInfo = parseMacroAsOf(m.as_of, m.key, refMs);
+            const lagNote =
+              asOfInfo.isLagged && asOfInfo.lagDays !== null
+                ? ` · 已滞后约 ${asOfInfo.lagDays} 天（非当日实时价）`
+                : "";
+            return (
+              <div
+                key={m.key}
+                className={`flex flex-col justify-between gap-1 rounded-md border px-2.5 py-1.5 ${
+                  asOfInfo.isLagged
+                    ? "border-warning/35 bg-warning/[0.06]"
+                    : "border-hairline-soft bg-sunken/70"
+                }`}
+                title={`${m.label} · 来源 ${m.source || "—"}${m.as_of ? ` · 截至 ${m.as_of}` : ""}${lagNote}`}
+              >
+                <span className="truncate text-[10px] text-muted">{m.label}</span>
+                <div className="flex items-baseline justify-between gap-1 font-mono tabular-nums">
+                  <span className="text-[13px] font-semibold text-ink">
+                    {formatHeadlineValue(m.value, m.unit)}
                   </span>
-                ) : null}
+                  {m.delta !== null && m.delta !== undefined ? (
+                    <span className={`text-[10px] ${signedToneClass(m.delta)}`}>
+                      {m.delta > 0 ? "+" : ""}
+                      {m.delta}
+                      {m.delta_unit || ""}
+                    </span>
+                  ) : null}
+                </div>
+                <div className="flex min-w-0 items-center">
+                  {asOfInfo.isLagged ? (
+                    <span className="inline-flex max-w-full items-center gap-1 rounded border border-warning/35 bg-warning/12 px-1 py-0.2 font-mono text-[9.5px] font-medium leading-tight text-warning">
+                      <Clock className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
+                      <span className="truncate">
+                        {asOfInfo.isMonthly ? "月度滞后" : "滞后"} · {asOfInfo.shortLabel}
+                      </span>
+                    </span>
+                  ) : asOfInfo.shortLabel ? (
+                    <span className="truncate font-mono text-[9.5px] leading-tight text-muted">
+                      截至 {asOfInfo.shortLabel}
+                    </span>
+                  ) : (
+                    <span className="font-mono text-[9.5px] leading-tight text-muted">—</span>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
           {!macro && macroLoading ? (
             <div className="col-span-full flex items-center gap-2 py-2 text-xs text-muted">
               <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" aria-hidden="true" />

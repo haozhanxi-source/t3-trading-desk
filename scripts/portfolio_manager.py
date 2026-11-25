@@ -58,6 +58,7 @@ from trade_planner import (  # noqa: E402
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 DEFAULT_PORTFOLIO_DIR = os.path.join(ROOT_DIR, "portfolio")
+DEFAULT_RESEARCH_DIR = os.path.join(ROOT_DIR, "research")
 
 DEFAULT_DRAWDOWN_STEPS: list[dict[str, float]] = [
     {"drawdown_pct": 5.0, "risk_scale": 0.75},
@@ -470,6 +471,207 @@ def _safe_export_mirrors_unlocked(pdir: str) -> tuple[bool, str | None]:
             file=sys.stderr,
         )
         return False, err_msg
+
+
+def _resolve_sync_research_dir(
+    portfolio_dir: str | None,
+    research_dir: str | None,
+) -> str | None:
+    """Resolve target research directory for archive status sync with strict anti-pollution isolation.
+
+    Only returns a directory when:
+      1. ``research_dir`` is explicitly provided and exists on disk, OR
+      2. ``portfolio_dir`` resolves to ``DEFAULT_PORTFOLIO_DIR`` AND we are not crossing from a
+         non-repo temporary portfolio directory into the real repository ``research/`` directory.
+    """
+    if research_dir is not None:
+        rdir = os.path.abspath(research_dir)
+        return rdir if os.path.isdir(rdir) else None
+
+    pdir = _resolve_portfolio_dir(portfolio_dir)
+    if os.path.realpath(pdir) != os.path.realpath(DEFAULT_PORTFOLIO_DIR):
+        return None
+
+    import research_archive as ra  # lazy import to avoid module-level circular dependency
+
+    candidate = os.path.abspath(ra.DEFAULT_RESEARCH_DIR)
+    repo_portfolio = os.path.realpath(os.path.join(ROOT_DIR, "portfolio"))
+    repo_research = os.path.realpath(DEFAULT_RESEARCH_DIR)
+    if os.path.realpath(candidate) == repo_research and os.path.realpath(pdir) != repo_portfolio:
+        return None
+    return candidate if os.path.isdir(candidate) else None
+
+
+_PRICE_PERSIST_DECIMALS = 6
+_FX_PERSIST_DECIMALS = 10
+
+_ASSET_CLASS_TO_ARCHIVE_MARKET: dict[str, str] = {
+    "us_stock_or_etf": "US",
+    "a_share": "A_SHARE",
+    "cn_future": "CN_FUTURES",
+    "commodity": "COMMODITIES",
+    "intl_commodity": "COMMODITIES",
+    "fx": "FX",
+    "crypto": "CRYPTO",
+    "macro": "MACRO",
+}
+
+
+def _asset_class_to_archive_market(asset_class: str | None) -> str | None:
+    """Map portfolio position asset_class to canonical research_archive market folder."""
+    if not asset_class:
+        return None
+    return _ASSET_CLASS_TO_ARCHIVE_MARKET.get(str(asset_class).strip().lower())
+
+
+def _position_archive_key(pos: dict[str, Any]) -> tuple[str | None, str]:
+    """Return canonical (archive_market, UPPER_SYMBOL) key for cross-market isolation."""
+    return (
+        _asset_class_to_archive_market(pos.get("asset_class")),
+        str(pos.get("symbol") or "").strip().upper(),
+    )
+
+
+def _sync_research_archive_status(
+    symbol: str,
+    target_status: str,
+    research_dir: str | None = None,
+    *,
+    portfolio_dir: str | None = None,
+    only_if_current_status: str | None = None,
+    market_override: str | None = None,
+    asset_class: str | None = None,
+) -> dict[str, Any]:
+    """Best-effort atomic sync of an existing research archive's ``state.json`` status.
+
+    Never creates a new empty archive, skips disk writes if already at ``target_status``,
+    and NEVER raises so committed SQLite portfolio mutations cannot be disrupted.
+    """
+    try:
+        eff_market = market_override or _asset_class_to_archive_market(asset_class)
+        eff_rdir = _resolve_sync_research_dir(portfolio_dir, research_dir)
+        if eff_rdir is None:
+            return {
+                "synced": False,
+                "skipped_reason": "research_dir_isolated",
+                "symbol": symbol,
+                "market": eff_market,
+                "target_status": target_status,
+            }
+
+        import research_archive as ra  # lazy import
+
+        if target_status not in ra.VALID_STATUSES:
+            return {
+                "synced": False,
+                "symbol": symbol,
+                "market": eff_market,
+                "target_status": target_status,
+                "error": f"Invalid target_status {target_status!r}",
+            }
+
+        folder, market, norm_sym, _ = ra.resolve_archive_dir(
+            symbol,
+            research_root=eff_rdir,
+            market_override=eff_market,
+        )
+        state_path = os.path.join(folder, "state.json")
+        if not os.path.exists(state_path):
+            return {
+                "synced": False,
+                "skipped_reason": "archive_not_found",
+                "symbol": norm_sym,
+                "market": market,
+                "target_status": target_status,
+            }
+
+        with ra._archive_lock(folder):
+            ra._apply_wal_unlocked(folder)
+            with open(state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            cur_status = state.get("status")
+            if only_if_current_status is not None and cur_status != only_if_current_status:
+                return {
+                    "synced": False,
+                    "skipped_reason": "status_mismatch",
+                    "symbol": norm_sym,
+                    "market": market,
+                    "previous_status": cur_status,
+                    "current_status": cur_status,
+                    "target_status": target_status,
+                }
+            if cur_status == target_status:
+                return {
+                    "synced": False,
+                    "skipped_reason": "already_target_status",
+                    "symbol": norm_sym,
+                    "market": market,
+                    "previous_status": cur_status,
+                    "current_status": cur_status,
+                    "target_status": target_status,
+                }
+
+            state["status"] = target_status
+            state["revision"] = int(state.get("revision", 1)) + 1
+            state["updated_at_utc"] = ra.utc_now_str()
+            ra._atomic_write_json(state_path, state)
+            return {
+                "synced": True,
+                "symbol": norm_sym,
+                "market": market,
+                "previous_status": cur_status,
+                "current_status": target_status,
+                "revision": state["revision"],
+                "archive_dir": folder,
+            }
+    except Exception as exc:  # noqa: BLE001
+        err_msg = f"{type(exc).__name__}: {exc}"
+        print(
+            f"[portfolio_manager] WARNING: research archive status sync failed for {symbol!r} -> "
+            f"{target_status!r} ({err_msg}); portfolio transaction remains committed.",
+            file=sys.stderr,
+        )
+        return {
+            "synced": False,
+            "symbol": symbol,
+            "market": market_override or _asset_class_to_archive_market(asset_class),
+            "target_status": target_status,
+            "error": err_msg,
+        }
+
+
+def _reconcile_archive_status_unlocked(
+    pdir: str,
+    symbol: str,
+    asset_class: str | None,
+    research_dir: str | None = None,
+) -> dict[str, Any]:
+    """Reconcile a symbol's archive status against live open positions in the ledger (idempotent replay safe)."""
+    eff_market = _asset_class_to_archive_market(asset_class)
+    target_key = (eff_market, str(symbol or "").strip().upper())
+    doc = _read_positions_doc_unlocked(pdir)
+    live_positions: list[dict[str, Any]] = list(doc.get("positions") or [])
+    has_live_open = any(
+        p.get("status") == "open" and _position_archive_key(p) == target_key
+        for p in live_positions
+    )
+    if has_live_open:
+        return _sync_research_archive_status(
+            symbol,
+            "holding",
+            research_dir=research_dir,
+            portfolio_dir=pdir,
+            market_override=eff_market,
+        )
+    return _sync_research_archive_status(
+        symbol,
+        "watchlist",
+        research_dir=research_dir,
+        portfolio_dir=pdir,
+        only_if_current_status="holding",
+        market_override=eff_market,
+    )
 
 
 def sync_mirrors(portfolio_dir: str | None = None) -> dict[str, Any]:
@@ -1267,7 +1469,7 @@ def _build_new_position(
         )
 
     # Cross-currency FX protection
-    fx_rate = resolve_fx_to_account(spec, account_currency, fx_to_account)
+    fx_rate = round(resolve_fx_to_account(spec, account_currency, fx_to_account), _FX_PERSIST_DECIMALS)
     quote_ccy = str(spec.get("quote_currency") or spec.get("currency") or "").strip().upper()
 
     # Exact quantity granularity check (min_order_qty + k * lot_step)
@@ -1306,7 +1508,7 @@ def _build_new_position(
         "contract_symbol": validated_contract_sym,
         "multiplier": eff_mult,
         "margin_rate": eff_margin,
-        "fx_to_account": round(fx_rate, 6),
+        "fx_to_account": fx_rate,
         "estimated_margin_account": est_margin,
         "quantity": clean_qty,
         "initial_quantity": clean_qty,
@@ -1370,6 +1572,7 @@ def open_position(
     enforce_macro_cap: bool = True,
     allow_equity_margin: bool = False,
     idempotency_key: str | None = None,
+    research_dir: str | None = None,
 ) -> dict[str, Any]:
     """Open a new position atomically after enforcing exclusivity, granularity, FX, capital, and risk caps."""
     idem_key = _normalize_idempotency_key(idempotency_key)
@@ -1506,15 +1709,40 @@ def open_position(
 
         mirror_ok, mirror_err = _safe_export_mirrors_unlocked(pdir)
         if replayed_result is not None:
+            replay_pos = replayed_result.get("position") or {}
+            archive_sync = _reconcile_archive_status_unlocked(
+                pdir,
+                str(replay_pos.get("symbol") or ""),
+                replay_pos.get("asset_class"),
+                research_dir=research_dir,
+            )
+            out_warnings = list(replayed_result.get("warnings") or [])
+            if archive_sync.get("error"):
+                out_warnings.append(f"archive_status_sync_failed: {archive_sync['error']}")
             return {
                 **replayed_result,
+                "warnings": out_warnings,
+                "archive_status_sync": archive_sync,
                 "idempotent_replay": True,
                 "mirror_sync_ok": mirror_ok,
                 "mirror_sync_error": mirror_err,
             }
         assert result_payload is not None
+        opened_pos = result_payload["position"]
+        archive_sync = _sync_research_archive_status(
+            opened_pos["symbol"],
+            "holding",
+            research_dir=research_dir,
+            portfolio_dir=pdir,
+            market_override=_asset_class_to_archive_market(opened_pos.get("asset_class")),
+        )
+        out_warnings = list(result_payload.get("warnings") or [])
+        if archive_sync.get("error"):
+            out_warnings.append(f"archive_status_sync_failed: {archive_sync['error']}")
         return {
             **result_payload,
+            "warnings": out_warnings,
+            "archive_status_sync": archive_sync,
             "mirror_sync_ok": mirror_ok,
             "mirror_sync_error": mirror_err,
         }
@@ -1529,6 +1757,7 @@ def rotate_leader(
     portfolio_dir: str | None = None,
     enforce_macro_cap: bool = True,
     idempotency_key: str | None = None,
+    research_dir: str | None = None,
 ) -> dict[str, Any]:
     """Atomically close outgoing leader, update realized ledger equity, and admit/open new leader in ONE SQLite tx."""
     idem_key = _normalize_idempotency_key(idempotency_key)
@@ -1552,6 +1781,7 @@ def rotate_leader(
     with _portfolio_lock(pdir):
         replayed_result: dict[str, Any] | None = None
         result_payload: dict[str, Any] | None = None
+        old_has_other_open = False
         with _sqlite_write_tx(pdir) as conn:
             _maybe_migrate_legacy_json_in_tx(conn, pdir)
             cached = _db_lookup_idempotency(conn, idem_key, "rotate_leader", req_hash)
@@ -1743,6 +1973,14 @@ def rotate_leader(
                     },
                 ]
 
+                old_key = _position_archive_key(old_pos)
+                old_has_other_open = any(
+                    p.get("status") == "open"
+                    and p.get("position_id") != old_position_id
+                    and _position_archive_key(p) == old_key
+                    for p in positions
+                )
+
                 result_payload = {
                     "status": "rotated",
                     "rotation_id": rotation_id,
@@ -1763,15 +2001,79 @@ def rotate_leader(
 
         mirror_ok, mirror_err = _safe_export_mirrors_unlocked(pdir)
         if replayed_result is not None:
+            replay_closed = replayed_result.get("closed_position") or {}
+            replay_opened = replayed_result.get("opened_position") or {}
+            old_sync = _reconcile_archive_status_unlocked(
+                pdir,
+                str(replay_closed.get("symbol") or ""),
+                replay_closed.get("asset_class"),
+                research_dir=research_dir,
+            )
+            new_sync = _reconcile_archive_status_unlocked(
+                pdir,
+                str(replay_opened.get("symbol") or ""),
+                replay_opened.get("asset_class"),
+                research_dir=research_dir,
+            )
+            out_warnings = list(replayed_result.get("warnings") or [])
+            for sync_item in (old_sync, new_sync):
+                if sync_item.get("error"):
+                    out_warnings.append(
+                        f"archive_status_sync_failed ({sync_item.get('symbol')}): {sync_item['error']}"
+                    )
             return {
                 **replayed_result,
+                "warnings": out_warnings,
+                "archive_status_sync": {
+                    "closed_symbol": old_sync,
+                    "opened_symbol": new_sync,
+                },
                 "idempotent_replay": True,
                 "mirror_sync_ok": mirror_ok,
                 "mirror_sync_error": mirror_err,
             }
         assert result_payload is not None
+        closed_pos_res = result_payload["closed_position"]
+        opened_pos_res = result_payload["opened_position"]
+        closed_sym = closed_pos_res["symbol"]
+        opened_sym = opened_pos_res["symbol"]
+        closed_market = _asset_class_to_archive_market(closed_pos_res.get("asset_class"))
+        opened_market = _asset_class_to_archive_market(opened_pos_res.get("asset_class"))
+        if not old_has_other_open:
+            old_sync = _sync_research_archive_status(
+                closed_sym,
+                "watchlist",
+                research_dir=research_dir,
+                portfolio_dir=pdir,
+                only_if_current_status="holding",
+                market_override=closed_market,
+            )
+        else:
+            old_sync = {
+                "synced": False,
+                "skipped_reason": "other_open_position_exists",
+                "symbol": closed_sym,
+                "market": closed_market,
+                "target_status": "watchlist",
+            }
+        new_sync = _sync_research_archive_status(
+            opened_sym,
+            "holding",
+            research_dir=research_dir,
+            portfolio_dir=pdir,
+            market_override=opened_market,
+        )
+        out_warnings = list(result_payload.get("warnings") or [])
+        for sync_item in (old_sync, new_sync):
+            if sync_item.get("error"):
+                out_warnings.append(f"archive_status_sync_failed ({sync_item.get('symbol')}): {sync_item['error']}")
         return {
             **result_payload,
+            "warnings": out_warnings,
+            "archive_status_sync": {
+                "closed_symbol": old_sync,
+                "opened_symbol": new_sync,
+            },
             "mirror_sync_ok": mirror_ok,
             "mirror_sync_error": mirror_err,
         }
@@ -1786,6 +2088,8 @@ def add_position_tranche(
     portfolio_dir: str | None = None,
     enforce_macro_cap: bool = True,
     idempotency_key: str | None = None,
+    fx_to_account: float | None = None,
+    note: str = "",
 ) -> dict[str, Any]:
     """Add a pyramid tranche ONLY on confirmed floating profit, strictly on the profit side of avg_entry,
     effective tactical_stop_30m, AND effective structural_stop_daily (if set).
@@ -1801,6 +2105,8 @@ def add_position_tranche(
                 "new_stop_30m": new_stop_30m,
                 "reason": reason,
                 "enforce_macro_cap": enforce_macro_cap,
+                "fx_to_account": fx_to_account,
+                "note": note,
             },
         )
         if idem_key is not None
@@ -1817,11 +2123,16 @@ def add_position_tranche(
             if cached is not None:
                 replayed_result = cached
             else:
-                price = _require_finite_float(add_price, "add_price", positive=True)
-                account = _db_read_account(conn, pdir)
-                if float(account["equity"]) <= 0:
+                price = round(_require_finite_float(add_price, "add_price", positive=True), _PRICE_PERSIST_DECIMALS)
+                if price <= 0:
                     raise ValueError(
-                        f"account_equity_non_positive: 账户权益 ({float(account['equity']):,.2f}) <= 0（已穿仓/资不抵债），严禁加仓"
+                        f"add_price ({add_price}) rounds to <= 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+                    )
+                account = _db_read_account(conn, pdir)
+                equity_val = float(account["equity"])
+                if equity_val <= 0:
+                    raise ValueError(
+                        f"account_equity_non_positive: 账户权益 ({equity_val:,.2f}) <= 0（已穿仓/资不抵债），严禁加仓"
                     )
                 doc = _db_read_positions_doc(conn, pdir)
                 positions: list[dict[str, Any]] = list(doc.get("positions") or [])
@@ -1839,35 +2150,49 @@ def add_position_tranche(
                 qty_add = float(clean_add_qty)
 
                 direction = pos["direction"]
-                old_avg = float(pos["avg_entry_price"])
-                old_qty = float(pos["quantity"])
-                old_stop = float(pos["tactical_stop_30m"])
+                old_avg = round(float(pos["avg_entry_price"]), _PRICE_PERSIST_DECIMALS)
+                old_qty_orig = pos["quantity"]
+                old_qty = float(old_qty_orig)
+                old_stop = round(float(pos["tactical_stop_30m"]), _PRICE_PERSIST_DECIMALS)
                 old_risk = float(pos.get("current_open_risk_amount") or 0.0)
                 mult = float(pos["multiplier"])
-                fx_rate = float(pos.get("fx_to_account", 1.0))
+                if fx_to_account is not None:
+                    fx_rate = round(
+                        resolve_fx_to_account(spec, str(account["base_currency"]), fx_to_account),
+                        _FX_PERSIST_DECIMALS,
+                    )
+                else:
+                    fx_rate = round(float(pos.get("fx_to_account", 1.0)), _FX_PERSIST_DECIMALS)
 
-                # HARD RULE 1: Strictly forbid floating-loss averaging down
+                # HARD RULE 1: Strictly forbid floating-loss or breakeven averaging down
                 if direction == "long" and not (price > old_avg):
                     raise ValueError(
-                        f"floating_loss_add_forbidden: 多头加仓价 ({price}) 必须严格高于当前持仓均价 ({old_avg})，"
-                        "仅允许浮盈确认后顺势加仓，严禁浮亏摊平"
+                        f"floating_loss_add_forbidden: 纪律禁止浮亏或平价摊平：多头加仓价 ({price}) "
+                        f"必须严格高于当前均价 ({old_avg})，仅允许浮盈确认后顺势加仓"
                     )
                 if direction == "short" and not (price < old_avg):
                     raise ValueError(
-                        f"floating_loss_add_forbidden: 空头加仓价 ({price}) 必须严格低于当前持仓均价 ({old_avg})，"
-                        "仅允许浮盈确认后顺势加仓，严禁浮亏摊平"
+                        f"floating_loss_add_forbidden: 纪律禁止浮亏或平价摊平：空头加仓价 ({price}) "
+                        f"必须严格低于当前均价 ({old_avg})，仅允许浮盈确认后顺势加仓"
                     )
 
                 eff_stop = old_stop
                 if new_stop_30m is not None:
-                    cand_stop = _require_finite_float(new_stop_30m, "new_stop_30m", positive=True)
+                    cand_stop = round(
+                        _require_finite_float(new_stop_30m, "new_stop_30m", positive=True),
+                        _PRICE_PERSIST_DECIMALS,
+                    )
+                    if cand_stop <= 0:
+                        raise ValueError(
+                            f"new_stop_30m ({new_stop_30m}) rounds to <= 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+                        )
                     if direction == "long" and cand_stop < old_stop:
                         raise ValueError(
-                            f"stop_widening_forbidden: 加仓时多头止损 ({cand_stop}) 不得低于原止损 ({old_stop})"
+                            f"stop_widening_forbidden: 移动止损只紧不松：加仓时多头止损 ({cand_stop}) 不得低于原止损 ({old_stop})"
                         )
                     if direction == "short" and cand_stop > old_stop:
                         raise ValueError(
-                            f"stop_widening_forbidden: 加仓时空头止损 ({cand_stop}) 不得高于原止损 ({old_stop})"
+                            f"stop_widening_forbidden: 移动止损只紧不松：加仓时空头止损 ({cand_stop}) 不得高于原止损 ({old_stop})"
                         )
                     eff_stop = cand_stop
 
@@ -1905,6 +2230,8 @@ def add_position_tranche(
                 new_open_risk = _compute_open_risk_amount(direction, new_avg, eff_stop, new_qty, mult, fx_rate)
                 added_tranche_risk = _compute_open_risk_amount(direction, price, eff_stop, qty_add, mult, fx_rate)
                 locked_profit = _compute_locked_profit_amount(direction, new_avg, eff_stop, new_qty, mult, fx_rate)
+                old_risk_pct = round((old_risk / equity_val) * 100.0, 4)
+                new_risk_pct = round((new_open_risk / equity_val) * 100.0, 4)
 
                 # Check BOTH combined position open risk AND added tranche's standalone stop risk against all risk caps
                 effective_risk_for_caps = max(new_open_risk, added_tranche_risk)
@@ -1927,7 +2254,7 @@ def add_position_tranche(
                         f"{other_sector_risk + effective_risk_for_caps:,.2f} "
                         f"(合并在途={new_open_risk:,.2f}, 新增笔风险={added_tranche_risk:,.2f}) "
                         f"超过单板块上限 {single_sector_cap:,.2f} (回撤缩放系数 {risk_scale:.2f})，"
-                        "请先上移/下移 30min 止损锁利或减小加仓手数"
+                        "可先将止损上移至保本/浮盈区释放风险额度后再加仓，或减小加仓手数"
                     )
 
                 other_total_risk = round(
@@ -1936,7 +2263,8 @@ def add_position_tranche(
                 if other_total_risk + effective_risk_for_caps > max_total_cap + 1e-6:
                     raise ValueError(
                         f"add_tranche_total_open_risk_exceeded: 加仓后组合总在途风险 "
-                        f"{other_total_risk + effective_risk_for_caps:,.2f} 超过上限 {max_total_cap:,.2f}"
+                        f"{other_total_risk + effective_risk_for_caps:,.2f} 超过上限 {max_total_cap:,.2f}，"
+                        "可先将止损上移至保本/浮盈区释放风险额度后再加仓"
                     )
 
                 if enforce_macro_cap:
@@ -1952,7 +2280,8 @@ def add_position_tranche(
                         if other_tag_risk + effective_risk_for_caps > max_macro_cap + 1e-6:
                             raise ValueError(
                                 f"macro_factor_overexposed: 加仓后宏大因子 {tag!r} 风险 "
-                                f"{other_tag_risk + effective_risk_for_caps:,.2f} 超过上限 {max_macro_cap:,.2f}"
+                                f"{other_tag_risk + effective_risk_for_caps:,.2f} 超过上限 {max_macro_cap:,.2f}，"
+                                "可先将止损上移至保本/浮盈区释放风险额度后再加仓"
                             )
 
                 # Portfolio margin / capital ceiling check
@@ -1960,7 +2289,6 @@ def add_position_tranche(
                     float(new_qty) * new_avg * mult * fx_rate * float(pos.get("margin_rate", 1.0)), 2
                 )
                 other_margin = round(sum(_position_estimated_margin_account(p) for p in open_others), 2)
-                equity_val = float(account["equity"])
                 if other_margin + new_pos_margin > equity_val + 1e-6:
                     raise ValueError(
                         f"portfolio_capital_limit_exceeded: 加仓后组合预计保证金/资金占用 "
@@ -1968,6 +2296,8 @@ def add_position_tranche(
                     )
 
                 now = utc_now_str()
+                clean_note = (note or "").strip()
+                clean_reason = (reason or "").strip() or (clean_note or "profit_pyramid")
                 tranches = list(pos.get("tranches") or [])
                 tranches.append(
                     {
@@ -1975,14 +2305,15 @@ def add_position_tranche(
                         "timestamp_utc": now,
                         "price": round(price, 6),
                         "quantity": clean_add_qty,
-                        "reason": (reason or "profit_pyramid").strip(),
+                        "reason": clean_reason,
                     }
                 )
-                eff_stop_rounded = round(eff_stop, 6)
+                eff_stop_rounded = eff_stop
                 pos["quantity"] = new_qty
                 pos["avg_entry_price"] = new_avg
                 pos["tactical_stop_30m"] = eff_stop_rounded
-                if new_stop_30m is not None and eff_stop_rounded != round(old_stop, 6):
+                pos["fx_to_account"] = fx_rate
+                if new_stop_30m is not None and eff_stop_rounded != old_stop:
                     pos["stop_updated_at_utc"] = now
                 pos["current_open_risk_amount"] = new_open_risk
                 pos["locked_profit_amount"] = locked_profit
@@ -1995,27 +2326,54 @@ def add_position_tranche(
                 journal_entry = {
                     "timestamp_utc": now,
                     "action": "add_on_profit",
+                    "event": "scale_in",
                     "position_id": position_id,
                     "symbol": pos["symbol"],
                     "sector_theme": pos["sector_theme"],
                     "direction": direction,
                     "price": round(price, 6),
+                    "add_price": round(price, 6),
+                    "old_entry_price": round(old_avg, 6),
                     "new_avg_entry_price": new_avg,
+                    "new_entry_price": new_avg,
+                    "old_stop_loss": round(old_stop, 6),
+                    "new_stop_loss": eff_stop_rounded,
                     "stop_30m": eff_stop_rounded,
+                    "old_quantity": old_qty_orig,
                     "add_quantity": clean_add_qty,
+                    "new_quantity": new_qty,
                     "total_quantity": new_qty,
                     "risk_delta": risk_delta,
+                    "old_risk_amount": old_risk,
+                    "new_risk_amount": new_open_risk,
+                    "old_risk_pct": old_risk_pct,
+                    "new_risk_pct": new_risk_pct,
                     "added_tranche_risk_amount": added_tranche_risk,
                     "current_open_risk_amount": new_open_risk,
-                    "reason": (reason or "profit_pyramid").strip(),
+                    "note": clean_note,
+                    "reason": clean_reason,
                 }
 
                 result_payload = {
                     "status": "added",
                     "revision": new_revision,
                     "position": pos,
+                    "old_quantity": old_qty_orig,
+                    "add_quantity": clean_add_qty,
+                    "new_quantity": new_qty,
+                    "old_entry_price": round(old_avg, 6),
+                    "add_price": round(price, 6),
+                    "new_entry_price": new_avg,
+                    "old_stop_loss": round(old_stop, 6),
+                    "new_stop_loss": eff_stop_rounded,
+                    "old_risk_amount": old_risk,
+                    "new_risk_amount": new_open_risk,
+                    "old_risk_pct": old_risk_pct,
+                    "new_risk_pct": new_risk_pct,
                     "risk_delta": risk_delta,
                     "added_tranche_risk_amount": added_tranche_risk,
+                    "tranche_count": len(tranches),
+                    "note": clean_note,
                 }
                 _db_upsert_position(conn, pos)
                 _db_update_meta(conn, revision=new_revision, updated_at_utc=now)
@@ -2036,6 +2394,33 @@ def add_position_tranche(
             "mirror_sync_ok": mirror_ok,
             "mirror_sync_error": mirror_err,
         }
+
+
+def scale_in_position(
+    position_id: str,
+    add_quantity: float,
+    add_price: float,
+    new_stop_loss: float | None = None,
+    fx_rate_to_base: float | None = None,
+    note: str = "",
+    portfolio_dir: str | None = None,
+    enforce_macro_cap: bool = True,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Scale into an existing open position strictly on confirmed floating profit (T2/T3 pyramid)."""
+    eff_reason = (note or "").strip() or "profit_pyramid"
+    return add_position_tranche(
+        position_id=position_id,
+        add_price=add_price,
+        add_quantity=add_quantity,
+        new_stop_30m=new_stop_loss,
+        reason=eff_reason,
+        portfolio_dir=portfolio_dir,
+        enforce_macro_cap=enforce_macro_cap,
+        idempotency_key=idempotency_key,
+        fx_to_account=fx_rate_to_base,
+        note=note,
+    )
 
 
 def trail_stop(
@@ -2412,6 +2797,7 @@ def close_position(
     portfolio_dir: str | None = None,
     update_account_equity: bool = True,
     idempotency_key: str | None = None,
+    research_dir: str | None = None,
 ) -> dict[str, Any]:
     """Close an open position, record realized PnL & R-multiple, and update ledger equity atomically."""
     idem_key = _normalize_idempotency_key(idempotency_key)
@@ -2434,6 +2820,7 @@ def close_position(
     with _portfolio_lock(pdir):
         replayed_result: dict[str, Any] | None = None
         result_payload: dict[str, Any] | None = None
+        has_other_open_for_symbol = False
         with _sqlite_write_tx(pdir) as conn:
             _maybe_migrate_legacy_json_in_tx(conn, pdir)
             cached = _db_lookup_idempotency(conn, idem_key, "close_position", req_hash)
@@ -2454,6 +2841,14 @@ def close_position(
                 pos = dict(positions[idx])
                 if pos.get("status") != "open":
                     raise ValueError(f"Position {position_id} is already closed")
+
+                pos_key = _position_archive_key(pos)
+                has_other_open_for_symbol = any(
+                    p.get("status") == "open"
+                    and p.get("position_id") != position_id
+                    and _position_archive_key(p) == pos_key
+                    for p in positions
+                )
 
                 old_risk = float(pos.get("current_open_risk_amount") or 0.0)
                 rem_pnl = _compute_realized_pnl(
@@ -2538,15 +2933,52 @@ def close_position(
 
         mirror_ok, mirror_err = _safe_export_mirrors_unlocked(pdir)
         if replayed_result is not None:
+            replay_pos = replayed_result.get("position") or {}
+            archive_sync = _reconcile_archive_status_unlocked(
+                pdir,
+                str(replay_pos.get("symbol") or ""),
+                replay_pos.get("asset_class"),
+                research_dir=research_dir,
+            )
+            out_warnings = list(replayed_result.get("warnings") or [])
+            if archive_sync.get("error"):
+                out_warnings.append(f"archive_status_sync_failed: {archive_sync['error']}")
             return {
                 **replayed_result,
+                "warnings": out_warnings,
+                "archive_status_sync": archive_sync,
                 "idempotent_replay": True,
                 "mirror_sync_ok": mirror_ok,
                 "mirror_sync_error": mirror_err,
             }
         assert result_payload is not None
+        closed_pos_res = result_payload["position"]
+        closed_sym = closed_pos_res["symbol"]
+        closed_market = _asset_class_to_archive_market(closed_pos_res.get("asset_class"))
+        if not has_other_open_for_symbol:
+            archive_sync = _sync_research_archive_status(
+                closed_sym,
+                "watchlist",
+                research_dir=research_dir,
+                portfolio_dir=pdir,
+                only_if_current_status="holding",
+                market_override=closed_market,
+            )
+        else:
+            archive_sync = {
+                "synced": False,
+                "skipped_reason": "other_open_position_exists",
+                "symbol": closed_sym,
+                "market": closed_market,
+                "target_status": "watchlist",
+            }
+        out_warnings = list(result_payload.get("warnings") or [])
+        if archive_sync.get("error"):
+            out_warnings.append(f"archive_status_sync_failed: {archive_sync['error']}")
         return {
             **result_payload,
+            "warnings": out_warnings,
+            "archive_status_sync": archive_sync,
             "mirror_sync_ok": mirror_ok,
             "mirror_sync_error": mirror_err,
         }
@@ -2557,6 +2989,7 @@ def void_position(
     reason: str = "误录作废",
     portfolio_dir: str | None = None,
     idempotency_key: str | None = None,
+    research_dir: str | None = None,
 ) -> dict[str, Any]:
     """Void a mistakenly entered open position without booking fake PnL or closed-trade history.
 
@@ -2580,6 +3013,7 @@ def void_position(
     with _portfolio_lock(pdir):
         replayed_result: dict[str, Any] | None = None
         result_payload: dict[str, Any] | None = None
+        has_other_open_for_symbol = False
         with _sqlite_write_tx(pdir) as conn:
             _maybe_migrate_legacy_json_in_tx(conn, pdir)
             cached = _db_lookup_idempotency(conn, idem_key, "void_position", req_hash)
@@ -2606,6 +3040,14 @@ def void_position(
                         "void_requires_untrimmed_initial_position: "
                         "该头寸已发生分批加仓或减仓结算，无法按误录无损作废，请使用平仓了结"
                     )
+
+                pos_key = _position_archive_key(pos)
+                has_other_open_for_symbol = any(
+                    p.get("status") == "open"
+                    and p.get("position_id") != position_id
+                    and _position_archive_key(p) == pos_key
+                    for p in positions
+                )
 
                 old_risk = float(pos.get("current_open_risk_amount") or 0.0)
                 now = utc_now_str()
@@ -2638,15 +3080,44 @@ def void_position(
 
         mirror_ok, mirror_err = _safe_export_mirrors_unlocked(pdir)
         if replayed_result is not None:
+            replay_voided = replayed_result.get("voided_position") or {}
+            archive_sync = _reconcile_archive_status_unlocked(
+                pdir,
+                str(replay_voided.get("symbol") or ""),
+                replay_voided.get("asset_class"),
+                research_dir=research_dir,
+            )
             return {
                 **replayed_result,
+                "archive_status_sync": archive_sync,
                 "idempotent_replay": True,
                 "mirror_sync_ok": mirror_ok,
                 "mirror_sync_error": mirror_err,
             }
         assert result_payload is not None
+        voided_pos_res = result_payload["voided_position"]
+        voided_sym = voided_pos_res["symbol"]
+        voided_market = _asset_class_to_archive_market(voided_pos_res.get("asset_class"))
+        if not has_other_open_for_symbol:
+            archive_sync = _sync_research_archive_status(
+                voided_sym,
+                "watchlist",
+                research_dir=research_dir,
+                portfolio_dir=pdir,
+                only_if_current_status="holding",
+                market_override=voided_market,
+            )
+        else:
+            archive_sync = {
+                "synced": False,
+                "skipped_reason": "other_open_position_exists",
+                "symbol": voided_sym,
+                "market": voided_market,
+                "target_status": "watchlist",
+            }
         return {
             **result_payload,
+            "archive_status_sync": archive_sync,
             "mirror_sync_ok": mirror_ok,
             "mirror_sync_error": mirror_err,
         }
@@ -2856,6 +3327,16 @@ def main(argv: list[str] | None = None) -> int:
     p_add.add_argument("--reason", default="profit_pyramid")
     p_add.add_argument("--idempotency-key", default=None)
 
+    # scale-in
+    p_scale = sub.add_parser("scale-in", help="Scale into an open position strictly on floating profit (T2/T3)")
+    p_scale.add_argument("--id", required=True)
+    p_scale.add_argument("--quantity", "--add-quantity", dest="quantity", type=float, required=True)
+    p_scale.add_argument("--price", "--add-price", dest="price", type=float, required=True)
+    p_scale.add_argument("--new-stop", "--new-stop-loss", dest="new_stop", type=float, default=None)
+    p_scale.add_argument("--fx-rate-to-base", "--fx-to-account", dest="fx_rate_to_base", type=float, default=None)
+    p_scale.add_argument("--note", default="")
+    p_scale.add_argument("--idempotency-key", default=None)
+
     # trail-stop
     p_trail = sub.add_parser("trail-stop", help="Tighten 30m (and optional daily) stop")
     p_trail.add_argument("--id", required=True)
@@ -2979,6 +3460,17 @@ def main(argv: list[str] | None = None) -> int:
                 add_quantity=args.quantity,
                 new_stop_30m=args.new_stop,
                 reason=args.reason,
+                portfolio_dir=args.portfolio_dir,
+                idempotency_key=args.idempotency_key,
+            )
+        elif args.command == "scale-in":
+            res = scale_in_position(
+                position_id=args.id,
+                add_quantity=args.quantity,
+                add_price=args.price,
+                new_stop_loss=args.new_stop,
+                fx_rate_to_base=args.fx_rate_to_base,
+                note=args.note,
                 portfolio_dir=args.portfolio_dir,
                 idempotency_key=args.idempotency_key,
             )

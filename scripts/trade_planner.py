@@ -587,6 +587,7 @@ _OVERSEAS_DATED_CONTRACT_RE = re.compile(r"^([A-Z]{2,3})([FGHJKMNQUVXZ])(\d{2})\
 _BARE_OVERSEAS_FUTURE_RE = re.compile(r"^([A-Z]{2,3})([FGHJKMNQUVXZ])(\d{2})$")
 
 VALID_DIRECTIONS = {"long", "short"}
+VALID_RESEARCH_DIRECTIONS = {"long", "short", "neutral", "pair"}
 VALID_ASSET_CLASSES = {"us_stock_or_etf", "a_share", "cn_future", "commodity", "fx", "crypto", "macro"}
 
 
@@ -1576,8 +1577,11 @@ def evaluate_four_quadrant_gate(
     carry_adjusted_rr_ratio: float | None = None,
     curve_stale_or_error: bool = False,
     us_short_thesis_verified: bool | None = None,
+    research_direction: str | None = None,
+    pair_leg_asset_class: str | None = None,
+    pair_leg_short_thesis_verified: bool | None = None,
 ) -> dict[str, Any]:
-    """Enforce fail-closed Layer-4 decision gate across thesis, alignment, sizing, capital, carry, and R:R."""
+    """Enforce fail-closed Layer-4 decision gate across thesis, direction, alignment, sizing, capital, carry, and R:R."""
     norm_dir = str(direction or "").strip().lower()
     if norm_dir == "pair":
         is_pair_trade = True
@@ -1587,6 +1591,54 @@ def evaluate_four_quadrant_gate(
     norm_ac = str(asset_class or "").strip().lower()
     if norm_ac not in VALID_ASSET_CLASSES:
         raise ValueError(f"Unsupported asset_class {asset_class!r}")
+
+    norm_pair_leg_ac: str | None = None
+    if pair_leg_asset_class is not None:
+        raw_pl_ac = str(pair_leg_asset_class).strip().lower()
+        if raw_pl_ac:
+            if raw_pl_ac not in VALID_ASSET_CLASSES:
+                raise ValueError(f"Unsupported pair_leg_asset_class {pair_leg_asset_class!r}")
+            norm_pair_leg_ac = raw_pl_ac
+
+    norm_research_dir: str | None = None
+    if research_direction is not None:
+        if not isinstance(research_direction, str):
+            raise ValueError(
+                f"research_direction must be one of {sorted(VALID_RESEARCH_DIRECTIONS)} or None, "
+                f"got {research_direction!r}"
+            )
+        raw_rd = research_direction.strip().lower()
+        if raw_rd:
+            if raw_rd not in VALID_RESEARCH_DIRECTIONS:
+                raise ValueError(
+                    f"research_direction must be one of {sorted(VALID_RESEARCH_DIRECTIONS)} or None, "
+                    f"got {research_direction!r}"
+                )
+            norm_research_dir = raw_rd
+
+    direction_aligned: bool | None = None
+    direction_conflict = False
+    research_direction_pending = False
+    research_direction_pair_mismatch = False
+    if norm_research_dir is not None:
+        if norm_research_dir == "neutral":
+            direction_aligned = False
+            research_direction_pending = True
+        elif norm_research_dir == "pair":
+            if is_pair_trade or norm_dir == "pair":
+                direction_aligned = True
+            else:
+                direction_aligned = False
+                research_direction_pair_mismatch = True
+        elif norm_dir in VALID_DIRECTIONS:
+            if norm_research_dir == norm_dir:
+                direction_aligned = True
+            else:
+                direction_aligned = False
+                direction_conflict = True
+        else:
+            direction_aligned = True
+
     if (
         isinstance(pending_verifications_count, bool)
         or not isinstance(pending_verifications_count, int)
@@ -1615,8 +1667,18 @@ def evaluate_four_quadrant_gate(
     alignment_status = str(alignment_dict.get("alignment_status") or "").strip() if alignment_dict else ""
     daily_bias = str(alignment_dict.get("daily_bias") or "").strip().lower() if alignment_dict else ""
     intraday_action = str(alignment_dict.get("intraday_action") or "").strip().lower() if alignment_dict else ""
+    intra_sig_meta = (
+        alignment_dict.get("intraday_signal_meta")
+        if isinstance(alignment_dict, dict) and isinstance(alignment_dict.get("intraday_signal_meta"), dict)
+        else None
+    )
+    intraday_stroke_end_weakening = bool(
+        (isinstance(alignment_dict, dict) and alignment_dict.get("intraday_stroke_end_weakening") is True)
+        or (intra_sig_meta is not None and intra_sig_meta.get("stroke_end_weakening") is True)
+    )
 
     # Fail-closed dual-timeframe verification: ALL THREE fields must be explicitly present & aligned
+    # and 30min MUST NOT have an active Lesson-11 same-direction stroke-end weakening warning.
     if norm_dir in VALID_DIRECTIONS:
         daily_bias_matches = bool(daily_bias) and (daily_bias == norm_dir)
         intraday_action_matches = bool(intraday_action) and (intraday_action == f"entry_{norm_dir}")
@@ -1629,19 +1691,28 @@ def evaluate_four_quadrant_gate(
         and alignment_status == "aligned_trigger"
         and daily_bias_matches
         and intraday_action_matches
+        and not intraday_stroke_end_weakening
     )
     sizing_ok = (qty_val is not None and qty_val > 0) and bool(within_capital_limits)
 
-    us_short_basis_ok = (
-        True
-        if not (norm_ac == "us_stock_or_etf" and norm_dir == "short" and not hedge_only and not is_pair_trade)
-        else (us_short_thesis_verified is not False)
-    )
+    primary_is_a_share_short = (norm_ac == "a_share" and norm_dir == "short")
+    pair_leg_is_a_share_short = (is_pair_trade and norm_dir == "long" and norm_pair_leg_ac == "a_share")
+    has_a_share_short_leg = primary_is_a_share_short or pair_leg_is_a_share_short
+
+    primary_is_us_short = (norm_ac == "us_stock_or_etf" and norm_dir == "short")
+    pair_leg_is_us_short = (is_pair_trade and norm_dir == "long" and norm_pair_leg_ac == "us_stock_or_etf")
+    primary_us_short_ok = (not primary_is_us_short) or (us_short_thesis_verified is True)
+    pair_leg_us_short_ok = (not pair_leg_is_us_short) or (pair_leg_short_thesis_verified is True)
+    us_short_basis_ok = primary_us_short_ok and pair_leg_us_short_ok
 
     checks = {
         "thesis_falsified": bool(thesis_falsified),
-        "equity_short_allowed": not (norm_ac == "a_share" and norm_dir == "short"),
-        "us_short_thesis_verified": us_short_thesis_verified if (norm_ac == "us_stock_or_etf" and norm_dir == "short") else None,
+        "equity_short_allowed": not has_a_share_short_leg,
+        "us_short_thesis_verified": us_short_thesis_verified if primary_is_us_short else None,
+        "pair_leg_asset_class": norm_pair_leg_ac if is_pair_trade else None,
+        "pair_leg_short_thesis_verified": pair_leg_short_thesis_verified if pair_leg_is_us_short else None,
+        "research_direction": norm_research_dir,
+        "direction_aligned": direction_aligned,
         "upstream_errors": up_errors,
         "curve_stale_or_error": bool(curve_stale_or_error),
         "upstream_ok": len(up_errors) == 0,
@@ -1654,6 +1725,7 @@ def evaluate_four_quadrant_gate(
         "daily_alignment_status": alignment_status or None,
         "daily_bias": daily_bias or None,
         "intraday_action": intraday_action or None,
+        "intraday_stroke_end_weakening": intraday_stroke_end_weakening,
         "alignment_verified": alignment_verified,
         "rr_ratio": rr_val,
         "carry_adjusted_rr_ratio": carry_adj_rr_val,
@@ -1662,40 +1734,43 @@ def evaluate_four_quadrant_gate(
         "carry_adjusted_rr_ok": (carry_adj_rr_val >= min_rr_val) if carry_adj_rr_val is not None else None,
     }
 
-    if thesis_falsified:
+    def _gate_result(decision: str, actionable: bool, reasons_list: list[str]) -> dict[str, Any]:
         return {
-            "decision": "rejected",
-            "actionable": False,
+            "decision": decision,
+            "actionable": actionable,
             "direction": norm_dir,
             "asset_class": norm_ac,
-            "reason": "核心研究论点已被 L1 硬证据证伪，四象限终裁否决",
-            "reasons": ["核心研究论点已被 L1 硬证据证伪，四象限终裁否决"],
+            "research_direction": norm_research_dir,
+            "direction_aligned": direction_aligned,
+            "reason": "；".join(reasons_list),
+            "reasons": reasons_list,
             "checks": checks,
         }
 
-    if norm_ac == "a_share" and norm_dir == "short":
-        msg = "A 股受限严格仅做多，无条件禁止直接做空（含对冲与配对空头腿）"
-        return {
-            "decision": "rejected",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+    if thesis_falsified:
+        return _gate_result("rejected", False, ["核心研究论点已被 L1 硬证据证伪，四象限终裁否决"])
+
+    if has_a_share_short_leg:
+        return _gate_result("rejected", False, ["A 股受限严格仅做多，无条件禁止直接做空（含对冲与配对空头腿）"])
+
+    if direction_conflict:
+        return _gate_result(
+            "rejected_direction_conflict",
+            False,
+            [
+                (
+                    "第三层研究方向与拟执行方向冲突，请先在研报档案复核结论"
+                    f"（档案研究方向：{norm_research_dir}，拟执行方向：{norm_dir}）"
+                )
+            ],
+        )
 
     if up_errors:
-        msg = f"上游行情/缠论/曲线抓取存在异常（{len(up_errors)} 项），默认拒批以防脏数据误触发：{'；'.join(up_errors)}"
-        return {
-            "decision": "watchlist_upstream_error",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result(
+            "watchlist_upstream_error",
+            False,
+            [f"上游行情/缠论/曲线抓取存在异常（{len(up_errors)} 项），默认拒批以防脏数据误触发：{'；'.join(up_errors)}"],
+        )
 
     if (qty_val is not None and qty_val <= 0) or not within_capital_limits:
         reasons_cap: list[str] = []
@@ -1703,72 +1778,53 @@ def evaluate_four_quadrant_gate(
             reasons_cap.append("风控/资金约束下可执行数量归零（严禁向上取整突破预算）")
         if not within_capital_limits:
             reasons_cap.append("预计保证金或名义杠杆超出账户资金上限")
-        msg = "；".join(reasons_cap)
-        return {
-            "decision": "rejected_sizing_or_capital",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": reasons_cap,
-            "checks": checks,
-        }
+        return _gate_result("rejected_sizing_or_capital", False, reasons_cap)
 
+    neutral_msg = "研报档案研究方向仍为中性（neutral），请先在「研报档案」明确做多/做空方向后再执行建仓"
     evidence_reasons: list[str] = []
     if not has_l1_l2_evidence:
         evidence_reasons.append("缺少 L1/L2 一手硬证据支撑，禁止直接放行建仓")
-    if not us_short_basis_ok:
+    if not primary_us_short_ok:
         evidence_reasons.append(
             "美股做空须经第三层研究裁决为看空（戴维斯双杀或周期见顶反转，direction_bias=short），当前档案尚未确认看空裁决，先入观察池"
+        )
+    if not pair_leg_us_short_ok:
+        evidence_reasons.append(
+            "配对反向美股空头腿须经第三层研究裁决为看空（L1/L2 证据 + direction_bias=short），当前反向腿档案尚未确认看空裁决，先入观察池"
         )
     if pending_verifications_count >= 2:
         evidence_reasons.append(f"尚有 {pending_verifications_count} 项关键核验未完成（>=2 项），先入观察池")
     if evidence_reasons:
-        return {
-            "decision": "watchlist",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": "；".join(evidence_reasons),
-            "reasons": evidence_reasons,
-            "checks": checks,
-        }
+        if research_direction_pending:
+            evidence_reasons.append(neutral_msg)
+        return _gate_result("watchlist", False, evidence_reasons)
+
+    if research_direction_pending:
+        return _gate_result("watchlist_research_pending", False, [neutral_msg])
+
+    if research_direction_pair_mismatch:
+        return _gate_result(
+            "watchlist_research_pending",
+            False,
+            ["研报档案研究方向为配对（pair），请勾选同板块多空配对或在「研报档案」明确单边方向后再执行建仓"],
+        )
 
     if is_pair_trade and not pair_leg_verified:
-        msg = "同板块配对交易需同时完成多/空双腿验证（pair_leg_verified=True），严禁凭单腿参数放行配对"
-        return {
-            "decision": "watchlist_pair_incomplete",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result(
+            "watchlist_pair_incomplete",
+            False,
+            ["同板块配对交易需同时完成多/空双腿验证（pair_leg_verified=True），严禁凭单腿参数放行配对"],
+        )
 
     if alignment_dict is None or not alignment_status:
-        msg = "缺少日线定方向 + 30min 缠论触发对齐验证（daily_alignment 缺失），默认拒绝放行"
-        return {
-            "decision": "watchlist_unverified",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result(
+            "watchlist_unverified",
+            False,
+            ["缺少日线定方向 + 30min 缠论触发对齐验证（daily_alignment 缺失），默认拒绝放行"],
+        )
 
     if alignment_status == "daily_opposes_direction":
-        msg = "日线方向相反，严禁逆日线接飞刀/逆势硬扛"
-        return {
-            "decision": "watchlist",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result("watchlist", False, ["日线方向相反，严禁逆日线接飞刀/逆势硬扛"])
 
     if alignment_status in {"daily_ok_wait_30m", "neutral_wait"}:
         msg = (
@@ -1776,125 +1832,79 @@ def evaluate_four_quadrant_gate(
             if alignment_status == "daily_ok_wait_30m"
             else "日线结构尚处中性震荡，继续等待日线方向与 30min 缠论结构共振"
         )
-        return {
-            "decision": "watchlist_wait_30m",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result("watchlist_wait_30m", False, [msg])
 
     if alignment_status == "data_quality_degraded":
-        msg = "行情数据质量降级（高比例无波幅结算平K或异常坏点），严禁自动放行开仓，请切换同板块高流动性主力合约验证"
-        return {
-            "decision": "watchlist_data_quality_degraded",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result(
+            "watchlist_data_quality_degraded",
+            False,
+            ["行情数据质量降级（高比例无波幅结算平K或异常坏点），严禁自动放行开仓，请切换同板块高流动性主力合约验证"],
+        )
+
+    if intraday_stroke_end_weakening:
+        return _gate_result(
+            "watchlist_wait_30m",
+            False,
+            ["30min 缠论已触发第11课反向K线破位/笔结束走弱警戒，与哨兵风控口径一致暂不放行建仓，等待 30min 结构重塑"],
+        )
 
     if alignment_status != "aligned_trigger":
-        msg = f"未识别或未确认的日线/30min 对齐状态 {alignment_status!r}（仅 'aligned_trigger' 可放行），默认转入待核验观察池"
-        return {
-            "decision": "watchlist_unverified",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result(
+            "watchlist_unverified",
+            False,
+            [f"未识别或未确认的日线/30min 对齐状态 {alignment_status!r}（仅 'aligned_trigger' 可放行），默认转入待核验观察池"],
+        )
 
     if not daily_bias_matches or not intraday_action_matches:
-        msg = (
-            f"大小级别对齐方向缺失或与交易方向不一致：daily_bias={daily_bias or 'MISSING'}, "
-            f"intraday_action={intraday_action or 'MISSING'}, 计划方向={norm_dir}（必须三项齐全且一致）"
+        return _gate_result(
+            "watchlist_unverified",
+            False,
+            [
+                (
+                    f"大小级别对齐方向缺失或与交易方向不一致：daily_bias={daily_bias or 'MISSING'}, "
+                    f"intraday_action={intraday_action or 'MISSING'}, 计划方向={norm_dir}（必须三项齐全且一致）"
+                )
+            ],
         )
-        return {
-            "decision": "watchlist_unverified",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
 
     if rr_val is None:
-        msg = f"缺少明确目标位与盈亏比（rr_ratio=None），无法核验盈亏比 >= {min_rr_val:.2f}，默认拒绝放行"
-        return {
-            "decision": "watchlist_missing_rr",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result(
+            "watchlist_missing_rr",
+            False,
+            [f"缺少明确目标位与盈亏比（rr_ratio=None），无法核验盈亏比 >= {min_rr_val:.2f}，默认拒绝放行"],
+        )
 
     if rr_val < min_rr_val:
-        msg = f"30min 紧凑止损下盈亏比 {rr_val:.2f} 低于最低门槛 {min_rr_val:.2f}，等待更优入场位"
-        return {
-            "decision": "watchlist_poor_rr",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result(
+            "watchlist_poor_rr",
+            False,
+            [f"30min 紧凑止损下盈亏比 {rr_val:.2f} 低于最低门槛 {min_rr_val:.2f}，等待更优入场位"],
+        )
 
     if carry_adj_rr_val is not None and carry_adj_rr_val < min_rr_val:
-        msg = (
-            f"计入展期/Carry 成本后的调整盈亏比 {carry_adj_rr_val:.4f} 低于最低门槛 {min_rr_val:.2f} "
-            f"（名义盈亏比 {rr_val:.2f}），建议切换远月合约、熊/牛市价差或等待更佳 30min 入场位"
+        return _gate_result(
+            "watchlist_poor_carry_adjusted_rr",
+            False,
+            [
+                (
+                    f"计入展期/Carry 成本后的调整盈亏比 {carry_adj_rr_val:.4f} 低于最低门槛 {min_rr_val:.2f} "
+                    f"（名义盈亏比 {rr_val:.2f}），建议切换远月合约、熊/牛市价差或等待更佳 30min 入场位"
+                )
+            ],
         )
-        return {
-            "decision": "watchlist_poor_carry_adjusted_rr",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
 
     if qty_val is None:
-        msg = "缺少明确算仓数量（total_quantity=None），无法核验风险预算与最小交易手数，默认拒绝放行"
-        return {
-            "decision": "watchlist_missing_sizing",
-            "actionable": False,
-            "direction": norm_dir,
-            "asset_class": norm_ac,
-            "reason": msg,
-            "reasons": [msg],
-            "checks": checks,
-        }
+        return _gate_result(
+            "watchlist_missing_sizing",
+            False,
+            ["缺少明确算仓数量（total_quantity=None），无法核验风险预算与最小交易手数，默认拒绝放行"],
+        )
 
     if is_pair_trade:
-        decision = "pair_trade"
-        msg = "同板块多空配对四象限与双腿核验全部通过，按配对风险预算执行"
-    elif norm_dir == "long":
-        decision = "actionable_long"
-        msg = "第三层 L1/L2 论据、日线方向、30min 触发与盈亏比全部通过，放行做多"
-    else:
-        decision = "actionable_short"
-        msg = "第三层 L1/L2 论据、日线方向、30min 触发与盈亏比全部通过，放行做空"
-
-    return {
-        "decision": decision,
-        "actionable": True,
-        "direction": norm_dir,
-        "asset_class": norm_ac,
-        "reason": msg,
-        "reasons": [msg],
-        "checks": checks,
-    }
+        return _gate_result("pair_trade", True, ["同板块多空配对四象限与双腿核验全部通过，按配对风险预算执行"])
+    if norm_dir == "long":
+        return _gate_result("actionable_long", True, ["第三层 L1/L2 论据、日线方向、30min 触发与盈亏比全部通过，放行做多"])
+    return _gate_result("actionable_short", True, ["第三层 L1/L2 论据、日线方向、30min 触发与盈亏比全部通过，放行做空"])
 
 
 # ---------------------------------------------------------------------------
@@ -2639,6 +2649,29 @@ def _parse_tranches_arg(raw: str) -> tuple[float, ...]:
     return tuple(float(p) for p in parts)
 
 
+def _load_archive_direction_bias(
+    symbol: str,
+    research_root: str | None = None,
+) -> str | None:
+    """Load direction_bias from the symbol's Layer-3 research archive state.json if present."""
+    try:
+        from research_archive import load_archive
+
+        loaded = load_archive(symbol, research_root=research_root, evidence_limit=0)
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    state = loaded.get("state") if isinstance(loaded, dict) else None
+    if not isinstance(state, dict):
+        return None
+    raw_dir = state.get("direction_bias")
+    if not isinstance(raw_dir, str):
+        return None
+    cleaned = raw_dir.strip().lower()
+    if not cleaned:
+        return None
+    return cleaned if cleaned in VALID_RESEARCH_DIRECTIONS else "neutral"
+
+
 class PlanInputError(ValueError):
     """Missing/contradictory planner inputs (CLI maps this to argparse usage errors)."""
 
@@ -2693,6 +2726,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pair-trade", action="store_true", help="Mark trade as same-sector pair trade")
     parser.add_argument("--pair-leg-verified", action="store_true", default=False, help="Explicitly confirm opposing pair leg passed verification")
     parser.add_argument("--min-rr", type=float, default=2.5, help="Minimum R:R gate threshold (default: 2.5)")
+    parser.add_argument(
+        "--research-direction",
+        choices=sorted(VALID_RESEARCH_DIRECTIONS),
+        default=None,
+        help="Explicit Layer-3 research direction override (defaults to archive state.json direction_bias when present)",
+    )
+    parser.add_argument(
+        "--research-root",
+        default=None,
+        help="Optional research archive root directory override for loading direction_bias",
+    )
     parser.add_argument("--alignment-status", default=None, help="Manual daily/30m alignment_status (offline mode only; forbidden with --live)")
     parser.add_argument("--live", action="store_true", help="Fetch live market snapshot & Layer-3 curve/rate/funding data")
     return parser
@@ -2949,6 +2993,23 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
     )
     if expression.get("carry_adjusted_rr_ratio") is not None:
         plan["carry_adjusted_rr_ratio"] = expression["carry_adjusted_rr_ratio"]
+    explicit_research_dir = getattr(args, "research_direction", None)
+    research_root = getattr(args, "research_root", None)
+    if explicit_research_dir is not None and str(explicit_research_dir).strip() != "":
+        resolved_research_direction: str | None = str(explicit_research_dir).strip().lower()
+    else:
+        resolved_research_direction = _load_archive_direction_bias(
+            args.symbol, research_root=research_root
+        )
+
+    explicit_us_short_verified = getattr(args, "us_short_thesis_verified", None)
+    if (
+        explicit_us_short_verified is None
+        and plan["asset_class"] == "us_stock_or_etf"
+        and args.direction == "short"
+    ):
+        explicit_us_short_verified = bool(args.has_l1_l2 and resolved_research_direction == "short")
+
     gate = evaluate_four_quadrant_gate(
         direction=args.direction,
         asset_class=plan["asset_class"],
@@ -2966,7 +3027,10 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
         pair_leg_verified=args.pair_leg_verified,
         carry_adjusted_rr_ratio=expression.get("carry_adjusted_rr_ratio"),
         curve_stale_or_error=bool(expression.get("curve_data_warning")),
-        us_short_thesis_verified=getattr(args, "us_short_thesis_verified", None),
+        us_short_thesis_verified=explicit_us_short_verified,
+        research_direction=resolved_research_direction,
+        pair_leg_asset_class=getattr(args, "pair_leg_asset_class", None),
+        pair_leg_short_thesis_verified=getattr(args, "pair_leg_short_thesis_verified", None),
     )
 
     stop_source = "live_30m_chanlun" if args.live else "manual_scenario"

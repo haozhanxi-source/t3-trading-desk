@@ -1,8 +1,13 @@
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   AlertTriangle,
+  ArrowDownRight,
+  ArrowRight,
+  ArrowUpRight,
   BookOpen,
+  Briefcase,
   Calculator,
+  Calendar,
   CheckCircle2,
   Crosshair,
   Eye,
@@ -10,7 +15,10 @@ import {
   Lock,
   PlusCircle,
   ShieldAlert,
+  ShieldCheck,
+  SlidersHorizontal,
   Wallet,
+  X,
 } from "lucide-react";
 import { api, ApiError, errorMessage } from "../../api/client";
 import type {
@@ -32,9 +40,13 @@ import {
 } from "../../lib/format";
 import { isSnapshotIntradayUntrusted, selectTrustedLastQuote } from "../../lib/snapshotPrice";
 import type { PlanOverlayLines } from "../chart/ChanlunChart";
-import type { OpenPositionSeed } from "../portfolio/PortfolioDialogs";
+import {
+  isGenericSectorTheme,
+  type OpenPositionReceipt,
+  type OpenPositionSeed,
+} from "../portfolio/PortfolioDialogs";
 import { CrossCurrencyFxBanner } from "../ui/CrossCurrencyFxBanner";
-import { GateDecisionBadge, StatusBadge } from "../ui/StatusBadge";
+import { StatusBadge, type Tone } from "../ui/StatusBadge";
 
 export type PickPriceField = "entry" | "stop30m" | "target";
 
@@ -44,10 +56,17 @@ export interface PickedPriceUpdate {
   price: number;
 }
 
+export interface ArchiveJumpOptions {
+  tab?: "thesis" | "evidence" | "hard_data" | "triggers";
+  openEvidenceForm?: boolean;
+  openMetaEditor?: boolean;
+}
+
 export interface ArchivePlanContext {
   forSymbol?: string;
   exists: boolean;
   market?: string | null;
+  directionBias?: string | null;
   sectorTheme?: string | null;
   hasL1L2Evidence?: boolean;
   evidenceCount?: number;
@@ -69,12 +88,320 @@ function formatQtyDisplay(qty: number, fractional: boolean): string {
   return Number(qty.toFixed(4)).toString();
 }
 
-function assetUnitLabel(assetClass?: string | null): string {
-  const ac = (assetClass || "").toLowerCase();
-  if (ac === "cn_future" || ac === "commodity") return "手";
+function assetUnitLabel(
+  assetClass?: string | null,
+  contractSpec?: ContractSpec | Record<string, unknown> | null,
+): string {
+  const specAc =
+    contractSpec && typeof contractSpec.asset_class === "string"
+      ? contractSpec.asset_class
+      : "";
+  const ac = (assetClass || specAc || "").trim().toLowerCase();
+  if (ac === "cn_future" || ac === "commodity" || ac === "intl_commodity" || ac === "us_future" || ac === "commodity_us") {
+    return "手";
+  }
   if (ac === "fx") return "单位";
   if (ac === "crypto") return "枚";
   return "股";
+}
+
+export function formatAssetClassZh(assetClass?: string | null): string {
+  const ac = (assetClass || "").trim().toLowerCase();
+  const map: Record<string, string> = {
+    us_stock_or_etf: "美股 / ETF",
+    us_equity: "美股 / ETF",
+    a_share: "A 股",
+    cn_equity: "A 股",
+    hk_stock: "港股",
+    hk_equity: "港股",
+    cn_future: "国内期货",
+    commodity: "海外商品",
+    intl_commodity: "海外商品",
+    commodity_us: "海外商品",
+    us_future: "海外期货",
+    fx: "外汇",
+    crypto: "加密货币",
+    macro_index: "宏观指数",
+    macro: "宏观指数",
+  };
+  return map[ac] ?? (ac ? ac : "股票 / 现货");
+}
+
+function formatCurveStructureZh(raw?: string | null): string {
+  const s = (raw || "").trim().toLowerCase();
+  if (!s) return "";
+  if (s.includes("backwardation")) return "大 B 结构（现货升水）";
+  if (s.includes("contango")) return "Contango（远月升水）";
+  if (s.includes("flat")) return "平坦期限结构";
+  if (s === "unknown") return "曲线待核验";
+  return raw || "";
+}
+
+function formatExpressionRecZh(
+  raw?: string | null,
+  direction?: string | null,
+  assetClass?: string | null,
+  opts?: { pairTrade?: boolean; hedgeOnly?: boolean },
+): string {
+  const key = (raw || "").trim().toLowerCase();
+  const dirZh = direction === "short" ? "做空" : "做多";
+  const ac = (assetClass || "").trim().toLowerCase();
+  const isEq = ac === "us_stock_or_etf" || ac === "a_share" || ac === "us_equity" || ac === "cn_equity";
+
+  if (isEq) {
+    if (opts?.pairTrade) return "同产业链多空配对";
+    if (opts?.hedgeOnly) return "阶段性组合对冲";
+  }
+
+  const map: Record<string, string> = {
+    cash_equity_staggered_long: "正股分批建仓（做多）",
+    equity_hedge_or_pair_expression_only: "同产业链配对 / 阶段性对冲",
+    prefer_far_month_short_or_bear_spread: "优先空远月合约或熊市价差",
+    short_active_or_far_month_with_carry_budget: "主力或次远月做空（预留展期预算）",
+    prefer_far_month_long_or_bull_spread: "优先多远月合约或跨期正套",
+    long_active_or_far_month_with_carry_budget: "主力或次远月做多（计入展期成本）",
+    long_active_contract_positive_carry: "主力合约做多（正展期顺风）",
+    short_active_contract_positive_carry: "主力合约做空（正展期顺风）",
+    long_active_contract_neutral_carry: "主力合约做多（展期中性）",
+    short_active_contract_neutral_carry: "主力合约做空（展期中性）",
+    long_active_contract_verify_curve: "主力合约做多（下单前核对月差）",
+    short_active_contract_verify_curve: "主力合约做空（下单前核对月差）",
+    long_fx_verify_carry_and_cross: "外汇做多（核对隔夜利差与交叉盘）",
+    short_fx_verify_carry_and_cross: "外汇做空（核对隔夜利差与交叉盘）",
+    long_direct_or_cross_positive_carry: "直盘 / 交叉盘做多（正利差顺风）",
+    short_direct_or_cross_positive_carry: "直盘 / 交叉盘做空（正利差顺风）",
+    long_prefer_cross_or_catalyst_window: "优先交叉盘做多或聚焦催化窗口",
+    short_prefer_cross_or_catalyst_window: "优先交叉盘做空或聚焦催化窗口",
+    long_direct_pair_manageable_carry: "直盘做多（负利差可控）",
+    short_direct_pair_manageable_carry: "直盘做空（负利差可控）",
+    long_crypto_verify_funding: "加密做多（核对永续资金费率）",
+    short_crypto_verify_funding: "加密做空（核对永续资金费率）",
+    long_spot_avoid_crowded_perp: "现货分批做多（规避高费率永续）",
+    short_cautious_crowded_negative_funding: "低杠杆谨慎做空（警惕负费率逼空）",
+    long_perp_or_spot_positive_carry: "现货 / 永续做多（资金费率顺风）",
+    short_perp_or_spot_positive_carry: "永续合约做空（资金费率顺风）",
+    long_spot_or_low_leverage_perp: "优先现货做多（减少费率磨损）",
+    short_spot_or_low_leverage_perp: "低杠杆永续做空（控制费率磨损）",
+    data_stale_refresh_required: "曲线数据陈旧，需刷新后再定合约",
+  };
+  if (key && map[key]) return map[key];
+  if (isEq) {
+    return direction === "short" ? "阶段性对冲 / 同产业链配对" : "正股分批建仓（做多）";
+  }
+  return raw ? sanitizePlanMessageZh(raw) : `${dirZh}主力流动合约`;
+}
+
+function sanitizePlanMessageZh(raw: string | null | undefined): string {
+  if (!raw) return "";
+  let s = raw.trim();
+  const exactCodes: Record<string, string> = {
+    intraday_bar_unclosed: "最新 30m K 线尚未收盘完结，暂停自动放行",
+    stale_intraday_30m_snapshot: "30m 日内行情快照已过期，请刷新后再验算",
+    stale_market_snapshot: "行情快照数据已过期，请刷新后再验算",
+    daily_data_quality_degraded: "日线行情质量降级（存在高比例平K或异常坏点）",
+    intraday_data_quality_degraded: "30m 日内行情质量降级（存在异常平K或坏点）",
+    missing_daily_timestamp: "缺少日线时间戳，无法核验行情时效",
+    missing_intraday_timestamp: "缺少 30m 日内时间戳，无法核验行情时效",
+    daily_future_timestamp: "日线时间戳异常（晚于当前时间）",
+    intraday_future_timestamp: "30m 日内时间戳异常（晚于当前时间）",
+    curve_stale_or_error: "期货期限结构曲线数据异常或陈旧",
+    missing_term_structure_data: "暂缺完整期货期限结构数据，请在下单前核对近远月升贴水",
+    missing_fx_rate_differential: "暂缺国债/政策利差数据，请在下单前核对隔夜掉期利差",
+    missing_crypto_funding: "暂缺永续资金费率数据，请核对资金费率与持仓量拥挤度",
+  };
+  if (exactCodes[s]) return exactCodes[s];
+
+  if (s.includes("Live mode strictly enforces live 30min Chanlun stops")) {
+    return "实时 30m 止损锁定模式下暂无当前方向的同侧 30m 缠论止损位；可等待 30m 结构就绪，或关闭「实时止损」开关进行手动推演。";
+  }
+
+  s = s
+    .replace(/\bdual_alignment\.daily_bias\s*=\s*short\b/gi, "日线主方向为空头")
+    .replace(/\bdual_alignment\.daily_bias\s*=\s*long\b/gi, "日线主方向为多头")
+    .replace(/\bdual_alignment\.daily_bias\s*=\s*neutral\b/gi, "日线主方向为中性震荡")
+    .replace(/\bdaily_bias\s*=\s*short\b/gi, "日线方向：空头")
+    .replace(/\bdaily_bias\s*=\s*long\b/gi, "日线方向：多头")
+    .replace(/\bdaily_bias\s*=\s*neutral\b/gi, "日线方向：中性")
+    .replace(/\bdaily_bias\s*=\s*MISSING\b/gi, "日线方向缺失")
+    .replace(/\bintraday_action\s*=\s*entry_long\b/gi, "30m 触发：做多入场")
+    .replace(/\bintraday_action\s*=\s*entry_short\b/gi, "30m 触发：做空入场")
+    .replace(/\bintraday_action\s*=\s*wait\b/gi, "30m 尚未触发")
+    .replace(/\bintraday_action\s*=\s*MISSING\b/gi, "30m 触发状态缺失")
+    .replace(/计划方向\s*=\s*long\b/gi, "计划方向：做多")
+    .replace(/计划方向\s*=\s*short\b/gi, "计划方向：做空")
+    .replace(/拟执行方向[：:]\s*long\b/gi, "拟执行方向：做多")
+    .replace(/拟执行方向[：:]\s*short\b/gi, "拟执行方向：做空")
+    .replace(/档案研究方向[：:]\s*long\b/gi, "档案研究方向：做多")
+    .replace(/档案研究方向[：:]\s*short\b/gi, "档案研究方向：做空")
+    .replace(/档案研究方向[：:]\s*neutral\b/gi, "档案研究方向：中性（待定性）")
+    .replace(/档案研究方向[：:]\s*pair\b/gi, "档案研究方向：同板块配对")
+    .replace(/[（(]\s*neutral\s*[)）]/gi, "（待定性）")
+    .replace(/[（(]\s*pair\s*[)）]/gi, "")
+    .replace(/[（(]\s*pair_leg_verified\s*=\s*True\s*[)）]/gi, "")
+    .replace(/[（(]\s*daily_alignment\s*缺失\s*[)）]/gi, "（缺少大小级别对齐数据）")
+    .replace(/[（(]\s*rr_ratio\s*=\s*None\s*[)）]/gi, "（尚未设定目标价）")
+    .replace(/[（(]\s*total_quantity\s*=\s*None\s*[)）]/gi, "（尚未完成仓位测算）")
+    .replace(/仅\s*'aligned_trigger'\s*可放行/g, "仅大小级别同向共振可放行")
+    .replace(/\bactionable_long\b/g, "放行做多")
+    .replace(/\bactionable_short\b/g, "放行做空")
+    .replace(/\bcash_equity_staggered_long\b/g, "正股分批建仓（做多）")
+    .replace(/\bequity_hedge_or_pair_expression_only\b/g, "阶段性对冲 / 同产业链配对")
+    .replace(/\bus_stock_or_etf\b/g, "美股 / ETF")
+    .replace(/\ba_share\b/g, "A 股")
+    .replace(/\bcn_future\b/g, "国内期货")
+    .replace(/\bintl_commodity\b/g, "海外商品")
+    .replace(/\baligned_trigger\b/g, "大小级别同向共振")
+    .replace(/\bdaily_opposes_direction\b/g, "日线方向相反")
+    .replace(/\bdaily_ok_wait_30m\b/g, "日线顺向，等待 30m 触发")
+    .replace(/\bneutral_wait\b/g, "中枢震荡观望")
+    .replace(/\bintraday_bar_unclosed\b/g, "最新 30m K 线尚未收盘")
+    .replace(/\bstale_intraday_30m_snapshot\b/g, "30m 日内快照已过期")
+    .replace(/\bstale_market_snapshot\b/g, "行情快照已过期")
+    .replace(/\bcurve_stale_or_error\b/g, "期限结构数据异常或陈旧")
+    .replace(/\bterm_structure_(stale|error)\b/gi, "期限结构数据异常")
+    .replace(/\b(rate_differential|fx_rate_differential)_(stale|error)\b/gi, "外汇利差数据异常")
+    .replace(/\bsources_status_[a-z0-9_]+_(stale|error)\b/gi, "上游数据源状态异常")
+    .replace(/\bcurve_data_warning:\s*/gi, "")
+    .replace(/\bsteep_front_backwardation_squeeze_risk:\s*/gi, "近月大 B 挤仓警戒：")
+    .replace(/\bsteep_front_contango_roll_drag:\s*/gi, "近月 Contango 展期损耗警戒：")
+    .replace(/\bdual_alignment_error:\s*/gi, "大小级别对齐计算异常：")
+    .replace(/\bresearch_error:\s*/gi, "研报硬数据抓取异常：");
+
+  return s;
+}
+
+function formatEarningsDateVal(raw: unknown): string | null {
+  if (raw == null) return null;
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      const parsed = formatEarningsDateVal(item);
+      if (parsed) return parsed;
+    }
+    return null;
+  }
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 1e8) {
+    const ms = raw > 1e12 ? raw : raw * 1000;
+    const d = new Date(ms);
+    if (!Number.isNaN(d.getTime())) {
+      return d.toISOString().slice(0, 10);
+    }
+  }
+  if (typeof raw === "string") {
+    const cleaned = raw.trim();
+    if (!cleaned) return null;
+    const iso = /^(\d{4}-\d{2}-\d{2})/.exec(cleaned);
+    if (iso) return iso[1] ?? cleaned;
+    return cleaned.slice(0, 16);
+  }
+  return null;
+}
+
+function normalizePctMetric(raw: unknown): number | null {
+  const n = typeof raw === "number" ? raw : typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
+  if (!Number.isFinite(n) || n < 0) return null;
+  /* yfinance sometimes returns dividendYield/shortPercentOfFloat as ratio (0.032) or percent (3.2) */
+  return n <= 0.5 ? n * 100 : n;
+}
+
+function extractEquityFundamentals(fundamentals: Record<string, unknown> | null | undefined) {
+  const f = fundamentals && typeof fundamentals === "object" ? fundamentals : {};
+  const nextEarningsDate =
+    formatEarningsDateVal(f.next_earnings_date) ??
+    formatEarningsDateVal(f.earnings_date) ??
+    formatEarningsDateVal(f.earningsDate) ??
+    formatEarningsDateVal(f.earningsTimestampStart) ??
+    formatEarningsDateVal(f.earningsTimestamp) ??
+    null;
+
+  const numField = (keys: string[]): number | null => {
+    for (const k of keys) {
+      const v = f[k];
+      const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v) : NaN;
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return null;
+  };
+
+  const forwardPe = numField(["forward_pe", "forwardPE"]);
+  const trailingPe = numField(["trailing_pe", "trailingPE"]);
+  const dividendYieldPct = normalizePctMetric(f.dividend_yield ?? f.dividendYield);
+  const shortPctOfFloat = normalizePctMetric(f.short_percent_of_float ?? f.shortPercentOfFloat);
+  const sector = typeof f.sector === "string" && f.sector.trim() ? f.sector.trim() : null;
+
+  return {
+    nextEarningsDate,
+    forwardPe,
+    trailingPe,
+    dividendYieldPct,
+    shortPctOfFloat,
+    sector,
+  };
+}
+
+function formatResearchDirectionZh(dir?: string | null): string {
+  const d = (dir || "").trim().toLowerCase();
+  if (d === "long") return "做多";
+  if (d === "short") return "做空";
+  if (d === "neutral") return "中性（待定性）";
+  if (d === "pair") return "同板块配对";
+  return "未定性";
+}
+
+function PlannerGateBadge({ decision, actionable }: { decision: string; actionable?: boolean }) {
+  const key = (decision || "").trim().toLowerCase();
+  if (key === "actionable_long" || key.includes("approve_long") || decision.includes("放行做多")) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded border border-[color:color-mix(in_srgb,var(--bull)_42%,transparent)] bg-[color:color-mix(in_srgb,var(--bull)_14%,transparent)] px-2 py-0.5 text-xs font-semibold text-bull whitespace-nowrap">
+        <ArrowUpRight className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <span>放行做多</span>
+      </span>
+    );
+  }
+  if (key === "actionable_short" || key.includes("approve_short") || decision.includes("放行做空")) {
+    return (
+      <span className="inline-flex items-center gap-1 rounded border border-[color:color-mix(in_srgb,var(--accent)_45%,transparent)] bg-[color:color-mix(in_srgb,var(--accent)_14%,transparent)] px-2 py-0.5 text-xs font-semibold text-accent whitespace-nowrap">
+        <ArrowDownRight className="h-3.5 w-3.5 shrink-0 text-bear" aria-hidden="true" />
+        <span className="text-ink">放行做空</span>
+      </span>
+    );
+  }
+
+  const DECISION_MAP: Record<string, { tone: Tone; label: string }> = {
+    pair_trade: { tone: "info", label: "放行同板块配对" },
+    rejected_direction_conflict: { tone: "critical", label: "方向冲突否决" },
+    watchlist_research_pending: { tone: "warning", label: "研究方向待定性" },
+    rejected_sizing_or_capital: { tone: "critical", label: "仓位/资金超限否决" },
+    rejected: { tone: "critical", label: "否决建仓" },
+    watchlist_wait_30m: { tone: "warning", label: "等待 30min 结构" },
+    watchlist_poor_rr: { tone: "warning", label: "盈亏比不足 (<2.5R)" },
+    watchlist_poor_carry_adjusted_rr: { tone: "warning", label: "展期后盈亏比不足" },
+    watchlist_missing_rr: { tone: "warning", label: "待设定目标价" },
+    watchlist_missing_sizing: { tone: "warning", label: "待完成算仓" },
+    watchlist_pair_incomplete: { tone: "warning", label: "配对双腿待核验" },
+    watchlist_upstream_error: { tone: "warning", label: "上游数据异常暂停" },
+    watchlist_data_quality_degraded: { tone: "warning", label: "行情质量降级暂停" },
+    watchlist_unverified: { tone: "warning", label: "对齐状态待核验" },
+    watchlist: { tone: "warning", label: "逻辑待观察" },
+  };
+
+  const mapped = DECISION_MAP[key];
+  if (mapped) {
+    return <StatusBadge tone={mapped.tone} label={mapped.label} className="text-xs font-semibold" />;
+  }
+
+  let tone: Tone = "warning";
+  let label = "逻辑待观察";
+  if (actionable) {
+    tone = "info";
+    label = "放行执行";
+  } else if (key.includes("reject") || key.includes("veto") || decision.includes("否决")) {
+    tone = "critical";
+    label = "否决建仓";
+  } else if (key.includes("pair") || decision.includes("配对")) {
+    tone = "info";
+    label = "同板块配对";
+  }
+  return <StatusBadge tone={tone} label={label} className="text-xs font-semibold" />;
 }
 
 interface TradePlannerCardProps {
@@ -87,13 +414,16 @@ interface TradePlannerCardProps {
   accountEquity?: number | null;
   accountCurrency?: string | null;
   archiveContext?: ArchivePlanContext | null;
+  openedReceipt?: OpenPositionReceipt | null;
+  onDismissOpenedReceipt?: () => void;
   activePickField?: PickPriceField | null;
   pickedPrice?: PickedPriceUpdate | null;
   onRequestPickField?: (field: PickPriceField | null) => void;
   onOverlayChange?: (overlay: PlanOverlayLines | null) => void;
   onOpenPositionSeed: (seed: OpenPositionSeed) => void;
   onLedgerInitialized?: () => void;
-  onJumpArchive?: (symbol: string, market?: string | null) => void;
+  onJumpArchive?: (symbol: string, market?: string | null, opts?: ArchiveJumpOptions) => void;
+  onJumpSentinel?: () => void;
 }
 
 export function TradePlannerCard({
@@ -106,6 +436,8 @@ export function TradePlannerCard({
   accountEquity = null,
   accountCurrency,
   archiveContext,
+  openedReceipt = null,
+  onDismissOpenedReceipt,
   activePickField = null,
   pickedPrice = null,
   onRequestPickField,
@@ -113,6 +445,7 @@ export function TradePlannerCard({
   onOpenPositionSeed,
   onLedgerInitialized,
   onJumpArchive,
+  onJumpSentinel,
 }: TradePlannerCardProps) {
   const headingId = useId();
   const snapshotStale = isSnapshotIntradayUntrusted(dualData, snapshotError);
@@ -162,11 +495,16 @@ export function TradePlannerCard({
   const [err, setErr] = useState<string | null>(null);
   const [plan, setPlan] = useState<TradePlanResponse | null>(null);
   const [planStale, setPlanStale] = useState(false);
+  const [capOverride, setCapOverride] = useState<{
+    maxMarginPct?: number;
+    maxLeverage?: number;
+  } | null>(null);
 
   const planReqIdRef = useRef(0);
   const planInputRevRef = useRef(0);
   const planAbortRef = useRef<AbortController | null>(null);
   const lastAppliedPickSeqRef = useRef(0);
+  const prevArchiveSigRef = useRef<{ symbol: string; sig: string } | null>(null);
 
   useEffect(() => {
     return () => {
@@ -193,6 +531,8 @@ export function TradePlannerCard({
 
   const markStale = () => {
     invalidateInFlightAndPlan();
+    onDismissOpenedReceipt?.();
+    setCapOverride(null);
     setPlanStale(true);
   };
 
@@ -254,6 +594,7 @@ export function TradePlannerCard({
 
   /* Reset symbol-scoped gate defaults (Fail-Closed hasL1L2 = false) whenever target symbol changes */
   useEffect(() => {
+    prevArchiveSigRef.current = null;
     setHasL1L2(false);
     setPendingVerif("0");
     setThesisFalsified(false);
@@ -261,6 +602,7 @@ export function TradePlannerCard({
     setSizingDriver("risk");
     setAllocAmount("");
     setManualQty("");
+    setCapOverride(null);
   }, [symbol]);
 
   const pickValidDailyStop = (dir: Direction, refEntry: number | null | undefined): number | null => {
@@ -340,17 +682,33 @@ export function TradePlannerCard({
     lastClose,
   ]);
 
-  /* Hydrate L1/L2 gate strictly from verified archive (unarchived/failed stays false) */
+  /* Hydrate L1/L2 & archive gate signature strictly from verified archive (ignore transient null during background refresh) */
+  const archiveGateSignature = useMemo(() => {
+    if (!archiveContext) return null;
+    const existsFlag = archiveContext.exists ? "1" : "0";
+    const mkt = (archiveContext.market || "").trim().toUpperCase();
+    const bias = (archiveContext.directionBias || "").trim().toLowerCase();
+    const l12Flag = archiveVerifiedL1L2 ? "1" : "0";
+    return `${existsFlag}|${mkt}|${bias}|${l12Flag}`;
+  }, [archiveContext, archiveVerifiedL1L2]);
+
   useEffect(() => {
-    setHasL1L2((prev) => {
-      if (prev !== archiveVerifiedL1L2) {
-        invalidateInFlightAndPlan();
-        setPlanStale(true);
-      }
-      return archiveVerifiedL1L2;
-    });
+    if (!archiveContext || archiveGateSignature === null) return;
+    if (
+      archiveContext.forSymbol &&
+      archiveContext.forSymbol.trim().toUpperCase() !== symbol.trim().toUpperCase()
+    ) {
+      return;
+    }
+    const prev = prevArchiveSigRef.current;
+    setHasL1L2(archiveVerifiedL1L2);
+    if (prev && prev.symbol === symbol && prev.sig !== archiveGateSignature) {
+      invalidateInFlightAndPlan();
+      setPlanStale(true);
+    }
+    prevArchiveSigRef.current = { symbol, sig: archiveGateSignature };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [archiveVerifiedL1L2, symbol]);
+  }, [archiveContext, archiveGateSignature, archiveVerifiedL1L2, symbol]);
 
   const effectiveAcctCurrency = (useSimEquity ? simCurrency : accountCurrency || "USD").toUpperCase();
   const staticQuoteCurrency = inferAssetCurrency(symbol, dualData?.asset_class);
@@ -368,8 +726,9 @@ export function TradePlannerCard({
   useEffect(() => {
     invalidateInFlightAndPlan();
     setFxToAccount("");
+    setCapOverride(null);
     setPlan(null);
-    setPlanStale(true);
+    setPlanStale(false);
   }, [effectiveAcctCurrency, staticQuoteCurrency]);
 
   const canonicalSymKey = (raw: string): string => {
@@ -397,11 +756,10 @@ export function TradePlannerCard({
     "us_stock_or_etf"
   ).toLowerCase();
   const isEquityAsset = resolvedAssetClass === "us_stock_or_etf" || resolvedAssetClass === "a_share";
-  const isMarginAsset =
-    resolvedAssetClass === "cn_future" ||
-    resolvedAssetClass === "commodity" ||
-    resolvedAssetClass === "fx";
-  const unitLabel = assetUnitLabel(resolvedAssetClass);
+  const unitLabel = assetUnitLabel(
+    resolvedAssetClass,
+    (!planStale && plan?.position_plan?.contract_spec) || dualData?.contract_spec,
+  );
 
   const activeSpec = useMemo(() => {
     const rawSpec = (
@@ -467,6 +825,8 @@ export function TradePlannerCard({
     }
 
     const stopDist = entry != null && stop != null ? Math.abs(entry - stop) : null;
+    const stopDistPct =
+      entry != null && entry > 0 && stopDist != null ? (stopDist / entry) * 100 : null;
     const rewardDist =
       entry != null && target != null
         ? direction === "long"
@@ -514,7 +874,14 @@ export function TradePlannerCard({
       if (equity != null && rPct != null && rPct > 0 && unitRisk != null && unitRisk > 0 && unitCost != null && unitCost > 0) {
         const riskBudget = equity * (rPct / 100) * slot;
         const qtyByRisk = riskBudget / unitRisk;
-        const qtyByCap = equity / unitCost;
+        const maxMarginFraction =
+          capOverride?.maxMarginPct != null ? capOverride.maxMarginPct / 100 : 1.0;
+        const qtyByMarginCap = (equity * maxMarginFraction) / unitCost;
+        const qtyByLevCap =
+          capOverride?.maxLeverage != null && unitNotional != null && unitNotional > 0
+            ? (equity * capOverride.maxLeverage) / unitNotional
+            : Infinity;
+        const qtyByCap = Math.min(qtyByMarginCap, qtyByLevCap);
         cappedByCash = qtyByCap + 1e-9 < qtyByRisk;
         const rawQty = Math.min(qtyByRisk, qtyByCap);
         estQty = quantizeQtyDown(rawQty, activeSpec.minOrderQty, activeSpec.lotStep, activeSpec.fractional);
@@ -566,6 +933,9 @@ export function TradePlannerCard({
       }
     }
 
+    const notionalLeverage =
+      estNotional != null && equity != null && equity > 0 ? estNotional / equity : null;
+
     return {
       entry,
       stop,
@@ -574,13 +944,16 @@ export function TradePlannerCard({
       slot,
       fx,
       stopDist,
+      stopDistPct,
       rrRatio,
       rr25Target,
+      unitNotional,
       unitCost,
       unitRisk,
       estQty,
       estOutlay,
       estNotional,
+      notionalLeverage,
       estRiskAmt,
       actualRiskPct,
       impliedBudgetRiskPct,
@@ -609,6 +982,7 @@ export function TradePlannerCard({
     riskPct,
     allocAmount,
     manualQty,
+    capOverride,
   ]);
 
   const handleQuickInitLedger = async () => {
@@ -656,9 +1030,16 @@ export function TradePlannerCard({
     markStale();
   };
 
-  const handleCalculate = async (e: FormEvent) => {
-    e.preventDefault();
+  const executeTradePlan = async (override?: {
+    capOverride?: { maxMarginPct?: number; maxLeverage?: number } | null;
+    forceRiskDriver?: boolean;
+  }) => {
     onRequestPickField?.(null);
+    onDismissOpenedReceipt?.();
+
+    const effectiveCap =
+      override && "capOverride" in override ? override.capOverride : capOverride;
+    const effectiveDriver: SizingDriver = override?.forceRiskDriver ? "risk" : sizingDriver;
 
     if (snapshotStale && live) {
       invalidateInFlightAndPlan();
@@ -680,7 +1061,7 @@ export function TradePlannerCard({
       invalidateInFlightAndPlan();
       setPlan(null);
       setPlanStale(true);
-      setErr("汇率折算 (fx_to_account) 必须为大于 0 的有效数值");
+      setErr("跨币种折算汇率必须为大于 0 的有效数值");
       return;
     }
     if (useSimEquity) {
@@ -702,7 +1083,17 @@ export function TradePlannerCard({
     }
 
     let submitRiskPct = optNum(riskPct) ?? 1.0;
-    if (sizingDriver === "amount" || sizingDriver === "qty") {
+    if (effectiveDriver === "risk") {
+      const parsedRisk = optNum(riskPct);
+      if (riskPct.trim() !== "" && (parsedRisk === undefined || parsedRisk < 0.01 || parsedRisk > 10)) {
+        invalidateInFlightAndPlan();
+        setPlan(null);
+        setPlanStale(true);
+        setErr("单笔风险 (%) 必须在 0.01% ~ 10% 之间");
+        return;
+      }
+      submitRiskPct = parsedRisk ?? 1.0;
+    } else if (effectiveDriver === "amount" || effectiveDriver === "qty") {
       if (!activeSpec.knownSpec || sizingPreview.unitCost == null) {
         invalidateInFlightAndPlan();
         setPlan(null);
@@ -775,6 +1166,8 @@ export function TradePlannerCard({
         target_price: optNum(targetPrice),
         risk_budget_pct: submitRiskPct,
         slot_risk_share: optNum(slotShare) ?? 1.0,
+        ...(effectiveCap?.maxMarginPct != null ? { max_margin_pct: effectiveCap.maxMarginPct } : {}),
+        ...(effectiveCap?.maxLeverage != null ? { max_leverage: effectiveCap.maxLeverage } : {}),
         horizon_days: Math.max(1, Math.round(optNum(horizonDays) ?? 90)),
         has_l1_l2: archiveVerifiedL1L2,
         pending_verifications: Math.max(0, Math.round(optNum(pendingVerif) ?? 0)),
@@ -815,6 +1208,20 @@ export function TradePlannerCard({
       }
       setPlan(res);
       setPlanStale(false);
+      if (effectiveCap && res.position_plan) {
+        const computedOutlay =
+          res.position_plan.estimated_margin_account ?? res.position_plan.notional_value_account;
+        if (computedOutlay != null && Number.isFinite(computedOutlay)) {
+          setAllocAmount(String(Math.round(computedOutlay)));
+        }
+        if (res.position_plan.total_quantity != null && Number.isFinite(res.position_plan.total_quantity)) {
+          const isFrac =
+            typeof res.position_plan.contract_spec?.fractional === "boolean"
+              ? res.position_plan.contract_spec.fractional
+              : activeSpec.fractional;
+          setManualQty(formatQtyDisplay(res.position_plan.total_quantity, isFrac));
+        }
+      }
     } catch (ex) {
       if (
         ctrl.signal.aborted ||
@@ -828,7 +1235,7 @@ export function TradePlannerCard({
       }
       setPlan(null);
       setPlanStale(true);
-      setErr(errorMessage(ex));
+      setErr(sanitizePlanMessageZh(errorMessage(ex)));
     } finally {
       if (reqId === planReqIdRef.current) {
         if (planAbortRef.current === ctrl) {
@@ -839,9 +1246,78 @@ export function TradePlannerCard({
     }
   };
 
+  const handleCalculate = (e: FormEvent) => {
+    e.preventDefault();
+    void executeTradePlan();
+  };
+
   const gate = plan?.four_quadrant_gate;
   const carry = plan?.expression_and_carry;
   const pos = plan?.position_plan;
+
+  const planAssetClass = (pos?.asset_class ?? carry?.asset_class ?? resolvedAssetClass).toLowerCase();
+  const planIsEquity = planAssetClass === "us_stock_or_etf" || planAssetClass === "a_share";
+  const planUnitLabel = assetUnitLabel(planAssetClass, pos?.contract_spec ?? dualData?.contract_spec);
+  const planEquity = pos?.account_equity ?? sizingPreview.equity ?? null;
+  const planNotional = pos?.notional_value_account ?? null;
+  const planMargin = pos?.estimated_margin_account ?? null;
+  const planNotionalLeverage =
+    planNotional != null && planEquity != null && planEquity > 0 ? planNotional / planEquity : null;
+  const planEquityOutlayPct =
+    pos?.margin_pct_of_equity ??
+    (planNotional != null && planEquity != null && planEquity > 0 ? (planNotional / planEquity) * 100 : null);
+  const planStopDistPct =
+    pos?.stop_distance_30m_pct ??
+    (pos?.entry_price != null && pos.entry_price > 0 && pos?.tactical_stop_30m != null
+      ? (Math.abs(pos.entry_price - pos.tactical_stop_30m) / pos.entry_price) * 100
+      : sizingPreview.stopDistPct);
+  const planFractional =
+    typeof pos?.contract_spec?.fractional === "boolean"
+      ? pos.contract_spec.fractional
+      : activeSpec.fractional;
+
+  const equityFundamentals = useMemo(
+    () => extractEquityFundamentals(dualData?.fundamentals),
+    [dualData?.fundamentals],
+  );
+
+  const planGuardrailAlerts = useMemo(() => {
+    const items: { severity: "warning" | "critical"; text: string }[] = [];
+    if (planIsEquity && planEquityOutlayPct != null && planEquityOutlayPct > 30) {
+      items.push({
+        severity: planEquityOutlayPct > 50 ? "critical" : "warning",
+        text: `单股集中度偏高：按当前 30m 窄止损反推，资金占用达净值的 ${fmtPct(planEquityOutlayPct, 1)}（> 30% 警戒线），建议压低单标的资金上限。`,
+      });
+    }
+    if (!planIsEquity && planNotionalLeverage != null && planNotionalLeverage > 3.0) {
+      items.push({
+        severity: planNotionalLeverage > 5.0 ? "critical" : "warning",
+        text: `高名义杠杆警戒：当前名义敞口 ${fmtMoney(planNotional, pos?.account_currency)}，实际杠杆达 ${planNotionalLeverage.toFixed(2)}×（> 3.0× 警戒线）；保证金占比低不代表低风险，隔夜跳空将按名义敞口放大实际亏损。`,
+      });
+    }
+    if (planStopDistPct != null && planStopDistPct < 0.5) {
+      items.push({
+        severity:
+          (!planIsEquity && planNotionalLeverage != null && planNotionalLeverage > 3.0) ||
+          (planIsEquity && planEquityOutlayPct != null && planEquityOutlayPct > 30)
+            ? "critical"
+            : "warning",
+        text: `30m 止损距极窄（仅 ${fmtPct(planStopDistPct, 2)} < 0.50%）：极易因隔夜跳空、财报或宏观数据发布触发滑点穿仓，建议主动压低名义仓位或改用更宽结构防线。`,
+      });
+    }
+    return items;
+  }, [planIsEquity, planEquityOutlayPct, planNotionalLeverage, planNotional, pos?.account_currency, planStopDistPct]);
+
+  const planGuardrailSevere = planGuardrailAlerts.some((a) => a.severity === "critical");
+
+  const applyGuardrailCap = (mode: "equity_25pct" | "leverage_2x") => {
+    const nextCap =
+      mode === "equity_25pct" ? { maxMarginPct: 25 } : { maxLeverage: 2.0 };
+    setCapOverride(nextCap);
+    setSizingDriver("risk");
+    setPlanStale(true);
+    void executeTradePlan({ capOverride: nextCap, forceRiskDriver: true });
+  };
 
   const equitySourceRaw = plan?.equity_source ?? pos?.equity_source ?? null;
   const isRealLedgerPlan = equitySourceRaw === "portfolio_ledger";
@@ -855,6 +1331,15 @@ export function TradePlannerCard({
     carry?.curve_structure &&
     carry.curve_structure.toLowerCase().includes("backwardation");
 
+  const isDirectionConflict = gate?.decision === "rejected_direction_conflict";
+  const isResearchDirectionPending =
+    gate?.decision === "watchlist_research_pending" ||
+    (gate?.research_direction === "neutral" && gate?.direction_aligned === false);
+  const needsArchiveDirectionConfirm = Boolean(
+    gate && !gate.actionable && (isDirectionConflict || isResearchDirectionPending),
+  );
+  const archiveTargetMarket = plan?.archive_context?.market ?? archiveContext?.market;
+
   const handleOpenLedgerFromPlan = () => {
     if (!canOpenPosition || !plan) return;
     const computedPos = plan.position_plan;
@@ -867,15 +1352,31 @@ export function TradePlannerCard({
     const inheritFx =
       planAcctCcy === realLedgerCcy ? (computedPos.fx_to_account ?? null) : null;
 
+    const planPrimaryTheme = (plan.archive_context?.layer1_drivers?.primary || "").trim();
+    const ctxTheme = (archiveContext?.sectorTheme || "").trim();
+    const preferredTheme =
+      (planPrimaryTheme && !isGenericSectorTheme(planPrimaryTheme) ? planPrimaryTheme : "") ||
+      (ctxTheme && !isGenericSectorTheme(ctxTheme) ? ctxTheme : "") ||
+      planPrimaryTheme ||
+      ctxTheme ||
+      "";
+    const tranches = Array.isArray(computedPos.tranches) ? computedPos.tranches : [];
+    const firstTranche = tranches.length > 0 ? tranches[0] : null;
+
     onOpenPositionSeed({
       symbol: computedPos.symbol,
       direction: computedDir,
-      sector_theme: archiveContext?.sectorTheme || dualData?.asset_class || "",
+      sector_theme: preferredTheme,
+      asset_class: computedPos.asset_class ?? dualData?.asset_class ?? null,
       entry_price: computedPos.entry_price ?? null,
       tactical_stop_30m: computedPos.tactical_stop_30m ?? null,
       structural_stop_daily: computedPos.structural_stop_daily ?? null,
       target_price: computedPos.target_price ?? null,
       quantity: computedPos.total_quantity ?? null,
+      first_tranche_qty: firstTranche?.quantity ?? null,
+      first_tranche_weight: firstTranche?.weight ?? null,
+      full_plan_qty: computedPos.total_quantity ?? null,
+      tranches,
       fx_to_account: inheritFx,
     });
   };
@@ -889,7 +1390,9 @@ export function TradePlannerCard({
     sizingDriver === "risk"
       ? riskPct
       : sizingPreview.impliedBudgetRiskPct != null
-        ? sizingPreview.impliedBudgetRiskPct.toFixed(2)
+        ? sizingPreview.impliedBudgetRiskPct > 0 && sizingPreview.impliedBudgetRiskPct < 0.01
+          ? sizingPreview.impliedBudgetRiskPct.toFixed(4)
+          : sizingPreview.impliedBudgetRiskPct.toFixed(2)
         : "";
   const displayAmountValue =
     sizingDriver === "amount"
@@ -1283,9 +1786,9 @@ export function TradePlannerCard({
                 type="number"
                 inputMode="decimal"
                 name="risk_budget_pct"
-                step="0.1"
-                min="0.01"
-                max="10"
+                step="any"
+                min={sizingDriver === "risk" ? "0.01" : "0"}
+                max={sizingDriver === "risk" ? "10" : undefined}
                 placeholder="如 1.0"
                 aria-invalid={sizingPreview.exceedsRiskCap ? true : undefined}
                 value={displayRiskValue}
@@ -1300,7 +1803,7 @@ export function TradePlannerCard({
             <label className="field">
               <span className="flex items-center justify-between">
                 <span>
-                  {isMarginAsset ? "占用保证金" : "投入金额"} ({effectiveAcctCurrency})
+                  {isEquityAsset ? "资金占用" : "占用保证金"} ({effectiveAcctCurrency})
                 </span>
                 {sizingDriver === "amount" ? (
                   <span className="text-[10.5px] font-medium text-accent">当前驱动</span>
@@ -1343,7 +1846,7 @@ export function TradePlannerCard({
                 type="number"
                 inputMode="decimal"
                 name="manual_quantity"
-                step={activeSpec.fractional ? "any" : activeSpec.lotStep}
+                step="any"
                 min="0"
                 placeholder={`输入${unitLabel}数`}
                 value={displayQtyValue}
@@ -1368,12 +1871,41 @@ export function TradePlannerCard({
                   <span>
                     预估仓位：
                     <strong className="font-mono text-ink">
-                      {formatQtyDisplay(sizingPreview.estQty, activeSpec.fractional)} {unitLabel}
+                      {fmtNum(sizingPreview.estQty, activeSpec.fractional ? 4 : 0)} {unitLabel}
                     </strong>
                     {sizingPreview.outlayPct != null ? (
-                      <span className="text-muted">（占净值 {fmtPct(sizingPreview.outlayPct, 1)}）</span>
+                      <span
+                        className={
+                          isEquityAsset && sizingPreview.outlayPct > 30
+                            ? sizingPreview.outlayPct > 50
+                              ? "font-medium text-critical"
+                              : "font-medium text-warning"
+                            : "text-muted"
+                        }
+                      >
+                        （{isEquityAsset ? "资金占净值" : "保证金占净值"} {fmtPct(sizingPreview.outlayPct, 1)}）
+                      </span>
                     ) : null}
                   </span>
+                  {!isEquityAsset &&
+                  sizingPreview.estNotional != null &&
+                  sizingPreview.notionalLeverage != null ? (
+                    <span>
+                      名义敞口：
+                      <strong
+                        className={`font-mono ${
+                          sizingPreview.notionalLeverage > 5.0
+                            ? "text-critical"
+                            : sizingPreview.notionalLeverage > 3.0
+                              ? "text-warning"
+                              : "text-ink"
+                        }`}
+                      >
+                        {fmtMoney(sizingPreview.estNotional, effectiveAcctCurrency)} (
+                        {sizingPreview.notionalLeverage.toFixed(2)}×)
+                      </strong>
+                    </span>
+                  ) : null}
                   {sizingPreview.estRiskAmt != null && sizingPreview.actualRiskPct != null ? (
                     <span>
                       30m 止损亏：
@@ -1385,6 +1917,17 @@ export function TradePlannerCard({
                         -{fmtMoney(sizingPreview.estRiskAmt, effectiveAcctCurrency)} (
                         {fmtPct(sizingPreview.actualRiskPct, 2)})
                       </strong>
+                      {sizingPreview.stopDistPct != null ? (
+                        <span
+                          className={
+                            sizingPreview.stopDistPct < 0.5
+                              ? "ml-1 font-medium text-warning"
+                              : "ml-1 text-muted"
+                          }
+                        >
+                          [距 {fmtPct(sizingPreview.stopDistPct, 2)}]
+                        </span>
+                      ) : null}
                     </span>
                   ) : null}
                   {sizingPreview.rrRatio != null ? (
@@ -1408,17 +1951,37 @@ export function TradePlannerCard({
                 <span className="text-warning">填写下方跨币种汇率后即可实时预览仓位与止损风险。</span>
               ) : sizingPreview.stop == null ? (
                 <span className="text-muted">
-                  当前方向暂无同侧 30m 止损预览；点击「运行算仓」由后端校验实时 30m 结构或关闭 Live 手动推演。
+                  当前方向暂无同侧 30m 止损预览；点击「运行算仓」由后端校验实时 30m 结构或关闭实时止损手动推演。
                 </span>
               ) : (
-                <span className="text-muted">填写上方任一仓位或风险参数，即可实时预览股数、资金占比与止损额。</span>
+                <span className="text-muted">填写上方任一仓位或风险参数，即可实时预览仓位、资金占用与止损额。</span>
               )}
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
-              {sizingPreview.cappedByCash ? (
+              {capOverride ? (
+                <span className="inline-flex items-center gap-1 rounded border border-accent/45 bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent">
+                  <span>
+                    {capOverride.maxMarginPct != null
+                      ? `后端硬封顶：≤${capOverride.maxMarginPct}% 资金上限`
+                      : `后端硬封顶：≤${capOverride.maxLeverage}× 名义杠杆`}
+                  </span>
+                  <button
+                    type="button"
+                    className="ml-0.5 inline-flex cursor-pointer items-center text-accent/80 hover:text-ink"
+                    aria-label="取消临时封顶"
+                    title="取消临时封顶（修改任意算仓参数也会自动清除）"
+                    onClick={() => {
+                      markStale();
+                    }}
+                  >
+                    <X className="h-3 w-3" aria-hidden="true" />
+                  </button>
+                </span>
+              ) : null}
+              {sizingPreview.cappedByCash && !capOverride ? (
                 <span className="text-[11px] font-medium text-warning">
-                  已触发现金 1.0x 满仓封顶（实际风险低于预算）
+                  已触发现金 1.0× 满仓封顶（实际风险低于预算）
                 </span>
               ) : null}
               {sizingPreview.exceedsEquity ? (
@@ -1426,6 +1989,26 @@ export function TradePlannerCard({
               ) : null}
               {sizingPreview.exceedsRiskCap ? (
                 <span className="text-[11px] font-medium text-critical">单笔风险超过 10% 上限</span>
+              ) : null}
+              {isEquityAsset && sizingPreview.outlayPct != null && sizingPreview.outlayPct > 30 ? (
+                <button
+                  type="button"
+                  className="chip py-0.5 text-[11px] text-warning"
+                  onClick={() => applyGuardrailCap("equity_25pct")}
+                >
+                  压至 25% 资金上限
+                </button>
+              ) : null}
+              {!isEquityAsset &&
+              sizingPreview.notionalLeverage != null &&
+              sizingPreview.notionalLeverage > 3.0 ? (
+                <button
+                  type="button"
+                  className="chip py-0.5 text-[11px] text-warning"
+                  onClick={() => applyGuardrailCap("leverage_2x")}
+                >
+                  压至 2× 名义杠杆
+                </button>
               ) : null}
               {sizingPreview.rrRatio != null &&
               sizingPreview.rrRatio < 2.5 &&
@@ -1535,7 +2118,7 @@ export function TradePlannerCard({
 
             {!needsCrossCurrencyFx ? (
               <label className="field lg:col-span-3">
-                <span>汇率折算 (fx_to_account)</span>
+                <span>跨币种折算汇率</span>
                 <input
                   className="input font-mono"
                   type="number"
@@ -1654,16 +2237,131 @@ export function TradePlannerCard({
         <div role="alert" className="flex items-start gap-2 rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
           <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-critical" aria-hidden="true" />
           <div>
-            <div className="font-semibold">算仓校验拒绝（Fail-Closed）</div>
-            <div className="mt-0.5 text-ink-2">{err}</div>
+            <div className="font-semibold">算仓风控拦截</div>
+            <div className="mt-0.5 text-ink-2">{sanitizePlanMessageZh(err)}</div>
           </div>
         </div>
       ) : null}
 
-      {plan && planStale ? (
+      {openedReceipt ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex flex-wrap items-center justify-between gap-2.5 rounded-md border border-good/50 bg-good/12 px-3.5 py-2.5 text-xs text-ink"
+        >
+          <div className="flex min-w-0 items-start gap-2">
+            <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-good" aria-hidden="true" />
+            <div className="min-w-0">
+              <span className="font-semibold text-ink">
+                已录入持仓账本：{openedReceipt.symbol}{" "}
+                {openedReceipt.direction === "short" ? "做空" : "做多"}{" "}
+                {fmtNum(openedReceipt.quantity, 4)}{" "}
+                {assetUnitLabel(openedReceipt.asset_class || resolvedAssetClass)} @{" "}
+                {fmtPrice(openedReceipt.entry_price)}
+              </span>
+              {(() => {
+                const extras = [
+                  openedReceipt.tranche_label,
+                  openedReceipt.archive_synced
+                    ? "研报档案已自动同步为「持仓中」"
+                    : archiveContext?.exists
+                      ? "研报档案已同步「持仓中」"
+                      : null,
+                ].filter(Boolean);
+                return extras.length > 0 ? (
+                  <span className="text-ink-2">（{extras.join(" · ")}）</span>
+                ) : null;
+              })()}
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1.5">
+            {onJumpSentinel ? (
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={onJumpSentinel}
+              >
+                <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>前往哨兵总控查看</span>
+                <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            ) : null}
+            {onDismissOpenedReceipt ? (
+              <button
+                type="button"
+                className="btn btn-sm px-2 text-muted hover:text-ink"
+                aria-label="关闭入账成功提示"
+                onClick={onDismissOpenedReceipt}
+              >
+                <X className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {plan && planStale && !openedReceipt ? (
         <div className="flex items-center gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-1.5 text-xs text-ink">
           <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
           <span>参数已修改，下方结果已锁定失效；请重新点击「运行算仓」后再录入账本。</span>
+        </div>
+      ) : null}
+
+      {/* Narrow-Stop / Concentration / High-Leverage Risk Guardrail Banner */}
+      {plan && planGuardrailAlerts.length > 0 ? (
+        <div
+          role="alert"
+          className={`flex flex-wrap items-start justify-between gap-3 rounded-md border px-3.5 py-2.5 text-xs text-ink ${
+            planGuardrailSevere
+              ? "border-critical/50 bg-critical/10"
+              : "border-warning/50 bg-warning/10"
+          }`}
+        >
+          <div className="flex min-w-0 flex-1 items-start gap-2">
+            {planGuardrailSevere ? (
+              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-critical" aria-hidden="true" />
+            ) : (
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden="true" />
+            )}
+            <div className="flex flex-col gap-1">
+              <div className="font-semibold">
+                {planIsEquity
+                  ? "窄止损单股集中度护栏预警"
+                  : "窄止损高杠杆 / 跳空风险护栏预警"}
+              </div>
+              <ul className="m-0 list-disc space-y-0.5 pl-4 text-ink-2">
+                {planGuardrailAlerts.map((item, idx) => (
+                  <li key={idx}>{item.text}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+            {planIsEquity ? (
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => applyGuardrailCap("equity_25pct")}
+                title="将单标的资金占用封顶至账户净值的 25%，反推对应股数与实际风险并立即重算"
+              >
+                <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>压至 25% 资金上限</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => applyGuardrailCap("leverage_2x")}
+                title="将保证金品种的名义敞口封顶至账户净值的 2×，反推对应头寸并立即重算"
+              >
+                <SlidersHorizontal className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>压至 2× 名义杠杆</span>
+              </button>
+            )}
+          </div>
         </div>
       ) : null}
 
@@ -1671,14 +2369,14 @@ export function TradePlannerCard({
       {plan ? (
         <div
           className={`grid grid-cols-1 divide-y divide-hairline border-t border-hairline pt-3.5 xl:grid-cols-12 xl:divide-x xl:divide-y-0 ${
-            planStale ? "opacity-60" : ""
+            planStale && !openedReceipt ? "opacity-60" : ""
           }`}
         >
           {/* Column 1: Four-Quadrant Verdict */}
           <div className="flex flex-col gap-2.5 pb-3.5 xl:col-span-4 xl:pr-4 xl:pb-0">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="section-title">四象限最终闸门</span>
-              {gate ? <GateDecisionBadge decision={gate.decision} actionable={gate.actionable} /> : null}
+              {gate ? <PlannerGateBadge decision={gate.decision} actionable={gate.actionable} /> : null}
             </div>
 
             <div className="flex flex-wrap items-center gap-1.5">
@@ -1691,24 +2389,93 @@ export function TradePlannerCard({
                   tone={stopSourceRaw === "live_30m_chanlun" ? "info" : "neutral"}
                   label={
                     stopSourceRaw === "live_30m_chanlun"
-                      ? `Live 30m 止损 (${stopTfRaw || "30m"})`
-                      : `手动止损 (${stopTfRaw || "manual"})`
+                      ? `实时 30m 止损`
+                      : `手动推演止损`
                   }
+                />
+              ) : null}
+              {gate?.research_direction ? (
+                <StatusBadge
+                  tone={
+                    gate.direction_aligned === true
+                      ? "good"
+                      : isDirectionConflict
+                        ? "critical"
+                        : "warning"
+                  }
+                  label={`档案方向：${formatResearchDirectionZh(gate.research_direction)}`}
                 />
               ) : null}
             </div>
 
-            {gate?.reason ? <p className="m-0 text-xs font-medium text-ink">{gate.reason}</p> : null}
+            {needsArchiveDirectionConfirm && gate ? (
+              <div
+                role="alert"
+                className={`rounded-md border px-3 py-2 text-xs text-ink ${
+                  isDirectionConflict
+                    ? "border-critical/45 bg-critical/10"
+                    : "border-warning/45 bg-warning/10"
+                }`}
+              >
+                <div className="flex items-start gap-2">
+                  {isDirectionConflict ? (
+                    <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-critical" aria-hidden="true" />
+                  ) : (
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+                  )}
+                  <div className="flex flex-col gap-1.5">
+                    <div className="font-semibold">
+                      {isDirectionConflict
+                        ? `第三层研究方向（${formatResearchDirectionZh(gate.research_direction)}）与拟执行方向（${direction === "short" ? "做空" : "做多"}）冲突`
+                        : gate.research_direction === "pair"
+                          ? "研报档案研究方向为「同板块配对」"
+                          : "研报档案研究方向仍为中性（待定性）"}
+                    </div>
+                    <div className="text-ink-2">
+                      {isDirectionConflict
+                        ? "四象限闸门已否决反向建仓。请先前往研报档案复核并更新研究方向，或切回与研究结论一致的执行方向。"
+                        : gate.research_direction === "pair"
+                          ? "请勾选高级门控中的「同板块多空配对」并核验反向腿，或前往研报档案明确单边做多/做空方向。"
+                          : "第三层研究尚未定性做多或做空方向，四象限闸门已拦截建仓。请先在研报档案确认研究方向后再重新运行算仓。"}
+                    </div>
+                    {onJumpArchive ? (
+                      <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          onClick={() =>
+                            onJumpArchive(symbol, archiveTargetMarket, {
+                              tab: "thesis",
+                              openMetaEditor: true,
+                            })
+                          }
+                        >
+                          <BookOpen className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>前往研报档案确认研究方向</span>
+                          <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            {gate?.reason ? (
+              <p className="m-0 text-xs font-medium text-ink">
+                {sanitizePlanMessageZh(gate.reason)}
+              </p>
+            ) : null}
             {gate?.reasons && gate.reasons.length > 0 ? (
               <ul className="m-0 list-disc space-y-1 pl-4 text-xs text-ink-2">
                 {gate.reasons.map((r, idx) => (
-                  <li key={idx}>{r}</li>
+                  <li key={idx}>{sanitizePlanMessageZh(r)}</li>
                 ))}
               </ul>
             ) : null}
             {gate && !gate.actionable ? (
               <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                {isEquityAsset && direction === "short" && !hedgeOnly && !pairTrade ? (
+                {planIsEquity && direction === "short" && !hedgeOnly && !pairTrade ? (
                   <>
                     <button
                       type="button"
@@ -1718,7 +2485,7 @@ export function TradePlannerCard({
                         markStale();
                       }}
                     >
-                      切回做多 (Long)
+                      切回做多
                     </button>
                     <button
                       type="button"
@@ -1761,11 +2528,16 @@ export function TradePlannerCard({
                     )
                   </button>
                 ) : null}
-                {!archiveVerifiedL1L2 && onJumpArchive ? (
+                {!archiveVerifiedL1L2 && !needsArchiveDirectionConfirm && onJumpArchive ? (
                   <button
                     type="button"
                     className="chip py-0.5 text-[11px]"
-                    onClick={() => onJumpArchive(symbol, archiveContext?.market)}
+                    onClick={() =>
+                      onJumpArchive(symbol, archiveTargetMarket, {
+                        tab: "evidence",
+                        openEvidenceForm: true,
+                      })
+                    }
                   >
                     <BookOpen className="h-3 w-3" aria-hidden="true" />
                     <span>前往研报档案录入 L1/L2 证据</span>
@@ -1778,76 +2550,228 @@ export function TradePlannerCard({
                 {plan.live_warnings.map((w, i) => (
                   <div key={i} className="flex items-start gap-1.5">
                     <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-warning" aria-hidden="true" />
-                    <span>{w}</span>
+                    <span>{sanitizePlanMessageZh(w)}</span>
                   </div>
                 ))}
               </div>
             ) : null}
           </div>
 
-          {/* Column 2: B-Structure & Roll Yield */}
-          <div className="flex flex-col gap-2.5 py-3.5 xl:col-span-4 xl:px-4 xl:py-0">
-            <div className="flex items-center justify-between gap-2">
-              <span className="section-title inline-flex items-center gap-1.5">
-                <GitBranch className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
-                期限结构 & 展期权衡
-              </span>
-              {carry?.curve_structure ? (
-                <StatusBadge
-                  tone={isBackwardationShort ? "warning" : "info"}
-                  label={carry.curve_structure}
-                />
-              ) : (
-                <StatusBadge tone="neutral" label={carry?.asset_class || "现货/正股"} />
-              )}
-            </div>
-
-            {isBackwardationShort ? (
-              <div className="rounded border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-[11.5px] text-ink">
-                <strong>强现实 vs 弱预期劈叉：</strong>大 B 结构绝不否决做空，已量化展期损耗并推荐合约载体。
-              </div>
-            ) : null}
-
-            <div className="metric-strip grid-cols-2">
-              <div className="metric-cell">
-                <span className="metric-label">近月年化 Carry</span>
-                <span className="metric-val">
-                  {fmtPct(carry?.near_annualized_carry_pct ?? carry?.annualized_carry_pct, 2, true)}
+          {/* Column 2: Equity Execution & Event Window vs Futures/FX/Crypto Curve & Carry */}
+          {planIsEquity ? (
+            <div className="flex flex-col gap-2.5 py-3.5 xl:col-span-4 xl:px-4 xl:py-0">
+              <div className="flex items-center justify-between gap-2">
+                <span className="section-title inline-flex items-center gap-1.5">
+                  <Briefcase className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
+                  股票执行与事件窗口
                 </span>
+                <StatusBadge tone="info" label={formatAssetClassZh(planAssetClass)} />
               </div>
-              <div className="metric-cell">
-                <span className="metric-label">全曲线年化展期</span>
-                <span className="metric-val">
-                  {fmtPct(carry?.curve_annualized_carry_pct ?? carry?.annualized_carry_pct, 2, true)}
-                </span>
-              </div>
-              <div className="metric-cell">
-                <span className="metric-label">计入 Carry 后 R:R</span>
-                <span className="metric-val">
-                  {fmtRatio(carry?.carry_adjusted_rr_ratio ?? pos?.carry_adjusted_rr_ratio)}
-                </span>
-              </div>
-              <div className="metric-cell">
-                <span className="metric-label">近月移仓压力 R:R</span>
-                <span className="metric-val">{fmtRatio(carry?.near_carry_stress_rr_ratio)}</span>
-              </div>
-            </div>
 
-            {carry?.expression_recommendation ? (
+              {(() => {
+                const metricCells: { key: string; label: string; value: string; withCalendar?: boolean }[] = [];
+                if (equityFundamentals.nextEarningsDate) {
+                  metricCells.push({
+                    key: "earnings",
+                    label: "下次财报日",
+                    value: equityFundamentals.nextEarningsDate,
+                    withCalendar: true,
+                  });
+                }
+                if (equityFundamentals.forwardPe != null) {
+                  metricCells.push({
+                    key: "forward_pe",
+                    label: "前瞻 PE",
+                    value: `${fmtNum(equityFundamentals.forwardPe, 1)}×`,
+                  });
+                } else if (equityFundamentals.trailingPe != null) {
+                  metricCells.push({
+                    key: "trailing_pe",
+                    label: "静态 PE (TTM)",
+                    value: `${fmtNum(equityFundamentals.trailingPe, 1)}×`,
+                  });
+                }
+                if (equityFundamentals.dividendYieldPct != null) {
+                  metricCells.push({
+                    key: "dividend_yield",
+                    label: "股息率",
+                    value: fmtPct(equityFundamentals.dividendYieldPct, 2),
+                  });
+                }
+                if (equityFundamentals.shortPctOfFloat != null) {
+                  metricCells.push({
+                    key: "short_pct",
+                    label: "空头占流通比",
+                    value: fmtPct(equityFundamentals.shortPctOfFloat, 2),
+                  });
+                }
+
+                const missingEventOrShort =
+                  !equityFundamentals.nextEarningsDate || equityFundamentals.shortPctOfFloat == null;
+
+                return (
+                  <>
+                    {metricCells.length > 0 ? (
+                      <div
+                        className={`metric-strip ${
+                          metricCells.length === 1 ? "grid-cols-1" : "grid-cols-2"
+                        }`}
+                      >
+                        {metricCells.map((cell) => (
+                          <div key={cell.key} className="metric-cell">
+                            <span className="metric-label inline-flex items-center gap-1">
+                              {cell.withCalendar ? (
+                                <Calendar className="h-3 w-3 text-muted" aria-hidden="true" />
+                              ) : null}
+                              {cell.label}
+                            </span>
+                            <span className="metric-val">{cell.value}</span>
+                          </div>
+                        ))}
+                      </div>
+                    ) : null}
+
+                    {missingEventOrShort ? (
+                      <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-hairline-soft bg-sunken/70 px-2.5 py-1.5 text-[11px] text-muted">
+                        <span>完整财报日与空头数据请前往研报「实时硬数据」页查看</span>
+                        {onJumpArchive ? (
+                          <button
+                            type="button"
+                            className="inline-flex cursor-pointer items-center gap-0.5 font-medium text-accent hover:underline"
+                            onClick={() =>
+                              onJumpArchive(symbol, archiveTargetMarket, { tab: "hard_data" })
+                            }
+                          >
+                            <span>查看硬数据</span>
+                            <ArrowRight className="h-3 w-3" aria-hidden="true" />
+                          </button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </>
+                );
+              })()}
+
               <p className="m-0 text-xs text-ink-2">
-                <strong className="text-ink">最优载体：</strong>
-                {carry.expression_recommendation}
+                <strong className="text-ink">建议执行载体：</strong>
+                {formatExpressionRecZh(
+                  carry?.expression_recommendation,
+                  pos?.direction ?? direction,
+                  planAssetClass,
+                  { pairTrade, hedgeOnly },
+                )}
               </p>
-            ) : null}
-            {carry?.contract_guidance ? (
-              <p className="m-0 text-[11.5px] text-muted">{carry.contract_guidance}</p>
-            ) : null}
-          </div>
+
+              {carry?.contract_guidance ? (
+                <p className="m-0 text-[11.5px] text-ink-2">
+                  {sanitizePlanMessageZh(carry.contract_guidance)}
+                </p>
+              ) : null}
+
+              <ul className="m-0 list-disc space-y-1 pl-4 text-[11px] text-muted">
+                <li>定价纪律：交易未来 1~3 年远期预期折现，严禁死板套用静态当期 PE（强周期股切忌低 PE 接飞刀）。</li>
+                <li>事件风控：临近财报窗口建议缩减首仓或配合保护性看跌/领口期权对冲，不逆日线方向硬扛。</li>
+              </ul>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2.5 py-3.5 xl:col-span-4 xl:px-4 xl:py-0">
+              <div className="flex items-center justify-between gap-2">
+                <span className="section-title inline-flex items-center gap-1.5">
+                  <GitBranch className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
+                  {planAssetClass === "fx"
+                    ? "利差 Carry & 货币对表达"
+                    : planAssetClass === "crypto"
+                      ? "资金费率 & 合约表达"
+                      : "期限结构 & 展期权衡"}
+                </span>
+                {carry?.curve_structure ? (
+                  <StatusBadge
+                    tone={isBackwardationShort ? "warning" : "info"}
+                    label={formatCurveStructureZh(carry.curve_structure)}
+                  />
+                ) : (
+                  <StatusBadge tone="neutral" label={formatAssetClassZh(carry?.asset_class || planAssetClass)} />
+                )}
+              </div>
+
+              {isBackwardationShort ? (
+                <div className="rounded border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-[11.5px] text-ink">
+                  <strong>强现实 vs 弱预期劈叉：</strong>大 B 结构绝不否决做空，已量化展期损耗并推荐合约载体。
+                </div>
+              ) : null}
+
+              <div className="metric-strip grid-cols-2">
+                <div className="metric-cell">
+                  <span className="metric-label">
+                    {planAssetClass === "fx"
+                      ? "年化利差 Carry"
+                      : planAssetClass === "crypto"
+                        ? "永续年化费率 Carry"
+                        : "近月年化 Carry"}
+                  </span>
+                  <span className="metric-val">
+                    {fmtPct(carry?.near_annualized_carry_pct ?? carry?.annualized_carry_pct, 2, true)}
+                  </span>
+                </div>
+                <div className="metric-cell">
+                  <span className="metric-label">
+                    {planAssetClass === "fx" || planAssetClass === "crypto"
+                      ? `持有期 Carry (${carry?.holding_horizon_days ?? horizonDays}天)`
+                      : "全曲线年化展期"}
+                  </span>
+                  <span className="metric-val">
+                    {planAssetClass === "fx" || planAssetClass === "crypto"
+                      ? fmtPct(carry?.horizon_carry_pct, 2, true)
+                      : fmtPct(carry?.curve_annualized_carry_pct ?? carry?.annualized_carry_pct, 2, true)}
+                  </span>
+                </div>
+                <div className="metric-cell">
+                  <span className="metric-label">计入 Carry 后 R:R</span>
+                  <span className="metric-val">
+                    {fmtRatio(carry?.carry_adjusted_rr_ratio ?? pos?.carry_adjusted_rr_ratio)}
+                  </span>
+                </div>
+                <div className="metric-cell">
+                  <span className="metric-label">
+                    {planAssetClass === "fx" || planAssetClass === "crypto"
+                      ? "资产类别"
+                      : "近月移仓压力 R:R"}
+                  </span>
+                  <span className="metric-val">
+                    {planAssetClass === "fx" || planAssetClass === "crypto"
+                      ? formatAssetClassZh(planAssetClass)
+                      : fmtRatio(carry?.near_carry_stress_rr_ratio)}
+                  </span>
+                </div>
+              </div>
+
+              {carry?.expression_recommendation ? (
+                <p className="m-0 text-xs text-ink-2">
+                  <strong className="text-ink">最优载体：</strong>
+                  {formatExpressionRecZh(
+                    carry.expression_recommendation,
+                    pos?.direction ?? direction,
+                    planAssetClass,
+                  )}
+                </p>
+              ) : null}
+              {carry?.contract_guidance ? (
+                <p className="m-0 text-[11.5px] text-muted">
+                  {sanitizePlanMessageZh(carry.contract_guidance)}
+                </p>
+              ) : null}
+            </div>
+          )}
 
           {/* Column 3: Position Sizing & Tranche Table */}
           <div className="flex flex-col gap-2.5 pt-3.5 xl:col-span-4 xl:pl-4 xl:pt-0">
-            <div className="flex items-center justify-between gap-2">
-              <span className="section-title">核定仓位 & 40/40/20 分批计划</span>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <span className="section-title">核定仓位 & 40/40/20 分批计划</span>
+                {openedReceipt && !planStale ? (
+                  <StatusBadge tone="good" label="已录入账本" />
+                ) : null}
+              </div>
               <button
                 type="button"
                 className="btn btn-sm btn-primary"
@@ -1870,7 +2794,11 @@ export function TradePlannerCard({
               <div className="metric-cell">
                 <span className="metric-label">核定总仓位</span>
                 <span className="metric-val text-accent">
-                  {pos?.total_quantity_str || fmtNum(pos?.total_quantity, 4)}
+                  {pos?.total_quantity != null
+                    ? `${fmtNum(pos.total_quantity, planFractional ? 4 : 0)} ${planUnitLabel}`
+                    : pos?.total_quantity_str
+                      ? `${pos.total_quantity_str} ${planUnitLabel}`
+                      : "—"}
                 </span>
               </div>
               <div className="metric-cell">
@@ -1884,22 +2812,81 @@ export function TradePlannerCard({
                 <span className="metric-val">{fmtRatio(pos?.rr_ratio)}</span>
               </div>
               <div className="metric-cell">
-                <span className="metric-label">入场 / 30m止损</span>
+                <span className="metric-label">
+                  入场 / 30m止损
+                  {planStopDistPct != null ? (
+                    <span
+                      className={
+                        planStopDistPct < 0.5 ? "ml-1 font-medium text-warning" : "ml-1"
+                      }
+                    >
+                      ({fmtPct(planStopDistPct, 2)})
+                    </span>
+                  ) : null}
+                </span>
                 <span className="metric-val">
                   {fmtPrice(pos?.entry_price)} / <span className="text-bear">{fmtPrice(pos?.tactical_stop_30m)}</span>
                 </span>
               </div>
-              <div className="metric-cell">
-                <span className="metric-label">保证金占用</span>
-                <span className="metric-val">{fmtPct(pos?.margin_pct_of_equity, 1)}</span>
-              </div>
-              <div className="metric-cell">
-                <span className="metric-label">30m 省噪金额</span>
-                <span className="metric-val text-bull">
-                  {fmtMoney(pos?.noise_risk_saved_amount, pos?.account_currency)}
-                </span>
-              </div>
+              {planIsEquity ? (
+                <>
+                  <div className="metric-cell">
+                    <span className="metric-label">资金占用</span>
+                    <span
+                      className={`metric-val ${
+                        planEquityOutlayPct != null && planEquityOutlayPct > 50
+                          ? "text-critical"
+                          : planEquityOutlayPct != null && planEquityOutlayPct > 30
+                            ? "text-warning"
+                            : ""
+                      }`}
+                    >
+                      {fmtMoney(planNotional ?? planMargin, pos?.account_currency)} (
+                      {fmtPct(planEquityOutlayPct, 1)})
+                    </span>
+                  </div>
+                  <div className="metric-cell">
+                    <span className="metric-label">30m 省噪金额</span>
+                    <span className="metric-val text-bull">
+                      {fmtMoney(pos?.noise_risk_saved_amount, pos?.account_currency)}
+                    </span>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="metric-cell">
+                    <span className="metric-label">保证金占用</span>
+                    <span className="metric-val">
+                      {fmtMoney(planMargin, pos?.account_currency)} (占净值 {fmtPct(pos?.margin_pct_of_equity, 1)})
+                    </span>
+                  </div>
+                  <div className="metric-cell">
+                    <span className="metric-label">名义敞口 / 实际杠杆</span>
+                    <span
+                      className={`metric-val ${
+                        planNotionalLeverage != null && planNotionalLeverage > 5.0
+                          ? "text-critical"
+                          : planNotionalLeverage != null && planNotionalLeverage > 3.0
+                            ? "text-warning"
+                            : ""
+                      }`}
+                    >
+                      {fmtMoney(planNotional, pos?.account_currency)}{" "}
+                      {planNotionalLeverage != null ? `(${planNotionalLeverage.toFixed(2)}×)` : ""}
+                    </span>
+                  </div>
+                </>
+              )}
             </div>
+
+            {!planIsEquity && pos?.noise_risk_saved_amount != null ? (
+              <div className="tnum flex items-center justify-between text-[11px] text-muted">
+                <span>相对日线止损的 30m 省噪金额</span>
+                <strong className="font-mono text-bull">
+                  {fmtMoney(pos.noise_risk_saved_amount, pos?.account_currency)}
+                </strong>
+              </div>
+            ) : null}
 
             {pos?.oversized_single_lot ? (
               <div className="rounded border border-critical/45 bg-critical/10 px-2.5 py-1.5 text-xs text-ink">
@@ -1917,7 +2904,7 @@ export function TradePlannerCard({
                         权重
                       </th>
                       <th scope="col" className="num">
-                        数量
+                        数量 ({planUnitLabel})
                       </th>
                       <th scope="col" className="num">
                         风险额
@@ -1932,8 +2919,12 @@ export function TradePlannerCard({
                         <td data-label="权重" className="num">
                           {fmtPct((tr.weight ?? 0) * 100, 0)}
                         </td>
-                        <td data-label="数量" className="num">
-                          <span>{tr.quantity_str || fmtNum(tr.quantity, 4)}</span>
+                        <td data-label={`数量 (${planUnitLabel})`} className="num">
+                          <span>
+                            {tr.quantity != null
+                              ? fmtNum(tr.quantity, planFractional ? 4 : 0)
+                              : tr.quantity_str || "—"}
+                          </span>
                           {tr.lots != null && tr.quantity != null && tr.lots !== tr.quantity ? (
                             <span className="ml-1 font-sans text-[10px] text-muted">({fmtNum(tr.lots, 0)}份)</span>
                           ) : null}

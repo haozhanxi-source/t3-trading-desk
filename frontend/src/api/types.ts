@@ -172,6 +172,39 @@ export interface TrimBody {
   reason?: string;
 }
 
+export interface ScaleInBody {
+  add_quantity: number;
+  add_price: number;
+  new_stop_loss?: number;
+  fx_rate_to_base?: number;
+  note?: string;
+  enforce_macro_cap?: boolean;
+  idempotency_key?: string;
+}
+
+export interface ScaleInResponse {
+  status: string;
+  revision?: number;
+  position: Position;
+  old_quantity: number;
+  add_quantity: number;
+  new_quantity: number;
+  old_entry_price: number;
+  add_price: number;
+  new_entry_price: number;
+  old_stop_loss: number;
+  new_stop_loss: number;
+  old_risk_amount: number;
+  new_risk_amount: number;
+  old_risk_pct: number;
+  new_risk_pct: number;
+  risk_delta: number;
+  added_tranche_risk_amount?: number;
+  tranche_count?: number;
+  note?: string;
+  summary?: PortfolioSummary;
+}
+
 export interface CloseBody {
   exit_price: number;
   exit_reason: string;
@@ -561,6 +594,8 @@ export interface TradePlanBody {
   fx_to_account?: number;
   risk_budget_pct?: number;
   slot_risk_share?: number;
+  max_margin_pct?: number;
+  max_leverage?: number;
   horizon_days?: number;
   has_l1_l2?: boolean;
   pending_verifications?: number;
@@ -571,6 +606,8 @@ export interface TradePlanBody {
   hedge_only?: boolean;
   min_rr?: number;
   alignment_status?: string;
+  research_direction_bias?: string;
+  archive_market?: string;
 }
 
 export interface FourQuadrantGate {
@@ -578,6 +615,8 @@ export interface FourQuadrantGate {
   actionable: boolean;
   direction?: string;
   asset_class?: string;
+  research_direction?: string | null;
+  direction_aligned?: boolean | null;
   reason?: string;
   reasons?: string[];
   checks?: Record<string, unknown>;
@@ -650,6 +689,8 @@ export interface PositionPlan {
   notional_value_account?: number;
   estimated_margin_account?: number;
   margin_pct_of_equity?: number;
+  max_margin_pct?: number;
+  max_leverage?: number | null;
   rr_ratio?: number | null;
   carry_adjusted_rr_ratio?: number | null;
   expected_move_pct?: number | null;
@@ -668,10 +709,19 @@ export interface TradePlanResponse {
   stop_source?: string | null;
   stop_timeframe?: string | null;
   live_warnings?: string[];
+  research_direction_bias?: string | null;
+  archive_context?: {
+    exists?: boolean;
+    market?: string | null;
+    status?: string | null;
+    direction_bias?: string | null;
+    layer1_drivers?: { primary?: string; secondary?: string } | null;
+    has_l1_l2?: boolean;
+  } | null;
 }
 
 /* ---------------- Research archive ---------------- */
-export type ArchiveStatus = "holding" | "watchlist" | "closed" | string;
+export type ArchiveStatus = "holding" | "watchlist" | "closed" | "archived" | string;
 
 export interface ArchiveListItem {
   market: string;
@@ -727,6 +777,7 @@ export interface ArchiveState {
   };
   status: ArchiveStatus;
   direction_bias?: string | null;
+  confidence?: "low" | "medium" | "high" | number | null;
   layer1_drivers?: { primary?: string; secondary?: string };
   thesis_summary?: string;
   chanlun_anchors?: Dict;
@@ -784,6 +835,10 @@ export interface ArchiveInitBody {
   thesis_summary?: string;
   primary_driver?: string;
   secondary_driver?: string;
+  direction_bias?: "long" | "short" | "neutral" | "pair" | string;
+  layer1_primary?: string;
+  layer1_secondary?: string;
+  confidence?: "low" | "medium" | "high" | number;
 }
 
 export interface ResearchDataResponse {

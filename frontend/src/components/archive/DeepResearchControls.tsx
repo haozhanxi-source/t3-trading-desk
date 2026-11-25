@@ -191,11 +191,77 @@ export function DeepResearchProgressCard({
   );
 }
 
+function resolveDynamicFocusPlaceholder(opts: {
+  symbol: string;
+  market: string | null;
+  assetClass?: string | null;
+  layer1Primary?: string | null;
+}): string {
+  const rawTheme = (opts.layer1Primary || "").trim();
+  const isGenericTheme =
+    !rawTheme ||
+    rawTheme === "临时自选" ||
+    rawTheme.toLowerCase() === "adhoc" ||
+    rawTheme.toLowerCase() === "custom" ||
+    rawTheme.includes("待补充");
+  const cleanTheme = isGenericTheme
+    ? ""
+    : rawTheme.length > 26
+      ? `${rawTheme.slice(0, 26)}…`
+      : rawTheme;
+
+  const ac = (opts.assetClass || "").trim().toLowerCase();
+  const mkt = (opts.market || "").trim().toUpperCase();
+  const sym = (opts.symbol || "").trim().toUpperCase();
+
+  let focusHint: string;
+  if (ac.includes("us_stock") || ac === "us_equity" || mkt === "US_STOCKS" || mkt === "US") {
+    focusHint = "未来 1~3 年盈利预期差、订单/资本开支与回购节奏，以及日线方向与 30min 缠论买点";
+  } else if (
+    ac.includes("a_share") ||
+    ac.includes("cn_stock") ||
+    mkt === "A_SHARES" ||
+    mkt === "CN_STOCKS" ||
+    /\.(SS|SZ|BJ)$/.test(sym) ||
+    /^\d{6}$/.test(sym)
+  ) {
+    focusHint = "未来 1~3 年业绩拐点与 5 年 PE/PB 历史分位、产业政策催化，以及 30min 缠论买点防线";
+  } else if (ac === "fx" || mkt === "FX" || sym.endsWith("=X") || sym === "DXY" || sym === "DX-Y.NYB") {
+    focusHint = "各国 10Y/2Y 国债利差、央行路径与干预红线、CFTC TFF 杠杆基金持仓，以及 30min 缠论结构";
+  } else if (
+    ac === "crypto" ||
+    mkt === "CRYPTO" ||
+    /^(BTC|ETH|SOL)/.test(sym) ||
+    sym.includes("/USDT") ||
+    sym.endsWith("-USD")
+  ) {
+    focusHint = "稳定币净流入、现货 ETF 资金流、永续资金费率与 OI 拥挤度，以及 30min 缠论防线";
+  } else if (
+    ac.includes("future") ||
+    ac.includes("commodity") ||
+    mkt === "CN_FUTURES" ||
+    mkt === "US_FUTURES" ||
+    mkt === "COMMODITIES" ||
+    sym.endsWith("=F") ||
+    /^[A-Z]{1,2}0$/.test(sym)
+  ) {
+    focusHint = "未来 1Q~1Y 供需平衡表（投产与需求）、显性库存与期限结构/基差变化，以及 30min 缠论买卖点";
+  } else {
+    focusHint = "未来 1Q~1Y 核心预期差、L1/L2 一手硬数据核验，以及日线定方向与 30min 缠论触发防线";
+  }
+
+  return cleanTheme
+    ? `例如：围绕「${cleanTheme}」主线，重点核查${focusHint}…`
+    : `例如：重点核查${focusHint}…`;
+}
+
 export function DeepResearchDialog({
   open,
   symbol,
   name,
   market,
+  assetClass,
+  layer1Primary,
   isHolding,
   enginesInfo,
   onClose,
@@ -205,6 +271,8 @@ export function DeepResearchDialog({
   symbol: string;
   name?: string;
   market: string | null;
+  assetClass?: string | null;
+  layer1Primary?: string | null;
   isHolding: boolean;
   enginesInfo: ResearchEnginesResponse | null;
   onClose: () => void;
@@ -251,6 +319,12 @@ export function DeepResearchDialog({
   };
 
   const titleLabel = name && name !== symbol ? `${name} (${symbol})` : symbol;
+  const focusPlaceholder = resolveDynamicFocusPlaceholder({
+    symbol,
+    market,
+    assetClass,
+    layer1Primary,
+  });
 
   return (
     <ModalDialog
@@ -354,7 +428,7 @@ export function DeepResearchDialog({
             className="input"
             rows={2}
             maxLength={1200}
-            placeholder="例如：重点核查印尼 RKAB 2026 配额审批进度、纯镍显性库存与 30min 缠论二买/三卖结构…"
+            placeholder={focusPlaceholder}
             value={focusPrompt}
             onChange={(e) => setFocusPrompt(e.target.value)}
           />

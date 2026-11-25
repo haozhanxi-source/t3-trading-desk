@@ -26,6 +26,7 @@ import statistics
 import sys
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -550,6 +551,86 @@ def _select_latest_price(
     if daily_px is not None:
         return daily_px, "daily", None
     return None, None, None
+
+
+def _price_display_dp(price: float, asset_class: str | None = None) -> int:
+    """Return canonical UI price display decimal places matching frontend ``fmtPrice``."""
+    a = abs(price)
+    if a == 0:
+        return 2
+    if a < 2:
+        return 4
+    if a < 20:
+        return 3
+    return 2
+
+
+def _quantize_display_price(price: float, dp: int) -> Decimal | None:
+    try:
+        q = Decimal("1") if dp <= 0 else Decimal("1").scaleb(-dp)
+        return Decimal(str(price)).quantize(q, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _compute_raw_unrealized_pnl_pct(
+    last_price: float | None,
+    entry_price: float | None,
+    direction: str | None,
+) -> float | None:
+    """Compute unrounded unrealized PnL percentage for risk & trailing-stop decisions."""
+    if last_price is None or entry_price is None or entry_price <= 0:
+        return None
+    if direction not in {"long", "short"}:
+        return None
+    if not (math.isfinite(last_price) and math.isfinite(entry_price)):
+        return None
+    eps = max(abs(entry_price) * 1e-12, 1e-15)
+    if abs(last_price - entry_price) < eps:
+        return 0.0
+    return (
+        (last_price / entry_price - 1.0) * 100.0
+        if direction == "long"
+        else (1.0 - last_price / entry_price) * 100.0
+    )
+
+
+def _compute_unrealized_pnl_pct(
+    last_price: float | None,
+    entry_price: float | None,
+    direction: str | None,
+    asset_class: str | None = None,
+) -> float | None:
+    """Compute unrealized PnL percentage without phantom -0.01%/+0.01% sub-tick noise.
+
+    When ``last_price`` and ``entry_price`` are equal within floating-point tolerance OR
+    round to the exact same canonical display quote (e.g. yfinance half-cent 30m print
+    ``84.605`` displayed as ``84.61`` against ``entry_price = 84.61``), returns ``0.0``.
+    Never clamps ultra-low-price assets (< 0.2) to fixed 4dp so micro-price moves stay exact.
+    """
+    if last_price is None or entry_price is None or entry_price <= 0:
+        return None
+    if direction not in {"long", "short"}:
+        return None
+    if not (math.isfinite(last_price) and math.isfinite(entry_price)):
+        return None
+    if abs(last_price - entry_price) < 1e-9:
+        return 0.0
+    if abs(entry_price) >= 0.2:
+        dp = _price_display_dp(entry_price, asset_class=asset_class)
+        q_last = _quantize_display_price(last_price, dp)
+        q_entry = _quantize_display_price(entry_price, dp)
+        if q_last is not None and q_entry is not None and q_last == q_entry:
+            return 0.0
+    raw_pct = (
+        (last_price / entry_price - 1.0) * 100.0
+        if direction == "long"
+        else (1.0 - last_price / entry_price) * 100.0
+    )
+    rounded = _round_finite(raw_pct, 2)
+    if rounded is not None and abs(rounded) < 1e-9:
+        return 0.0
+    return rounded
 
 
 def _combine_signal_text(cl_block: dict[str, Any] | None, summary_block: dict[str, Any] | None) -> str | None:
@@ -2590,12 +2671,17 @@ def evaluate_holding_health(
     if structural_stop_daily is None:
         structural_stop_daily = _to_float(anchors.get("structural_invalidation"))
 
-    unrealized_pnl_pct: float | None = None
-    if last_price is not None and entry_price is not None and entry_price > 0:
-        if norm_dir == "long":
-            unrealized_pnl_pct = _round_finite((last_price / entry_price - 1.0) * 100.0, 2)
-        elif norm_dir == "short":
-            unrealized_pnl_pct = _round_finite((1.0 - last_price / entry_price) * 100.0, 2)
+    raw_unrealized_pnl_pct = _compute_raw_unrealized_pnl_pct(
+        last_price,
+        entry_price,
+        norm_dir,
+    )
+    unrealized_pnl_pct = _compute_unrealized_pnl_pct(
+        last_price,
+        entry_price,
+        norm_dir,
+        asset_class=asset_class,
+    )
 
     # ------------------------------------------------------------------
     # Layer 5 (early): Price Feed, Daily/30m Freshness & Chanlun Completeness
@@ -3366,9 +3452,15 @@ def evaluate_holding_health(
             and entry_price is not None
             and tactical_stop_30m is not None
         ):
+            pnl_label = (
+                f"+{raw_unrealized_pnl_pct:.4f}%"
+                if (raw_unrealized_pnl_pct is not None and 0.0 < raw_unrealized_pnl_pct < 0.01)
+                else f"+{(unrealized_pnl_pct if unrealized_pnl_pct is not None else (raw_unrealized_pnl_pct or 0.0)):.2f}%"
+            )
             if (
                 norm_dir == "long"
                 and last_price > entry_price
+                and (raw_unrealized_pnl_pct is None or raw_unrealized_pnl_pct > 0)
                 and intra_zd is not None
                 and tactical_stop_30m < intra_zd < last_price
             ):
@@ -3381,7 +3473,7 @@ def evaluate_holding_health(
                     "buffer_to_price_pct": _round_finite((1.0 - intra_zd / last_price) * 100.0, 2),
                     "anchor": "30m_zhongshu_zd",
                     "rationale": (
-                        f"多头浮盈 +{unrealized_pnl_pct:.2f}%，最新 30min 中枢下沿 ZD={intra_zd} "
+                        f"多头浮盈 {pnl_label}，最新 30min 中枢下沿 ZD={intra_zd} "
                         f"严格高于原战术止损 {tactical_stop_30m} 且位于现价 {last_price} 下方，建议上移追踪止损锁定浮盈。"
                     ),
                 }
@@ -3389,6 +3481,7 @@ def evaluate_holding_health(
             elif (
                 norm_dir == "short"
                 and last_price < entry_price
+                and (raw_unrealized_pnl_pct is None or raw_unrealized_pnl_pct > 0)
                 and intra_zg is not None
                 and last_price < intra_zg < tactical_stop_30m
             ):
@@ -3401,7 +3494,7 @@ def evaluate_holding_health(
                     "buffer_to_price_pct": _round_finite((intra_zg / last_price - 1.0) * 100.0, 2),
                     "anchor": "30m_zhongshu_zg",
                     "rationale": (
-                        f"空头浮盈 +{unrealized_pnl_pct:.2f}%，最新 30min 中枢上沿 ZG={intra_zg} "
+                        f"空头浮盈 {pnl_label}，最新 30min 中枢上沿 ZG={intra_zg} "
                         f"严格低于原战术止损 {tactical_stop_30m} 且位于现价 {last_price} 上方，建议下移追踪止损锁定浮盈。"
                     ),
                 }

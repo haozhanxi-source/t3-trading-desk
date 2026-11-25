@@ -22,6 +22,8 @@ import type {
   ResearchDataResponse,
   ResearchEnginesResponse,
   RotatePositionBody,
+  ScaleInBody,
+  ScaleInResponse,
   SentinelResponse,
   SymbolSearchItem,
   TaskEventEnvelope,
@@ -146,6 +148,8 @@ export const api = {
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/trail-stop`, body),
   trimPosition: (id: string, body: TrimBody) =>
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/trim`, body),
+  scaleInPosition: (id: string, body: ScaleInBody) =>
+    post<ScaleInResponse>(`/portfolio/positions/${encodeURIComponent(id)}/scale-in`, body),
   closePosition: (id: string, body: CloseBody) =>
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/close`, body),
   voidPosition: (id: string, body: VoidBody = {}) =>

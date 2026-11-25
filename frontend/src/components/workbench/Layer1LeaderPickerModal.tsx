@@ -117,7 +117,13 @@ export function Layer1LeaderPickerModal({
     setSuggestions([]);
     setSaveAsPool(false);
     setPoolName(card.suggested_pool_name || `theme_${card.id}`);
-    setPoolDesc(card.suggested_pool_description || `${card.title}（${card.primary_driver.dimension} + ${card.secondary_driver.dimension}）`);
+    const driverLabel = [card.primary_driver?.dimension, card.secondary_driver?.dimension]
+      .filter((d): d is string => Boolean(d && d.trim()))
+      .join(" + ");
+    setPoolDesc(
+      card.suggested_pool_description ||
+        (driverLabel ? `${card.title}（${driverLabel}）` : card.title),
+    );
     setAllowOverwrite(false);
     setPoolConflict(false);
     setErr(null);
@@ -227,6 +233,12 @@ export function Layer1LeaderPickerModal({
     [longSymbols, shortSymbols],
   );
 
+  const effectiveSymbolCount = useMemo(() => {
+    const pending = parseSymbolList(query);
+    if (pending.length === 0) return allSelectedSymbols.length;
+    return dedupeUpper([...allSelectedSymbols, ...pending]).length;
+  }, [allSelectedSymbols, query]);
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
     if (!card || submitting || scanBusy) return;
@@ -238,8 +250,16 @@ export function Layer1LeaderPickerModal({
     if (pendingInput.length > 0) {
       if (targetLeg === "short") {
         finalShort = dedupeUpper([...finalShort, ...pendingInput]);
+        if (isPair) {
+          const shortSet = new Set(finalShort);
+          finalLong = finalLong.filter((s) => !shortSet.has(s));
+        }
       } else {
         finalLong = dedupeUpper([...finalLong, ...pendingInput]);
+        if (isPair) {
+          const longSet = new Set(finalLong);
+          finalShort = finalShort.filter((s) => !longSet.has(s));
+        }
       }
     }
 
@@ -292,11 +312,11 @@ export function Layer1LeaderPickerModal({
       for (const s of finalShort) expected[s] = "short";
 
       const compassContext: CompassScanContext = {
-        run_id: runId || "",
-        direction_id: card.id,
-        direction_title: card.title,
+        run_id: (runId || "").trim(),
+        direction_id: (card.id || "").trim(),
+        direction_title: (card.title || "").trim(),
         direction: card.direction,
-        value_chain_focus: card.value_chain_focus || "",
+        value_chain_focus: (card.value_chain_focus || "").trim(),
         expected_directions: expected,
       };
 
@@ -338,7 +358,9 @@ export function Layer1LeaderPickerModal({
               <span>{dirLabel}</span>
             </span>
             <span className="text-[11px] text-muted">
-              {card.primary_driver.dimension} + {card.secondary_driver.dimension}
+              {[card.primary_driver?.dimension, card.secondary_driver?.dimension]
+                .filter((d): d is string => Boolean(d && d.trim()))
+                .join(" + ")}
             </span>
           </div>
           {card.value_chain_focus ? (
@@ -497,16 +519,17 @@ export function Layer1LeaderPickerModal({
             搜索中文名或直接输入任意代码（回车添加{isPair ? `到${activeLeg === "short" ? "空头腿" : "多头腿"}` : ""}）
           </label>
           <div className="flex gap-2">
-            <div className="relative flex-1">
+            <div className="input flex flex-1 items-center gap-2 focus-within:border-accent focus-within:bg-surface">
               <Search
-                className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted"
+                className="h-3.5 w-3.5 shrink-0 text-muted"
                 aria-hidden="true"
               />
               <input
                 ref={inputRef}
                 id="l1-leader-search"
                 type="text"
-                className="input w-full pl-8 text-xs"
+                className="w-full min-w-0 border-0 bg-transparent p-0 text-xs text-ink outline-none placeholder:text-muted"
+                style={{ outline: "none" }}
                 placeholder="如：MOS, NTR, 600096.SS / 铝 / 日元 / 澳元（逗号分隔可一次加多只）"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -717,7 +740,7 @@ export function Layer1LeaderPickerModal({
             <span>
               {submitting || scanBusy
                 ? "正在启动日线过筛…"
-                : `日线缠论过筛（${allSelectedSymbols.length} 只专属标的）`}
+                : `日线缠论过筛（${effectiveSymbolCount} 只专属标的）`}
             </span>
           </button>
         </div>

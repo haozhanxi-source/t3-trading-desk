@@ -545,11 +545,15 @@ def parse_eia_ngs_csv(csv_text: str) -> dict[str, Any]:
 def _classify_xbrl_period_type(period_days: int | None) -> str:
     if period_days is None:
         return "instant"
+    if period_days < 60:
+        return "short_stub"
     if period_days <= 105:
         return "quarterly"
     if period_days <= 300:
         return "ytd_or_multi_quarter"
-    return "annual"
+    if period_days <= 400:
+        return "annual"
+    return "multi_year"
 
 
 def _extract_xbrl_metric(
@@ -651,13 +655,42 @@ def _extract_xbrl_metric(
     if not merged:
         return None
 
+    def _record_sort_key(rec: dict[str, Any]) -> tuple[str, int, int, str, int, int]:
+        pd_days = rec.get("period_days")
+        tag_rank = int(rec.get("_tag_rank", 999))
+        if pd_days is None:
+            # Point-in-time instant fact (balance sheet / share count)
+            period_tier = 1
+            period_bucket = 0
+            dur_tiebreak = 0
+        elif 60 <= pd_days <= 400:
+            # Standard duration (quarterly / YTD / annual) always outranks non-standard durations
+            # on the same end date; within the same standard bucket, later filed date wins.
+            period_tier = 2
+            if pd_days <= 105:
+                period_bucket = 3  # standalone quarterly
+            elif pd_days <= 300:
+                period_bucket = 2  # ytd / multi-quarter
+            else:
+                period_bucket = 1  # annual
+            dur_tiebreak = -pd_days
+        else:
+            # Non-standard short stub (<60d) or multi-year (>400d)
+            period_tier = 0
+            period_bucket = 0
+            dur_tiebreak = -pd_days
+        return (
+            str(rec.get("end") or ""),
+            period_tier,
+            period_bucket,
+            str(rec.get("filed") or ""),
+            dur_tiebreak,
+            -tag_rank,
+        )
+
     records = sorted(
         merged.values(),
-        key=lambda x: (
-            str(x.get("end") or ""),
-            str(x.get("filed") or ""),
-            -(x.get("period_days") or 0),
-        ),
+        key=_record_sort_key,
         reverse=True,
     )[:limit]
     for r in records:
@@ -757,7 +790,192 @@ def _build_capital_structure_snapshot(metrics: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def extract_sec_companyfacts(facts_json: dict[str, Any], limit: int = 8) -> dict[str, Any]:
+SEC_STALE_METRIC_MAX_DAYS = 730
+
+SEC_XBRL_METRIC_SPECS: list[tuple[str, list[str], str | None, str | None, tuple[str, ...] | None]] = [
+    (
+        "revenue",
+        [
+            "RegulatedAndUnregulatedOperatingRevenue",
+            "Revenues",
+            "RevenueFromContractWithCustomerExcludingAssessedTax",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+            "RevenuesNetOfInterestExpense",
+            "OperatingRevenues",
+            "RegulatedOperatingRevenue",
+            "ElectricUtilityRevenue",
+            "InterestAndDividendIncomeOperating",
+            "SalesRevenueNet",
+            "SalesRevenueServicesNet",
+            "SalesRevenueGoodsNet",
+        ],
+        None,
+        None,
+        None,
+    ),
+    ("net_income", ["NetIncomeLoss", "ProfitLoss"], None, None, None),
+    ("eps_diluted", ["EarningsPerShareDiluted"], None, None, ("USD/shares", "USD")),
+    (
+        "operating_cash_flow",
+        [
+            "NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations",
+        ],
+        "GAAP_XBRL_reported_may_be_YTD",
+        None,
+        None,
+    ),
+    (
+        "capex",
+        [
+            "PaymentsToAcquirePropertyPlantAndEquipment",
+            "PaymentsToAcquireProductiveAssets",
+            "PaymentsToAcquireUtilityPropertyPlantAndEquipment",
+            "PaymentsForCapitalImprovements",
+            "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+        ],
+        "GAAP_XBRL_reported_may_be_YTD",
+        None,
+        None,
+    ),
+    (
+        "remaining_performance_obligation",
+        ["RevenueRemainingPerformanceObligation"],
+        "Point-in-time contract backlog",
+        "Hard contract backlog / RPO reference",
+        None,
+    ),
+    (
+        "cash_and_equivalents",
+        [
+            "CashAndCashEquivalentsAtCarryingValue",
+            "CashCashEquivalentsAndShortTermInvestments",
+            "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        ],
+        "Point-in-time balance sheet (reconcile post-period 8-K)",
+        "Check tag for combined short-term investments or restricted cash",
+        ("USD",),
+    ),
+    (
+        "short_term_investments",
+        [
+            "MarketableSecuritiesCurrent",
+            "ShortTermInvestments",
+            "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+            "AvailableForSaleSecuritiesCurrent",
+            "AvailableForSaleSecuritiesDebtSecurities",
+        ],
+        "Point-in-time marketable / available-for-sale securities",
+        "Verify maturity split (current vs noncurrent) in 10-Q/10-K notes when using fallback AFS tag",
+        ("USD",),
+    ),
+    (
+        "long_term_debt",
+        [
+            "LongTermDebtNoncurrent",
+            "LongTermDebtAndCapitalLeaseObligations",
+            "LongTermDebt",
+        ],
+        "Point-in-time noncurrent/long-term debt",
+        "Check 8-K for post-period debt issuance or repayment",
+        ("USD",),
+    ),
+    (
+        "short_term_debt",
+        [
+            "ShortTermBorrowings",
+            "LongTermDebtCurrent",
+            "DebtCurrent",
+            "CommercialPaper",
+        ],
+        "Point-in-time current/short-term debt",
+        None,
+        ("USD",),
+    ),
+    (
+        "stock_based_compensation",
+        [
+            "ShareBasedCompensation",
+            "AllocatedShareBasedCompensationExpense",
+        ],
+        "GAAP_XBRL_reported_may_be_YTD",
+        "Non-cash SBC expense; cross-check against share count dilution",
+        ("USD",),
+    ),
+    (
+        "share_repurchases",
+        [
+            "PaymentsForRepurchaseOfCommonStock",
+            "StockRepurchasedAndRetiredDuringPeriodValue",
+            "StockRepurchasedDuringPeriodValue",
+            "TreasuryStockValueAcquiredCostMethod",
+            "PaymentsForRepurchaseOfEquity",
+        ],
+        "GAAP_XBRL_reported_may_be_YTD",
+        "Actual cash spent on common stock buybacks (not authorization)",
+        ("USD",),
+    ),
+    (
+        "shares_outstanding_ending",
+        [
+            "CommonStockSharesOutstanding",
+            "dei:EntityCommonStockSharesOutstanding",
+        ],
+        "Point-in-time ending common shares outstanding",
+        "Track multi-year share count expansion vs net retirement",
+        ("shares",),
+    ),
+    (
+        "shares_diluted_weighted",
+        ["WeightedAverageNumberOfDilutedSharesOutstanding"],
+        "GAAP_XBRL_weighted_average_diluted_shares",
+        "Note: anti-dilutive securities excluded in GAAP loss periods",
+        ("shares",),
+    ),
+    (
+        "inventory",
+        [
+            "InventoryNet",
+            "InventoryFinishedGoodsAndWorkInProcess",
+        ],
+        "Point-in-time working capital (inventory)",
+        "Compare growth vs revenue to detect channel/warehouse buildup",
+        ("USD",),
+    ),
+    (
+        "accounts_receivable",
+        [
+            "AccountsReceivableNetCurrent",
+            "ReceivablesNetCurrent",
+        ],
+        "Point-in-time working capital (receivables)",
+        "Compare growth vs revenue to verify FCF conversion quality",
+        ("USD",),
+    ),
+]
+
+
+def _tracked_sec_xbrl_tags() -> dict[str, set[str]]:
+    """Build namespace -> tag set mapping for all metrics tracked by extract_sec_companyfacts."""
+    tracked: dict[str, set[str]] = {"us-gaap": set(), "dei": set()}
+    for _, tags, _, _, _ in SEC_XBRL_METRIC_SPECS:
+        for raw_tag in tags:
+            if ":" in raw_tag:
+                ns, name = raw_tag.split(":", 1)
+                ns_key = ns.strip().lower()
+                if ns_key in tracked:
+                    tracked[ns_key].add(name)
+            else:
+                tracked["us-gaap"].add(raw_tag)
+    return tracked
+
+
+def extract_sec_companyfacts(
+    facts_json: dict[str, Any],
+    limit: int = 8,
+    *,
+    max_stale_days: int = SEC_STALE_METRIC_MAX_DAYS,
+) -> dict[str, Any]:
     """Extract core US-GAAP & capital-structure metrics from SEC EDGAR companyfacts JSON."""
     if not isinstance(facts_json, dict):
         raise ValueError("companyfacts payload must be a JSON object")
@@ -768,152 +986,7 @@ def extract_sec_companyfacts(facts_json: dict[str, Any], limit: int = 8) -> dict
         raise ValueError("No us-gaap section found in SEC companyfacts")
 
     metrics: dict[str, Any] = {}
-    specs: list[tuple[str, list[str], str | None, str | None, tuple[str, ...] | None]] = [
-        (
-            "revenue",
-            [
-                "RevenueFromContractWithCustomerExcludingAssessedTax",
-                "Revenues",
-                "SalesRevenueNet",
-                "SalesRevenueServicesNet",
-            ],
-            None,
-            None,
-            None,
-        ),
-        ("net_income", ["NetIncomeLoss"], None, None, None),
-        ("eps_diluted", ["EarningsPerShareDiluted"], None, None, ("USD/shares", "USD")),
-        (
-            "operating_cash_flow",
-            ["NetCashProvidedByUsedInOperatingActivities"],
-            "GAAP_XBRL_reported_may_be_YTD",
-            None,
-            None,
-        ),
-        (
-            "capex",
-            [
-                "PaymentsToAcquirePropertyPlantAndEquipment",
-                "PaymentsToAcquireProductiveAssets",
-            ],
-            "GAAP_XBRL_reported_may_be_YTD",
-            None,
-            None,
-        ),
-        (
-            "remaining_performance_obligation",
-            ["RevenueRemainingPerformanceObligation"],
-            "Point-in-time contract backlog",
-            "Hard contract backlog / RPO reference",
-            None,
-        ),
-        (
-            "cash_and_equivalents",
-            [
-                "CashAndCashEquivalentsAtCarryingValue",
-                "CashCashEquivalentsAndShortTermInvestments",
-                "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
-            ],
-            "Point-in-time balance sheet (reconcile post-period 8-K)",
-            "Check tag for combined short-term investments or restricted cash",
-            ("USD",),
-        ),
-        (
-            "short_term_investments",
-            [
-                "MarketableSecuritiesCurrent",
-                "ShortTermInvestments",
-                "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
-                "AvailableForSaleSecuritiesCurrent",
-                "AvailableForSaleSecuritiesDebtSecurities",
-            ],
-            "Point-in-time marketable / available-for-sale securities",
-            "Verify maturity split (current vs noncurrent) in 10-Q/10-K notes when using fallback AFS tag",
-            ("USD",),
-        ),
-        (
-            "long_term_debt",
-            [
-                "LongTermDebtNoncurrent",
-                "LongTermDebtAndCapitalLeaseObligations",
-                "LongTermDebt",
-            ],
-            "Point-in-time noncurrent/long-term debt",
-            "Check 8-K for post-period debt issuance or repayment",
-            ("USD",),
-        ),
-        (
-            "short_term_debt",
-            [
-                "ShortTermBorrowings",
-                "LongTermDebtCurrent",
-                "DebtCurrent",
-                "CommercialPaper",
-            ],
-            "Point-in-time current/short-term debt",
-            None,
-            ("USD",),
-        ),
-        (
-            "stock_based_compensation",
-            [
-                "ShareBasedCompensation",
-                "AllocatedShareBasedCompensationExpense",
-            ],
-            "GAAP_XBRL_reported_may_be_YTD",
-            "Non-cash SBC expense; cross-check against share count dilution",
-            ("USD",),
-        ),
-        (
-            "share_repurchases",
-            [
-                "PaymentsForRepurchaseOfCommonStock",
-                "StockRepurchasedAndRetiredDuringPeriodValue",
-                "TreasuryStockValueAcquiredCostMethod",
-            ],
-            "GAAP_XBRL_reported_may_be_YTD",
-            "Actual cash spent on common stock buybacks (not authorization)",
-            ("USD",),
-        ),
-        (
-            "shares_outstanding_ending",
-            [
-                "CommonStockSharesOutstanding",
-                "dei:EntityCommonStockSharesOutstanding",
-            ],
-            "Point-in-time ending common shares outstanding",
-            "Track multi-year share count expansion vs net retirement",
-            ("shares",),
-        ),
-        (
-            "shares_diluted_weighted",
-            ["WeightedAverageNumberOfDilutedSharesOutstanding"],
-            "GAAP_XBRL_weighted_average_diluted_shares",
-            "Note: anti-dilutive securities excluded in GAAP loss periods",
-            ("shares",),
-        ),
-        (
-            "inventory",
-            [
-                "InventoryNet",
-                "InventoryFinishedGoodsAndWorkInProcess",
-            ],
-            "Point-in-time working capital (inventory)",
-            "Compare growth vs revenue to detect channel/warehouse buildup",
-            ("USD",),
-        ),
-        (
-            "accounts_receivable",
-            [
-                "AccountsReceivableNetCurrent",
-                "ReceivablesNetCurrent",
-            ],
-            "Point-in-time working capital (receivables)",
-            "Compare growth vs revenue to verify FCF conversion quality",
-            ("USD",),
-        ),
-    ]
-    for metric_key, tags, basis, note, pref_units in specs:
+    for metric_key, tags, basis, note, pref_units in SEC_XBRL_METRIC_SPECS:
         extracted = _extract_xbrl_metric(
             us_gaap,
             tags,
@@ -926,11 +999,51 @@ def extract_sec_companyfacts(facts_json: dict[str, Any], limit: int = 8) -> dict
         if extracted is not None:
             metrics[metric_key] = extracted
 
+    # Prune discontinued/zombie metrics whose latest observation lags the entity's latest report date
+    # by more than max_stale_days (e.g., 2014-12-31 buybacks when company reports through 2026-09-30).
+    stale_metrics_omitted: dict[str, Any] = {}
+    entity_latest_end_dt: date | None = None
+    for m in metrics.values():
+        recs = m.get("records") or []
+        if not recs:
+            continue
+        try:
+            rec_dt = date.fromisoformat(str(recs[0].get("end") or ""))
+        except ValueError:
+            continue
+        if entity_latest_end_dt is None or rec_dt > entity_latest_end_dt:
+            entity_latest_end_dt = rec_dt
+
+    if entity_latest_end_dt is not None and max_stale_days > 0:
+        for metric_key in list(metrics.keys()):
+            recs = metrics[metric_key].get("records") or []
+            if not recs:
+                continue
+            latest_rec = recs[0]
+            try:
+                rec_dt = date.fromisoformat(str(latest_rec.get("end") or ""))
+            except ValueError:
+                continue
+            stale_days = (entity_latest_end_dt - rec_dt).days
+            if stale_days > max_stale_days:
+                stale_metrics_omitted[metric_key] = {
+                    "tag": latest_rec.get("tag") or metrics[metric_key].get("tag"),
+                    "latest_end": latest_rec.get("end"),
+                    "val": latest_rec.get("val"),
+                    "unit": latest_rec.get("unit") or metrics[metric_key].get("unit"),
+                    "form": latest_rec.get("form"),
+                    "stale_days": stale_days,
+                    "entity_latest_end": entity_latest_end_dt.isoformat(),
+                    "reason": f"omitted discontinued/stale XBRL metric ({stale_days}d behind latest filing)",
+                }
+                metrics.pop(metric_key, None)
+
     return {
         "entity_name": facts_json.get("entityName"),
         "cik": str(facts_json.get("cik") or "").zfill(10) if facts_json.get("cik") is not None else None,
         "metrics": metrics,
         "capital_structure_snapshot": _build_capital_structure_snapshot(metrics),
+        "stale_metrics_omitted": stale_metrics_omitted,
     }
 
 
@@ -1308,6 +1421,311 @@ def extract_sec_submissions_filings(
     }
 
 
+_XBRLI_NS = "http://www.xbrl.org/2003/instance"
+_XSI_NIL_ATTR = "{http://www.w3.org/2001/XMLSchema-instance}nil"
+
+
+_SEC_CORE_BACKFILL_METRICS: tuple[str, ...] = (
+    "revenue",
+    "net_income",
+    "eps_diluted",
+    "operating_cash_flow",
+    "cash_and_equivalents",
+    "long_term_debt",
+)
+_SEC_PRIMARY_BACKFILL_METRICS: tuple[str, ...] = ("revenue", "net_income")
+
+
+def _core_companyfacts_coverage(facts_json: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return per-core-metric latest (max_end, max_filed, accns) across 10-Q/10-K entries."""
+    facts_root = (facts_json.get("facts") or {}) if isinstance(facts_json, dict) else {}
+    namespaces: dict[str, dict[str, Any]] = {
+        "us-gaap": facts_root.get("us-gaap") if isinstance(facts_root.get("us-gaap"), dict) else {},
+        "dei": facts_root.get("dei") if isinstance(facts_root.get("dei"), dict) else {},
+    }
+    spec_map = {metric_key: tags for metric_key, tags, _, _, _ in SEC_XBRL_METRIC_SPECS}
+    coverage: dict[str, dict[str, Any]] = {}
+    for metric_key in _SEC_CORE_BACKFILL_METRICS:
+        max_end = ""
+        max_filed = ""
+        accns: set[str] = set()
+        for raw_tag in spec_map.get(metric_key, ()):
+            if ":" in raw_tag:
+                ns_name, tag_name = raw_tag.split(":", 1)
+                ns_dict = namespaces.get(ns_name.strip().lower()) or {}
+            else:
+                ns_dict = namespaces["us-gaap"]
+                tag_name = raw_tag
+            tag_obj = ns_dict.get(tag_name)
+            if not isinstance(tag_obj, dict):
+                continue
+            for items in (tag_obj.get("units") or {}).values():
+                if not isinstance(items, list):
+                    continue
+                for it in items:
+                    if not isinstance(it, dict):
+                        continue
+                    if str(it.get("form") or "") not in ("10-Q", "10-K", "10-Q/A", "10-K/A"):
+                        continue
+                    end = str(it.get("end") or "").strip()
+                    val = it.get("val")
+                    if not end or val is None or _clean_scalar(val) is None:
+                        continue
+                    filed = str(it.get("filed") or "").strip()
+                    accn = str(it.get("accn") or "").strip()
+                    if end > max_end:
+                        max_end = end
+                    if filed > max_filed:
+                        max_filed = filed
+                    if accn:
+                        accns.add(accn)
+        coverage[metric_key] = {
+            "max_end": max_end,
+            "max_filed": max_filed,
+            "accns": accns,
+        }
+    return coverage
+
+
+def _filing_missing_core_metrics(
+    filing: dict[str, Any],
+    coverage: dict[str, dict[str, Any]],
+) -> list[str]:
+    """Return tracked core metrics that have NOT yet covered ``filing`` (by accession or reportDate/filingDate)."""
+    rdate = str(filing.get("reportDate") or "").strip()
+    fdate = str(filing.get("filingDate") or "").strip()
+    accn = str(filing.get("accessionNumber") or "").strip()
+    if not rdate:
+        return []
+    try:
+        rdate_dt = date.fromisoformat(rdate)
+    except ValueError:
+        rdate_dt = None
+
+    missing: list[str] = []
+    for metric_key in _SEC_CORE_BACKFILL_METRICS:
+        info = coverage.get(metric_key) or {"max_end": "", "max_filed": "", "accns": set()}
+        m_end = str(info.get("max_end") or "")
+        m_filed = str(info.get("max_filed") or "")
+        m_accns = info.get("accns") or set()
+
+        is_primary = metric_key in _SEC_PRIMARY_BACKFILL_METRICS
+        if not is_primary:
+            # Skip optional core metrics that the entity has never reported or discontinued long ago
+            if not m_end:
+                continue
+            if rdate_dt is not None:
+                try:
+                    m_end_dt = date.fromisoformat(m_end)
+                    if (rdate_dt - m_end_dt).days > SEC_STALE_METRIC_MAX_DAYS:
+                        continue
+                except ValueError:
+                    pass
+
+        if accn and accn in m_accns:
+            continue
+        if accn and m_accns and (not m_end or rdate >= m_end):
+            missing.append(metric_key)
+            continue
+        if (not m_end) or (rdate > m_end) or (rdate == m_end and fdate and fdate > m_filed):
+            missing.append(metric_key)
+    return missing
+
+
+def _latest_companyfacts_dates(facts_json: dict[str, Any]) -> tuple[str, str]:
+    """Return (max_end, max_filed) across tracked core 10-Q/10-K metrics in companyfacts."""
+    cov = _core_companyfacts_coverage(facts_json)
+    max_end = ""
+    max_filed = ""
+    for info in cov.values():
+        end = str(info.get("max_end") or "")
+        filed = str(info.get("max_filed") or "")
+        if end > max_end:
+            max_end = end
+        if filed > max_filed:
+            max_filed = filed
+    return max_end, max_filed
+
+
+def _parse_xbrl_unit_name(unit_elem: ET.Element) -> str:
+    """Normalize XBRL <unit> element into SEC companyfacts unit name (USD, USD/shares, shares, ...)."""
+    def _local_measure(text: str | None) -> str:
+        raw = (text or "").strip()
+        return raw.split(":", 1)[1] if ":" in raw else raw
+
+    divide = unit_elem.find(f"{{{_XBRLI_NS}}}divide")
+    if divide is not None:
+        num = divide.find(f"{{{_XBRLI_NS}}}unitNumerator/{{{_XBRLI_NS}}}measure")
+        den = divide.find(f"{{{_XBRLI_NS}}}unitDenominator/{{{_XBRLI_NS}}}measure")
+        num_s = _local_measure(num.text if num is not None else "")
+        den_s = _local_measure(den.text if den is not None else "")
+        if num_s and den_s:
+            return f"{num_s}/{den_s}"
+    meas = unit_elem.find(f"{{{_XBRLI_NS}}}measure")
+    return _local_measure(meas.text if meas is not None else "") or str(unit_elem.attrib.get("id") or "USD")
+
+
+def _parse_numeric_xbrl_text(raw: str | None) -> int | float | None:
+    if raw is None:
+        return None
+    s = raw.strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        fval = float(s)
+    except ValueError:
+        return None
+    if not math.isfinite(fval):
+        return None
+    if "." not in s and "e" not in s.lower():
+        try:
+            return int(s)
+        except ValueError:
+            return fval
+    return fval
+
+
+def parse_sec_xbrl_instance_xml(
+    xml_data: bytes | str,
+    *,
+    cik: str,
+    form: str,
+    filing_date: str,
+    accession: str | None = None,
+    allowed_tags: dict[str, set[str]] | None = None,
+) -> dict[str, dict[str, dict[str, list[dict[str, Any]]]]]:
+    """Extract non-dimensional entity-level us-gaap/dei facts from an SEC XBRL instance XML."""
+    target_cik = str(cik or "").strip().zfill(10)
+    tracked = allowed_tags if allowed_tags is not None else _tracked_sec_xbrl_tags()
+    root = ET.fromstring(xml_data)
+
+    contexts: dict[str, tuple[str | None, str]] = {}
+    for ctx in root.findall(f"{{{_XBRLI_NS}}}context"):
+        cid = ctx.attrib.get("id")
+        if not cid:
+            continue
+        ent = ctx.find(f"{{{_XBRLI_NS}}}entity")
+        if ent is None:
+            continue
+        ident_raw = ent.findtext(f"{{{_XBRLI_NS}}}identifier")
+        if not ident_raw or ident_raw.strip().zfill(10) != target_cik:
+            continue
+        # Strictly exclude dimensional segment/scenario contexts (subsidiaries, segments, product breakdowns)
+        if ent.find(f"{{{_XBRLI_NS}}}segment") is not None or ctx.find(f"{{{_XBRLI_NS}}}scenario") is not None:
+            continue
+        per = ctx.find(f"{{{_XBRLI_NS}}}period")
+        if per is None:
+            continue
+        start = (per.findtext(f"{{{_XBRLI_NS}}}startDate") or "").strip() or None
+        end = (per.findtext(f"{{{_XBRLI_NS}}}endDate") or per.findtext(f"{{{_XBRLI_NS}}}instant") or "").strip()
+        if not end:
+            continue
+        contexts[cid] = (start, end)
+
+    units_map: dict[str, str] = {}
+    for unit_elem in root.findall(f"{{{_XBRLI_NS}}}unit"):
+        uid = unit_elem.attrib.get("id")
+        if uid:
+            units_map[uid] = _parse_xbrl_unit_name(unit_elem)
+
+    extracted: dict[str, dict[str, dict[str, list[dict[str, Any]]]]] = {}
+    for elem in root:
+        tag_full = elem.tag
+        if not isinstance(tag_full, str) or "}" not in tag_full:
+            continue
+        ns_uri, local = tag_full[1:].split("}", 1)
+        ns_uri_low = ns_uri.lower()
+        if "/us-gaap/" in ns_uri_low:
+            ns_key = "us-gaap"
+        elif "/dei/" in ns_uri_low:
+            ns_key = "dei"
+        else:
+            continue
+        if local not in tracked.get(ns_key, ()):
+            continue
+        if str(elem.attrib.get(_XSI_NIL_ATTR) or "").lower() == "true":
+            continue
+        cid = elem.attrib.get("contextRef")
+        if not cid or cid not in contexts:
+            continue
+        val = _parse_numeric_xbrl_text(elem.text)
+        if val is None:
+            continue
+        start, end = contexts[cid]
+        unit_ref = elem.attrib.get("unitRef")
+        unit_name = units_map.get(unit_ref, "USD") if unit_ref else "USD"
+        entry: dict[str, Any] = {
+            "end": end,
+            "val": val,
+            "form": form,
+            "filed": filing_date,
+        }
+        if accession:
+            entry["accn"] = str(accession).strip()
+        if start:
+            entry["start"] = start
+        extracted.setdefault(ns_key, {}).setdefault(local, {}).setdefault(unit_name, []).append(entry)
+
+    return extracted
+
+
+def _merge_xbrl_facts_into_companyfacts(
+    facts_json: dict[str, Any],
+    extra_facts: dict[str, dict[str, dict[str, list[dict[str, Any]]]]],
+) -> dict[str, Any]:
+    """Merge extracted XBRL instance facts into a shallow-copied SEC companyfacts payload."""
+    if not extra_facts:
+        return facts_json
+    merged_root = dict(facts_json)
+    facts_section = dict(facts_json.get("facts") or {})
+    for ns_key, tag_map in extra_facts.items():
+        ns_dict = dict(facts_section.get(ns_key) or {})
+        for tag_name, units_map in tag_map.items():
+            existing_tag = dict(ns_dict.get(tag_name) or {})
+            existing_units = dict(existing_tag.get("units") or {})
+            for unit_name, new_items in units_map.items():
+                prev_list = list(existing_units.get(unit_name) or [])
+                prev_list.extend(new_items)
+                existing_units[unit_name] = prev_list
+            existing_tag["units"] = existing_units
+            ns_dict[tag_name] = existing_tag
+        facts_section[ns_key] = ns_dict
+    merged_root["facts"] = facts_section
+    return merged_root
+
+
+def _fetch_xbrl_instance_xml(cik_int: int, accession: str, primary_doc: str) -> bytes | None:
+    """Fetch official SEC EDGAR extracted XBRL instance XML (*_htm.xml) for a periodic filing."""
+    acc_nodash = str(accession or "").replace("-", "").strip()
+    doc = str(primary_doc or "").strip()
+    if not acc_nodash:
+        return None
+    base_url = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}"
+    if doc:
+        stem = doc.rsplit(".", 1)[0] if "." in doc else doc
+        try:
+            resp = requests.get(f"{base_url}/{stem}_htm.xml", headers=SEC_HEADERS, timeout=HTTP_TIMEOUT)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+        except Exception:
+            pass
+    # Fallback: query filing directory index.json for *_htm.xml
+    try:
+        idx_resp = requests.get(f"{base_url}/index.json", headers=SEC_HEADERS, timeout=HTTP_TIMEOUT)
+        if idx_resp.status_code != 200:
+            return None
+        items = ((idx_resp.json().get("directory") or {}).get("item") or [])
+        for it in items:
+            name = str((it or {}).get("name") or "")
+            if name.endswith("_htm.xml"):
+                xml_resp = requests.get(f"{base_url}/{name}", headers=SEC_HEADERS, timeout=HTTP_TIMEOUT)
+                if xml_resp.status_code == 200 and xml_resp.content:
+                    return xml_resp.content
+    except Exception:
+        return None
+    return None
+
+
 def fetch_sec_edgar(symbol: str) -> dict[str, Any]:
     cik = _get_sec_cik(symbol)
     cik_int = int(cik)
@@ -1327,9 +1745,64 @@ def fetch_sec_edgar(symbol: str) -> dict[str, Any]:
         timeout=HTTP_TIMEOUT,
     )
     facts_resp.raise_for_status()
-    facts_summary = extract_sec_companyfacts(facts_resp.json(), limit=8)
+    facts_json = facts_resp.json()
 
-    return {
+    # Backfill unindexed or partially ingested recent 10-Q/10-K filings directly from official SEC
+    # XBRL instance XML when core tracked metrics in companyfacts lag behind submissions.
+    core_coverage = _core_companyfacts_coverage(facts_json)
+    missing_filings: list[tuple[dict[str, Any], list[str]]] = []
+    for filing in sub_extracted["recent_filings"]:
+        missing_core = _filing_missing_core_metrics(filing, core_coverage)
+        if missing_core:
+            missing_filings.append((filing, missing_core))
+
+    xbrl_backfilled: list[dict[str, Any]] = []
+    if missing_filings:
+        tracked_tags = _tracked_sec_xbrl_tags()
+        for filing, missing_before in missing_filings[:2]:
+            accn = str(filing.get("accessionNumber") or "")
+            xml_bytes = _fetch_xbrl_instance_xml(
+                cik_int,
+                accn,
+                str(filing.get("primaryDocument") or ""),
+            )
+            if not xml_bytes:
+                continue
+            try:
+                parsed_extra = parse_sec_xbrl_instance_xml(
+                    xml_bytes,
+                    cik=cik,
+                    form=str(filing.get("form") or "10-Q"),
+                    filing_date=str(filing.get("filingDate") or ""),
+                    accession=accn,
+                    allowed_tags=tracked_tags,
+                )
+            except Exception:
+                continue
+            if parsed_extra:
+                facts_json = _merge_xbrl_facts_into_companyfacts(facts_json, parsed_extra)
+                core_coverage = _core_companyfacts_coverage(facts_json)
+                missing_after = _filing_missing_core_metrics(filing, core_coverage)
+                covered_now = [m for m in missing_before if m not in missing_after]
+                xbrl_backfilled.append(
+                    {
+                        "form": filing.get("form"),
+                        "reportDate": filing.get("reportDate"),
+                        "filingDate": filing.get("filingDate"),
+                        "accessionNumber": filing.get("accessionNumber"),
+                        "missing_core_before": missing_before,
+                        "covered_core_after": covered_now,
+                        "core_metric_latest_end": {
+                            k: str((core_coverage.get(k) or {}).get("max_end") or "")
+                            for k in _SEC_CORE_BACKFILL_METRICS
+                            if (core_coverage.get(k) or {}).get("max_end")
+                        },
+                    }
+                )
+
+    facts_summary = extract_sec_companyfacts(facts_json, limit=8)
+
+    out: dict[str, Any] = {
         "cik": cik,
         "entity_name": sub_json.get("name") or facts_summary.get("entity_name"),
         "sic_description": sub_json.get("sicDescription"),
@@ -1339,6 +1812,11 @@ def fetch_sec_edgar(symbol: str) -> dict[str, Any]:
         "gaap_metrics": facts_summary.get("metrics", {}),
         "capital_structure_snapshot": facts_summary.get("capital_structure_snapshot", {}),
     }
+    if facts_summary.get("stale_metrics_omitted"):
+        out["stale_metrics_omitted"] = facts_summary["stale_metrics_omitted"]
+    if xbrl_backfilled:
+        out["xbrl_instance_backfill"] = xbrl_backfilled
+    return out
 
 
 def _extract_stmt_rows(df: pd.DataFrame | None, row_candidates: dict[str, list[str]], n_cols: int = 4) -> dict[str, Any]:
@@ -1361,6 +1839,53 @@ def _extract_stmt_rows(df: pd.DataFrame | None, row_candidates: dict[str, list[s
             str(_clean_scalar(c))[:10]: _clean_scalar(series[c])
             for c in cols
         }
+    return out
+
+
+def _sanitize_us_valuation_positioning(
+    extracted: dict[str, Any],
+    info_data: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Ensure short_percent_of_float / short_ratio never turn missing or invalid Yahoo 0/0 anomalies into 0.0."""
+    out = dict(extracted)
+    src = info_data if isinstance(info_data, dict) else {}
+    # Prefer raw unrounded shortPercentOfFloat / shortRatio from info_data when present so
+    # upstream rounding in extract_us_valuation_positioning cannot truncate valid tiny values (e.g. 3e-7) to 0.0.
+    raw_short_pct = (
+        _to_float(src.get("shortPercentOfFloat"))
+        if "shortPercentOfFloat" in src
+        else _to_float(out.get("short_percent_of_float"))
+    )
+    raw_short_ratio = (
+        _to_float(src.get("shortRatio"))
+        if "shortRatio" in src
+        else _to_float(out.get("short_ratio"))
+    )
+
+    if raw_short_ratio is not None and raw_short_ratio < 0:
+        raw_short_ratio = None
+
+    if raw_short_pct is None or raw_short_pct < 0:
+        out["short_percent_of_float"] = None
+    elif raw_short_pct == 0.0:
+        # Yahoo Finance may emit 0.0 for shortPercentOfFloat (and shortRatio) either when short
+        # interest is unavailable OR when a legitimate ultra-low short ratio underflows Yahoo's
+        # display rounding. Reconstruct from sharesShort / floatShares whenever valid positive
+        # counts exist (and ratio <= 5.0); otherwise treat 0/0 as unavailable (None).
+        sh_short = _to_float(src.get("sharesShort"))
+        flt_sh = _to_float(src.get("floatShares"))
+        rebuilt: float | None = None
+        if sh_short is not None and flt_sh is not None and sh_short > 0 and flt_sh > 0:
+            ratio = sh_short / flt_sh
+            if 0.0 < ratio <= 5.0:
+                rebuilt = round(ratio, 6) if ratio >= 1e-4 else float(ratio)
+        out["short_percent_of_float"] = rebuilt
+        if raw_short_ratio is not None and raw_short_ratio <= 0.0:
+            raw_short_ratio = None
+    else:
+        out["short_percent_of_float"] = round(raw_short_pct, 6) if raw_short_pct >= 1e-4 else float(raw_short_pct)
+
+    out["short_ratio"] = round(raw_short_ratio, 4) if raw_short_ratio is not None else None
     return out
 
 
@@ -1428,7 +1953,10 @@ def fetch_yfinance_consensus(symbol: str) -> dict[str, Any]:
             cal_err = str(exc)
         if info_data is None and cal_data is None and (info_err or cal_err):
             return {"error": info_err or cal_err}
-        extracted = rext.extract_us_valuation_positioning(info_data, cal_data)
+        extracted = _sanitize_us_valuation_positioning(
+            rext.extract_us_valuation_positioning(info_data, cal_data),
+            info_data,
+        )
         has_any_metric = any(v is not None for v in extracted.values())
         if not has_any_metric and (info_err or cal_err):
             return {"error": info_err or cal_err}

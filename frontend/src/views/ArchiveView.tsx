@@ -17,18 +17,22 @@ import {
   RefreshCw,
   Save,
   ShieldAlert,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
+  X,
 } from "lucide-react";
 import { api, ApiError, errorMessage, parseTaskEvent } from "../api/client";
 import type {
   ArchiveDetail,
   ArchiveListItem,
+  ArchiveState,
   ArchiveStatus,
   ArchiveTrigger,
   DeepResearchEngine,
   DeepResearchMode,
   EvidenceItem,
+  Position,
   ResearchDataResponse,
   ResearchEnginesResponse,
   TaskRecord,
@@ -622,25 +626,71 @@ function extractEditableBody(md: string): string {
   return raw.trimEnd();
 }
 
-/** Strip redundant top `# [SYMBOL] ...` H1 during read-mode since card header already displays SymbolLabel */
-function cleanThesisDisplayMarkdown(md: string): string {
-  return (md || "").replace(/^#\s+\[[^\]]+\][^\n]*\n+/, "");
+function statusBadgeLabel(st: string | undefined): string {
+  const norm = (st || "").trim().toLowerCase();
+  if (norm === "holding") return "持有中";
+  if (norm === "watchlist") return "逻辑观察";
+  if (norm === "actionable_long") return "放行做多";
+  if (norm === "actionable_short") return "放行做空";
+  if (norm === "pair_trade") return "配对候选";
+  if (norm === "rejected" || norm === "closed" || norm === "archived") return "已归档";
+  return st || "观察池";
 }
 
-function statusBadgeLabel(st: string | undefined): string {
-  if (st === "holding") return "持有中";
-  if (st === "watchlist") return "逻辑观察";
-  if (st === "actionable_long") return "放行做多";
-  if (st === "actionable_short") return "放行做空";
-  if (st === "pair_trade") return "配对候选";
-  if (st === "rejected" || st === "closed") return "已归档";
-  return st || "观察池";
+function directionBadgeInput(dir: string | null | undefined): string | null | undefined {
+  const norm = (dir || "").trim().toLowerCase();
+  if (norm === "long" || norm === "short") return norm;
+  if (norm === "pair") return "多空配对";
+  if (norm === "neutral" || !norm) return "中性观察";
+  return dir;
+}
+
+function normalizeConfidenceOption(val: ArchiveState["confidence"]): "" | "high" | "medium" | "low" {
+  if (val == null) return "";
+  if (typeof val === "number" && Number.isFinite(val)) {
+    if (val >= 0.75) return "high";
+    if (val >= 0.45) return "medium";
+    return "low";
+  }
+  const norm = String(val).trim().toLowerCase();
+  if (norm === "high" || norm === "medium" || norm === "low") return norm;
+  return "";
+}
+
+function formatConfidenceLabel(val: ArchiveState["confidence"]): string {
+  if (val == null || String(val).trim() === "") return "未设定";
+  if (typeof val === "number" && Number.isFinite(val)) {
+    const bucket = normalizeConfidenceOption(val);
+    const bucketZh = bucket === "high" ? "高" : bucket === "medium" ? "中" : "低";
+    return `${bucketZh} (${Math.round(val * 100)}%)`;
+  }
+  const norm = String(val).trim().toLowerCase();
+  if (norm === "high") return "高 (High)";
+  if (norm === "medium") return "中 (Medium)";
+  if (norm === "low") return "低 (Low)";
+  return String(val);
+}
+
+export interface ArchiveViewNavIntent {
+  tab?: "thesis" | "evidence" | "hard_data" | "triggers";
+  openEvidenceForm?: boolean;
+  openMetaEditor?: boolean;
+  nonce: number;
+  targetSymbol: string;
+  targetMarket: string | null;
+}
+
+function mapIntentTab(t?: ArchiveViewNavIntent["tab"]): ArchiveTab | null {
+  if (!t) return null;
+  if (t === "hard_data") return "harddata";
+  return t;
 }
 
 interface ArchiveViewProps {
   active?: boolean;
   symbol: string;
   market?: string | null;
+  navIntent?: ArchiveViewNavIntent;
   workspaceRev?: number;
   onArchiveMutated?: () => void;
   onSelectSymbol: (symbol: string, market?: string | null) => void;
@@ -651,6 +701,7 @@ export function ArchiveView({
   active = true,
   symbol,
   market = null,
+  navIntent,
   workspaceRev = 0,
   onArchiveMutated,
   onSelectSymbol,
@@ -658,6 +709,7 @@ export function ArchiveView({
 }: ArchiveViewProps) {
   const [archives, setArchives] = useState<ArchiveListItem[]>([]);
   const [archivesLoaded, setArchivesLoaded] = useState(false);
+  const [openPositions, setOpenPositions] = useState<Position[]>([]);
   const [selected, setSelected] = useState<ArchiveSelection>({ market, symbol });
   const prevPropKeyRef = useRef(makeArchiveKey(market, symbol));
 
@@ -669,6 +721,14 @@ export function ArchiveView({
 
   const [tab, setTab] = useState<ArchiveTab>("thesis");
   const [levelFilter, setLevelFilter] = useState<"ALL" | "L1" | "L2" | "L3" | "L4">("ALL");
+  const lastNavNonceRef = useRef<number>(0);
+  const [pendingNavAction, setPendingNavAction] = useState<{
+    openEvidenceForm: boolean;
+    openMetaEditor: boolean;
+    nonce: number;
+    targetSymbol: string;
+    targetMarket: string | null;
+  } | null>(null);
 
   /* Online thesis editor state pinned to immutable base revision captured on open */
   const [editSession, setEditSession] = useState<{
@@ -680,6 +740,23 @@ export function ArchiveView({
   const [draftThesisBody, setDraftThesisBody] = useState("");
   const [editNote, setEditNote] = useState("");
   const [savingThesis, setSavingThesis] = useState(false);
+
+  /* Editable core archive metadata (direction_bias, layer1_drivers, thesis_summary, confidence) */
+  const [metaEditSession, setMetaEditSession] = useState<{
+    symbol: string;
+    market: string;
+    baseRevision: number;
+  } | null>(null);
+  const [metaDirection, setMetaDirection] = useState<"long" | "short" | "neutral" | "pair">("neutral");
+  const [metaPrimary, setMetaPrimary] = useState("");
+  const [metaSecondary, setMetaSecondary] = useState("");
+  const [metaSummary, setMetaSummary] = useState("");
+  const [metaConfidence, setMetaConfidence] = useState<"" | "high" | "medium" | "low">("");
+  const [savingMeta, setSavingMeta] = useState(false);
+  const [refreshingMetaConflict, setRefreshingMetaConflict] = useState(false);
+  const [metaEditErr, setMetaEditErr] = useState<string | null>(null);
+  const [metaConflict, setMetaConflict] = useState(false);
+  const [metaSaveFeedback, setMetaSaveFeedback] = useState<string | null>(null);
 
   /* Visual Trigger & Event builder states */
   const trigHintId = useId();
@@ -827,6 +904,7 @@ export function ArchiveView({
     (nextMarket: string | null, nextSymbol: string) => {
       const cleanSym = nextSymbol.trim().toUpperCase();
       const cleanMkt = nextMarket ? nextMarket.trim().toUpperCase() : null;
+      setPendingNavAction(null);
       prevPropKeyRef.current = makeArchiveKey(cleanMkt, cleanSym);
       setSelected({ market: cleanMkt, symbol: cleanSym });
       onSelectSymbol(cleanSym, cleanMkt);
@@ -836,10 +914,18 @@ export function ArchiveView({
 
   const loadList = useCallback(async (signal?: AbortSignal) => {
     try {
-      const res = await api.archives(signal);
+      const [res, portRes] = await Promise.all([
+        api.archives(signal),
+        api.portfolioSummary(signal).catch(() => null),
+      ]);
       const list = res.archives ?? [];
       setArchives(list);
       setArchivesLoaded(true);
+      if (portRes && Array.isArray(portRes.positions)) {
+        setOpenPositions(
+          portRes.positions.filter((p) => (p.status || "open").trim().toLowerCase() === "open"),
+        );
+      }
       return list;
     } catch {
       if (!signal?.aborted) setArchivesLoaded(true);
@@ -853,28 +939,30 @@ export function ArchiveView({
       targetMarket: string | null | undefined,
       signal?: AbortSignal,
       expectedToken?: number,
-    ) => {
+    ): Promise<ArchiveDetail | null> => {
       const cleanSym = targetSym.trim();
-      if (!cleanSym) return;
+      if (!cleanSym) return null;
       const token = expectedToken ?? selectionTokenRef.current;
-      if (token !== selectionTokenRef.current) return;
+      if (token !== selectionTokenRef.current) return null;
       const reqId = ++detailReqIdRef.current;
       setLoadingDetail(true);
       setErr(null);
       setNotFoundSym(null);
       try {
         const d = await api.archive(cleanSym, targetMarket, signal);
-        if (signal?.aborted || reqId !== detailReqIdRef.current || token !== selectionTokenRef.current) return;
+        if (signal?.aborted || reqId !== detailReqIdRef.current || token !== selectionTokenRef.current) return null;
         setDetail(d);
+        return d;
       } catch (ex) {
-        if (signal?.aborted || (ex instanceof DOMException && ex.name === "AbortError")) return;
-        if (reqId !== detailReqIdRef.current || token !== selectionTokenRef.current) return;
+        if (signal?.aborted || (ex instanceof DOMException && ex.name === "AbortError")) return null;
+        if (reqId !== detailReqIdRef.current || token !== selectionTokenRef.current) return null;
         if (ex instanceof ApiError && ex.status === 404) {
           setDetail(null);
           setNotFoundSym(cleanSym);
         } else {
           setErr(errorMessage(ex));
         }
+        return null;
       } finally {
         if (!signal?.aborted && reqId === detailReqIdRef.current && token === selectionTokenRef.current) {
           setLoadingDetail(false);
@@ -1427,6 +1515,156 @@ export function ArchiveView({
     }
   };
 
+  const handleStartEditMeta = useCallback(() => {
+    if (!detail) return;
+    const rawDir = (detail.state.direction_bias || "neutral").trim().toLowerCase();
+    const normDir: "long" | "short" | "neutral" | "pair" =
+      rawDir === "long" || rawDir === "short" || rawDir === "pair" ? rawDir : "neutral";
+    setMetaDirection(normDir);
+    setMetaPrimary(detail.state.layer1_drivers?.primary || "");
+    setMetaSecondary(detail.state.layer1_drivers?.secondary || "");
+    setMetaSummary(detail.state.thesis_summary || "");
+    setMetaConfidence(normalizeConfidenceOption(detail.state.confidence));
+    setMetaEditErr(null);
+    setMetaConflict(false);
+    setMetaSaveFeedback(null);
+    setMetaEditSession({
+      symbol: detail.symbol,
+      market: detail.market,
+      baseRevision: detail.state.revision,
+    });
+  }, [detail]);
+
+  /* Apply incoming cross-view navigation intent (scroll top, tab switch, form auto-open) */
+  useEffect(() => {
+    if (!navIntent || navIntent.nonce === lastNavNonceRef.current) return;
+    lastNavNonceRef.current = navIntent.nonce;
+    if (typeof window !== "undefined") {
+      window.scrollTo({ top: 0, behavior: "smooth" });
+    }
+    const targetTab =
+      mapIntentTab(navIntent.tab) ??
+      (navIntent.openEvidenceForm ? "evidence" : navIntent.openMetaEditor ? "thesis" : null);
+    if (targetTab) {
+      setTab(targetTab);
+    }
+    if (navIntent.openEvidenceForm || navIntent.openMetaEditor) {
+      const targetSymbol = (navIntent.targetSymbol || "").trim().toUpperCase();
+      const targetMarket = navIntent.targetMarket ? navIntent.targetMarket.trim().toUpperCase() : null;
+      if (targetSymbol) {
+        setPendingNavAction({
+          openEvidenceForm: Boolean(navIntent.openEvidenceForm),
+          openMetaEditor: Boolean(navIntent.openMetaEditor),
+          nonce: navIntent.nonce,
+          targetSymbol,
+          targetMarket,
+        });
+      } else {
+        setPendingNavAction(null);
+      }
+    } else {
+      setPendingNavAction(null);
+    }
+  }, [navIntent]);
+
+  useEffect(() => {
+    if (!active || !pendingNavAction) return;
+    const activeSymUpper = activeSym.trim().toUpperCase();
+    const activeMktUpper = activeMarket ? activeMarket.trim().toUpperCase() : null;
+    if (
+      activeSymUpper !== pendingNavAction.targetSymbol ||
+      (pendingNavAction.targetMarket !== null &&
+        activeMktUpper !== null &&
+        activeMktUpper !== pendingNavAction.targetMarket)
+    ) {
+      setPendingNavAction(null);
+      return;
+    }
+    if (notFoundSym && notFoundSym.trim().toUpperCase() === pendingNavAction.targetSymbol) {
+      setPendingNavAction(null);
+      return;
+    }
+    if (!detail) return;
+    const detailSymUpper = detail.symbol.trim().toUpperCase();
+    const detailMktUpper = detail.market.trim().toUpperCase();
+    if (
+      detailSymUpper !== pendingNavAction.targetSymbol ||
+      (pendingNavAction.targetMarket !== null && detailMktUpper !== pendingNavAction.targetMarket)
+    ) {
+      return;
+    }
+    if (pendingNavAction.openEvidenceForm) {
+      setEvidenceModalOpen(true);
+    }
+    if (pendingNavAction.openMetaEditor) {
+      handleStartEditMeta();
+    }
+    setPendingNavAction(null);
+  }, [active, activeMarket, activeSym, detail, handleStartEditMeta, notFoundSym, pendingNavAction]);
+
+  const handleSaveMeta = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!metaEditSession || !detail) return;
+    const { symbol: targetSym, market: targetMkt, baseRevision } = metaEditSession;
+    const token = selectionTokenRef.current;
+    const patch: Partial<ArchiveState> = {
+      direction_bias: metaDirection,
+      layer1_drivers: {
+        primary: metaPrimary.trim(),
+        secondary: metaSecondary.trim(),
+      },
+      thesis_summary: metaSummary.trim(),
+    };
+    if (metaConfidence) {
+      patch.confidence = metaConfidence;
+    } else if (detail.state.confidence != null) {
+      patch.confidence = null;
+    }
+
+    setSavingMeta(true);
+    setMetaEditErr(null);
+    setMetaConflict(false);
+    try {
+      await api.archiveState(targetSym, patch, baseRevision, targetMkt);
+      if (selectionTokenRef.current === token) {
+        setMetaEditSession(null);
+        setMetaSaveFeedback("研究结论与核心元数据已保存并更新档案版本");
+        loadedKeyRef.current = "";
+        await loadDetail(targetSym, targetMkt, undefined, token);
+      }
+      await loadList();
+      onArchiveMutated?.();
+    } catch (ex) {
+      if (selectionTokenRef.current === token) {
+        if (ex instanceof ApiError && ex.status === 409) {
+          setMetaConflict(true);
+          setMetaEditErr(
+            "版本冲突（409）：该档案在您编辑期间已被后台任务或其他页面更新。当前表单草稿已保留，请先刷新最新版本后再保存。",
+          );
+        } else {
+          setMetaEditErr(errorMessage(ex));
+        }
+      }
+    } finally {
+      setSavingMeta(false);
+    }
+  };
+
+  useEffect(() => {
+    setMetaEditSession((prev) =>
+      prev && makeArchiveKey(prev.market, prev.symbol) !== activeKey ? null : prev,
+    );
+    setMetaEditErr(null);
+    setMetaConflict(false);
+    setMetaSaveFeedback(null);
+  }, [activeKey]);
+
+  useEffect(() => {
+    if (!metaSaveFeedback) return;
+    const timer = window.setTimeout(() => setMetaSaveFeedback(null), 4500);
+    return () => window.clearTimeout(timer);
+  }, [metaSaveFeedback]);
+
   const handleStartEditThesis = () => {
     if (!detail) return;
     setDraftThesisBody(extractEditableBody(detail.thesis_md));
@@ -1843,16 +2081,45 @@ export function ArchiveView({
     return firstHit?.market.toUpperCase() ?? null;
   }, [activeMarket, activeSym, filteredArchives]);
 
-  const holdingArchives = useMemo(
-    () => filteredArchives.filter((a) => a.status === "holding"),
-    [filteredArchives],
-  );
-  const otherArchives = useMemo(
-    () => filteredArchives.filter((a) => a.status !== "holding"),
-    [filteredArchives],
+  const openHoldingSyms = useMemo(
+    () => new Set(openPositions.map((p) => (p.symbol || "").trim().toUpperCase()).filter(Boolean)),
+    [openPositions],
   );
 
-  const showCompanion = Boolean(detail && tab !== "harddata" && tab !== "triggers");
+  const isArchiveHolding = useCallback(
+    (a: ArchiveListItem): boolean => {
+      const symUpper = a.symbol.trim().toUpperCase();
+      if (
+        detail &&
+        detail.symbol.trim().toUpperCase() === symUpper &&
+        detail.market.trim().toUpperCase() === a.market.trim().toUpperCase()
+      ) {
+        if ((detail.state.status || "").trim().toLowerCase() === "holding") return true;
+      }
+      if ((a.status || "").trim().toLowerCase() === "holding") return true;
+      return openHoldingSyms.has(symUpper);
+    },
+    [detail, openHoldingSyms],
+  );
+
+  const holdingArchives = useMemo(
+    () => filteredArchives.filter((a) => isArchiveHolding(a)),
+    [filteredArchives, isArchiveHolding],
+  );
+  const otherArchives = useMemo(
+    () => filteredArchives.filter((a) => !isArchiveHolding(a)),
+    [filteredArchives, isArchiveHolding],
+  );
+
+  const isDetailHeldInPortfolio = Boolean(
+    detail && openHoldingSyms.has(detail.symbol.trim().toUpperCase()),
+  );
+  const isDetailEffectiveHolding = Boolean(
+    detail &&
+      ((detail.state.status || "").trim().toLowerCase() === "holding" || isDetailHeldInPortfolio),
+  );
+
+  const showCompanion = Boolean(detail);
 
   const activeDeepRun = useMemo(() => {
     const exact = deepRuns[makeArchiveKey(effectiveMarket, detail?.symbol || activeSym)];
@@ -1879,11 +2146,14 @@ export function ArchiveView({
       (resolvedActiveMarket === null || a.market.toUpperCase() === resolvedActiveMarket);
     const rowRun = deepRuns[makeArchiveKey(a.market, a.symbol)];
     const rowResearching = rowRun?.status === "queued" || rowRun?.status === "running";
+    const holdingRow = isArchiveHolding(a);
+    const syncedLedgerOnly =
+      holdingRow && (a.status || "").trim().toLowerCase() !== "holding";
     const dotClass = rowResearching
       ? "bg-accent animate-ping"
-      : a.status === "holding"
+      : holdingRow
         ? "bg-bull"
-        : a.status === "watchlist"
+        : (a.status || "").trim().toLowerCase() === "watchlist"
           ? "bg-warning"
           : "bg-muted";
     return (
@@ -1905,14 +2175,26 @@ export function ArchiveView({
                   研究中
                 </span>
               ) : null}
-              <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`} title={a.status} aria-hidden="true" />
+              {syncedLedgerOnly ? (
+                <span
+                  className="rounded bg-bull/15 px-1 py-0.5 text-[10px] font-medium text-bull"
+                  title="实盘/模拟账本存在在途持仓，档案状态尚未同步为 holding"
+                >
+                  账本在途
+                </span>
+              ) : null}
+              <span
+                className={`h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`}
+                title={holdingRow ? "持有中" : statusBadgeLabel(a.status)}
+                aria-hidden="true"
+              />
             </span>
           </div>
           <div className="flex items-center justify-between gap-2 text-[11px] text-muted">
             <span className="font-mono">
               {a.market} · v{a.revision}
             </span>
-            <DirectionBadge direction={a.direction_bias} />
+            <DirectionBadge direction={directionBadgeInput(a.direction_bias)} />
           </div>
         </button>
       </li>
@@ -1955,14 +2237,14 @@ export function ArchiveView({
             <>
               {holdingArchives.length > 0 ? (
                 <div>
-                  <div className="section-title mb-1 px-2">在途持仓 ({holdingArchives.length})</div>
+                  <div className="section-title mb-1 px-2">持仓中 ({holdingArchives.length})</div>
                   <ul className="m-0 flex list-none flex-col gap-0.5 p-0">{holdingArchives.map(renderArchiveRow)}</ul>
                 </div>
               ) : null}
 
               {otherArchives.length > 0 ? (
                 <div>
-                  <div className="section-title mb-1 px-2">观察与归档 ({otherArchives.length})</div>
+                  <div className="section-title mb-1 px-2">观察池 / 已归档 ({otherArchives.length})</div>
                   <ul className="m-0 flex list-none flex-col gap-0.5 p-0">{otherArchives.map(renderArchiveRow)}</ul>
                 </div>
               ) : null}
@@ -1971,8 +2253,8 @@ export function ArchiveView({
         </div>
       </aside>
 
-      {/* Center Column: Memo Reader / Editor, Evidence Table, Wide Hard-Data or Trigger Builder */}
-      <div className={`flex min-w-0 flex-col gap-3.5 ${showCompanion ? "xl:col-span-6" : "xl:col-span-9"}`}>
+      {/* Right Workspace (stable full 9-col header + consistent 6/3 split below to prevent tab-switch jumps) */}
+      <div className="flex min-w-0 flex-col gap-3.5 xl:col-span-9">
         <section className="card flex flex-col gap-3 p-4">
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div className="min-w-0 flex-1 space-y-1.5">
@@ -1985,16 +2267,23 @@ export function ArchiveView({
                 {detail ? (
                   <StatusBadge
                     tone={
-                      detail.state.status === "holding"
+                      isDetailEffectiveHolding
                         ? "good"
-                        : detail.state.status === "watchlist"
+                        : (detail.state.status || "").trim().toLowerCase() === "watchlist"
                           ? "info"
                           : "neutral"
                     }
-                    label={statusBadgeLabel(detail.state.status)}
+                    label={isDetailEffectiveHolding ? "持有中" : statusBadgeLabel(detail.state.status)}
                   />
                 ) : null}
-                {detail ? <DirectionBadge direction={detail.state.direction_bias} /> : null}
+                {detail ? <DirectionBadge direction={directionBadgeInput(detail.state.direction_bias)} /> : null}
+                {detail &&
+                detail.state.confidence != null &&
+                String(detail.state.confidence).trim() !== "" ? (
+                  <span className="rounded border border-hairline-soft bg-elevated px-2 py-0.5 text-[11px] text-ink-2">
+                    置信度：{formatConfidenceLabel(detail.state.confidence)}
+                  </span>
+                ) : null}
                 {detail ? (
                   <span className="rounded border border-hairline-soft bg-sunken px-2 py-0.5 font-mono text-[11px] text-muted">
                     {detail.market} · v{detail.state.revision}
@@ -2004,6 +2293,17 @@ export function ArchiveView({
             </div>
 
             <div className="flex flex-wrap items-center gap-1.5">
+              {detail && !metaEditSession ? (
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={handleStartEditMeta}
+                  title="修改研究方向、主/次驱动板块、核心预期差摘要与置信度"
+                >
+                  <SlidersHorizontal className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
+                  <span>编辑研究结论</span>
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="btn btn-sm btn-primary"
@@ -2046,16 +2346,267 @@ export function ArchiveView({
             </div>
           </div>
 
+          {detail && isDetailHeldInPortfolio && (detail.state.status || "").trim().toLowerCase() !== "holding" ? (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-bull/35 bg-bull/8 px-3 py-1.5 text-xs text-ink">
+              <span>检测到该标的在持仓账本中处于在途持仓，但本地档案状态仍为「{statusBadgeLabel(detail.state.status)}」。</span>
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={statusBusy}
+                onClick={() => void handleStatusSwitch("holding")}
+              >
+                同步档案为持有中
+              </button>
+            </div>
+          ) : null}
+
+          {metaSaveFeedback ? (
+            <div
+              role="status"
+              className="flex items-center justify-between gap-2 rounded border border-bull/40 bg-bull/10 px-3 py-1.5 text-xs text-ink"
+            >
+              <span className="inline-flex items-center gap-1.5">
+                <CheckCircle2 className="h-3.5 w-3.5 text-bull" aria-hidden="true" />
+                <span>{metaSaveFeedback}</span>
+              </span>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm px-1 text-muted hover:text-ink"
+                aria-label="关闭保存提示"
+                onClick={() => setMetaSaveFeedback(null)}
+              >
+                <X className="h-3 w-3" aria-hidden="true" />
+              </button>
+            </div>
+          ) : null}
+
           {checkFeedback ? (
             <div className="rounded border border-accent/30 bg-accent/8 px-3 py-1.5 text-xs text-ink">
               {checkFeedback}
             </div>
           ) : null}
 
-          {detail?.state?.thesis_summary ? (
-            <div className="callout-editorial text-[12.5px] leading-relaxed text-ink-2">
-              <strong className="font-semibold text-ink">核心预期差：</strong>
-              {detail.state.thesis_summary}
+          {detail && metaEditSession ? (
+            <form
+              onSubmit={handleSaveMeta}
+              className="flex flex-col gap-3 rounded-lg border border-accent/40 bg-sunken/60 p-3.5"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-ink">编辑研究结论与核心元数据</span>
+                <span className="font-mono text-[11px] text-muted">
+                  基准版本 v{metaEditSession.baseRevision}
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label className="field">
+                  <span>研究方向 (direction_bias)</span>
+                  <select
+                    className="input"
+                    value={metaDirection}
+                    onChange={(e) =>
+                      setMetaDirection(e.target.value as "long" | "short" | "neutral" | "pair")
+                    }
+                  >
+                    <option value="long">做多 (long)</option>
+                    <option value="short">做空 (short)</option>
+                    <option value="neutral">中性观察 (neutral)</option>
+                    <option value="pair">多空配对 (pair)</option>
+                  </select>
+                </label>
+
+                <label className="field">
+                  <span>研究置信度 (confidence)</span>
+                  <select
+                    className="input"
+                    value={metaConfidence}
+                    onChange={(e) =>
+                      setMetaConfidence(e.target.value as "" | "high" | "medium" | "low")
+                    }
+                  >
+                    <option value="">未设定</option>
+                    <option value="high">高 (high)</option>
+                    <option value="medium">中 (medium)</option>
+                    <option value="low">低 (low)</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label className="field">
+                  <span>主驱动板块 / 主题 (layer1_drivers.primary)</span>
+                  <input
+                    className="input"
+                    placeholder="如 美国受监管电力公用事业与电网升级板块"
+                    value={metaPrimary}
+                    onChange={(e) => setMetaPrimary(e.target.value)}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>次驱动维度 (layer1_drivers.secondary)</span>
+                  <input
+                    className="input"
+                    placeholder="如 技术与产业迭代 × 宏观利率路径"
+                    value={metaSecondary}
+                    onChange={(e) => setMetaSecondary(e.target.value)}
+                  />
+                </label>
+              </div>
+
+              <label className="field">
+                <span>核心预期差摘要 (thesis_summary)</span>
+                <textarea
+                  className="input"
+                  rows={3}
+                  placeholder="概括 1Q~1Y 核心逻辑、关键预期差与证伪红线…"
+                  value={metaSummary}
+                  onChange={(e) => setMetaSummary(e.target.value)}
+                />
+              </label>
+
+              {metaEditErr ? (
+                <div
+                  role="alert"
+                  className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink"
+                >
+                  <span>{metaEditErr}</span>
+                  {metaConflict ? (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={refreshingMetaConflict || savingMeta}
+                        onClick={() => {
+                          if (!metaEditSession) return;
+                          const token = selectionTokenRef.current;
+                          const { symbol: targetSym, market: targetMkt } = metaEditSession;
+                          setRefreshingMetaConflict(true);
+                          loadedKeyRef.current = "";
+                          void loadDetail(targetSym, targetMkt, undefined, token)
+                            .then((latest) => {
+                              if (selectionTokenRef.current !== token) return;
+                              if (!latest) {
+                                setMetaEditErr(
+                                  "刷新最新档案失败，您的编辑草稿已保留，请检查网络或稍后重试。",
+                                );
+                                return;
+                              }
+                              setMetaEditSession((prev) =>
+                                prev ? { ...prev, baseRevision: latest.state.revision } : prev,
+                              );
+                              setMetaEditErr(null);
+                              setMetaConflict(false);
+                              setMetaSaveFeedback(
+                                `已刷新至最新基准版本 v${latest.state.revision}，您的草稿已保留，核对后可重新点击保存`,
+                              );
+                            })
+                            .finally(() => {
+                              if (selectionTokenRef.current === token) {
+                                setRefreshingMetaConflict(false);
+                              }
+                            });
+                        }}
+                      >
+                        {refreshingMetaConflict ? "正在刷新…" : "刷新最新档案"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-ghost"
+                        disabled={refreshingMetaConflict || savingMeta}
+                        onClick={() => {
+                          if (!metaEditSession) return;
+                          const token = selectionTokenRef.current;
+                          const { symbol: targetSym, market: targetMkt } = metaEditSession;
+                          setRefreshingMetaConflict(true);
+                          loadedKeyRef.current = "";
+                          void loadDetail(targetSym, targetMkt, undefined, token)
+                            .then((latest) => {
+                              if (selectionTokenRef.current !== token) return;
+                              if (!latest) {
+                                setMetaEditErr(
+                                  "拉取最新远端值失败，当前草稿已保留，请稍后重试。",
+                                );
+                                return;
+                              }
+                              const rawDir = (latest.state.direction_bias || "neutral").trim().toLowerCase();
+                              const normDir: "long" | "short" | "neutral" | "pair" =
+                                rawDir === "long" || rawDir === "short" || rawDir === "pair"
+                                  ? rawDir
+                                  : "neutral";
+                              setMetaDirection(normDir);
+                              setMetaPrimary(latest.state.layer1_drivers?.primary || "");
+                              setMetaSecondary(latest.state.layer1_drivers?.secondary || "");
+                              setMetaSummary(latest.state.thesis_summary || "");
+                              setMetaConfidence(normalizeConfidenceOption(latest.state.confidence));
+                              setMetaEditSession({
+                                symbol: latest.symbol,
+                                market: latest.market,
+                                baseRevision: latest.state.revision,
+                              });
+                              setMetaEditErr(null);
+                              setMetaConflict(false);
+                              setMetaSaveFeedback(
+                                `已载入最新远端版本 v${latest.state.revision} 的研究结论`,
+                              );
+                            })
+                            .finally(() => {
+                              if (selectionTokenRef.current === token) {
+                                setRefreshingMetaConflict(false);
+                              }
+                            });
+                        }}
+                      >
+                        放弃草稿改用最新远端值
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
+
+              <div className="flex justify-end gap-2 border-t border-hairline-soft pt-2.5">
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  disabled={savingMeta}
+                  onClick={() => {
+                    setMetaEditSession(null);
+                    setMetaEditErr(null);
+                    setMetaConflict(false);
+                  }}
+                >
+                  取消
+                </button>
+                <button type="submit" className="btn btn-sm btn-primary" disabled={savingMeta}>
+                  <Save className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>{savingMeta ? "正在保存…" : "保存研究结论"}</span>
+                </button>
+              </div>
+            </form>
+          ) : detail ? (
+            <div className="flex flex-col gap-2">
+              {detail.state.layer1_drivers?.primary || detail.state.layer1_drivers?.secondary ? (
+                <div className="grid grid-cols-1 gap-2 rounded-md border border-hairline-soft bg-sunken/50 px-3 py-2 text-xs sm:grid-cols-2">
+                  <div className="min-w-0">
+                    <span className="text-[11px] font-medium text-muted">主驱动板块 / 主题：</span>
+                    <span className="text-ink">
+                      {detail.state.layer1_drivers?.primary || "未设定"}
+                    </span>
+                  </div>
+                  <div className="min-w-0">
+                    <span className="text-[11px] font-medium text-muted">次驱动维度：</span>
+                    <span className="text-ink-2">
+                      {detail.state.layer1_drivers?.secondary || "未设定"}
+                    </span>
+                  </div>
+                </div>
+              ) : null}
+              {detail.state.thesis_summary ? (
+                <div className="callout-editorial text-[12.5px] leading-relaxed text-ink-2">
+                  <strong className="font-semibold text-ink">核心预期差：</strong>
+                  {detail.state.thesis_summary}
+                </div>
+              ) : null}
             </div>
           ) : null}
 
@@ -2184,6 +2735,8 @@ export function ArchiveView({
           </div>
         ) : null}
 
+        <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-9">
+          <div className={`flex min-w-0 flex-col gap-3.5 ${showCompanion ? "xl:col-span-6" : "xl:col-span-9"}`}>
         {/* TAB 1: Warm-Paper Thesis Markdown Reader / Safe Body Editor + Append Log */}
         {tab === "thesis" && detail ? (
           <div className="flex flex-col gap-3.5">
@@ -2229,8 +2782,8 @@ export function ArchiveView({
             ) : (
               <article className="card bg-paper px-6 py-6 md:px-8 md:py-7">
                 <div className="prose-desk mx-auto">
-                  <Markdown remarkPlugins={[remarkGfm]}>
-                    {cleanThesisDisplayMarkdown(detail.thesis_md) || "_暂无正文_"}
+                  <Markdown remarkPlugins={[[remarkGfm, { singleTilde: false }]]}>
+                    {detail.thesis_md || "_暂无正文_"}
                   </Markdown>
                 </div>
               </article>
@@ -2404,7 +2957,7 @@ export function ArchiveView({
                 </div>
               ) : null}
 
-              <form onSubmit={handleAddTrigger} className="grid grid-cols-1 items-end gap-2.5 sm:grid-cols-2 lg:grid-cols-12">
+              <form onSubmit={handleAddTrigger} className="grid grid-cols-1 items-end gap-2.5 sm:grid-cols-2 lg:grid-cols-6">
                 <label className="field lg:col-span-2">
                   <span>监控维度</span>
                   <select
@@ -2420,7 +2973,7 @@ export function ArchiveView({
                     ))}
                   </select>
                 </label>
-                <label className="field lg:col-span-3">
+                <label className="field lg:col-span-4">
                   <span>监控指标 *</span>
                   <select
                     className="input"
@@ -2437,7 +2990,7 @@ export function ArchiveView({
                   </select>
                 </label>
                 {trigCustomMode ? (
-                  <label className="field lg:col-span-3">
+                  <label className="field sm:col-span-2 lg:col-span-6">
                     <span>自定义键名 (metric) *</span>
                     <input
                       className="input font-mono"
@@ -2495,13 +3048,13 @@ export function ArchiveView({
                     <option value="alert">指标松动预警</option>
                   </select>
                 </label>
-                <div className="lg:col-span-2">
+                <div className="lg:col-span-1">
                   <button type="submit" className="btn btn-primary w-full" disabled={trigBusy}>
                     <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-                    <span>添加触发器</span>
+                    <span>添加</span>
                   </button>
                 </div>
-                <p id={trigHintId} className="m-0 text-[11px] text-muted sm:col-span-2 lg:col-span-12">
+                <p id={trigHintId} className="m-0 text-[11px] text-muted sm:col-span-2 lg:col-span-6">
                   {activeMetricPreset
                     ? `哨兵自动校验键名 ${activeMetricPreset.key}：${activeMetricPreset.note}`
                     : "自定义模式：请输入每日哨兵 observations 支持的精确指标键名，否则会被标为待校验。"}
@@ -2872,7 +3425,7 @@ export function ArchiveView({
             )}
           </section>
 
-          {tab === "thesis" ? (
+          {tab === "thesis" || tab === "harddata" ? (
             <section className="card flex flex-col gap-2.5 p-3.5">
               <div className="flex items-center justify-between gap-2">
                 <span className="section-title">最新 L1~L4 证据 ({detail.evidence_count})</span>
@@ -2908,6 +3461,8 @@ export function ArchiveView({
           ) : null}
         </aside>
       ) : null}
+        </div>
+      </div>
 
       <InitArchiveDialog
         open={initModalOpen}
@@ -2945,7 +3500,9 @@ export function ArchiveView({
         symbol={detail?.symbol || activeSym}
         name={detail?.state?.instrument?.name}
         market={effectiveMarket}
-        isHolding={detail?.state?.status === "holding"}
+        assetClass={detail?.asset_class ?? detail?.state?.instrument?.asset_class ?? null}
+        layer1Primary={detail?.state?.layer1_drivers?.primary ?? null}
+        isHolding={isDetailEffectiveHolding}
         enginesInfo={enginesInfo}
         onClose={() => setDeepDialogOpen(false)}
         onLaunch={async (opts) => {

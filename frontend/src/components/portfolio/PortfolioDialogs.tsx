@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { AlertTriangle } from "lucide-react";
 import { api, errorMessage } from "../../api/client";
-import type { Direction, OpenPositionBody, Position } from "../../api/types";
+import type { Direction, OpenPositionBody, Position, Tranche } from "../../api/types";
 import { fmtInputPrice, fmtPlanNum, fmtPrice, inferAssetCurrency, optNum, parseSymbolList } from "../../lib/format";
 import { formatSymbolWithCode } from "../../lib/symbols";
 import { CrossCurrencyFxBanner } from "../ui/CrossCurrencyFxBanner";
@@ -86,8 +87,9 @@ export function InitPortfolioDialog({
             <input
               className="input font-mono"
               type="number"
-              step="0.1"
-              min="0.1"
+              inputMode="decimal"
+              step="any"
+              min="0.01"
               max="10"
               required
               value={riskPerTrade}
@@ -99,7 +101,8 @@ export function InitPortfolioDialog({
             <input
               className="input font-mono"
               type="number"
-              step="0.1"
+              inputMode="decimal"
+              step="any"
               min="0.5"
               max="30"
               required
@@ -112,7 +115,8 @@ export function InitPortfolioDialog({
             <input
               className="input font-mono"
               type="number"
-              step="0.1"
+              inputMode="decimal"
+              step="any"
               min="0.5"
               max="20"
               required
@@ -144,10 +148,32 @@ export function InitPortfolioDialog({
 /* ------------------------------------------------------------------
  * 2. Open Position Dialog (sole_leader / co_leader)
  * ------------------------------------------------------------------ */
+const GENERIC_SECTOR_THEMES = new Set([
+  "临时自选",
+  "adhoc",
+  "ad-hoc",
+  "custom",
+  "us_stock_or_etf",
+  "a_share",
+  "cn_future",
+  "commodity",
+  "fx",
+  "crypto",
+  "default",
+  "watchlist",
+  "未分类",
+]);
+
+export function isGenericSectorTheme(theme?: string | null): boolean {
+  const norm = (theme || "").trim().toLowerCase();
+  return norm.length > 0 && GENERIC_SECTOR_THEMES.has(norm);
+}
+
 export interface OpenPositionSeed {
   symbol?: string;
   direction?: Direction;
   sector_theme?: string;
+  asset_class?: string | null;
   leader_role?: "sole_leader" | "co_leader";
   co_leader_reason?: string | null;
   entry_price?: number | null;
@@ -155,10 +181,27 @@ export interface OpenPositionSeed {
   structural_stop_daily?: number | null;
   target_price?: number | null;
   quantity?: number | null;
+  first_tranche_qty?: number | null;
+  first_tranche_weight?: number | null;
+  full_plan_qty?: number | null;
+  tranches?: Tranche[];
   fx_to_account?: number | null;
   macro_factors?: string[];
   exit_red_lines?: string[];
   notes?: string | null;
+}
+
+export interface OpenPositionReceipt {
+  symbol: string;
+  direction: Direction;
+  quantity: number;
+  entry_price: number;
+  sector_theme: string;
+  asset_class?: string | null;
+  position_id?: string | null;
+  archive_synced?: boolean;
+  tranche_label?: string | null;
+  opened_at_ms: number;
 }
 
 export function canVoidMistakenPosition(pos: Position | null | undefined): boolean {
@@ -179,16 +222,25 @@ export function OpenPositionDialog({
   onSuccess,
   seed,
   accountCurrency,
+  firstTrancheQty,
+  firstTrancheWeight,
+  fullPlanQty,
+  tranches,
 }: {
   open: boolean;
   onClose: () => void;
-  onSuccess: () => void;
+  onSuccess: (receipt?: OpenPositionReceipt) => void;
   seed?: OpenPositionSeed;
   accountCurrency?: string | null;
+  firstTrancheQty?: number | null;
+  firstTrancheWeight?: number | null;
+  fullPlanQty?: number | null;
+  tranches?: Tranche[];
 }) {
   const [symbol, setSymbol] = useState("");
   const [direction, setDirection] = useState<Direction>("long");
   const [sectorTheme, setSectorTheme] = useState("");
+  const [genericThemeHint, setGenericThemeHint] = useState<string | null>(null);
   const [leaderRole, setLeaderRole] = useState<"sole_leader" | "co_leader">("sole_leader");
   const [coLeaderReason, setCoLeaderReason] = useState("");
   const [entryPrice, setEntryPrice] = useState("");
@@ -196,6 +248,7 @@ export function OpenPositionDialog({
   const [stopDaily, setStopDaily] = useState("");
   const [targetPrice, setTargetPrice] = useState("");
   const [quantity, setQuantity] = useState("");
+  const [qtyPreset, setQtyPreset] = useState<"t1" | "full" | "custom">("full");
   const [fxToAccount, setFxToAccount] = useState("");
   const [macroFactors, setMacroFactors] = useState("");
   const [redLines, setRedLines] = useState("");
@@ -203,28 +256,95 @@ export function OpenPositionDialog({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  const resolvedTranches = tranches ?? seed?.tranches ?? [];
+  const resolvedFullQty = fullPlanQty ?? seed?.full_plan_qty ?? seed?.quantity ?? null;
+  const resolvedFirstQty =
+    firstTrancheQty ?? seed?.first_tranche_qty ?? (resolvedTranches[0]?.quantity ?? null);
+  const resolvedFirstWeight =
+    firstTrancheWeight ?? seed?.first_tranche_weight ?? (resolvedTranches[0]?.weight ?? null);
+  const hasSplitTranches = Boolean(
+    resolvedFirstQty != null &&
+      resolvedFirstQty > 0 &&
+      resolvedFullQty != null &&
+      resolvedFullQty > 0 &&
+      resolvedFirstQty < resolvedFullQty - 1e-9,
+  );
+  const firstTranchePct = hasSplitTranches
+    ? resolvedFirstWeight != null && resolvedFirstWeight > 0
+      ? Math.round(resolvedFirstWeight * 100)
+      : Math.round(((resolvedFirstQty ?? 0) / (resolvedFullQty ?? 1)) * 100)
+    : null;
+
   useEffect(() => {
     if (!open) return;
     setSymbol(seed?.symbol ?? "");
     setDirection(seed?.direction ?? "long");
-    setSectorTheme(seed?.sector_theme ?? "");
+    const rawTheme = (seed?.sector_theme ?? "").trim();
+    if (isGenericSectorTheme(rawTheme)) {
+      setSectorTheme("");
+      setGenericThemeHint(rawTheme);
+    } else {
+      setSectorTheme(rawTheme);
+      setGenericThemeHint(null);
+    }
     setLeaderRole(seed?.leader_role === "co_leader" ? "co_leader" : "sole_leader");
     setCoLeaderReason(seed?.co_leader_reason ?? "");
     setEntryPrice(seed?.entry_price != null ? fmtPlanNum(seed.entry_price, 6) : "");
     setStop30m(seed?.tactical_stop_30m != null ? fmtPlanNum(seed.tactical_stop_30m, 6) : "");
     setStopDaily(seed?.structural_stop_daily != null ? fmtPlanNum(seed.structural_stop_daily, 6) : "");
     setTargetPrice(seed?.target_price != null ? fmtPlanNum(seed.target_price, 6) : "");
-    setQuantity(seed?.quantity != null && seed.quantity > 0 ? fmtPlanNum(seed.quantity, 6) : "");
+    if (hasSplitTranches && resolvedFirstQty != null) {
+      setQuantity(fmtPlanNum(resolvedFirstQty, 6));
+      setQtyPreset("t1");
+    } else if (resolvedFullQty != null && resolvedFullQty > 0) {
+      setQuantity(fmtPlanNum(resolvedFullQty, 6));
+      setQtyPreset("full");
+    } else {
+      setQuantity("");
+      setQtyPreset("custom");
+    }
     setFxToAccount(seed?.fx_to_account != null && seed.fx_to_account > 0 ? fmtPlanNum(seed.fx_to_account, 6) : "");
     setMacroFactors((seed?.macro_factors ?? []).join(", "));
     setRedLines((seed?.exit_red_lines ?? []).join("\n"));
     setNotes(seed?.notes ?? "");
     setErr(null);
-  }, [open, seed]);
+  }, [open, seed, hasSplitTranches, resolvedFirstQty, resolvedFullQty]);
 
   const acctCcy = (accountCurrency || "USD").toUpperCase();
   const quoteCcy = inferAssetCurrency(symbol);
   const needsCrossFx = Boolean(quoteCcy && quoteCcy !== acctCcy);
+  const currentThemeIsGeneric = isGenericSectorTheme(sectorTheme);
+  const genericThemeLabel = currentThemeIsGeneric
+    ? sectorTheme.trim()
+    : !sectorTheme.trim() && genericThemeHint
+      ? genericThemeHint
+      : null;
+
+  const handleSelectQtyPreset = (mode: "t1" | "full") => {
+    if (mode === "t1" && resolvedFirstQty != null && resolvedFirstQty > 0) {
+      setQuantity(fmtPlanNum(resolvedFirstQty, 6));
+      setQtyPreset("t1");
+    } else if (mode === "full" && resolvedFullQty != null && resolvedFullQty > 0) {
+      setQuantity(fmtPlanNum(resolvedFullQty, 6));
+      setQtyPreset("full");
+    }
+  };
+
+  const handleQuantityChange = (val: string) => {
+    setQuantity(val);
+    if (!hasSplitTranches) {
+      setQtyPreset("custom");
+      return;
+    }
+    const parsed = optNum(val);
+    if (parsed != null && resolvedFirstQty != null && Math.abs(parsed - resolvedFirstQty) <= 1e-6) {
+      setQtyPreset("t1");
+    } else if (parsed != null && resolvedFullQty != null && Math.abs(parsed - resolvedFullQty) <= 1e-6) {
+      setQtyPreset("full");
+    } else {
+      setQtyPreset("custom");
+    }
+  };
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -233,6 +353,12 @@ export function OpenPositionDialog({
     const qty = optNum(quantity);
     if (!symbol.trim() || !sectorTheme.trim() || ep === undefined || s30 === undefined || qty === undefined) {
       setErr("请填写标的代码、所属主驱动板块、入场价、30min 战术止损与数量");
+      return;
+    }
+    if (isGenericSectorTheme(sectorTheme)) {
+      setErr(
+        `所属板块不能使用「${sectorTheme.trim()}」等通用占位名，请填写具体板块主题名称，以免与其他无关标的在单一板块龙头独占制下互相锁死。`,
+      );
       return;
     }
     const fxVal = optNum(fxToAccount);
@@ -269,8 +395,38 @@ export function OpenPositionDialog({
       if (lines.length > 0) body.exit_red_lines = lines;
       if (notes.trim()) body.notes = notes.trim();
 
-      await api.openPosition(body);
-      onSuccess();
+      const rawRes = await api.openPosition(body);
+      const resObj =
+        rawRes && typeof rawRes === "object" ? (rawRes as Record<string, unknown>) : null;
+      const posObj =
+        resObj?.position && typeof resObj.position === "object"
+          ? (resObj.position as Record<string, unknown>)
+          : null;
+      const archiveSyncObj =
+        resObj?.archive_status_sync && typeof resObj.archive_status_sync === "object"
+          ? (resObj.archive_status_sync as Record<string, unknown>)
+          : null;
+      const trancheLabel = hasSplitTranches
+        ? qtyPreset === "t1"
+          ? "T1 首仓"
+          : qtyPreset === "full"
+            ? "核定全仓"
+            : null
+        : null;
+      const receipt: OpenPositionReceipt = {
+        symbol: typeof posObj?.symbol === "string" ? posObj.symbol : body.symbol,
+        direction: body.direction,
+        quantity: body.quantity,
+        entry_price: body.entry_price,
+        sector_theme: body.sector_theme,
+        asset_class:
+          typeof posObj?.asset_class === "string" ? posObj.asset_class : (seed?.asset_class ?? null),
+        position_id: typeof posObj?.position_id === "string" ? posObj.position_id : null,
+        archive_synced: Boolean(archiveSyncObj?.synced),
+        tranche_label: trancheLabel,
+        opened_at_ms: Date.now(),
+      };
+      onSuccess(receipt);
       onClose();
     } catch (ex) {
       setErr(errorMessage(ex));
@@ -327,9 +483,11 @@ export function OpenPositionDialog({
           <label className="field sm:col-span-2">
             <span>所属板块 / 主驱动主题 *</span>
             <input
-              className="input"
+              className={`input ${genericThemeLabel ? "border-warning/70" : ""}`}
               required
-              autoFocus={Boolean(seed?.symbol && !seed?.sector_theme)}
+              autoFocus={Boolean(
+                seed?.symbol && (!seed?.sector_theme || isGenericSectorTheme(seed.sector_theme)),
+              )}
               placeholder="如 北美电网基建 / 全球铜供需劈叉"
               value={sectorTheme}
               onChange={(e) => setSectorTheme(e.target.value)}
@@ -344,10 +502,51 @@ export function OpenPositionDialog({
               min="0.0001"
               required
               value={quantity}
-              onChange={(e) => setQuantity(e.target.value)}
+              onChange={(e) => handleQuantityChange(e.target.value)}
             />
           </label>
         </div>
+
+        {hasSplitTranches && resolvedFirstQty != null && resolvedFullQty != null ? (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline bg-sunken px-3 py-2 text-xs">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="font-medium text-ink-2">建仓仓位快切：</span>
+              <div className="inline-flex items-center gap-1.5" role="group" aria-label="首仓与全仓切换">
+                <button
+                  type="button"
+                  className="chip py-0.5 text-[11.5px] font-medium"
+                  aria-pressed={qtyPreset === "t1"}
+                  onClick={() => handleSelectQtyPreset("t1")}
+                >
+                  T1 首仓 ({firstTranchePct}% · {fmtPlanNum(resolvedFirstQty, 4)})
+                </button>
+                <button
+                  type="button"
+                  className="chip py-0.5 text-[11.5px] font-medium"
+                  aria-pressed={qtyPreset === "full"}
+                  onClick={() => handleSelectQtyPreset("full")}
+                >
+                  核定全仓 (100% · {fmtPlanNum(resolvedFullQty, 4)})
+                </button>
+              </div>
+            </div>
+            <span className="text-[11px] text-muted">
+              默认按分批计划预填 T1 首仓，浮盈确认后可在哨兵总控继续顺势加仓
+            </span>
+          </div>
+        ) : null}
+
+        {genericThemeLabel ? (
+          <div
+            role="status"
+            className="flex items-start gap-2 rounded-md border border-warning/50 bg-warning/10 px-3 py-2 text-xs text-ink"
+          >
+            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
+            <span>
+              <strong>板块防撞名提示：</strong>当前所属板块为「{genericThemeLabel}」，为避免与其他无关标的在单一板块龙头独占制下互相锁死，请填写具体板块主题名称（如「北美电网基建」「全球铜供需劈叉」）。
+            </span>
+          </div>
+        ) : null}
 
         {needsCrossFx && quoteCcy ? (
           <CrossCurrencyFxBanner
@@ -382,7 +581,12 @@ export function OpenPositionDialog({
               type="number"
               step="any"
               required
-              autoFocus={Boolean(seed?.symbol && seed?.sector_theme && seed?.entry_price == null)}
+              autoFocus={Boolean(
+                seed?.symbol &&
+                  seed?.sector_theme &&
+                  !isGenericSectorTheme(seed.sector_theme) &&
+                  seed?.entry_price == null,
+              )}
               value={entryPrice}
               onChange={(e) => setEntryPrice(e.target.value)}
             />

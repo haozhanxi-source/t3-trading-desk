@@ -1544,6 +1544,215 @@ class TestChanlunEngine(unittest.TestCase):
         self.assertNotEqual(mom_zero["verdict"], "higher_low_pullback")
         self.assertEqual(mom_zero["verdict"], "neutral_extension_down")
 
+    def test_lesson11_reverse_k_boundary_and_warroom_sentinel_alignment(self):
+        from chanlun import (
+            Stroke,
+            assess_dual_timeframe_alignment,
+            detect_stroke_end_trigger,
+            evaluate_signal_tier,
+        )
+
+        # 1) Continuing bar at hi_r == len(df) - 1 making a new stroke high MUST NOT false-trigger
+        #    just because its lower wick dipped below an earlier reverse yin bar inside the same stroke.
+        df_live_up = make_df([
+            (100.0, 102.0, 99.5, 101.8),   # bar 0: stroke start
+            (101.8, 105.0, 101.5, 104.5),  # bar 1: yang
+            (104.5, 104.8, 103.0, 103.5),  # bar 2: reverse yin (cluster_low = 103.0)
+            (103.5, 108.0, 102.5, 107.5),  # bar 3 (hi_r == last bar): yang making new stroke high 108.0
+        ], start="2026-11-20")
+        live_up = Stroke(
+            direction="up", start_date="2026-11-20", end_date="2026-11-23",
+            start_price=99.5, end_price=108.0, high=108.0, low=99.5,
+            start_merged_idx=0, end_merged_idx=3, start_raw_idx=0, end_raw_idx=3,
+            raw_bars=4, pct_change=8.54, macd_area=3.0, macd_peak=1.2, dif_extreme=1.0,
+            efficiency=2.1, avg_vol_ratio=1.0, is_confirmed=False,
+        )
+        trig_live_up = detect_stroke_end_trigger(df_live_up, [live_up])
+        self.assertIsNotNone(trig_live_up)
+        self.assertFalse(trig_live_up["triggered"])
+
+        # 2) Exact equality on subsequent bar (post_low == lvl) MUST NOT trigger; precision 84.605 preserved in description
+        df_eq = make_df([
+            (83.785, 84.87, 83.27, 84.65),
+            (84.65, 85.05, 84.605, 84.685),   # stroke end, low = 84.605
+            (84.685, 84.90, 84.605, 84.72),   # exact touch 84.605 -> NOT strictly broken
+        ], start="2026-11-20")
+        eq_up = Stroke(
+            direction="up", start_date="2026-11-20", end_date="2026-11-21",
+            start_price=83.27, end_price=85.05, high=85.05, low=83.27,
+            start_merged_idx=0, end_merged_idx=1, start_raw_idx=0, end_raw_idx=1,
+            raw_bars=2, pct_change=2.14, macd_area=0.4, macd_peak=0.2, dif_extreme=0.04,
+            efficiency=1.07, avg_vol_ratio=1.0, is_confirmed=False,
+        )
+        trig_eq = detect_stroke_end_trigger(df_eq, [eq_up])
+        self.assertIsNotNone(trig_eq)
+        self.assertFalse(trig_eq["triggered"])
+        self.assertEqual(trig_eq["level"], 84.605)
+        self.assertIn("84.605", trig_eq["description"])
+
+        # 3) Real break below 84.605 -> triggered=True AND exact 84.605 in description (not rounded 84.61)
+        df_brk = make_df([
+            (83.785, 84.87, 83.27, 84.65),
+            (84.65, 85.05, 84.605, 84.685),
+            (84.68, 84.69, 84.39, 84.505),    # strictly breaks below 84.605
+        ], start="2026-11-20")
+        trig_brk = detect_stroke_end_trigger(df_brk, [eq_up])
+        self.assertIsNotNone(trig_brk)
+        self.assertTrue(trig_brk["triggered"])
+        self.assertIn("84.605", trig_brk["description"])
+
+        # 4) War Room vs Sentinel unified boundary (NEE repro):
+        #    When 30m has a buy signal BUT its up-stroke already triggered Lesson-11 break (direction="up", triggered=True),
+        #    evaluate_signal_tier MUST demote confirmed=False and assess_dual_timeframe_alignment MUST NOT emit aligned_trigger/entry_long!
+        daily_long = {
+            "timeframe": "日线",
+            "last_close": 84.58,
+            "price_vs_zhongshu": "above_zg(+2.14%)",
+            "latest_zhongshu": {"zd": 80.87, "zg": 82.81},
+            "momentum_assessment": {"active_direction": "up", "is_capital_consensus": False},
+            "stroke_end_trigger": {"direction": "up", "level": 83.27, "triggered": False},
+            "recent_strokes": [{"direction": "up", "start_price": 82.94, "end_price": 85.05, "low": 82.94, "high": 85.05, "is_confirmed": False}],
+            "signals": ["日线首中枢三买确认(回踩不破ZG=82.81·底分型上攻)"],
+        }
+        intraday_nee_broken_up = {
+            "timeframe": "30分钟",
+            "last_close": 84.605,
+            "price_vs_zhongshu": "inside_zs(46%)",
+            "latest_zhongshu": {"zd": 84.2073, "zg": 85.075},
+            "momentum_assessment": {"active_direction": "up", "is_capital_consensus": True, "verdict": "capital_consensus_up"},
+            "stroke_end_trigger": {
+                "direction": "up",
+                "trigger_kind": "break_prev_bar_low",
+                "level": 84.605,
+                "ref_date": "2026-11-24T10:00-05:00",
+                "triggered": True,
+                "description": "已下破上行笔末根K线低点 84.605（旧上行笔大概率结束）",
+            },
+            "recent_strokes": [{"direction": "up", "start_price": 83.27, "end_price": 85.05, "low": 83.27, "high": 85.05, "is_confirmed": False}],
+            "signals": ["30分钟3出(D3)/二买启动(不破前低82.94+底分型)"],
+        }
+        ev_broken = evaluate_signal_tier(intraday_nee_broken_up, timeframe_label="30分钟")
+        self.assertFalse(ev_broken["signal_meta"]["confirmed"])
+        self.assertTrue(ev_broken["signal_meta"]["stroke_end_weakening"])
+        aln_broken = assess_dual_timeframe_alignment(daily_long, intraday_nee_broken_up, desired_direction="long")
+        self.assertFalse(aln_broken["aligned"])
+        self.assertEqual(aln_broken["alignment_status"], "daily_ok_wait_30m")
+        self.assertEqual(aln_broken["intraday_action"], "wait_structure")
+        self.assertFalse(aln_broken["intraday_signal_meta"]["confirmed"])
+        self.assertTrue(aln_broken["intraday_signal_meta"]["stroke_end_weakening"])
+
+        # 5) Positive control: 30m pullback DOWN stroke breaking its reverse yang high (direction="down", triggered=True)
+        #    is a BULLISH confirmation, NOT weakening -> MUST remain aligned_trigger / entry_long!
+        intraday_pullback_confirm = {
+            "timeframe": "30分钟",
+            "last_close": 84.90,
+            "price_vs_zhongshu": "above_zg(+0.5%)",
+            "latest_zhongshu": {"zd": 83.5, "zg": 84.5},
+            "momentum_assessment": {"active_direction": "down", "is_capital_consensus": False, "verdict": "higher_low_pullback"},
+            "stroke_end_trigger": {
+                "direction": "down",
+                "trigger_kind": "break_reverse_yang_high",
+                "level": 84.70,
+                "triggered": True,
+                "description": "已上破下行笔内最近反向阳线高点 84.7（旧下行笔大概率结束）",
+            },
+            "recent_strokes": [{"direction": "down", "start_price": 85.5, "end_price": 84.5, "low": 84.5, "high": 85.5, "is_confirmed": False}],
+            "signals": ["30分钟3出(D3·首次底抬高)/二买确认(回踩不破前低83.27)"],
+        }
+        aln_ok = assess_dual_timeframe_alignment(daily_long, intraday_pullback_confirm, desired_direction="long")
+        self.assertTrue(aln_ok["aligned"])
+        self.assertEqual(aln_ok["alignment_status"], "aligned_trigger")
+        self.assertEqual(aln_ok["intraday_action"], "entry_long")
+        self.assertTrue(aln_ok["intraday_signal_meta"]["confirmed"])
+        self.assertFalse(aln_ok["intraday_signal_meta"]["stroke_end_weakening"])
+
+        # 6) Symmetric SHORT case: 30m down-stroke already broke upward (direction="down", triggered=True)
+        #    MUST block aligned_trigger / entry_short!
+        daily_short = {
+            "timeframe": "日线",
+            "last_close": 100.0,
+            "price_vs_zhongshu": "below_zd(-5.0%)",
+            "latest_zhongshu": {"zd": 105.0, "zg": 112.0},
+            "momentum_assessment": {"active_direction": "down", "is_capital_consensus": True},
+            "recent_strokes": [{"direction": "down", "start_price": 110.0, "end_price": 100.0, "low": 100.0, "high": 110.0, "is_confirmed": False}],
+            "signals": ["日线向下离开段·资金方向一致"],
+        }
+        intraday_broken_dn = {
+            "timeframe": "30分钟",
+            "last_close": 100.5,
+            "price_vs_zhongshu": "below_zd(-1.0%)",
+            "latest_zhongshu": {"zd": 101.5, "zg": 103.5},
+            "momentum_assessment": {"active_direction": "down", "is_capital_consensus": False},
+            "stroke_end_trigger": {
+                "direction": "down",
+                "trigger_kind": "break_prev_bar_high",
+                "level": 100.2,
+                "triggered": True,
+                "description": "已上破下行笔末根K线高点 100.2（旧下行笔大概率结束）",
+            },
+            "recent_strokes": [{"direction": "down", "start_price": 102.0, "end_price": 99.8, "low": 99.8, "high": 102.0, "is_confirmed": False}],
+            "signals": ["30分钟首中枢三卖确认(反抽不过ZD=101.5+顶分型)"],
+        }
+        aln_short_brk = assess_dual_timeframe_alignment(daily_short, intraday_broken_dn, desired_direction="short")
+        self.assertFalse(aln_short_brk["aligned"])
+        self.assertEqual(aln_short_brk["alignment_status"], "daily_ok_wait_30m")
+        self.assertEqual(aln_short_brk["intraday_action"], "wait_structure")
+        self.assertTrue(aln_short_brk["intraday_signal_meta"]["stroke_end_weakening"])
+
+    def test_stroke_end_trigger_micro_price_scale_aware_eps_and_precision(self):
+        """P2-1: Scale-aware eps & micro-price precision in Lesson-11 stroke_end_trigger."""
+        from chanlun import Stroke, detect_stroke_end_trigger
+
+        dates = pd.date_range("2026-01-01", periods=5, freq="D")
+        # Up stroke spanning bars 0..3 at 1e-9 price scale, with reverse yin bar at index 2 (low = 1.0e-9).
+        # Bar 4 drops 9.5% below 1.0e-9 to 0.905e-9 — old fixed eps=1e-9 swallowed this break!
+        df_break = pd.DataFrame(
+            {
+                "Open": [0.80e-9, 0.95e-9, 1.08e-9, 1.05e-9, 1.00e-9],
+                "High": [0.96e-9, 1.10e-9, 1.09e-9, 1.15e-9, 1.01e-9],
+                "Low": [0.78e-9, 0.94e-9, 1.00e-9, 1.04e-9, 0.905e-9],
+                "Close": [0.95e-9, 1.08e-9, 1.02e-9, 1.14e-9, 0.91e-9],
+            },
+            index=dates,
+        )
+        up_stroke = Stroke(
+            direction="up",
+            start_date="2026-01-01",
+            end_date="2026-01-04",
+            start_price=0.78e-9,
+            end_price=1.15e-9,
+            high=1.15e-9,
+            low=0.78e-9,
+            start_merged_idx=0,
+            end_merged_idx=3,
+            start_raw_idx=0,
+            end_raw_idx=3,
+            raw_bars=4,
+            pct_change=47.44,
+            macd_area=1.0,
+            macd_peak=0.5,
+            dif_extreme=0.3,
+            efficiency=11.86,
+            avg_vol_ratio=1.0,
+            is_confirmed=False,
+        )
+        trig = detect_stroke_end_trigger(df_break, [up_stroke])
+        self.assertIsNotNone(trig)
+        self.assertTrue(trig["triggered"])
+        self.assertGreater(trig["level"], 0.0)
+        self.assertAlmostEqual(trig["level"], 1.0e-9, delta=1e-15)
+        self.assertIn("1e-09", trig["description"])
+        self.assertNotIn(" 0.0", trig["description"])
+
+        # Exact touch at 1.0e-9 MUST NOT false-trigger
+        df_touch = df_break.copy()
+        df_touch.iloc[4, df_touch.columns.get_loc("Low")] = 1.00e-9
+        df_touch.iloc[4, df_touch.columns.get_loc("Close")] = 1.01e-9
+        trig_touch = detect_stroke_end_trigger(df_touch, [up_stroke])
+        self.assertIsNotNone(trig_touch)
+        self.assertFalse(trig_touch["triggered"])
+        self.assertAlmostEqual(trig_touch["level"], 1.0e-9, delta=1e-15)
+
 
 if __name__ == "__main__":
     unittest.main()

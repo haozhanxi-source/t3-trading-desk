@@ -10,17 +10,204 @@ import {
   createSeriesMarkers,
   type IChartApi,
   type IPriceLine,
+  type IPrimitivePaneRenderer,
+  type IPrimitivePaneView,
   type ISeriesApi,
   type ISeriesMarkersPluginApi,
+  type ISeriesPrimitive,
   type MouseEventParams,
+  type PrimitivePaneViewZOrder,
+  type SeriesAttachedParameter,
+  type SeriesType,
   type Time,
 } from "lightweight-charts";
 import { Crosshair, Layers, Maximize2, Table2 } from "lucide-react";
 import type { ChanlunTimeframe, SignalSummary, ZhongshuRelation } from "../../api/types";
 import { fmtFixed, fmtMomentumVerdict, fmtPct, fmtPosVsZs, fmtPrice, shortTime } from "../../lib/format";
-import { useTheme } from "../../lib/theme";
+import { useTheme, type ChartPalette } from "../../lib/theme";
 import { ZhongshuBoxesPrimitive, type ZhongshuBoxDrawItem } from "./ZhongshuBoxesPrimitive";
-import { computePosVsZs, prepareChanlunSeries, timeKey, type AnyBar, type IndexedBar } from "./chanlunUtils";
+import {
+  computePosVsZs,
+  prepareChanlunSeries,
+  timeKey,
+  type AnyBar,
+  type IndexedBar,
+  type SignalCalloutItem,
+} from "./chanlunUtils";
+
+type CalloutRenderTarget = Parameters<IPrimitivePaneRenderer["draw"]>[0];
+
+interface PixelSignalCallout {
+  x: number;
+  y: number;
+  position: "aboveBar" | "belowBar";
+  text: string;
+  color: string;
+}
+
+class SignalCalloutRenderer implements IPrimitivePaneRenderer {
+  private _item: PixelSignalCallout | null = null;
+  private _palette: ChartPalette;
+
+  constructor(palette: ChartPalette) {
+    this._palette = palette;
+  }
+
+  update(item: PixelSignalCallout | null, palette: ChartPalette): void {
+    this._item = item;
+    this._palette = palette;
+  }
+
+  draw(target: CalloutRenderTarget): void {
+    const item = this._item;
+    if (!item) return;
+    const isDark = this._palette.mode === "dark";
+
+    target.useMediaCoordinateSpace(({ context: ctx, mediaSize }) => {
+      const w = mediaSize.width;
+      const h = mediaSize.height;
+      if (w <= 20 || h <= 20) return;
+      /* Skip when marker bar has scrolled completely off the visible viewport */
+      if (item.x < -36 || item.x > w + 36 || item.y < -36 || item.y > h + 36) return;
+
+      ctx.save();
+      ctx.font = '600 11px "Inter", -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
+      const textW = ctx.measureText(item.text).width;
+      const padX = 6;
+      const pillW = Math.min(Math.max(24, Math.ceil(textW + padX * 2)), Math.max(24, w - 8));
+      const pillH = 19;
+
+      /* Edge-clamped horizontal placement: automatically shifts left near the right Y-axis */
+      const idealLeft = item.x - pillW / 2;
+      const pillX = Math.max(4, Math.min(Math.max(4, w - pillW - 4), idealLeft));
+
+      const offset = 19;
+      const rawY = item.position === "belowBar" ? item.y + offset : item.y - offset - pillH;
+      const pillY = Math.max(4, Math.min(Math.max(4, h - pillH - 4), rawY));
+
+      /* Subtle leader line when edge-clamping shifts the pill noticeably away from the arrow */
+      const pillCenterX = pillX + pillW / 2;
+      if (Math.abs(pillCenterX - item.x) > 8 && item.x >= 0 && item.x <= w) {
+        const anchorY = item.position === "belowBar" ? Math.min(h - 4, item.y + 11) : Math.max(4, item.y - 11);
+        const edgeY = item.position === "belowBar" ? pillY : pillY + pillH;
+        const connectX = Math.max(pillX + 6, Math.min(pillX + pillW - 6, item.x));
+        ctx.strokeStyle = item.color;
+        ctx.globalAlpha = 0.55;
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(item.x, anchorY);
+        ctx.lineTo(connectX, edgeY);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+
+      /* Crisp tinted backdrop + color border so label remains legible over candles/gridlines */
+      ctx.fillStyle = isDark ? "rgba(12, 14, 18, 0.90)" : "rgba(255, 255, 255, 0.94)";
+      ctx.beginPath();
+      ctx.roundRect(pillX, pillY, pillW, pillH, 4);
+      ctx.fill();
+
+      ctx.strokeStyle = item.color;
+      ctx.globalAlpha = 0.65;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+
+      ctx.fillStyle = item.color;
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(item.text, pillX + pillW / 2, pillY + pillH / 2 + 0.5);
+      ctx.restore();
+    });
+  }
+}
+
+class SignalCalloutPaneView implements IPrimitivePaneView {
+  private readonly _renderer: SignalCalloutRenderer;
+
+  constructor(palette: ChartPalette) {
+    this._renderer = new SignalCalloutRenderer(palette);
+  }
+
+  update(item: PixelSignalCallout | null, palette: ChartPalette): void {
+    this._renderer.update(item, palette);
+  }
+
+  zOrder(): PrimitivePaneViewZOrder {
+    return "top";
+  }
+
+  renderer(): IPrimitivePaneRenderer {
+    return this._renderer;
+  }
+}
+
+/**
+ * Edge-aware signal callout primitive so latest-bar Chanlun labels (e.g. "2买·已确认")
+ * automatically align inside the plot boundary and are NEVER clipped by the right Y-axis.
+ */
+class SignalCalloutPrimitive implements ISeriesPrimitive<Time> {
+  private _attached: SeriesAttachedParameter<Time, SeriesType> | null = null;
+  private _item: SignalCalloutItem | null = null;
+  private _palette: ChartPalette;
+  private readonly _paneView: SignalCalloutPaneView;
+  private readonly _paneViews: readonly IPrimitivePaneView[];
+
+  constructor(palette: ChartPalette) {
+    this._palette = palette;
+    this._paneView = new SignalCalloutPaneView(palette);
+    this._paneViews = [this._paneView];
+  }
+
+  attached(param: SeriesAttachedParameter<Time, SeriesType>): void {
+    this._attached = param;
+    this.updateAllViews();
+  }
+
+  detached(): void {
+    this._attached = null;
+  }
+
+  setItem(item: SignalCalloutItem | null): void {
+    this._item = item;
+    this.updateAllViews();
+    this._attached?.requestUpdate();
+  }
+
+  setPalette(palette: ChartPalette): void {
+    this._palette = palette;
+    this.updateAllViews();
+    this._attached?.requestUpdate();
+  }
+
+  updateAllViews(): void {
+    if (!this._attached || !this._item) {
+      this._paneView.update(null, this._palette);
+      return;
+    }
+    const { chart, series } = this._attached;
+    const x = chart.timeScale().timeToCoordinate(this._item.time);
+    const y = series.priceToCoordinate(this._item.price);
+    if (x === null || y === null || !Number.isFinite(x) || !Number.isFinite(y)) {
+      this._paneView.update(null, this._palette);
+      return;
+    }
+    this._paneView.update(
+      {
+        x,
+        y,
+        position: this._item.position,
+        text: this._item.text,
+        color: this._item.color,
+      },
+      this._palette,
+    );
+  }
+
+  paneViews(): readonly IPrimitivePaneView[] {
+    return this._paneViews;
+  }
+}
 
 function fmtRelationLabel(rel: ZhongshuRelation | undefined): string {
   switch (rel) {
@@ -187,6 +374,7 @@ export function ChanlunChart({
   const macdDeaRef = useRef<ISeriesApi<"Line", Time> | null>(null);
   const markersRef = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
   const zsPrimitiveRef = useRef<ZhongshuBoxesPrimitive | null>(null);
+  const signalCalloutRef = useRef<SignalCalloutPrimitive | null>(null);
   const priceLinesRef = useRef<IPriceLine[]>([]);
   const prevBarCountRef = useRef<number>(0);
   const prevFirstTimeRef = useRef<string>("");
@@ -246,7 +434,7 @@ export function ChanlunChart({
         borderColor: palette.gridline,
         timeVisible: intraday,
         secondsVisible: false,
-        rightOffset: 4,
+        rightOffset: intraday ? 12 : 10,
       },
     });
 
@@ -262,6 +450,8 @@ export function ChanlunChart({
 
     const zsPrimitive = new ZhongshuBoxesPrimitive(palette);
     candleSeries.attachPrimitive(zsPrimitive);
+    const signalCalloutPrimitive = new SignalCalloutPrimitive(palette);
+    candleSeries.attachPrimitive(signalCalloutPrimitive);
 
     /* Strokes (笔): neutral understated silver skeleton so Zhongshu & Segments own color hierarchy */
     const strokeConfirmed = chart.addSeries(LineSeries, {
@@ -445,6 +635,7 @@ export function ChanlunChart({
     macdDeaRef.current = macdDea;
     markersRef.current = markersPlugin;
     zsPrimitiveRef.current = zsPrimitive;
+    signalCalloutRef.current = signalCalloutPrimitive;
 
     return () => {
       window.cancelAnimationFrame(rafId);
@@ -453,6 +644,7 @@ export function ChanlunChart({
       chart.unsubscribeCrosshairMove(onCrosshair);
       chart.unsubscribeClick(onClick);
       markersPlugin.detach();
+      candleSeries.detachPrimitive(signalCalloutPrimitive);
       candleSeries.detachPrimitive(zsPrimitive);
       chart.remove();
       chartRef.current = null;
@@ -466,6 +658,7 @@ export function ChanlunChart({
       macdDeaRef.current = null;
       markersRef.current = null;
       zsPrimitiveRef.current = null;
+      signalCalloutRef.current = null;
       priceLinesRef.current = [];
       prevBarCountRef.current = 0;
       prevFirstTimeRef.current = "";
@@ -524,6 +717,7 @@ export function ChanlunChart({
     macdDifRef.current?.applyOptions({ color: palette.slots[0] });
     macdDeaRef.current?.applyOptions({ color: palette.slots[3] });
     zsPrimitiveRef.current?.setPalette(palette);
+    signalCalloutRef.current?.setPalette(palette);
   }, [palette]);
 
   /* Push base candle & MACD data */
@@ -556,9 +750,10 @@ export function ChanlunChart({
       prevBarCountRef.current = prepared.bars.length;
       const total = prepared.bars.length;
       const visibleWindow = intraday ? Math.min(total, 150) : Math.min(total, 220);
+      const rightPad = intraday ? 12 : 10;
       chartRef.current?.timeScale().setVisibleLogicalRange({
         from: Math.max(0, total - visibleWindow),
-        to: total + 4,
+        to: total + rightPad,
       });
     }
     const rafId = window.requestAnimationFrame(() => syncMacdOverlayRef.current?.());
@@ -596,6 +791,7 @@ export function ChanlunChart({
     zsPrimitiveRef.current?.setBoxes(visibleZhongshuBoxes);
     zsPrimitiveRef.current?.setVisible(visibleZhongshuBoxes.length > 0);
     markersRef.current?.setMarkers(showMarkers ? prepared.markers : []);
+    signalCalloutRef.current?.setItem(showMarkers ? prepared.signalCallout : null);
   }, [prepared, palette.segConfirmed, dynamicFormats.price, showStrokes, showSegments, visibleZhongshuBoxes, showMarkers, intraday, height]);
 
   /* Apply synchronized crosshair AFTER candle data is pushed; clear stale crosshair when date is absent */
@@ -679,9 +875,10 @@ export function ChanlunChart({
     const total = prepared.bars.length;
     if (total === 0) return;
     const visibleWindow = intraday ? Math.min(total, 150) : Math.min(total, 220);
+    const rightPad = intraday ? 12 : 10;
     chartRef.current?.timeScale().setVisibleLogicalRange({
       from: Math.max(0, total - visibleWindow),
-      to: total + 4,
+      to: total + rightPad,
     });
   };
 

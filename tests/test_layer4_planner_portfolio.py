@@ -2746,6 +2746,366 @@ class TestPortfolioManager(unittest.TestCase):
                     idempotency_key="legacy-key-1",
                 )
 
+    def test_four_quadrant_gate_blocks_when_30m_stroke_end_weakening(self):
+        # Even if a caller supplies alignment_status="aligned_trigger", intraday_signal_meta.stroke_end_weakening=True
+        # MUST fail-closed into watchlist_wait_30m so War Room and Sentinel never contradict each other.
+        weak_align = {
+            "alignment_status": "aligned_trigger",
+            "daily_bias": "long",
+            "intraday_action": "entry_long",
+            "intraday_signal_meta": {
+                "signal_type": "candidate_buy",
+                "direction": "long",
+                "confirmed": False,
+                "stroke_end_weakening": True,
+            },
+        }
+        gate = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=weak_align,
+            rr_ratio=3.0,
+            total_quantity=100,
+        )
+        self.assertEqual(gate["decision"], "watchlist_wait_30m")
+        self.assertFalse(gate["actionable"])
+        self.assertFalse(gate["checks"]["alignment_verified"])
+        self.assertTrue(gate["checks"]["intraday_stroke_end_weakening"])
+
+    def test_four_quadrant_gate_research_direction_consistency_and_archive_integration(self):
+        import research_archive as ra
+
+        aligned_long = {
+            "alignment_status": "aligned_trigger",
+            "daily_bias": "long",
+            "intraday_action": "entry_long",
+        }
+        aligned_short = {
+            "alignment_status": "aligned_trigger",
+            "daily_bias": "short",
+            "intraday_action": "entry_short",
+        }
+
+        # 1) Direction conflict: research=short vs trade=long -> hard veto!
+        g_conflict_1 = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="cn_future",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=4.0,
+            total_quantity=2,
+            research_direction="short",
+        )
+        self.assertEqual(g_conflict_1["decision"], "rejected_direction_conflict")
+        self.assertFalse(g_conflict_1["actionable"])
+        self.assertEqual(g_conflict_1["research_direction"], "short")
+        self.assertIs(g_conflict_1["direction_aligned"], False)
+        self.assertIn("第三层研究方向与拟执行方向冲突，请先在研报档案复核结论", g_conflict_1["reason"])
+        self.assertTrue(
+            any("第三层研究方向与拟执行方向冲突，请先在研报档案复核结论" in r for r in g_conflict_1["reasons"])
+        )
+
+        # 2) Direction conflict: research=long vs trade=short -> hard veto!
+        g_conflict_2 = evaluate_four_quadrant_gate(
+            direction="short",
+            asset_class="cn_future",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_short,
+            rr_ratio=4.0,
+            total_quantity=2,
+            research_direction="long",
+        )
+        self.assertEqual(g_conflict_2["decision"], "rejected_direction_conflict")
+        self.assertFalse(g_conflict_2["actionable"])
+        self.assertEqual(g_conflict_2["research_direction"], "long")
+        self.assertIs(g_conflict_2["direction_aligned"], False)
+        self.assertIn("第三层研究方向与拟执行方向冲突，请先在研报档案复核结论", g_conflict_2["reason"])
+
+        # 3) Neutral research direction MUST block even when L1/L2, alignment, sizing & R:R are all green!
+        g_neutral = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=3.5,
+            total_quantity=100,
+            research_direction="neutral",
+        )
+        self.assertEqual(g_neutral["decision"], "watchlist_research_pending")
+        self.assertFalse(g_neutral["actionable"])
+        self.assertEqual(g_neutral["research_direction"], "neutral")
+        self.assertIs(g_neutral["direction_aligned"], False)
+        self.assertIn(
+            "研报档案研究方向仍为中性（neutral），请先在「研报档案」明确做多/做空方向后再执行建仓",
+            g_neutral["reason"],
+        )
+
+        # 4) Aligned research direction passes cleanly and exposes direction_aligned=True
+        g_ok_long = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=3.5,
+            total_quantity=100,
+            research_direction="long",
+        )
+        self.assertEqual(g_ok_long["decision"], "actionable_long")
+        self.assertTrue(g_ok_long["actionable"])
+        self.assertEqual(g_ok_long["research_direction"], "long")
+        self.assertIs(g_ok_long["direction_aligned"], True)
+
+        g_ok_short = evaluate_four_quadrant_gate(
+            direction="short",
+            asset_class="cn_future",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_short,
+            rr_ratio=3.5,
+            total_quantity=2,
+            research_direction="short",
+        )
+        self.assertEqual(g_ok_short["decision"], "actionable_short")
+        self.assertTrue(g_ok_short["actionable"])
+        self.assertEqual(g_ok_short["research_direction"], "short")
+        self.assertIs(g_ok_short["direction_aligned"], True)
+
+        # 5) Backward compatibility: omitted research_direction -> None & direction_aligned=None
+        g_compat = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=3.5,
+            total_quantity=100,
+        )
+        self.assertEqual(g_compat["decision"], "actionable_long")
+        self.assertTrue(g_compat["actionable"])
+        self.assertIsNone(g_compat["research_direction"])
+        self.assertIsNone(g_compat["direction_aligned"])
+
+        # 6) Pair research_direction alignment check
+        g_pair_mismatch = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=3.5,
+            total_quantity=100,
+            research_direction="pair",
+        )
+        self.assertEqual(g_pair_mismatch["decision"], "watchlist_research_pending")
+        self.assertFalse(g_pair_mismatch["actionable"])
+        self.assertIs(g_pair_mismatch["direction_aligned"], False)
+
+        g_pair_ok = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=3.5,
+            total_quantity=100,
+            is_pair_trade=True,
+            pair_leg_verified=True,
+            research_direction="pair",
+        )
+        self.assertEqual(g_pair_ok["decision"], "pair_trade")
+        self.assertTrue(g_pair_ok["actionable"])
+        self.assertIs(g_pair_ok["direction_aligned"], True)
+
+        # 7) Invalid research_direction raises ValueError
+        with self.assertRaises(ValueError):
+            evaluate_four_quadrant_gate(
+                direction="long",
+                asset_class="us_stock_or_etf",
+                has_l1_l2_evidence=True,
+                research_direction="bullish",
+            )
+
+        # 8) End-to-end build_trade_plan / CLI auto-reads archive state.json direction_bias
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 8a) Archive with default direction_bias="neutral" MUST block even with --has-l1-l2
+            ra.init_archive("NVDA", name="NVIDIA", research_root=tmpdir)
+            buf_n = io.StringIO()
+            with redirect_stdout(buf_n):
+                rc_n = planner_main([
+                    "--symbol", "NVDA",
+                    "--direction", "long",
+                    "--entry", "120",
+                    "--stop", "115",
+                    "--target", "140",
+                    "--equity", "1000000",
+                    "--account-currency", "USD",
+                    "--has-l1-l2",
+                    "--alignment-status", "aligned_trigger",
+                    "--research-root", tmpdir,
+                ])
+            self.assertEqual(rc_n, 0)
+            payload_n = json.loads(buf_n.getvalue())
+            self.assertEqual(payload_n["four_quadrant_gate"]["decision"], "watchlist_research_pending")
+            self.assertFalse(payload_n["four_quadrant_gate"]["actionable"])
+            self.assertEqual(payload_n["four_quadrant_gate"]["research_direction"], "neutral")
+            self.assertIs(payload_n["four_quadrant_gate"]["direction_aligned"], False)
+
+            # 8b) Archive with direction_bias="short" vs --direction long -> rejected_direction_conflict
+            ra.update_state("NVDA", {"direction_bias": "short"}, research_root=tmpdir)
+            buf_c = io.StringIO()
+            with redirect_stdout(buf_c):
+                rc_c = planner_main([
+                    "--symbol", "NVDA",
+                    "--direction", "long",
+                    "--entry", "120",
+                    "--stop", "115",
+                    "--target", "140",
+                    "--equity", "1000000",
+                    "--account-currency", "USD",
+                    "--has-l1-l2",
+                    "--alignment-status", "aligned_trigger",
+                    "--research-root", tmpdir,
+                ])
+            self.assertEqual(rc_c, 0)
+            payload_c = json.loads(buf_c.getvalue())
+            self.assertEqual(payload_c["four_quadrant_gate"]["decision"], "rejected_direction_conflict")
+            self.assertFalse(payload_c["four_quadrant_gate"]["actionable"])
+            self.assertEqual(payload_c["four_quadrant_gate"]["research_direction"], "short")
+            self.assertIs(payload_c["four_quadrant_gate"]["direction_aligned"], False)
+
+            # 8c) Explicit --research-direction override takes precedence over archive state
+            buf_ovr = io.StringIO()
+            with redirect_stdout(buf_ovr):
+                rc_ovr = planner_main([
+                    "--symbol", "NVDA",
+                    "--direction", "long",
+                    "--entry", "120",
+                    "--stop", "115",
+                    "--target", "140",
+                    "--equity", "1000000",
+                    "--account-currency", "USD",
+                    "--has-l1-l2",
+                    "--alignment-status", "aligned_trigger",
+                    "--research-root", tmpdir,
+                    "--research-direction", "long",
+                ])
+            self.assertEqual(rc_ovr, 0)
+            payload_ovr = json.loads(buf_ovr.getvalue())
+            self.assertEqual(payload_ovr["four_quadrant_gate"]["decision"], "actionable_long")
+            self.assertTrue(payload_ovr["four_quadrant_gate"]["actionable"])
+            self.assertEqual(payload_ovr["four_quadrant_gate"]["research_direction"], "long")
+            self.assertIs(payload_ovr["four_quadrant_gate"]["direction_aligned"], True)
+
+            # 8d) Archive updated to matching direction_bias="long" passes automatically without override
+            ra.update_state("NVDA", {"direction_bias": "long"}, research_root=tmpdir)
+            buf_ok = io.StringIO()
+            with redirect_stdout(buf_ok):
+                rc_ok = planner_main([
+                    "--symbol", "NVDA",
+                    "--direction", "long",
+                    "--entry", "120",
+                    "--stop", "115",
+                    "--target", "140",
+                    "--equity", "1000000",
+                    "--account-currency", "USD",
+                    "--has-l1-l2",
+                    "--alignment-status", "aligned_trigger",
+                    "--research-root", tmpdir,
+                ])
+            self.assertEqual(rc_ok, 0)
+            payload_ok = json.loads(buf_ok.getvalue())
+            self.assertEqual(payload_ok["four_quadrant_gate"]["decision"], "actionable_long")
+            self.assertTrue(payload_ok["four_quadrant_gate"]["actionable"])
+            self.assertEqual(payload_ok["four_quadrant_gate"]["research_direction"], "long")
+            self.assertIs(payload_ok["four_quadrant_gate"]["direction_aligned"], True)
+
+    def test_p1_3_pair_and_standalone_short_leg_enforcement(self):
+        aligned_short = {
+            "alignment_status": "aligned_trigger",
+            "daily_bias": "short",
+            "intraday_action": "entry_short",
+        }
+        aligned_long = {
+            "alignment_status": "aligned_trigger",
+            "daily_bias": "long",
+            "intraday_action": "entry_long",
+        }
+
+        # 1) Standalone call omitting us_short_thesis_verified MUST fail closed for US equity short
+        g_omitted = evaluate_four_quadrant_gate(
+            direction="short",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_short,
+            rr_ratio=3.5,
+            total_quantity=100,
+        )
+        self.assertEqual(g_omitted["decision"], "watchlist")
+        self.assertFalse(g_omitted["actionable"])
+
+        # 2) Pair trade mode MUST NOT exempt US equity short primary leg from Option A verification
+        g_pair_us_short_unverified = evaluate_four_quadrant_gate(
+            direction="short",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_short,
+            rr_ratio=3.5,
+            total_quantity=100,
+            is_pair_trade=True,
+            pair_leg_verified=True,
+            us_short_thesis_verified=False,
+            research_direction="pair",
+        )
+        self.assertEqual(g_pair_us_short_unverified["decision"], "watchlist")
+        self.assertFalse(g_pair_us_short_unverified["actionable"])
+
+        # 3) Long primary + A-share opposing short leg MUST be unconditionally rejected
+        g_pair_a_share_short = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=3.5,
+            total_quantity=100,
+            is_pair_trade=True,
+            pair_leg_verified=True,
+            pair_leg_asset_class="a_share",
+            research_direction="pair",
+        )
+        self.assertEqual(g_pair_a_share_short["decision"], "rejected")
+        self.assertFalse(g_pair_a_share_short["actionable"])
+        self.assertIn("A 股受限严格仅做多", g_pair_a_share_short["reason"])
+
+        # 4) Long primary + US equity opposing short leg requires pair_leg_short_thesis_verified=True
+        g_pair_us_opp_unverified = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=3.5,
+            total_quantity=100,
+            is_pair_trade=True,
+            pair_leg_verified=True,
+            pair_leg_asset_class="us_stock_or_etf",
+            pair_leg_short_thesis_verified=False,
+            research_direction="pair",
+        )
+        self.assertEqual(g_pair_us_opp_unverified["decision"], "watchlist")
+        self.assertFalse(g_pair_us_opp_unverified["actionable"])
+
+        g_pair_us_opp_verified = evaluate_four_quadrant_gate(
+            direction="long",
+            asset_class="us_stock_or_etf",
+            has_l1_l2_evidence=True,
+            daily_alignment=aligned_long,
+            rr_ratio=3.5,
+            total_quantity=100,
+            is_pair_trade=True,
+            pair_leg_verified=True,
+            pair_leg_asset_class="us_stock_or_etf",
+            pair_leg_short_thesis_verified=True,
+            research_direction="pair",
+        )
+        self.assertEqual(g_pair_us_opp_verified["decision"], "pair_trade")
+        self.assertTrue(g_pair_us_opp_verified["actionable"])
+
 
 if __name__ == "__main__":
     unittest.main()

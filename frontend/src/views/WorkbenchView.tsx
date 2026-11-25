@@ -14,10 +14,14 @@ import {
   Play,
   RefreshCw,
   Square,
+  X,
   XCircle,
 } from "lucide-react";
 import { api, ApiError, errorMessage, parseTaskEvent } from "../api/client";
 import type {
+  ArchiveInitBody,
+  CompassDirectionCard,
+  CompassRunRecord,
   CompassScanContext,
   PersistedScanRun,
   ScanRow,
@@ -27,8 +31,7 @@ import type {
   WarehouseSummary,
 } from "../api/types";
 import { ModalDialog } from "../components/ui/ModalDialog";
-import { signedToneClass, StatusBadge } from "../components/ui/StatusBadge";
-import { SymbolLabel } from "../components/ui/SymbolLabel";
+import { signedToneClass, StatusBadge, type Tone } from "../components/ui/StatusBadge";
 import { Layer1CompassPanel } from "../components/workbench/Layer1CompassPanel";
 import {
   fmtFractalText,
@@ -78,6 +81,17 @@ function resolveExpectedDirection(
   if (sym && ctx.expected_directions[sym]) {
     return { expected: ctx.expected_directions[sym], boundToL1: true };
   }
+  const stripped = sym.replace(/\.(SS|SH|SZ|BJ)$/, "");
+  if (stripped && stripped !== sym && ctx.expected_directions[stripped]) {
+    return { expected: ctx.expected_directions[stripped], boundToL1: true };
+  }
+  if (/^\d{6}$/.test(stripped)) {
+    for (const [k, v] of Object.entries(ctx.expected_directions)) {
+      if (k.replace(/\.(SS|SH|SZ|BJ)$/, "") === stripped) {
+        return { expected: v, boundToL1: true };
+      }
+    }
+  }
   /* Only treat symbols explicitly entered by the user (market === "adhoc") as bound to the staged L1 sector thesis;
      do NOT blindly broadcast a narrow L1 thesis (e.g. phosphate/sulfur) onto unrelated members of a broad pool (e.g. rubber RU0)! */
   const isUserCustom = (row.market || "").trim().toLowerCase() === "adhoc";
@@ -107,6 +121,95 @@ function classifyRowWithCompass(
     return { status: "counter", expected, actual, boundToL1: true };
   }
   return { status: "watch", expected, actual, boundToL1: true };
+}
+
+function formatDirectionBiasZh(dir: string | null | undefined): string {
+  const d = (dir || "").trim().toLowerCase();
+  if (d === "long") return "做多";
+  if (d === "short") return "做空";
+  if (d === "pair") return "多空配对";
+  return "中性观察";
+}
+
+function formatCompassSecondaryDriver(card: CompassDirectionCard | null): string {
+  if (!card) return "";
+  const pDim = (card.primary_driver?.dimension || "").trim();
+  const pSum = (card.primary_driver?.summary || "").trim();
+  const sDim = (card.secondary_driver?.dimension || "").trim();
+  const sSum = (card.secondary_driver?.summary || "").trim();
+  if (pDim && sDim) {
+    return `${pDim} × ${sDim}${sSum ? `（${sSum}）` : ""}`;
+  }
+  if (sDim) {
+    return sSum ? `${sDim}（${sSum}）` : sDim;
+  }
+  if (sSum) return sSum;
+  if (pDim) return pSum ? `${pDim}（${pSum}）` : pDim;
+  return pSum;
+}
+
+function findCompassCardInRun(
+  run: CompassRunRecord | null | undefined,
+  ctx: CompassScanContext,
+): CompassDirectionCard | null {
+  const directions = run?.result?.directions;
+  if (Array.isArray(directions) && directions.length > 0) {
+    if (ctx.direction_id) {
+      const byId = directions.find((d) => d.id === ctx.direction_id);
+      if (byId) return byId;
+    }
+    const title = (ctx.direction_title || "").trim();
+    if (title) {
+      const byTitle = directions.find((d) => (d.title || "").trim() === title);
+      if (byTitle) return byTitle;
+    }
+  }
+  const avoidSectors = run?.result?.avoid_sectors;
+  if (Array.isArray(avoidSectors) && avoidSectors.length > 0) {
+    const idMatch = /^headwind_short_(\d+)$/.exec((ctx.direction_id || "").trim());
+    const idx = idMatch ? Number(idMatch[1]) - 1 : -1;
+    const title = (ctx.direction_title || "").trim();
+    const hit =
+      (idx >= 0 && idx < avoidSectors.length ? avoidSectors[idx] : undefined) ??
+      (title
+        ? avoidSectors.find(
+            (item) =>
+              `逆风衍生做空：${item.sector}` === title || item.sector === title,
+          )
+        : undefined);
+    if (hit) {
+      const focus =
+        hit.short_proxy_hint ||
+        hit.derived_strategy ||
+        ctx.value_chain_focus ||
+        "";
+      return {
+        id: ctx.direction_id || `headwind_short_${idx + 1}`,
+        rank: idx >= 0 ? idx + 1 : 1,
+        title: title || `逆风衍生做空：${hit.sector}`,
+        direction: "short",
+        horizon: "1Q~2Q",
+        conviction: "medium",
+        asset_scope: "cross_asset",
+        primary_driver: { dimension: "宏观双核", summary: hit.reason || hit.sector },
+        secondary_driver: {
+          dimension: "商品供需平衡与库存周期",
+          summary: "逆风逻辑延伸合规空头/代理表达",
+        },
+        thesis: hit.reason || hit.sector,
+        value_chain_focus: focus,
+        key_catalyst: "",
+        invalidation: "",
+        recommended_universes: [],
+        is_new_theme: true,
+        suggested_pool_name: ctx.direction_id || "short_headwind",
+        suggested_pool_description: title || `逆风衍生做空：${hit.sector}`,
+        leaders: [],
+        evidence: [],
+      };
+    }
+  }
+  return null;
 }
 
 function isTerminalTaskStatus(status: string | null | undefined): boolean {
@@ -180,6 +283,187 @@ function classifyScanRow(row: ScanRow): "long" | "short" | "watch" {
   return "watch";
 }
 
+function signalTierRank(row: ScanRow): number {
+  if (row.error) return 99;
+  const st = (row.signal_type || "").trim().toLowerCase();
+  if (row.quality_grade === "degraded" || st === "data_quality_degraded") return 80;
+  if (st === "insufficient_data") return 85;
+  if (st === "confirmed_buy" || st === "confirmed_sell") return 0;
+  if (
+    st === "momentum_long" ||
+    st === "momentum_short" ||
+    st === "steep_non_div_up" ||
+    st === "steep_non_div_down"
+  ) {
+    return 10;
+  }
+  if (st === "exhaustion_buy_warn" || st === "exhaustion_sell_warn") return 20;
+  if (st === "candidate_buy" || st === "candidate_sell") return 30;
+  if (st === "weak_momentum_long" || st === "weak_momentum_short") return 40;
+  if (st === "consolidation") return 50;
+  const tier = (row.signal_tier || "").trim();
+  if (tier === "买卖点信号") return 5;
+  if (tier.startsWith("资金一致推进")) return 15;
+  if (tier === "背驰观察") return 32;
+  if (tier === "中枢震荡") return 50;
+  if (tier === "常规结构运行") return 60;
+  return 70;
+}
+
+function directionalReturnScore(val: number | null | undefined, dir: "long" | "short" | null): number {
+  if (typeof val !== "number" || !Number.isFinite(val)) return -1e9;
+  return dir === "short" ? -val : val;
+}
+
+const UNCONFIRMED_SIG_RE = /(?:候选|疑似|准|观察|蓄势)/;
+
+function resolveSignalBadge(row: ScanRow): { label: string; tone: Tone } | null {
+  const sigType = (row.signal_type || "").trim().toLowerCase();
+  const tier = (row.signal_tier || "").trim();
+  const dir = (row.signal_direction || "").trim().toLowerCase();
+  const bias = (row.action_bias || "").trim();
+  const rawSignals = Array.isArray(row.signals) ? row.signals.map((s) => String(s || "")) : [];
+  // Exclude the synthetic bracketed summary entry `【...】` (which bundles slashes like "三买 / 2+3买")
+  // so exact signal parsing prioritizes concrete daily.signals items first.
+  const detailedSignals = rawSignals.filter((s) => !/^【.*】$/.test(s.trim()));
+  const confirmedSignals = detailedSignals.filter((s) => !UNCONFIRMED_SIG_RE.test(s));
+  const confirmedBlob = confirmedSignals.join(" ");
+  const allBlob = `${rawSignals.join(" ")} ${bias}`;
+
+  if (row.quality_grade === "degraded" || sigType === "data_quality_degraded" || tier === "数据质量降级") {
+    return { label: "数据降级", tone: "warning" };
+  }
+  if (sigType === "insufficient_data" || tier === "数据不足") {
+    return { label: "数据不足", tone: "neutral" };
+  }
+
+  /* 1. Exhaustion warnings (non-first zhongshu 3rd buy/sell) */
+  if (sigType === "exhaustion_buy_warn" || /非首中枢三买/.test(allBlob)) {
+    return { label: "后段三买·防追", tone: "warning" };
+  }
+  if (sigType === "exhaustion_sell_warn" || /非首中枢三卖/.test(allBlob)) {
+    return { label: "后段三卖·防追", tone: "serious" };
+  }
+
+  /* 2. Confirmed buy points: prioritize 4出/3出 composite signals before generic 2/3/1 buy */
+  const isConfirmedBuy =
+    sigType === "confirmed_buy" ||
+    (tier === "买卖点信号" && (dir === "long" || dir === "bullish" || dir === "up"));
+  if (isConfirmedBuy) {
+    if (/2\+3买/.test(confirmedBlob)) return { label: "日线2+3买", tone: "good" };
+    if (/4出(?:\(D4)?/.test(confirmedBlob)) {
+      if (/三买/.test(confirmedBlob) && !/非首中枢三买/.test(confirmedBlob)) return { label: "日线四出·三买", tone: "good" };
+      if (/二买/.test(confirmedBlob)) return { label: "日线四出·二买", tone: "good" };
+      if (/一买/.test(confirmedBlob)) return { label: "日线四出·一买", tone: "good" };
+      return { label: "日线四出买", tone: "good" };
+    }
+    if (/3出(?:\(D3)?/.test(confirmedBlob)) {
+      if (/三买/.test(confirmedBlob) && !/非首中枢三买/.test(confirmedBlob)) return { label: "日线三出·三买", tone: "good" };
+      if (/二买/.test(confirmedBlob)) return { label: "日线三出·二买", tone: "good" };
+      if (/一买/.test(confirmedBlob)) return { label: "日线三出·一买", tone: "good" };
+      return { label: "日线三出买", tone: "good" };
+    }
+    if (/三买/.test(confirmedBlob) && !/非首中枢三买/.test(confirmedBlob)) return { label: "日线三买", tone: "good" };
+    if (/二买/.test(confirmedBlob)) return { label: "日线二买", tone: "good" };
+    if (/一买/.test(confirmedBlob)) return { label: "日线一买", tone: "good" };
+    if (/2\+3买/.test(allBlob)) return { label: "日线2+3买", tone: "good" };
+    if (/4出(?:\(D4)?/.test(allBlob)) {
+      if (/首中枢上沿\s*ZG|首中枢三买/.test(allBlob)) return { label: "日线四出·三买", tone: "good" };
+      if (/二买/.test(allBlob)) return { label: "日线四出·二买", tone: "good" };
+      if (/一买/.test(allBlob)) return { label: "日线四出·一买", tone: "good" };
+      return { label: "日线四出买", tone: "good" };
+    }
+    if (/3出(?:\(D3)?/.test(allBlob)) {
+      if (/首中枢上沿\s*ZG|首中枢三买/.test(allBlob)) return { label: "日线三出·三买", tone: "good" };
+      if (/二买/.test(allBlob)) return { label: "日线三出·二买", tone: "good" };
+      if (/一买/.test(allBlob)) return { label: "日线三出·一买", tone: "good" };
+      return { label: "日线三出买", tone: "good" };
+    }
+    if (/首中枢上沿\s*ZG|首中枢三买/.test(allBlob)) return { label: "日线三买", tone: "good" };
+    if (/二买/.test(allBlob)) return { label: "日线二买", tone: "good" };
+    if (/一买/.test(allBlob)) return { label: "日线一买", tone: "good" };
+    return { label: "日线买点", tone: "good" };
+  }
+
+  /* 3. Confirmed sell points: prioritize 4出/3出 composite signals before generic 2/3/1 sell */
+  const isConfirmedSell =
+    sigType === "confirmed_sell" ||
+    (tier === "买卖点信号" && (dir === "short" || dir === "bearish" || dir === "down"));
+  if (isConfirmedSell) {
+    if (/2\+3卖/.test(confirmedBlob)) return { label: "日线2+3卖", tone: "critical" };
+    if (/4出(?:\(D4)?/.test(confirmedBlob)) {
+      if (/三卖/.test(confirmedBlob) && !/非首中枢三卖/.test(confirmedBlob)) return { label: "日线四出·三卖", tone: "critical" };
+      if (/二卖/.test(confirmedBlob)) return { label: "日线四出·二卖", tone: "critical" };
+      if (/一卖/.test(confirmedBlob)) return { label: "日线四出·一卖", tone: "critical" };
+      return { label: "日线四出卖", tone: "critical" };
+    }
+    if (/3出(?:\(D3)?/.test(confirmedBlob)) {
+      if (/三卖/.test(confirmedBlob) && !/非首中枢三卖/.test(confirmedBlob)) return { label: "日线三出·三卖", tone: "critical" };
+      if (/二卖/.test(confirmedBlob)) return { label: "日线三出·二卖", tone: "critical" };
+      if (/一卖/.test(confirmedBlob)) return { label: "日线三出·一卖", tone: "critical" };
+      return { label: "日线三出卖", tone: "critical" };
+    }
+    if (/三卖/.test(confirmedBlob) && !/非首中枢三卖/.test(confirmedBlob)) return { label: "日线三卖", tone: "critical" };
+    if (/二卖/.test(confirmedBlob)) return { label: "日线二卖", tone: "critical" };
+    if (/一卖/.test(confirmedBlob)) return { label: "日线一卖", tone: "critical" };
+    if (/2\+3卖/.test(allBlob)) return { label: "日线2+3卖", tone: "critical" };
+    if (/4出(?:\(D4)?/.test(allBlob)) {
+      if (/首中枢下沿\s*ZD|首中枢三卖/.test(allBlob)) return { label: "日线四出·三卖", tone: "critical" };
+      if (/二卖/.test(allBlob)) return { label: "日线四出·二卖", tone: "critical" };
+      if (/一卖/.test(allBlob)) return { label: "日线四出·一卖", tone: "critical" };
+      return { label: "日线四出卖", tone: "critical" };
+    }
+    if (/3出(?:\(D3)?/.test(allBlob)) {
+      if (/首中枢下沿\s*ZD|首中枢三卖/.test(allBlob)) return { label: "日线三出·三卖", tone: "critical" };
+      if (/二卖/.test(allBlob)) return { label: "日线三出·二卖", tone: "critical" };
+      if (/一卖/.test(allBlob)) return { label: "日线三出·一卖", tone: "critical" };
+      return { label: "日线三出卖", tone: "critical" };
+    }
+    if (/首中枢下沿\s*ZD|首中枢三卖/.test(allBlob)) return { label: "日线三卖", tone: "critical" };
+    if (/二卖/.test(allBlob)) return { label: "日线二卖", tone: "critical" };
+    if (/一卖/.test(allBlob)) return { label: "日线一卖", tone: "critical" };
+    return { label: "日线卖点", tone: "critical" };
+  }
+
+  /* 4. Capital consensus & steep non-divergence */
+  if (sigType === "steep_non_div_up") return { label: "多头急拉一致", tone: "good" };
+  if (sigType === "momentum_long") return { label: "多头一致", tone: "good" };
+  if (sigType === "steep_non_div_down") return { label: "空头急跌一致", tone: "critical" };
+  if (sigType === "momentum_short") return { label: "空头一致", tone: "critical" };
+
+  /* 5. Unconfirmed candidate / divergence watch */
+  if (sigType === "candidate_buy") return { label: "准买点·待确认", tone: "info" };
+  if (sigType === "candidate_sell") return { label: "准卖点·待确认", tone: "serious" };
+  if (tier === "背驰观察") return { label: "背驰观察", tone: "warning" };
+
+  /* 6. Weak momentum / consolidation / neutral */
+  if (sigType === "weak_momentum_long") return { label: "弱多延续", tone: "neutral" };
+  if (sigType === "weak_momentum_short") return { label: "弱空延续", tone: "neutral" };
+  if (sigType === "consolidation" || tier === "中枢震荡") return { label: "中枢震荡", tone: "neutral" };
+
+  /* Legacy fallback without signal_type */
+  if (tier === "买卖点信号") {
+    const cls = classifyScanRow(row);
+    if (cls === "long") return { label: "日线买点", tone: "good" };
+    if (cls === "short") return { label: "日线卖点", tone: "critical" };
+  }
+  if (tier.includes("资金一致推进")) {
+    if (tier.includes("顺势") || dir === "long") return { label: "多头一致", tone: "good" };
+    if (tier.includes("勿逆势") || dir === "short") return { label: "空头一致", tone: "critical" };
+  }
+  if (tier) return { label: tier, tone: "neutral" };
+  return null;
+}
+
+function shortBarDate(raw: string | null | undefined): string {
+  const s = (raw || "").trim();
+  if (!s) return "";
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s);
+  if (!m) return s.slice(0, 10);
+  const curYear = String(new Date().getFullYear());
+  return m[1] === curYear ? `${m[2]}-${m[3]}` : `${m[1]}-${m[2]}-${m[3]}`;
+}
+
 function describeScanTaskScope(t: TaskRecord): string {
   const p = t.params;
   if (!p || typeof p !== "object") return "板块龙头扫描";
@@ -230,9 +514,15 @@ export function WorkbenchView({
   const [cancelling, setCancelling] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  /* Quick add-to-watchlist (archiveInit) tracking */
+  /* Quick add-to-watchlist (archiveInit) tracking + Toast feedback */
   const [archivedSyms, setArchivedSyms] = useState<Set<string>>(new Set());
   const [addingWatchSym, setAddingWatchSym] = useState<string | null>(null);
+  const [archiveToast, setArchiveToast] = useState<{
+    symbol: string;
+    directionBias: string;
+    theme: string;
+    existed?: boolean;
+  } | null>(null);
 
   /* Save new universe modal */
   const [savePoolOpen, setSavePoolOpen] = useState(false);
@@ -246,6 +536,7 @@ export function WorkbenchView({
   const layer2Ref = useRef<HTMLDivElement | null>(null);
   const launchingRef = useRef(false);
   const scanReqSeqRef = useRef(0);
+  const compassRunCacheRef = useRef<Map<string, CompassRunRecord>>(new Map());
 
   const loadUniverses = useCallback(async (signal?: AbortSignal) => {
     try {
@@ -611,6 +902,39 @@ export function WorkbenchView({
     }
   };
 
+  const resolveCompassCard = useCallback(
+    async (ctx: CompassScanContext, signal?: AbortSignal): Promise<CompassDirectionCard | null> => {
+      const runId = (ctx.run_id || "").trim();
+      if (runId) {
+        const cached = compassRunCacheRef.current.get(runId);
+        if (cached && cached.run_id === runId) {
+          return findCompassCardInRun(cached, ctx);
+        }
+        try {
+          const fetched = await api.compassHistoryDetail(runId, signal);
+          if (fetched?.run_id === runId) {
+            compassRunCacheRef.current.set(fetched.run_id, fetched);
+            return findCompassCardInRun(fetched, ctx);
+          }
+        } catch {
+          /* Never fall back to latest run when a historical run_id fails or mismatches */
+        }
+        return null;
+      }
+      try {
+        const latestRes = await api.compassLatest(signal);
+        if (latestRes.latest) {
+          compassRunCacheRef.current.set(latestRes.latest.run_id, latestRes.latest);
+          return findCompassCardInRun(latestRes.latest, ctx);
+        }
+      } catch {
+        /* ignore */
+      }
+      return null;
+    },
+    [],
+  );
+
   const handleQuickAddWatchlist = async (row: ScanRow) => {
     const sym = row.symbol.trim().toUpperCase();
     if (archivedSyms.has(sym)) {
@@ -618,18 +942,99 @@ export function WorkbenchView({
       return;
     }
     setAddingWatchSym(sym);
+    setErr(null);
     try {
-      await api.archiveInit({
-        symbol: sym,
-        name: getSymbolName(sym) || undefined,
-        primary_driver: row.market ? getUniverseLabel(row.market) : undefined,
-        thesis_summary: `自扫描台收入观察池（日线结构：${row.daily_structure || "—"}，信号：${row.signal_tier || row.action_bias || "待观察"}）`,
-      });
+      const scanCompassCtx = extractCompassContext(activeTask);
+      const expectedInfo = scanCompassCtx ? resolveExpectedDirection(row, scanCompassCtx) : null;
+      let payload: ArchiveInitBody;
+      let toastDirection = "neutral";
+      let toastTheme = "";
+
+      if (scanCompassCtx && expectedInfo?.boundToL1) {
+        const card = await resolveCompassCard(scanCompassCtx);
+        const directionBias: "long" | "short" | "pair" | "neutral" =
+          expectedInfo.expected ?? scanCompassCtx.direction;
+
+        const rawPrimaryTheme =
+          (card?.title || "").trim() ||
+          (scanCompassCtx.direction_title || "").trim() ||
+          (card?.primary_driver?.dimension || "").trim();
+        const fallbackPoolLabel =
+          row.market && !["adhoc", "custom"].includes(row.market.toLowerCase())
+            ? getUniverseLabel(row.market, universes[row.market]?.description)
+            : "";
+        const primaryTheme = rawPrimaryTheme || fallbackPoolLabel || "Layer 1 战略主题";
+        const secondaryDriver = formatCompassSecondaryDriver(card);
+
+        const dailyBrief = `日线初筛：${row.daily_structure || "—"}（${row.signal_tier || row.action_bias || "待观察"}）`;
+        const thesisParts: string[] = [];
+        if (card?.thesis?.trim()) {
+          thesisParts.push(card.thesis.trim());
+        } else {
+          thesisParts.push(`Layer 1 战略主题「${primaryTheme}」（方向：${formatDirectionBiasZh(directionBias)}）`);
+        }
+        const valueChainFocus = (card?.value_chain_focus || scanCompassCtx.value_chain_focus || "").trim();
+        if (valueChainFocus) {
+          thesisParts.push(`产业链切入：${valueChainFocus}`);
+        }
+        thesisParts.push(dailyBrief);
+
+        const rawConviction = (card?.conviction || "").trim().toLowerCase();
+        const confidence =
+          rawConviction === "high" || rawConviction === "medium" || rawConviction === "low"
+            ? rawConviction
+            : undefined;
+
+        payload = {
+          symbol: sym,
+          name: getSymbolName(sym) || undefined,
+          direction_bias: directionBias,
+          primary_driver: primaryTheme,
+          layer1_primary: primaryTheme,
+          ...(secondaryDriver
+            ? { secondary_driver: secondaryDriver, layer1_secondary: secondaryDriver }
+            : {}),
+          thesis_summary: thesisParts.join("｜"),
+          ...(confidence ? { confidence } : {}),
+        };
+        toastDirection = directionBias;
+        toastTheme = primaryTheme;
+      } else {
+        /* Independent manual scan: keep strictly isolated from any unrelated Layer 1 card */
+        const poolLabel = row.market
+          ? getUniverseLabel(row.market, universes[row.market]?.description)
+          : "";
+        payload = {
+          symbol: sym,
+          name: getSymbolName(sym) || undefined,
+          primary_driver: poolLabel || undefined,
+          thesis_summary: `自扫描台收入观察池（日线结构：${row.daily_structure || "—"}，信号：${row.signal_tier || row.action_bias || "待观察"}）`,
+        };
+        toastDirection = "neutral";
+        toastTheme = poolLabel || "观察池";
+      }
+
+      const initRes = (await api.archiveInit(payload)) as { status?: string } | null;
       setArchivedSyms((prev) => new Set(prev).add(sym));
+      setArchiveToast({
+        symbol: sym,
+        directionBias: toastDirection,
+        theme: toastTheme,
+        existed: initRes?.status === "exists",
+      });
       onArchiveMutated?.();
-    } catch {
-      /* If already exists on disk under another alias, jump directly */
-      onJumpArchive(sym);
+    } catch (ex) {
+      if (ex instanceof ApiError && ex.status === 409) {
+        setArchivedSyms((prev) => new Set(prev).add(sym));
+        setArchiveToast({
+          symbol: sym,
+          directionBias: "neutral",
+          theme: "已存在本地档案",
+          existed: true,
+        });
+      } else {
+        setErr(`入池建档失败：${errorMessage(ex)}`);
+      }
     } finally {
       setAddingWatchSym(null);
     }
@@ -659,6 +1064,21 @@ export function WorkbenchView({
   );
 
   const activeCompassContext = useMemo(() => extractCompassContext(activeTask), [activeTask]);
+
+  /* Warm full Layer 1 direction card metadata for the active Compass-guided scan */
+  useEffect(() => {
+    if (!activeCompassContext) return;
+    const ctrl = new AbortController();
+    void resolveCompassCard(activeCompassContext, ctrl.signal);
+    return () => ctrl.abort();
+  }, [activeCompassContext, resolveCompassCard]);
+
+  /* Auto-dismiss archive creation toast after 4.5 seconds */
+  useEffect(() => {
+    if (!archiveToast) return;
+    const timer = window.setTimeout(() => setArchiveToast(null), 4500);
+    return () => window.clearTimeout(timer);
+  }, [archiveToast]);
 
   /* Reset incompatible filter when switching between Compass-guided and manual scans */
   useEffect(() => {
@@ -752,12 +1172,63 @@ export function WorkbenchView({
   }, [activeCompassContext, scanRows]);
 
   const filteredScanRows = useMemo(() => {
-    if (rowFilter === "all") return scanRows;
+    const base =
+      rowFilter === "all"
+        ? scanRows
+        : activeCompassContext
+          ? scanRows.filter((r) => classifyRowWithCompass(r, activeCompassContext).status === rowFilter)
+          : scanRows.filter((r) => classifyScanRow(r) === rowFilter);
+
     if (activeCompassContext) {
-      return scanRows.filter((r) => classifyRowWithCompass(r, activeCompassContext).status === rowFilter);
+      const ALIGN_RANK: Record<CompassRowAlignment, number> = {
+        aligned: 0,
+        watch: 1,
+        pool_unverified: 2,
+        counter: 3,
+        degraded: 4,
+      };
+      return [...base].sort((a, b) => {
+        const ca = classifyRowWithCompass(a, activeCompassContext);
+        const cb = classifyRowWithCompass(b, activeCompassContext);
+        const alignDiff = ALIGN_RANK[ca.status] - ALIGN_RANK[cb.status];
+        if (alignDiff !== 0) return alignDiff;
+
+        const tierDiff = signalTierRank(a) - signalTierRank(b);
+        if (tierDiff !== 0) return tierDiff;
+
+        const dirA = ca.expected ?? (ca.actual === "short" ? "short" : "long");
+        const dirB = cb.expected ?? (cb.actual === "short" ? "short" : "long");
+        const r20Diff =
+          directionalReturnScore(b["ret_20d_%"], dirB) -
+          directionalReturnScore(a["ret_20d_%"], dirA);
+        if (r20Diff !== 0) return r20Diff;
+
+        return (
+          directionalReturnScore(b["ret_60d_%"], dirB) -
+          directionalReturnScore(a["ret_60d_%"], dirA)
+        );
+      });
     }
-    return scanRows.filter((r) => classifyScanRow(r) === rowFilter);
-  }, [scanRows, rowFilter, activeCompassContext]);
+
+    if (sortMode === "tier") {
+      return [...base].sort((a, b) => {
+        const tierDiff = signalTierRank(a) - signalTierRank(b);
+        if (tierDiff !== 0) return tierDiff;
+        const dirA = classifyScanRow(a) === "short" ? "short" : "long";
+        const dirB = classifyScanRow(b) === "short" ? "short" : "long";
+        const r20Diff =
+          directionalReturnScore(b["ret_20d_%"], dirB) -
+          directionalReturnScore(a["ret_20d_%"], dirA);
+        if (r20Diff !== 0) return r20Diff;
+        return (
+          directionalReturnScore(b["ret_60d_%"], dirB) -
+          directionalReturnScore(a["ret_60d_%"], dirA)
+        );
+      });
+    }
+
+    return base;
+  }, [scanRows, rowFilter, activeCompassContext, sortMode]);
 
   const selectedSummaryText = useMemo(() => {
     const poolLabels = selectedPools.map((k) => getUniverseLabel(k));
@@ -834,9 +1305,9 @@ export function WorkbenchView({
           </div>
         </div>
 
-      <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-12">
+      <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-[minmax(0,1fr)_248px] 2xl:grid-cols-[minmax(0,1fr)_292px]">
         {/* Main Column: Collapsible Pool Launcher + Wide Scan Results Table */}
-        <div className="flex flex-col gap-3.5 xl:col-span-9">
+        <div className="flex min-w-0 flex-col gap-3.5">
           <section className="card flex flex-col gap-3 p-4" aria-label="手动板块龙头池选择器">
             {/* Collapsible Summary Bar (Collapsed by default so Layer 1 leads) */}
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1173,24 +1644,39 @@ export function WorkbenchView({
             ) : null}
 
             {scanRows.length > 0 ? (
-              <div tabIndex={0} role="region" aria-label="板块龙头日线缠论扫描结果表" className="table-wrapper max-h-[66dvh]">
+              <div
+                tabIndex={0}
+                role="region"
+                aria-label="板块龙头日线缠论扫描结果表"
+                className={`table-wrapper ${filteredScanRows.length > 30 ? "max-h-[78dvh]" : ""}`}
+              >
                 <table className="data-table">
-                  <thead>
+                  <thead style={{ zIndex: 3 }}>
                     <tr>
-                      <th scope="col">标的</th>
-                      <th scope="col" className="num">
+                      <th scope="col" style={{ paddingInline: 8 }}>
+                        标的
+                      </th>
+                      <th scope="col" className="num" style={{ paddingInline: 6 }}>
                         最新收盘
                       </th>
-                      <th scope="col" className="num">
-                        20D 涨跌
+                      <th scope="col" className="num" style={{ paddingInline: 6 }}>
+                        20D
                       </th>
-                      <th scope="col">日线结构 & 中枢数</th>
-                      <th scope="col" className="num">
-                        最新中枢 [ZD, ZG]
+                      <th scope="col" style={{ paddingInline: 6 }}>
+                        日线结构 & 中枢
                       </th>
-                      <th scope="col">信号与方向建议</th>
-                      <th scope="col" className="num">
-                        流转动作
+                      <th scope="col" className="num" style={{ paddingInline: 6 }}>
+                        中枢 [ZD, ZG]
+                      </th>
+                      <th scope="col" style={{ paddingInline: 6 }}>
+                        信号与方向建议
+                      </th>
+                      <th
+                        scope="col"
+                        className="num sticky right-0 z-[2] bg-sunken shadow-[-1px_0_0_var(--hairline)]"
+                        style={{ paddingInline: 8 }}
+                      >
+                        操作
                       </th>
                     </tr>
                   </thead>
@@ -1198,128 +1684,171 @@ export function WorkbenchView({
                     {filteredScanRows.map((row) => {
                       const symUpper = row.symbol.toUpperCase();
                       const isArchived = archivedSyms.has(symUpper);
+                      const zhName = getSymbolName(row.symbol);
                       const marketLabel = row.market
                         ? getUniverseLabel(row.market, universes[row.market]?.description)
                         : null;
-                      const rowClass = classifyScanRow(row);
+                      const fullSymTitle = [
+                        row.symbol,
+                        zhName || null,
+                        marketLabel ? `(${marketLabel})` : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ");
                       const compassAlign = activeCompassContext
                         ? classifyRowWithCompass(row, activeCompassContext)
                         : null;
+                      const signalBadge = resolveSignalBadge(row);
+                      const structureSubline = [
+                        `${row.daily_zs_count ?? 0}${row.daily_zs_level === "segment" ? "段" : "笔"}枢`,
+                        fmtPosVsZs(row.pos_vs_zs),
+                        fmtFractalText(row.daily_fractal),
+                        row.daily_momentum ? fmtMomentumVerdict(row.daily_momentum) : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" · ");
+                      const rawSignalsTitle =
+                        Array.isArray(row.signals) && row.signals.length > 0
+                          ? row.signals.join("\n")
+                          : undefined;
 
                       return (
                         <tr
                           key={`${row.market}-${row.symbol}`}
-                          className="clickable"
+                          className={`clickable ${
+                            compassAlign?.status === "aligned" ? "bg-bull/[0.03]" : ""
+                          }`}
                           onClick={() => onJumpWarRoom(row.symbol)}
                         >
-                          <th scope="row">
-                            <div className="flex flex-col gap-0.5">
-                              <SymbolLabel symbol={row.symbol} size="sm" />
-                              {marketLabel ? (
-                                <span className="text-[10.5px] font-normal text-muted">{marketLabel}</span>
+                          <th scope="row" style={{ paddingInline: 8 }}>
+                            <div
+                              className="flex w-full max-w-[144px] flex-col gap-0.5 overflow-hidden"
+                              title={fullSymTitle}
+                            >
+                              <div className="flex min-w-0 items-center gap-1">
+                                <span className="shrink-0 rounded border border-hairline-soft bg-sunken px-1.5 py-0.2 font-mono text-[11px] font-semibold text-ink">
+                                  {row.symbol}
+                                </span>
+                                {marketLabel ? (
+                                  <span className="truncate text-[10px] font-normal text-muted">
+                                    {marketLabel}
+                                  </span>
+                                ) : null}
+                              </div>
+                              {zhName ? (
+                                <span className="truncate text-[11.5px] font-medium text-ink-2">
+                                  {zhName}
+                                </span>
                               ) : null}
                             </div>
                           </th>
                           {row.error ? (
-                            <td colSpan={6} data-label="异常" className="text-critical">
+                            <td colSpan={6} data-label="异常" className="text-critical" style={{ paddingInline: 8 }}>
                               行情错误：{row.error}
                             </td>
                           ) : (
                             <>
-                              <td data-label="最新收盘" className="num">
-                                <div>{fmtPrice(row.close)}</div>
+                              <td
+                                data-label="最新收盘"
+                                className="num"
+                                style={{ paddingInline: 6 }}
+                                title={row.as_of_bar ? `行情截至 ${row.as_of_bar}` : undefined}
+                              >
+                                <div className="text-[12.5px] font-medium text-ink">{fmtPrice(row.close)}</div>
                                 {row.as_of_bar ? (
-                                  <div className="font-mono text-[10.5px] font-normal text-muted">
-                                    {row.as_of_bar}
-                                    {row.bar_is_closed === false ? " · 盘中" : ""}
-                                    {row.cache_status === "hit" ? " · 本地" : ""}
+                                  <div className="font-mono text-[10px] font-normal text-muted">
+                                    {shortBarDate(row.as_of_bar)}
+                                    {row.bar_is_closed === false ? "·盘中" : ""}
+                                    {row.cache_status === "hit" ? "·本地" : ""}
                                   </div>
                                 ) : null}
                               </td>
                               <td
                                 data-label="20D 涨跌"
                                 className={`num font-semibold ${signedToneClass(row["ret_20d_%"])}`}
+                                style={{ paddingInline: 6 }}
+                                title={
+                                  typeof row["ret_60d_%"] === "number"
+                                    ? `20D: ${fmtPct(row["ret_20d_%"], 2, true)} · 60D: ${fmtPct(row["ret_60d_%"], 2, true)}`
+                                    : undefined
+                                }
                               >
-                                {fmtPct(row["ret_20d_%"], 2, true)}
+                                {fmtPct(row["ret_20d_%"], 1, true)}
                               </td>
-                              <td data-label="日线结构 & 中枢数">
-                                <div>{row.daily_structure || "—"}</div>
-                                <div className="text-[11px] text-muted">
-                                  {row.daily_zs_count ?? 0}{" "}
-                                  {row.daily_zs_level === "segment" ? "线段中枢" : "笔中枢"} ·{" "}
-                                  {fmtPosVsZs(row.pos_vs_zs)} · {fmtFractalText(row.daily_fractal)}
-                                  {row.daily_momentum ? ` · ${fmtMomentumVerdict(row.daily_momentum)}` : ""}
+                              <td data-label="日线结构 & 中枢" style={{ paddingInline: 6 }}>
+                                <div className="max-w-[168px]" title={`${row.daily_structure || "—"} | ${structureSubline}`}>
+                                  <div className="truncate text-xs text-ink">{row.daily_structure || "—"}</div>
+                                  <div className="truncate text-[10.5px] text-muted">{structureSubline}</div>
                                 </div>
                               </td>
-                              <td data-label="最新中枢 [ZD, ZG]" className="num">
+                              <td data-label="中枢 [ZD, ZG]" className="num text-[11px]" style={{ paddingInline: 6 }}>
                                 {row.daily_zs ? `[${fmtPrice(row.daily_zs[0])}, ${fmtPrice(row.daily_zs[1])}]` : "—"}
                               </td>
-                              <td data-label="信号与方向建议">
-                                <div className="flex flex-wrap items-center gap-1.5">
-                                  {compassAlign ? (
-                                    <StatusBadge
-                                      tone={
-                                        compassAlign.status === "aligned"
-                                          ? "good"
-                                          : compassAlign.status === "counter"
-                                            ? "critical"
-                                            : compassAlign.status === "degraded"
-                                              ? "warning"
-                                              : "neutral"
-                                      }
-                                      label={
-                                        compassAlign.status === "aligned"
-                                          ? `L1同向通过 (${compassAlign.expected === "short" ? "空" : "多"})`
-                                          : compassAlign.status === "counter"
-                                            ? `L1反向冲突 (预期${compassAlign.expected === "short" ? "空" : "多"})`
-                                            : compassAlign.status === "pool_unverified"
-                                              ? "池内参考·需核实归属"
-                                              : compassAlign.status === "degraded"
-                                                ? "数据不足"
-                                                : `L1待成熟 (预期${compassAlign.expected === "short" ? "空" : compassAlign.expected === "long" ? "多" : "—"})`
-                                      }
-                                    />
-                                  ) : null}
-                                  {row.signal_tier ? (
-                                    <StatusBadge
-                                      tone={
-                                        row.quality_grade === "degraded" || row.signal_tier === "数据质量降级"
-                                          ? "warning"
-                                          : rowClass === "long"
+                              <td data-label="信号与方向建议" style={{ paddingInline: 6 }}>
+                                <div className="flex min-w-[155px] flex-col gap-1" title={rawSignalsTitle}>
+                                  <div className="flex flex-wrap items-center gap-1">
+                                    {compassAlign ? (
+                                      <StatusBadge
+                                        tone={
+                                          compassAlign.status === "aligned"
                                             ? "good"
-                                            : rowClass === "short"
+                                            : compassAlign.status === "counter"
                                               ? "critical"
-                                              : "neutral"
-                                      }
-                                      label={row.signal_tier}
-                                    />
-                                  ) : null}
-                                  {row.quality_grade === "caution" ? (
+                                              : compassAlign.status === "degraded"
+                                                ? "warning"
+                                                : "neutral"
+                                        }
+                                        label={
+                                          compassAlign.status === "aligned"
+                                            ? `L1同向通过(${compassAlign.expected === "short" ? "空" : "多"})`
+                                            : compassAlign.status === "counter"
+                                              ? `L1反向(${compassAlign.expected === "short" ? "空" : "多"})`
+                                              : compassAlign.status === "pool_unverified"
+                                                ? "池内参考·需核实归属"
+                                                : compassAlign.status === "degraded"
+                                                  ? "数据不足"
+                                                  : `L1待成熟(${compassAlign.expected === "short" ? "空" : compassAlign.expected === "long" ? "多" : "—"})`
+                                        }
+                                      />
+                                    ) : null}
+                                    {signalBadge ? (
+                                      <StatusBadge tone={signalBadge.tone} label={signalBadge.label} />
+                                    ) : null}
+                                    {row.quality_grade === "caution" ? (
+                                      <span
+                                        className="inline-flex items-center gap-0.5 rounded bg-warning/15 px-1.5 py-0.5 text-[10px] text-warning"
+                                        title={(row.quality_notes ?? []).join("；") || "数据源存在轻微平K或包络修正"}
+                                      >
+                                        <AlertTriangle className="h-2.5 w-2.5" aria-hidden="true" />
+                                        <span>质量提示</span>
+                                      </span>
+                                    ) : null}
+                                  </div>
+                                  {row.action_bias ? (
                                     <span
-                                      className="inline-flex items-center gap-0.5 rounded bg-warning/15 px-1.5 py-0.5 text-[10.5px] text-warning"
-                                      title={(row.quality_notes ?? []).join("；") || "数据源存在轻微平K或包络修正"}
+                                      className="line-clamp-2 text-[11px] leading-snug text-ink-2"
+                                      title={
+                                        [row.action_bias, (row.quality_notes ?? []).join("；")]
+                                          .filter(Boolean)
+                                          .join(" | ")
+                                      }
                                     >
-                                      <AlertTriangle className="h-2.5 w-2.5" aria-hidden="true" />
-                                      <span>质量提示</span>
+                                      {row.action_bias}
                                     </span>
                                   ) : null}
-                                  <span
-                                    className="text-xs text-ink-2"
-                                    title={(row.quality_notes ?? []).join("；") || undefined}
-                                  >
-                                    {row.action_bias || ""}
-                                  </span>
                                 </div>
                               </td>
                               <td
-                                data-label="流转动作"
-                                className="num"
+                                data-label="操作"
+                                className="num sticky right-0 z-[1] bg-surface shadow-[-1px_0_0_var(--hairline-soft)]"
+                                style={{ paddingInline: 8 }}
                                 onClick={(ev) => ev.stopPropagation()}
                               >
                                 <div className="inline-flex items-center justify-end gap-1">
                                   <button
                                     type="button"
                                     className="btn btn-sm"
+                                    style={{ paddingInline: 7 }}
                                     title="进入缠论战情室下钻 30min 触发与算仓"
                                     onClick={() => onJumpWarRoom(row.symbol)}
                                   >
@@ -1329,6 +1858,7 @@ export function WorkbenchView({
                                   <button
                                     type="button"
                                     className="btn btn-sm"
+                                    style={{ paddingInline: 7 }}
                                     disabled={addingWatchSym === symUpper}
                                     title={
                                       isArchived
@@ -1400,7 +1930,7 @@ export function WorkbenchView({
         </div>
 
         {/* Right Sidebar: Transparent Scan History (shows pool names instead of opaque hashes) */}
-        <aside className="card flex flex-col overflow-hidden xl:col-span-3" aria-label="近期扫描记录">
+        <aside className="card flex min-w-0 flex-col overflow-hidden" aria-label="近期扫描记录">
           <div className="flex items-center justify-between border-b border-hairline px-3.5 py-2.5">
             <span className="text-[13px] font-semibold text-ink">近期扫描记录 ({tasks.length})</span>
             <button
@@ -1480,6 +2010,57 @@ export function WorkbenchView({
         }}
         onSaved={() => void loadUniverses()}
       />
+
+      {archiveToast ? (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-5 right-5 z-50 flex max-w-md items-start gap-2.5 rounded-lg border border-bull/45 bg-surface px-3.5 py-3 shadow-lg"
+        >
+          <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-bull" aria-hidden="true" />
+          <div className="min-w-0 flex-1 text-xs">
+            <div className="font-semibold text-ink">
+              {archiveToast.existed
+                ? `${formatSymbolWithCode(archiveToast.symbol)} 已存在于研究档案库`
+                : `已将 ${formatSymbolWithCode(archiveToast.symbol)} 入池建档`}
+            </div>
+            <div className="mt-0.5 text-[11px] text-muted">
+              {archiveToast.existed
+                ? "可直接打开现有研报档案继续深研或修订"
+                : `方向：${formatDirectionBiasZh(archiveToast.directionBias)} · 主题：${archiveToast.theme || "观察池"}`}
+            </div>
+            <div className="mt-2 flex items-center gap-2">
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={() => {
+                  const sym = archiveToast.symbol;
+                  setArchiveToast(null);
+                  onJumpArchive(sym);
+                }}
+              >
+                <BookOpen className="h-3 w-3" aria-hidden="true" />
+                <span>查看研报档案</span>
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost btn-sm text-muted"
+                onClick={() => setArchiveToast(null)}
+              >
+                稍后
+              </button>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm px-1 text-muted hover:text-ink"
+            aria-label="关闭入池提示"
+            onClick={() => setArchiveToast(null)}
+          >
+            <X className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

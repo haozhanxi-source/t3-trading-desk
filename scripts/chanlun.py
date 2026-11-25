@@ -1171,6 +1171,45 @@ def select_active_zhongshus(
     return "stroke", f"{tf}笔中枢", stroke_zss
 
 
+def _fmt_trigger_level(val: float) -> str:
+    """Format Lesson-11 trigger price preserving up to 4 decimals (or 6 sig figs for micro-prices < 1e-3)."""
+    fval = float(val)
+    if fval != 0.0 and abs(fval) < 1e-3:
+        return f"{fval:.6g}"
+    return f"{round(fval, 4)}"
+
+
+def _round_trigger_level(val: float) -> float:
+    """Preserve raw precision for micro-prices (< 1e-3) instead of truncating to 0.0; round normal prices to 4dp."""
+    fval = float(val)
+    if fval != 0.0 and abs(fval) < 1e-3:
+        return fval
+    return round(fval, 4)
+
+
+def _stroke_end_weakening_reason(cl_block: Optional[dict], trade_dir: Optional[str]) -> Optional[str]:
+    """Return weakening reason if Lesson-11 stroke_end_trigger fired AGAINST ``trade_dir``.
+
+    For ``long``, an ``up`` stroke breaking its reverse yin / last-bar low means the up-stroke
+    likely ended (weakening). Conversely, a ``down`` stroke breaking its reverse yang high is a
+    pullback-end confirmation (NOT weakening). Symmetric for ``short``.
+    """
+    if not isinstance(cl_block, dict) or trade_dir not in ("long", "short"):
+        return None
+    trig = cl_block.get("stroke_end_trigger")
+    if not isinstance(trig, dict) or trig.get("triggered") is not True:
+        return None
+    our_stroke_dir = "up" if trade_dir == "long" else "down"
+    if str(trig.get("direction") or "").strip().lower() != our_stroke_dir:
+        return None
+    default_desc = (
+        "触发第11课破反向阴线低点（上行笔或已结束）"
+        if trade_dir == "long"
+        else "触发第11课破反向阳线高点（下行笔或已结束）"
+    )
+    return str(trig.get("description") or default_desc)
+
+
 def detect_stroke_end_trigger(df: Optional[pd.DataFrame], strokes: list[Stroke]) -> Optional[dict]:
     """Lesson 11: Reverse K-line break trigger for current stroke termination (笔结束判定)."""
     if df is None or df.empty or not strokes:
@@ -1190,10 +1229,11 @@ def detect_stroke_end_trigger(df: Optional[pd.DataFrame], strokes: list[Stroke])
     all_dates = _format_bar_timestamps(df.index)
     dates = all_dates[lo_r : hi_r + 1]
 
-    last_close = float(df["Close"].iloc[-1])
-    last_high = float(df["High"].iloc[-1])
-    last_low = float(df["Low"].iloc[-1])
-
+    # Strictly compare bars AFTER the stroke's extreme bar (hi_r) with a scale-aware epsilon so:
+    # (1) exact touches (==) and IEEE-754 rounding noise never false-trigger;
+    # (2) micro-price assets (e.g. ~1e-9) do not get their real breaks swallowed by a fixed 1e-9 eps;
+    # (3) a continuing bar at hi_r == len(df)-1 making a brand-new stroke extreme never
+    #     false-triggers against an earlier counter-K-line inside the same stroke.
     post_high = float(df["High"].iloc[hi_r + 1 :].max()) if hi_r < len(df) - 1 else None
     post_low = float(df["Low"].iloc[hi_r + 1 :].min()) if hi_r < len(df) - 1 else None
     post_close_max = float(df["Close"].iloc[hi_r + 1 :].max()) if hi_r < len(df) - 1 else None
@@ -1204,17 +1244,22 @@ def detect_stroke_end_trigger(df: Optional[pd.DataFrame], strokes: list[Stroke])
         rev_indices = [k for k in range(1, len(sub)) if closes[k] > opens[k]]
         if not rev_indices:
             lvl = float(highs[-1])
-            triggered = (post_high is not None and post_high > lvl) or (post_close_max is not None and post_close_max > lvl)
+            eps = max(abs(lvl) * 1e-9, 1e-15)
+            lvl_txt = _fmt_trigger_level(lvl)
+            triggered = (
+                (post_high is not None and post_high > lvl + eps)
+                or (post_close_max is not None and post_close_max > lvl + eps)
+            )
             return {
                 "direction": "down",
                 "trigger_kind": "break_prev_bar_high",
-                "level": round(lvl, 4),
+                "level": _round_trigger_level(lvl),
                 "ref_date": dates[-1],
                 "triggered": triggered,
                 "description": (
-                    f"已上破下行笔末根K线高点 {round(lvl, 2)}（旧下行笔大概率结束）"
+                    f"已上破下行笔末根K线高点 {lvl_txt}（旧下行笔大概率结束）"
                     if triggered
-                    else f"下行笔内无明显阳线，观察右侧站上 {round(lvl, 2)} 确认笔结束"
+                    else f"下行笔内无明显阳线，观察右侧站上 {lvl_txt} 确认笔结束"
                 ),
             }
         idx = rev_indices[-1]
@@ -1223,39 +1268,44 @@ def detect_stroke_end_trigger(df: Optional[pd.DataFrame], strokes: list[Stroke])
         while k >= 1 and closes[k] > opens[k]:
             cluster_high = max(cluster_high, float(highs[k]))
             k -= 1
+        eps = max(abs(cluster_high) * 1e-9, 1e-15)
+        lvl_txt = _fmt_trigger_level(cluster_high)
         triggered = (
-            (post_high is not None and post_high > cluster_high)
-            or (post_close_max is not None and post_close_max > cluster_high)
-            or last_close > cluster_high
-            or last_high > cluster_high
+            (post_high is not None and post_high > cluster_high + eps)
+            or (post_close_max is not None and post_close_max > cluster_high + eps)
         )
         return {
             "direction": "down",
             "trigger_kind": "break_reverse_yang_high",
-            "level": round(cluster_high, 4),
+            "level": _round_trigger_level(cluster_high),
             "ref_date": dates[idx],
             "triggered": triggered,
             "description": (
-                f"已上破下行笔内最近反向阳线高点 {round(cluster_high, 2)}（旧下行笔大概率结束）"
+                f"已上破下行笔内最近反向阳线高点 {lvl_txt}（旧下行笔大概率结束）"
                 if triggered
-                else f"待右侧放量站上反向阳线高点 {round(cluster_high, 2)} 确认下行笔结束"
+                else f"待右侧放量站上反向阳线高点 {lvl_txt} 确认下行笔结束"
             ),
         }
     else:
         rev_indices = [k for k in range(1, len(sub)) if closes[k] < opens[k]]
         if not rev_indices:
             lvl = float(lows[-1])
-            triggered = (post_low is not None and post_low < lvl) or (post_close_min is not None and post_close_min < lvl)
+            eps = max(abs(lvl) * 1e-9, 1e-15)
+            lvl_txt = _fmt_trigger_level(lvl)
+            triggered = (
+                (post_low is not None and post_low < lvl - eps)
+                or (post_close_min is not None and post_close_min < lvl - eps)
+            )
             return {
                 "direction": "up",
                 "trigger_kind": "break_prev_bar_low",
-                "level": round(lvl, 4),
+                "level": _round_trigger_level(lvl),
                 "ref_date": dates[-1],
                 "triggered": triggered,
                 "description": (
-                    f"已下破上行笔末根K线低点 {round(lvl, 2)}（旧上行笔大概率结束）"
+                    f"已下破上行笔末根K线低点 {lvl_txt}（旧上行笔大概率结束）"
                     if triggered
-                    else f"上行笔内无明显阴线，观察右侧跌破 {round(lvl, 2)} 确认笔结束"
+                    else f"上行笔内无明显阴线，观察右侧跌破 {lvl_txt} 确认笔结束"
                 ),
             }
         idx = rev_indices[-1]
@@ -1264,22 +1314,22 @@ def detect_stroke_end_trigger(df: Optional[pd.DataFrame], strokes: list[Stroke])
         while k >= 1 and closes[k] < opens[k]:
             cluster_low = min(cluster_low, float(lows[k]))
             k -= 1
+        eps = max(abs(cluster_low) * 1e-9, 1e-15)
+        lvl_txt = _fmt_trigger_level(cluster_low)
         triggered = (
-            (post_low is not None and post_low < cluster_low)
-            or (post_close_min is not None and post_close_min < cluster_low)
-            or last_close < cluster_low
-            or last_low < cluster_low
+            (post_low is not None and post_low < cluster_low - eps)
+            or (post_close_min is not None and post_close_min < cluster_low - eps)
         )
         return {
             "direction": "up",
             "trigger_kind": "break_reverse_yin_low",
-            "level": round(cluster_low, 4),
+            "level": _round_trigger_level(cluster_low),
             "ref_date": dates[idx],
             "triggered": triggered,
             "description": (
-                f"已下破上行笔内最近反向阴线低点 {round(cluster_low, 2)}（旧上行笔大概率结束）"
+                f"已下破上行笔内最近反向阴线低点 {lvl_txt}（旧上行笔大概率结束）"
                 if triggered
-                else f"防守上行笔内最近反向阴线低点 {round(cluster_low, 2)}，跌破则防笔结束"
+                else f"防守上行笔内最近反向阴线低点 {lvl_txt}，跌破则防笔结束"
             ),
         }
 
@@ -1490,6 +1540,13 @@ def classify_chanlun_signals(
     has_3b = False
     has_3s = False
 
+    curr_stroke_ended = bool(
+        curr is not None
+        and isinstance(stroke_end_trigger, dict)
+        and stroke_end_trigger.get("triggered") is True
+        and str(stroke_end_trigger.get("direction") or "").strip().lower() == curr.direction
+    )
+
     unit_seq = segments if (zhongshu_level == "segment" and segments) else strokes
     if latest_zs and len(unit_seq) >= 2:
         u_curr = unit_seq[-1]
@@ -1501,7 +1558,7 @@ def classify_chanlun_signals(
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag_3b}三买确认(回踩不破ZG={latest_zs.zg}+底分型)")
                 else:
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag_3b}准三买观察(回踩ZG={latest_zs.zg}上方)")
-            elif not u_curr.is_confirmed and len(unit_seq) >= 3:
+            elif not u_curr.is_confirmed and not curr_stroke_ended and len(unit_seq) >= 3:
                 prev_rebound = unit_seq[-2]
                 prev_break = unit_seq[-3]
                 if prev_rebound.direction == "up" and prev_break.direction == "down" and prev_break.low < latest_zs.zd and prev_rebound.high <= latest_zs.zd:
@@ -1515,7 +1572,7 @@ def classify_chanlun_signals(
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag_3s}三卖确认(反抽不过ZD={latest_zs.zd}+顶分型)")
                 else:
                     signals.append(f"{timeframe_label}{level_prefix}{zs_tag_3s}准三卖观察(反抽受阻于ZD={latest_zs.zd}下方)")
-            elif not u_curr.is_confirmed and len(unit_seq) >= 3:
+            elif not u_curr.is_confirmed and not curr_stroke_ended and len(unit_seq) >= 3:
                 prev_pullback = unit_seq[-2]
                 prev_break = unit_seq[-3]
                 if prev_pullback.direction == "down" and prev_break.direction == "up" and prev_break.high > latest_zs.zg and prev_pullback.low >= latest_zs.zg:
@@ -1618,7 +1675,9 @@ def classify_chanlun_signals(
                     signals.append(f"{timeframe_label}{out_tag}/{mode_tag}确认(反弹不过前高{prev_up.end_price}{strong_note})")
 
     # 6. Fresh reversal launch right after completed stroke (reuse assess_momentum on strokes[:-1] for 1B/1S)
-    if curr and not curr.is_confirmed and curr.raw_bars <= 4 and len(strokes) >= 4:
+    #    Guarded by `not curr_stroke_ended`: if the unconfirmed launch stroke already broke its Lesson-11
+    #    reverse-K / last-bar extreme, it is no longer a fresh confirmed launch.
+    if curr and not curr.is_confirmed and not curr_stroke_ended and curr.raw_bars <= 4 and len(strokes) >= 4:
         last_opp = strokes[-2]
         prev_opp = strokes[-4]
         prev_mom = assess_momentum(strokes[:-1])
@@ -1791,6 +1850,7 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
                 "confirmed": False,
                 "momentum_confirmed": False,
                 "is_exhaustion": False,
+                "stroke_end_weakening": False,
                 "signal_timestamp": None,
             },
         }
@@ -2087,6 +2147,40 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
         confirmed = False
         momentum_confirmed = False
 
+    # Unified Lesson-11 boundary guard: if a confirmed directional signal shares the same stroke
+    # direction as an already-triggered Lesson-11 stroke_end_trigger (or same-direction divergence),
+    # demote confirmed=False so War Room entry evaluation and Sentinel holding monitoring stay aligned.
+    stroke_end_weak_reason = (
+        _stroke_end_weakening_reason(chanlun_result, direction)
+        if direction in ("long", "short")
+        else None
+    )
+    same_dir_div_weak = False
+    if direction in ("long", "short"):
+        our_st_dir = "up" if direction == "long" else "down"
+        same_dir_div_weak = (d_div and d_dir == our_st_dir) or (
+            raw_verdict == f"divergence_candidate_{our_st_dir}"
+        )
+    stroke_end_weakening = bool(stroke_end_weak_reason)
+    if confirmed and direction in ("long", "short") and (stroke_end_weakening or same_dir_div_weak):
+        confirmed = False
+        signal_type = "candidate_buy" if direction == "long" else "candidate_sell"
+        tier = "背驰观察"
+        if stroke_end_weak_reason:
+            stroke_lbl = "上行笔" if direction == "long" else "下行笔"
+            summary = f"{tf}原{'买' if direction == 'long' else '卖'}点{stroke_lbl}已破反向K线(待重塑)"
+            action_bias = f"{stroke_end_weak_reason}；暂不放行追单，等待{tf}结构重塑确认"
+        else:
+            summary = f"{tf}原{'买' if direction == 'long' else '卖'}点出现同向背驰观察(待确认)"
+            action_bias = f"{tf}同向笔力度衰减，暂不追单，等待次级别重塑确认"
+    elif stroke_end_weak_reason and signal_type in (
+        "momentum_long",
+        "momentum_short",
+        "steep_non_div_up",
+        "steep_non_div_down",
+    ):
+        action_bias = f"{stroke_end_weak_reason}；原顺势笔已出现第11课破位信号，暂不追单，注意防守或等待{tf}结构重塑"
+
     dq = chanlun_result.get("data_quality") if isinstance(chanlun_result.get("data_quality"), dict) else None
     quality_degraded = bool(dq and dq.get("quality_grade") == "degraded")
     if quality_degraded:
@@ -2109,6 +2203,7 @@ def evaluate_signal_tier(chanlun_result: dict, timeframe_label: Optional[str] = 
             "confirmed": confirmed,
             "momentum_confirmed": momentum_confirmed,
             "is_exhaustion": is_exhaustion,
+            "stroke_end_weakening": stroke_end_weakening,
             "quality_degraded": quality_degraded,
             "signal_timestamp": sig_ts,
         },
@@ -2482,6 +2577,10 @@ def assess_dual_timeframe_alignment(
     intra_dir = intraday_signal_meta.get("direction", "neutral")
     intra_confirmed = bool(intraday_signal_meta.get("confirmed", False))
     intra_exhaustion = bool(intraday_signal_meta.get("is_exhaustion", False))
+    intra_weak_check_dir = ref_dir or (intra_dir if intra_dir in ("long", "short") else None)
+    intra_stroke_weak_reason = _stroke_end_weakening_reason(intraday_cl, intra_weak_check_dir)
+    if intra_stroke_weak_reason is None and intra_dir in ("long", "short") and intra_dir != intra_weak_check_dir:
+        intra_stroke_weak_reason = _stroke_end_weakening_reason(intraday_cl, intra_dir)
 
     if (
         not isinstance(intraday_cl, dict)
@@ -2497,9 +2596,15 @@ def assess_dual_timeframe_alignment(
     elif intra_type == "steep_non_div_up":
         intraday_action = "exhaustion_warning" if ref_dir != "long" else "wait_structure"
     elif intra_confirmed and intra_dir == "long":
-        intraday_action = "entry_long"
+        if _stroke_end_weakening_reason(intraday_cl, "long"):
+            intraday_action = "wait_structure"
+        else:
+            intraday_action = "entry_long"
     elif intra_confirmed and intra_dir == "short":
-        intraday_action = "entry_short"
+        if _stroke_end_weakening_reason(intraday_cl, "short"):
+            intraday_action = "wait_structure"
+        else:
+            intraday_action = "entry_short"
     else:
         intraday_action = "wait_structure"
 
@@ -2595,6 +2700,10 @@ def assess_dual_timeframe_alignment(
     elif alignment_status == "daily_ok_wait_30m":
         if intraday_action == "exhaustion_warning":
             notes.append(f"日线方向({daily_bias})顺向，但{intraday_tf}出现末端追击/非背驰警告({intraday_summary})，耐心等次级别回踩再切入")
+        elif intra_stroke_weak_reason:
+            notes.append(
+                f"日线方向({daily_bias})顺向，但{intraday_tf}触发第11课笔结束走弱({intra_stroke_weak_reason})，与哨兵风控口径一致暂不放行追单，等待{intraday_tf}结构重塑确认"
+            )
         else:
             notes.append(f"日线方向({daily_bias})已确认，等待{intraday_tf}走出明确结构触发点(当前:{intraday_summary})")
     else:

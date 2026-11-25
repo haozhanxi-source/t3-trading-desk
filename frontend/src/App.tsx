@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import {
   BookOpen,
   Crosshair,
@@ -79,6 +79,24 @@ function isEditableElement(el: EventTarget | null): boolean {
   );
 }
 
+export interface ArchiveNavOptions {
+  tab?: "thesis" | "evidence" | "hard_data" | "triggers";
+  openEvidenceForm?: boolean;
+  openMetaEditor?: boolean;
+}
+
+export interface ArchiveNavIntent extends ArchiveNavOptions {
+  nonce: number;
+  targetSymbol: string;
+  targetMarket: string | null;
+}
+
+function scrollToPageTop(): void {
+  if (typeof window !== "undefined") {
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  }
+}
+
 export function App() {
   const { choice, systemDark, cycleChoice } = useTheme();
   const initial = readInitialRoute();
@@ -92,6 +110,8 @@ export function App() {
   });
   const [activeSymbol, setActiveSymbol] = useState<string>(initial.symbol);
   const [activeMarket, setActiveMarket] = useState<string | null>(initial.market);
+  const [archiveNavIntent, setArchiveNavIntent] = useState<ArchiveNavIntent | undefined>(undefined);
+  const archiveNavNonceRef = useRef(0);
   const [paletteOpen, setPaletteOpen] = useState(false);
 
   const [health, setHealth] = useState<HealthResponse | null>(null);
@@ -187,24 +207,52 @@ export function App() {
       setActiveSymbol(sym.trim().toUpperCase());
       setActiveMarket(null);
       setScreen("warroom");
+      scrollToPageTop();
     },
     [setScreen],
   );
 
   const handleJumpArchive = useCallback(
-    (sym: string, market?: string | null) => {
-      setActiveSymbol(sym.trim().toUpperCase());
-      setActiveMarket(market ? market.trim().toUpperCase() : null);
+    (sym: string, market?: string | null, opts?: ArchiveNavOptions) => {
+      const normSym = sym.trim().toUpperCase();
+      const normMkt = market ? market.trim().toUpperCase() : null;
+      setActiveSymbol(normSym);
+      setActiveMarket(normMkt);
+      archiveNavNonceRef.current += 1;
+      setArchiveNavIntent({
+        tab: opts?.tab,
+        openEvidenceForm: opts?.openEvidenceForm,
+        openMetaEditor: opts?.openMetaEditor,
+        nonce: archiveNavNonceRef.current,
+        targetSymbol: normSym,
+        targetMarket: normMkt,
+      });
       setScreen("archive");
+      scrollToPageTop();
     },
     [setScreen],
   );
 
+  const handleJumpSentinel = useCallback(() => {
+    setScreen("sentinel");
+    scrollToPageTop();
+  }, [setScreen]);
+
   const handlePaletteJump = useCallback(
     (sym: string, target: "warroom" | "archive") => {
-      setActiveSymbol(sym.trim().toUpperCase());
+      const normSym = sym.trim().toUpperCase();
+      setActiveSymbol(normSym);
       setActiveMarket(null);
+      if (target === "archive") {
+        archiveNavNonceRef.current += 1;
+        setArchiveNavIntent({
+          nonce: archiveNavNonceRef.current,
+          targetSymbol: normSym,
+          targetMarket: null,
+        });
+      }
       setScreen(target);
+      scrollToPageTop();
     },
     [setScreen],
   );
@@ -387,6 +435,7 @@ export function App() {
                 active={screen === "archive"}
                 symbol={activeSymbol}
                 market={activeMarket}
+                navIntent={archiveNavIntent}
                 workspaceRev={workspaceRev}
                 onArchiveMutated={bumpWorkspaceRev}
                 onSelectSymbol={(s, mkt) => {
@@ -407,6 +456,7 @@ export function App() {
                 portfolioInitialized={health?.portfolio_initialized}
                 onSelectSymbol={(s) => setActiveSymbol(s.trim().toUpperCase())}
                 onJumpArchive={handleJumpArchive}
+                onJumpSentinel={handleJumpSentinel}
                 onMacroContext={setMacro}
                 onPortfolioChanged={bumpWorkspaceRev}
               />

@@ -3010,6 +3010,135 @@ class TestRound3Hardening(unittest.TestCase):
                 {a["code"] for a in run_cross["holdings"][0]["yellow_alerts"]},
             )
 
+    def test_display_equal_entry_price_no_phantom_minus_001_pnl_and_warroom_sentinel_parity(self):
+        # 1) NEE exact repro: 30m last_close=84.605 (displays as 84.61) vs entry_price=84.61 -> 0.0% (NOT -0.01%!)
+        ref = date(2026, 11, 24)
+        state = _make_armed_state("long", stop_threshold=80.87)
+        snap_nee = _make_healthy_snapshot(
+            symbol="NEE", price=84.605, daily_zd=80.87, daily_zg=82.81, intra_zd=84.2073, intra_zg=85.075,
+            daily_bar="2026-11-24", intraday_bar="2026-11-24T20:30:00+00:00",
+        )
+        pos_nee = _make_base_position(
+            symbol="NEE", direction="long", entry_price=84.61,
+            tactical_stop_30m=83.27, structural_stop_daily=80.87, target_price=88.0,
+        )
+        res_nee = ds.evaluate_holding_health(
+            "NEE", "long", position=pos_nee, archive_state=state, snapshot=snap_nee, ref_date=ref
+        )
+        self.assertEqual(res_nee["unrealized_pnl_pct"], 0.0)
+        # Ensure it's positive zero, not -0.0
+        self.assertFalse(ds.math.copysign(1.0, res_nee["unrealized_pnl_pct"]) < 0)
+
+        # Short side with same sub-tick display-equal prices -> also 0.0% (not +0.01%)
+        self.assertEqual(ds._compute_unrealized_pnl_pct(84.605, 84.61, "short", "us_stock_or_etf"), 0.0)
+        # Real 1-cent move (84.60 vs 84.61) MUST still show -0.01% / +0.01%
+        self.assertEqual(ds._compute_unrealized_pnl_pct(84.60, 84.61, "long", "us_stock_or_etf"), -0.01)
+        self.assertEqual(ds._compute_unrealized_pnl_pct(84.60, 84.61, "short", "us_stock_or_etf"), 0.01)
+        # FX 4dp display equality (1.08452 vs 1.0845 -> 0.0) vs real 1-pip move (1.0846 vs 1.0845 -> +0.01)
+        self.assertEqual(ds._compute_unrealized_pnl_pct(1.08452, 1.0845, "long", "fx"), 0.0)
+        self.assertEqual(ds._compute_unrealized_pnl_pct(1.0846, 1.0845, "long", "fx"), 0.01)
+        # Ultra-cheap micro-price token (+25% move) MUST NOT be clamped to 0.0
+        self.assertEqual(ds._compute_unrealized_pnl_pct(0.000015, 0.000012, "long", "crypto"), 25.0)
+        # Exact equality -> 0.0
+        self.assertEqual(ds._compute_unrealized_pnl_pct(84.61, 84.61, "long", "us_stock_or_etf"), 0.0)
+
+        # 2) War Room vs Sentinel parity on 30m Lesson-11 stroke_end_trigger:
+        #    When 30m up-stroke trigger is NOT fired, War Room emits aligned_trigger AND Sentinel emits GREEN_HOLD.
+        daily_cl = {
+            "timeframe": "日线",
+            "last_close": 84.58,
+            "price_vs_zhongshu": "above_zg(+2.14%)",
+            "latest_zhongshu": {"zd": 80.87, "zg": 82.81},
+            "momentum_assessment": {"active_direction": "up", "is_capital_consensus": False},
+            "stroke_end_trigger": {"direction": "up", "level": 83.27, "triggered": False},
+            "recent_strokes": [{"direction": "up", "start_price": 82.94, "end_price": 85.05, "low": 82.94, "high": 85.05, "is_confirmed": False}],
+            "signals": ["日线首中枢三买确认(回踩不破ZG=82.81·底分型上攻)"],
+        }
+        intra_cl_clean = {
+            "timeframe": "30分钟",
+            "last_close": 84.605,
+            "price_vs_zhongshu": "inside_zs(46%)",
+            "latest_zhongshu": {"zd": 84.2073, "zg": 85.075},
+            "momentum_assessment": {"active_direction": "down", "is_capital_consensus": False, "verdict": "higher_low_pullback"},
+            "stroke_end_trigger": {"direction": "down", "level": 84.50, "triggered": True, "description": "已上破下行笔内最近反向阳线高点 84.5"},
+            "recent_strokes": [{"direction": "down", "start_price": 85.05, "end_price": 84.39, "low": 84.39, "high": 85.05, "is_confirmed": False}],
+            "signals": ["30分钟3出(D3·首次底抬高)/二买确认(回踩不破前低83.27)"],
+        }
+        dual_clean = ds.cl_mod.assess_dual_timeframe_alignment(daily_cl, intra_cl_clean, desired_direction="long")
+        self.assertEqual(dual_clean["alignment_status"], "aligned_trigger")
+        snap_clean = ds.copy.deepcopy(snap_nee)
+        snap_clean["chanlun"].pop("intraday_30m", None)
+        snap_clean["chanlun"]["daily"] = daily_cl
+        snap_clean["chanlun"]["intraday"] = intra_cl_clean
+        snap_clean["chanlun"]["dual_alignment"] = dual_clean
+        snap_clean["chanlun"]["signal_summary"] = ds.cl_mod.evaluate_signal_tier(daily_cl, "日线")
+        snap_clean["chanlun"]["intraday_signal_summary"] = ds.cl_mod.evaluate_signal_tier(intra_cl_clean, "30分钟")
+        res_clean = ds.evaluate_holding_health(
+            "NEE", "long", position=pos_nee, archive_state=state, snapshot=snap_clean, ref_date=ref
+        )
+        self.assertEqual(res_clean["status"], ds.STATUS_GREEN)
+
+        # When 30m up-stroke trigger IS fired, War Room MUST block aligned_trigger AND Sentinel flags YELLOW.
+        intra_cl_broken = {
+            "timeframe": "30分钟",
+            "last_close": 84.605,
+            "price_vs_zhongshu": "inside_zs(46%)",
+            "latest_zhongshu": {"zd": 84.2073, "zg": 85.075},
+            "momentum_assessment": {"active_direction": "up", "is_capital_consensus": True, "verdict": "capital_consensus_up"},
+            "stroke_end_trigger": {"direction": "up", "level": 84.605, "triggered": True, "description": "已下破上行笔末根K线低点 84.605（旧上行笔大概率结束）"},
+            "recent_strokes": [{"direction": "up", "start_price": 83.27, "end_price": 85.05, "low": 83.27, "high": 85.05, "is_confirmed": False}],
+            "signals": ["30分钟3出(D3)/二买启动(不破前低82.94+底分型)"],
+        }
+        dual_broken = ds.cl_mod.assess_dual_timeframe_alignment(daily_cl, intra_cl_broken, desired_direction="long")
+        self.assertNotEqual(dual_broken["alignment_status"], "aligned_trigger")
+        self.assertEqual(dual_broken["alignment_status"], "daily_ok_wait_30m")
+        snap_broken = ds.copy.deepcopy(snap_nee)
+        snap_broken["chanlun"].pop("intraday_30m", None)
+        snap_broken["chanlun"]["daily"] = daily_cl
+        snap_broken["chanlun"]["intraday"] = intra_cl_broken
+        snap_broken["chanlun"]["dual_alignment"] = dual_broken
+        snap_broken["chanlun"]["signal_summary"] = ds.cl_mod.evaluate_signal_tier(daily_cl, "日线")
+        snap_broken["chanlun"]["intraday_signal_summary"] = ds.cl_mod.evaluate_signal_tier(intra_cl_broken, "30分钟")
+        res_broken = ds.evaluate_holding_health(
+            "NEE", "long", position=pos_nee, archive_state=state, snapshot=snap_broken, ref_date=ref
+        )
+        self.assertEqual(res_broken["status"], ds.STATUS_YELLOW)
+        self.assertIn("intraday_30m_weakening", {a["code"] for a in res_broken["yellow_alerts"]})
+
+    def test_fx_micro_profit_still_emits_trailing_stop_while_display_pnl_zeroed(self):
+        """P2-2: FX 1.09996 -> 1.10004 (+0.00727% raw profit, display 0.0%) MUST still emit trailing stop."""
+        ref = date(2026, 11, 24)
+        state = _make_armed_state("long", stop_threshold=1.0850)
+        snap_fx = _make_healthy_snapshot(
+            symbol="EURUSD=X",
+            price=1.10004,
+            daily_zd=1.0850,
+            daily_zg=1.0950,
+            intra_zd=1.0960,
+            intra_zg=1.1020,
+            daily_bar="2026-11-24",
+            intraday_bar="2026-11-24T20:30:00+00:00",
+        )
+        snap_fx["asset_class"] = "fx"
+        pos_fx = _make_base_position(
+            symbol="EURUSD=X",
+            direction="long",
+            entry_price=1.09996,
+            tactical_stop_30m=1.0920,
+            structural_stop_daily=1.0850,
+            target_price=1.1250,
+        )
+        pos_fx["asset_class"] = "fx"
+        res_fx = ds.evaluate_holding_health(
+            "EURUSD=X", "long", position=pos_fx, archive_state=state, snapshot=snap_fx, ref_date=ref
+        )
+        # Display PnL stays 0.0 (same 4dp display quote 1.1000), but raw PnL > 0 unlocks trailing stop!
+        self.assertEqual(res_fx["unrealized_pnl_pct"], 0.0)
+        self.assertIsNotNone(res_fx["suggested_trail_stop"])
+        self.assertEqual(res_fx["suggested_trail_stop"]["suggested_stop"], 1.096)
+        self.assertEqual(res_fx["suggested_trail_stop"]["anchor"], "30m_zhongshu_zd")
+        self.assertIn("+0.0073%", res_fx["suggested_trail_stop"]["rationale"])
+
 
 if __name__ == "__main__":
     unittest.main()

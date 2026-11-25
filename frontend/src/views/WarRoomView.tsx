@@ -3,11 +3,18 @@ import { AlertTriangle, BookOpen, RefreshCw, Search } from "lucide-react";
 import { api, errorMessage } from "../api/client";
 import type { ArchiveListItem, MarketDualResponse, Position, SymbolSearchItem } from "../api/types";
 import { ChanlunChart, type PlanOverlayLines } from "../components/chart/ChanlunChart";
-import { OpenPositionDialog, type OpenPositionSeed } from "../components/portfolio/PortfolioDialogs";
+import {
+  isGenericSectorTheme,
+  OpenPositionDialog,
+  type OpenPositionReceipt,
+  type OpenPositionSeed,
+} from "../components/portfolio/PortfolioDialogs";
 import { DirectionBadge, StatusBadge } from "../components/ui/StatusBadge";
 import { SymbolLabel } from "../components/ui/SymbolLabel";
 import {
+  formatAssetClassZh,
   TradePlannerCard,
+  type ArchiveJumpOptions,
   type ArchivePlanContext,
   type PickedPriceUpdate,
   type PickPriceField,
@@ -42,7 +49,8 @@ interface WarRoomViewProps {
   workspaceRev?: number;
   portfolioInitialized?: boolean;
   onSelectSymbol: (symbol: string) => void;
-  onJumpArchive: (symbol: string, market?: string | null) => void;
+  onJumpArchive: (symbol: string, market?: string | null, opts?: ArchiveJumpOptions) => void;
+  onJumpSentinel?: () => void;
   onMacroContext?: (macro: Record<string, unknown>) => void;
   onPortfolioChanged?: () => void;
 }
@@ -54,6 +62,7 @@ export function WarRoomView({
   portfolioInitialized,
   onSelectSymbol,
   onJumpArchive,
+  onJumpSentinel,
   onMacroContext,
   onPortfolioChanged,
 }: WarRoomViewProps) {
@@ -72,6 +81,7 @@ export function WarRoomView({
   const snapReqIdRef = useRef(0);
 
   const [openPosSeed, setOpenPosSeed] = useState<OpenPositionSeed | null>(null);
+  const [openedReceipt, setOpenedReceipt] = useState<OpenPositionReceipt | null>(null);
   const [ledgerInit, setLedgerInit] = useState<boolean | undefined>(portfolioInitialized);
   const [accountEquity, setAccountEquity] = useState<number | null>(null);
   const [accountCurrency, setAccountCurrency] = useState<string | null>(null);
@@ -139,12 +149,14 @@ export function WarRoomView({
   /* Fetch research archive metadata ONLY when canonical symbol exists in archive catalog (zero 404 spam) */
   useEffect(() => {
     const reqKey = currentReqKey;
-    setArchiveCtx(null);
+    setArchiveCtx((prev) => (prev && prev.forSymbol === reqKey ? prev : null));
     if (!archivesLoaded) return;
     if (!matchedArchiveEntry) {
       setArchiveCtx({
         forSymbol: reqKey,
         exists: false,
+        market: null,
+        directionBias: null,
         sectorTheme: holdingSectorTheme,
         hasL1L2Evidence: false,
       });
@@ -158,15 +170,22 @@ export function WarRoomView({
         const hasL1L2 = (detail.recent_evidence ?? []).some(
           (ev) => ev.level === "L1" || ev.level === "L2",
         );
+        const primaryDriver = (detail.state?.layer1_drivers?.primary || "").trim();
+        const holdingTheme = (holdingSectorTheme || "").trim();
+        const subtypeTheme = (detail.state?.instrument?.subtype || "").trim();
+        const resolvedSectorTheme =
+          (primaryDriver && !isGenericSectorTheme(primaryDriver) ? primaryDriver : "") ||
+          (holdingTheme && !isGenericSectorTheme(holdingTheme) ? holdingTheme : "") ||
+          primaryDriver ||
+          holdingTheme ||
+          subtypeTheme ||
+          null;
         setArchiveCtx({
           forSymbol: reqKey,
           exists: true,
-          market: detail.market,
-          sectorTheme:
-            holdingSectorTheme ||
-            detail.state?.layer1_drivers?.primary ||
-            detail.state?.instrument?.subtype ||
-            null,
+          market: detail.market ?? null,
+          directionBias: detail.state?.direction_bias ?? null,
+          sectorTheme: resolvedSectorTheme,
           hasL1L2Evidence: hasL1L2,
           evidenceCount: detail.evidence_count,
         });
@@ -176,6 +195,8 @@ export function WarRoomView({
           setArchiveCtx({
             forSymbol: reqKey,
             exists: false,
+            market: null,
+            directionBias: null,
             sectorTheme: holdingSectorTheme,
             hasL1L2Evidence: false,
           });
@@ -416,9 +437,26 @@ export function WarRoomView({
     [pickField],
   );
 
+  const handleJumpSentinel = useCallback(() => {
+    if (onJumpSentinel) {
+      onJumpSentinel();
+      return;
+    }
+    const navBtn = document.querySelector<HTMLButtonElement>(
+      'nav[aria-label="四层投研工作流主导航"] button[title*="哨兵总控"]',
+    );
+    if (navBtn) {
+      navBtn.click();
+      return;
+    }
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "1", altKey: true, bubbles: true }));
+  }, [onJumpSentinel]);
+
   const resolvedSym = currentData?.symbol || symbol;
   const scopedArchiveCtx =
     archiveCtx && archiveCtx.forSymbol === currentReqKey ? archiveCtx : null;
+  const scopedOpenedReceipt =
+    openedReceipt && matchCanonicalTicker(openedReceipt.symbol, resolvedSym) ? openedReceipt : null;
 
   return (
     <div className="flex flex-col gap-3.5">
@@ -465,22 +503,24 @@ export function WarRoomView({
           <div className="flex flex-wrap items-center gap-2">
             <form onSubmit={handleSubmitSymbol} className="relative flex items-center gap-1.5">
               <div className="relative">
-                <Search
-                  className="pointer-events-none absolute top-1/2 left-2.5 h-3.5 w-3.5 -translate-y-1/2 text-muted"
-                  aria-hidden="true"
-                />
-                <input
-                  className="input w-44 pl-8"
-                  aria-label="输入标的代码或中文名称快速切换"
-                  placeholder="代码或中文名…"
-                  value={draftSymbol}
-                  onFocus={() => setSuggestOpen(true)}
-                  onBlur={() => window.setTimeout(() => setSuggestOpen(false), 140)}
-                  onChange={(e) => {
-                    setDraftSymbol(e.target.value);
-                    setSuggestOpen(true);
-                  }}
-                />
+                <div className="input flex w-48 items-center gap-2 focus-within:border-transparent focus-within:bg-surface focus-within:outline-2 focus-within:outline-accent">
+                  <Search
+                    className="h-3.5 w-3.5 shrink-0 text-muted"
+                    aria-hidden="true"
+                  />
+                  <input
+                    className="min-w-0 flex-1 border-0 bg-transparent p-0 text-[13px] text-ink outline-none placeholder:text-muted"
+                    aria-label="输入标的代码或中文名称快速切换"
+                    placeholder="代码或中文名…"
+                    value={draftSymbol}
+                    onFocus={() => setSuggestOpen(true)}
+                    onBlur={() => window.setTimeout(() => setSuggestOpen(false), 140)}
+                    onChange={(e) => {
+                      setDraftSymbol(e.target.value);
+                      setSuggestOpen(true);
+                    }}
+                  />
+                </div>
                 {suggestOpen && suggestions.length > 0 ? (
                   <ul
                     role="listbox"
@@ -509,7 +549,9 @@ export function WarRoomView({
                               <span className="ml-1.5 font-mono text-[11px] text-muted">{it.symbol}</span>
                             ) : null}
                           </span>
-                          <span className="font-mono text-[10px] text-muted">{it.asset_class}</span>
+                          <span className="shrink-0 text-[10.5px] text-muted">
+                            {formatAssetClassZh(it.asset_class)}
+                          </span>
                         </li>
                       );
                     })}
@@ -718,6 +760,8 @@ export function WarRoomView({
         accountEquity={accountEquity}
         accountCurrency={accountCurrency}
         archiveContext={scopedArchiveCtx}
+        openedReceipt={scopedOpenedReceipt}
+        onDismissOpenedReceipt={() => setOpenedReceipt(null)}
         activePickField={pickField}
         pickedPrice={pickedPrice}
         onRequestPickField={setPickField}
@@ -727,18 +771,26 @@ export function WarRoomView({
           refreshWorkspaceContext();
           onPortfolioChanged?.();
         }}
-        onJumpArchive={(sym, mkt) => onJumpArchive(sym, mkt)}
+        onJumpArchive={(sym, mkt, opts) => onJumpArchive(sym, mkt, opts)}
+        onJumpSentinel={handleJumpSentinel}
       />
 
       <OpenPositionDialog
         open={openPosSeed !== null}
         onClose={() => setOpenPosSeed(null)}
-        onSuccess={() => {
+        onSuccess={(receipt) => {
           setOpenPosSeed(null);
+          if (receipt) {
+            setOpenedReceipt(receipt);
+          }
           refreshWorkspaceContext();
           onPortfolioChanged?.();
         }}
         seed={openPosSeed ?? undefined}
+        firstTrancheQty={openPosSeed?.first_tranche_qty}
+        firstTrancheWeight={openPosSeed?.first_tranche_weight}
+        fullPlanQty={openPosSeed?.full_plan_qty ?? openPosSeed?.quantity}
+        tranches={openPosSeed?.tranches}
         accountCurrency={accountCurrency}
       />
     </div>

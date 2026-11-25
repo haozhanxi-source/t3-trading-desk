@@ -53,7 +53,7 @@ class TestResearchArchive(unittest.TestCase):
             self.assertEqual(res_cmd["status"], "created")
             loaded_cmd = load_archive("碳酸锂", research_root=tmpdir)
             self.assertEqual(loaded_cmd["market"], "CN_FUTURES")
-            self.assertIn("1Q~1Y 供需平衡表预期", loaded_cmd["thesis_md"])
+            self.assertIn("1Q–1Y 供需平衡表预期", loaded_cmd["thesis_md"])
             self.assertIn("资源国政策叙事追踪", loaded_cmd["thesis_md"])
             self.assertIn("红蓝辩论反方必答 5 问", loaded_cmd["thesis_md"])
 
@@ -292,6 +292,157 @@ class TestResearchArchive(unittest.TestCase):
             self.assertIn("供需与交易结构证伪阈值", cl_loaded["thesis_md"])
             self.assertIn("大 B 结构绝非做空禁区", cl_loaded["thesis_md"])
             self.assertIn("单一板块龙头独占制", cl_loaded["thesis_md"])
+
+    def test_init_and_update_state_direction_drivers_status_confidence(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1) init_archive supports explicit direction_bias, layer1_primary, layer1_secondary, thesis_summary, confidence
+            res = init_archive(
+                "NVDA",
+                name="NVIDIA",
+                subtype="A成长",
+                thesis_summary="AI 算力代际迭代驱动 1~3 年盈利上修",
+                direction_bias="long",
+                layer1_primary="维度3技术与产业迭代",
+                layer1_secondary="维度1宏观流动性",
+                confidence="high",
+                research_root=tmpdir,
+            )
+            self.assertEqual(res["status"], "created")
+            st = res["state"]
+            self.assertEqual(st["direction_bias"], "long")
+            self.assertEqual(st["layer1_drivers"]["primary"], "维度3技术与产业迭代")
+            self.assertEqual(st["layer1_drivers"]["secondary"], "维度1宏观流动性")
+            self.assertEqual(st["thesis_summary"], "AI 算力代际迭代驱动 1~3 年盈利上修")
+            self.assertEqual(st["confidence"], "high")
+            self.assertEqual(st["revision"], 1)
+
+            loaded = load_archive("NVDA", research_root=tmpdir)
+            self.assertIn("AI 算力代际迭代驱动 1~3 年盈利上修", loaded["thesis_md"])
+            self.assertIn("维度3技术与产业迭代", loaded["thesis_md"])
+            self.assertIn("维度1宏观流动性", loaded["thesis_md"])
+            self.assertIn("做多 (long)", loaded["thesis_md"])
+            self.assertNotIn("临时自选", loaded["thesis_md"])
+
+            # Invalid direction_bias or confidence in init_archive MUST raise ValueError
+            with self.assertRaises(ValueError):
+                init_archive("AMD", direction_bias="bullish", research_root=tmpdir)
+            with self.assertRaises(ValueError):
+                init_archive("AMD", confidence="ultra", research_root=tmpdir)
+            with self.assertRaises(ValueError):
+                init_archive("AMD", confidence=1.5, research_root=tmpdir)
+            with self.assertRaises(ValueError):
+                init_archive("AMD", confidence=True, research_root=tmpdir)
+
+            # 2) update_state supports atomic update of direction_bias, thesis_summary, layer1_primary/secondary,
+            #    status (watchlist/holding/archived), confidence (enum & [0, 1]), updating revision & updated_at_utc
+            st2 = update_state(
+                "NVDA",
+                {
+                    "direction_bias": "short",
+                    "thesis_summary": "更新后的核心论点",
+                    "layer1_primary": "维度4供需拐点",
+                    "status": "holding",
+                    "confidence": 0.75,
+                },
+                expected_revision=1,
+                research_root=tmpdir,
+            )
+            self.assertEqual(st2["revision"], 2)
+            self.assertEqual(st2["direction_bias"], "short")
+            self.assertEqual(st2["thesis_summary"], "更新后的核心论点")
+            self.assertEqual(st2["layer1_drivers"]["primary"], "维度4供需拐点")
+            # Existing secondary preserved when only layer1_primary is patched
+            self.assertEqual(st2["layer1_drivers"]["secondary"], "维度1宏观流动性")
+            self.assertNotIn("layer1_primary", st2)
+            self.assertNotIn("layer1_secondary", st2)
+            self.assertEqual(st2["status"], "holding")
+            self.assertEqual(st2["confidence"], 0.75)
+            self.assertTrue(bool(st2.get("updated_at_utc")))
+
+            # Patching status -> archived, direction_bias -> neutral, layer1_secondary, confidence -> medium
+            st3 = update_state(
+                "NVDA",
+                {
+                    "status": "archived",
+                    "direction_bias": "neutral",
+                    "layer1_secondary": "维度6资金流拥挤",
+                    "confidence": "medium",
+                },
+                expected_revision=2,
+                research_root=tmpdir,
+            )
+            self.assertEqual(st3["revision"], 3)
+            self.assertEqual(st3["status"], "archived")
+            self.assertEqual(st3["direction_bias"], "neutral")
+            self.assertEqual(st3["layer1_drivers"]["primary"], "维度4供需拐点")
+            self.assertEqual(st3["layer1_drivers"]["secondary"], "维度6资金流拥挤")
+            self.assertEqual(st3["confidence"], "medium")
+
+            # Patching confidence=None clears it cleanly
+            st4 = update_state("NVDA", {"confidence": None}, expected_revision=3, research_root=tmpdir)
+            self.assertEqual(st4["revision"], 4)
+            self.assertIsNone(st4["confidence"])
+
+            # Invalid patches MUST be rejected atomically without bumping revision
+            for bad_patch in (
+                {"direction_bias": "bullish"},
+                {"direction_bias": None},
+                {"status": "deleted"},
+                {"confidence": "extreme"},
+                {"confidence": -0.1},
+                {"confidence": 1.2},
+                {"confidence": True},
+                {"layer1_primary": 123},
+                {"layer1_secondary": ["bad"]},
+                {"thesis_summary": 999},
+            ):
+                with self.assertRaises(ValueError, msg=f"Should reject {bad_patch}"):
+                    update_state("NVDA", bad_patch, research_root=tmpdir)
+            self.assertEqual(load_archive("NVDA", research_root=tmpdir)["state"]["revision"], 4)
+
+            # 3) CLI init supports --direction-bias, --layer1-primary, --layer1-secondary, --confidence
+            import io
+            from contextlib import redirect_stdout
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                archive_main([
+                    "--root", tmpdir,
+                    "init", "CU0",
+                    "--name", "沪铜",
+                    "--direction-bias", "short",
+                    "--layer1-primary", "维度4供需过剩预期",
+                    "--layer1-secondary", "维度1中国地产偏弱",
+                    "--thesis", "强现实弱预期劈叉做空远月",
+                    "--confidence", "medium",
+                ])
+            cli_out = json.loads(buf.getvalue())
+            self.assertEqual(cli_out["status"], "created")
+            self.assertEqual(cli_out["state"]["direction_bias"], "short")
+            self.assertEqual(cli_out["state"]["layer1_drivers"]["primary"], "维度4供需过剩预期")
+            self.assertEqual(cli_out["state"]["layer1_drivers"]["secondary"], "维度1中国地产偏弱")
+            self.assertEqual(cli_out["state"]["confidence"], "medium")
+
+            # 4) P2-4: overwrite=True MUST monotonically increment revision (old_revision + 1), never reset to 1
+            r1 = init_archive("PWR", name="Quanta", direction_bias="long", research_root=tmpdir)
+            self.assertEqual(r1["state"]["revision"], 1)
+            st2 = update_state("PWR", {"confidence": "high"}, expected_revision=1, research_root=tmpdir)
+            self.assertEqual(st2["revision"], 2)
+
+            r_over = init_archive(
+                "PWR",
+                name="Quanta Rebuilt",
+                direction_bias="short",
+                thesis_summary="Rebuilt thesis",
+                overwrite=True,
+                research_root=tmpdir,
+            )
+            self.assertEqual(r_over["status"], "created")
+            self.assertEqual(r_over["state"]["revision"], 3)
+            # Stale client holding expected_revision=1 MUST be rejected with Revision conflict
+            with self.assertRaises(ValueError) as ctx_rev:
+                update_state("PWR", {"confidence": "low"}, expected_revision=1, research_root=tmpdir)
+            self.assertIn("Revision conflict", str(ctx_rev.exception))
 
 
 if __name__ == "__main__":

@@ -43,8 +43,17 @@ ASSET_CLASS_TO_MARKET = {
 VALID_MARKETS = set(ASSET_CLASS_TO_MARKET.values())
 VALID_EVIDENCE_LEVELS = {"L1", "L2", "L3", "L4"}
 VALID_EVIDENCE_KINDS = {"fact", "external_forecast", "assumption"}
-VALID_STATUSES = {"watchlist", "actionable_long", "actionable_short", "pair_trade", "holding", "rejected"}
+VALID_STATUSES = {
+    "watchlist",
+    "actionable_long",
+    "actionable_short",
+    "pair_trade",
+    "holding",
+    "rejected",
+    "archived",
+}
 VALID_DIRECTIONS = {"long", "short", "neutral", "pair"}
+VALID_CONFIDENCE_LEVELS = {"low", "medium", "high"}
 VALID_OPERATORS = {">", ">=", "<", "<=", "==", "contains", "event"}
 VALID_TRIGGER_KINDS = {
     "fundamental",
@@ -294,12 +303,16 @@ def resolve_archive_dir(
     if "/" in raw_clean and not re.fullmatch(r"[A-Za-z0-9]+/[A-Za-z0-9]+", raw_clean):
         raise ValueError(f"Path separator not allowed in symbol: {raw_symbol!r}")
 
-    norm_sym, asset_class = normalize_symbol(raw_clean)
     if market_override is not None:
         market = str(market_override).strip().upper()
         if market not in VALID_MARKETS:
             raise ValueError(f"Invalid market_override {market_override!r}; expected one of {sorted(VALID_MARKETS)}")
+        if market == "US" and ":" not in raw_clean:
+            norm_sym, asset_class = normalize_symbol(f"US:{raw_clean}")
+        else:
+            norm_sym, asset_class = normalize_symbol(raw_clean)
     else:
+        norm_sym, asset_class = normalize_symbol(raw_clean)
         market = ASSET_CLASS_TO_MARKET.get(asset_class, "US")
 
     safe_sym = safe_symbol_dir_name(norm_sym)
@@ -349,6 +362,86 @@ def _apply_wal_unlocked(folder: str) -> None:
     os.unlink(wal_path)
 
 
+_DIRECTION_LABELS = {
+    "long": "做多 (long)",
+    "short": "做空 (short)",
+    "neutral": "待定 (neutral)",
+    "pair": "配对 (pair)",
+}
+
+
+def _normalize_status(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid status {value!r}; expected one of {sorted(VALID_STATUSES)}")
+    norm = value.strip().lower()
+    if norm not in VALID_STATUSES:
+        raise ValueError(f"Invalid status {value!r}; expected one of {sorted(VALID_STATUSES)}")
+    return norm
+
+
+def _normalize_direction_bias(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"Invalid direction_bias {value!r}; expected one of {sorted(VALID_DIRECTIONS)}")
+    norm = value.strip().lower()
+    if norm not in VALID_DIRECTIONS:
+        raise ValueError(f"Invalid direction_bias {value!r}; expected one of {sorted(VALID_DIRECTIONS)}")
+    return norm
+
+
+def _normalize_confidence(value: Any) -> str | float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(
+            f"Invalid confidence {value!r}; expected one of {sorted(VALID_CONFIDENCE_LEVELS)} or a number in [0.0, 1.0]"
+        )
+    if isinstance(value, str):
+        norm = value.strip().lower()
+        if norm in VALID_CONFIDENCE_LEVELS:
+            return norm
+        raise ValueError(
+            f"Invalid confidence {value!r}; expected one of {sorted(VALID_CONFIDENCE_LEVELS)} or a number in [0.0, 1.0]"
+        )
+    if isinstance(value, (int, float)):
+        fval = float(value)
+        if not math.isfinite(fval) or fval < 0.0 or fval > 1.0:
+            raise ValueError(f"Invalid numeric confidence {value!r}; expected finite number in [0.0, 1.0]")
+        return round(fval, 4)
+    raise ValueError(
+        f"Invalid confidence {value!r}; expected one of {sorted(VALID_CONFIDENCE_LEVELS)} or a number in [0.0, 1.0]"
+    )
+
+
+def _format_header_meta_lines(
+    direction_bias: str,
+    primary_driver: str,
+    secondary_driver: str,
+    confidence: str | float | None,
+) -> str:
+    lines: list[str] = []
+    if primary_driver or secondary_driver:
+        lines.append(
+            f"- **第一层驱动维度**：主驱动 `{primary_driver or '待补充'}` / 次驱动 `{secondary_driver or '待补充'}`"
+        )
+    if direction_bias != "neutral" or confidence is not None:
+        dir_label = _DIRECTION_LABELS.get(direction_bias, direction_bias)
+        conf_suffix = f" / 置信度 `{confidence}`" if confidence is not None else ""
+        lines.append(f"- **初始研究方向**：`{dir_label}`{conf_suffix}")
+    return ("\n" + "\n".join(lines)) if lines else ""
+
+
+def _format_conclusion_direction_line(
+    direction_bias: str,
+    confidence: str | float | None,
+    default_hint: str,
+) -> str:
+    if direction_bias == "neutral" and confidence is None:
+        return default_hint
+    dir_label = _DIRECTION_LABELS.get(direction_bias, direction_bias)
+    conf_suffix = f"；置信度：{confidence}" if confidence is not None else ""
+    return f"{dir_label}{conf_suffix}（核心 `L1/L2` 证据缺口清单待核验）"
+
+
 def _build_commodity_template(
     symbol: str,
     market: str,
@@ -356,20 +449,28 @@ def _build_commodity_template(
     title_name: str,
     subtype: str,
     summary_line: str,
+    direction_bias: str = "neutral",
+    primary_driver: str = "",
+    secondary_driver: str = "",
+    confidence: str | float | None = None,
 ) -> str:
+    extra_meta = _format_header_meta_lines(direction_bias, primary_driver, secondary_driver, confidence)
+    conclusion_dir = _format_conclusion_direction_line(
+        direction_bias, confidence, "待定（多 / 空 / 中性 / 配对；核心 `L1/L2` 证据缺口清单）"
+    )
     return f"""# [{symbol}]{title_name} · 大宗商品深度投研与交易档案
 
 - **市场 / 类别**：`{market}` / `{subtype or "待分类(能源/有色/黑色/农产/化工新材料/航运)"}`
-- **建档日期**：`{today}`
+- **建档日期**：`{today}`{extra_meta}
 - **一句话 Thesis**：{summary_line}
 
 ---
 
 ## 第三层：深度研究与红蓝对抗
-> 定位：纯研究层——确立 1Q~1Y 供需平衡表与交易结构真相，完成独立红蓝对抗并给出客观研究裁决，**不决定入场价、合约选择与仓位大小**。
+> 定位：纯研究层——确立 1Q–1Y 供需平衡表与交易结构真相，完成独立红蓝对抗并给出客观研究裁决，**不决定入场价、合约选择与仓位大小**。
 
-### 1Q~1Y 供需平衡表预期（新投产爬坡 vs 下游需求）
-| 分项 | 上季(实际) | 当季(估) | Q+1(预) | Q+2(预) | Q+3~Q+4(预) | 关键假设 / 口径 / 来源 |
+### 1Q–1Y 供需平衡表预期（新投产爬坡 vs 下游需求）
+| 分项 | 上季(实际) | 当季(估) | Q+1(预) | Q+2(预) | Q+3–Q+4(预) | 关键假设 / 口径 / 来源 |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
 | 存量产能 × 开工率 | 待检索 | 待检索 | 待检索 | 待检索 | 待检索 | |
 | (+) 新增投产 / 爬坡净增量 | 待检索 | 待检索 | 待检索 | 待检索 | 待检索 | 按重点项目逐一加总 |
@@ -399,7 +500,7 @@ def _build_commodity_template(
 5. **供需与交易结构证伪阈值**：库存趋势、现货基差/月差结构或行业现金成本支撑出现什么量化逆转即证伪原论点？（具体日线 `ZD/ZG` 止损位交由第四层设定）
 
 ### 第三层客观研究结论（不含下单与仓位决策）
-- **研究方向与置信度**：待定（多 / 空 / 中性 / 配对；核心 `L1/L2` 证据缺口清单）
+- **研究方向与置信度**：{conclusion_dir}
 - **核心风险与证伪条件**：待定
 
 ---
@@ -427,20 +528,28 @@ def _build_fx_template(
     title_name: str,
     subtype: str,
     summary_line: str,
+    direction_bias: str = "neutral",
+    primary_driver: str = "",
+    secondary_driver: str = "",
+    confidence: str | float | None = None,
 ) -> str:
+    extra_meta = _format_header_meta_lines(direction_bias, primary_driver, secondary_driver, confidence)
+    conclusion_dir = _format_conclusion_direction_line(
+        direction_bias, confidence, "待定（多 / 空 / 中性 / 交叉盘配对；核心 `L1/L2` 证据缺口清单）"
+    )
     return f"""# [{symbol}]{title_name} · 外汇（FX）深度投研与交易档案
 
 - **市场 / 类别**：`{market}` / `{subtype or "待分类(G10利差/避险/商品货币/新兴市场)"}`
-- **建档日期**：`{today}`
+- **建档日期**：`{today}`{extra_meta}
 - **一句话 Thesis**：{summary_line}
 
 ---
 
 ## 第三层：深度研究与红蓝对抗
-> 定位：纯研究层——确立 1Q~1Y 利差周期、持仓结构与宏观/贸易驱动逻辑，完成独立红蓝对抗并给出客观研究裁决，**不决定入场价、工具选择与仓位大小**。
+> 定位：纯研究层——确立 1Q–1Y 利差周期、持仓结构与宏观/贸易驱动逻辑，完成独立红蓝对抗并给出客观研究裁决，**不决定入场价、工具选择与仓位大小**。
 
 ### 利差与货币政策路径（10Y/2Y 利差与通胀预期）
-| 维度 | 基准货币（左侧） | 计价货币（右侧） | 利差 / 相对变化 | 1Q~1Y 政策路径预期 | 口径 / 来源 |
+| 维度 | 基准货币（左侧） | 计价货币（右侧） | 利差 / 相对变化 | 1Q–1Y 政策路径预期 | 口径 / 来源 |
 | :--- | :---: | :---: | :---: | :--- | :--- |
 | 政策利率与 OIS 隐含路径 | 待检索 | 待检索 | 待算 | 待检索 | 央行纪要 / L1 |
 | 10Y / 2Y 国债收益率与利差 | 待拉取 | 待拉取 | 待算 | 利差走阔/收窄驱动 | FRED / 东财中美国债 |
@@ -462,7 +571,7 @@ def _build_fx_template(
 5. **核心宏观与利差证伪阈值**：10Y/2Y 利差、通胀路径或国际收支出现什么量化逆转即证伪原论点？（具体日线 `ZD/ZG` 止损位交由第四层设定）
 
 ### 第三层客观研究结论（不含下单与仓位决策）
-- **研究方向与置信度**：待定（多 / 空 / 中性 / 交叉盘配对；核心 `L1/L2` 证据缺口清单）
+- **研究方向与置信度**：{conclusion_dir}
 - **核心风险与证伪条件**：待定
 
 ---
@@ -490,21 +599,29 @@ def _build_equity_template(
     title_name: str,
     subtype: str,
     summary_line: str,
+    direction_bias: str = "neutral",
+    primary_driver: str = "",
+    secondary_driver: str = "",
+    confidence: str | float | None = None,
 ) -> str:
-    return f"""# [{symbol}]{title_name} · 股票深度投研与交易档案（1~3 年预期差框架）
+    extra_meta = _format_header_meta_lines(direction_bias, primary_driver, secondary_driver, confidence)
+    conclusion_dir = _format_conclusion_direction_line(
+        direction_bias, confidence, "待定（中长线以做多为主；列明 `L1/L2` 证据支撑与待核验项）"
+    )
+    return f"""# [{symbol}]{title_name} · 股票深度投研与交易档案（1–3 年预期差框架）
 
 - **市场 / 资产分类**：`{market}` / `{subtype or "待分类(A成长/B强周期/C稳定现金流/D困境反转)"}`
-- **建档日期**：`{today}`
+- **建档日期**：`{today}`{extra_meta}
 - **一句话 Thesis**：{summary_line}
 
 ---
 
 ## 第三层：深度研究与红蓝对抗
-> 定位：纯研究层——确立 1~3 年远期盈利与估值预期差，完成一手财报核验与独立红蓝对抗，输出客观研究裁决，**不决定入场价、表达方式与仓位大小**。
+> 定位：纯研究层——确立 1–3 年远期盈利与估值预期差，完成一手财报核验与独立红蓝对抗，输出客观研究裁决，**不决定入场价、表达方式与仓位大小**。
 
-### 1~3 年远期预期拆解与预期差
-- **定型、受益纯度与瓶颈久期**：待定（A 成长 / B 强周期 / C 稳定现金流 / D 困境反转；量化核心逻辑真实收入占比；区分材料/工艺 5~10 年、客户验证 2~5 年[防大客户自研绕过]、纯产能缺货 1~3 年[按 B 型周期股处理]）
-- **估值锚选择**：（成长看前瞻 1~3Y EPS×PE 与二阶增速；强周期看中周期正常化盈利与产能拐点，严禁景气顶峰因静态低 PE 接飞刀；A 股结合 5 年 PE(TTM)/PB 分位，美股结合一致预期修正与空头比例）
+### 1–3 年远期预期拆解与预期差
+- **定型、受益纯度与瓶颈久期**：待定（A 成长 / B 强周期 / C 稳定现金流 / D 困境反转；量化核心逻辑真实收入占比；区分材料/工艺 5–10 年、客户验证 2–5 年[防大客户自研绕过]、纯产能缺货 1–3 年[按 B 型周期股处理]）
+- **估值锚选择**：（成长看前瞻 1–3Y EPS×PE 与二阶增速；强周期看中周期正常化盈利与产能拐点，严禁景气顶峰因静态低 PE 接飞刀；A 股结合 5 年 PE(TTM)/PB 分位，美股结合一致预期修正与空头比例）
 - **收入驱动树与分部三拆**：待拆解（量 × 价 × 高毛利 Mix Shift − 衰退老业务 Drag Segment；如指引压向 H2 放量须按 H1 实绩倒推 H2 隐含环比增速）
 - **预期差来源**：一致预期 vs 我们的判断 vs 验证时间点（说不出预期差最多进观察池）
 
@@ -527,7 +644,7 @@ def _build_equity_template(
 5. **客户/单一需求链集中度与自研替代风险**：待核验
 6. **现金流质量与营运资金（FCF/净利、存货与应收相对营收增速）**：待核验
 7. **期后 8-K 净现金与净债务桥**：待核验（核对季报截止日后的并购交割、新增债务、受限现金与流动性跑道）
-8. **股本稀释与真实回购弹药**：待核验（3~5 年期末股数趋势、SBC、ATM/可转债/Warrants；回购按 Rule 10b-18 日均成交额 ≤25% 折算，CFO 最新表态高于历史规律）
+8. **股本稀释与真实回购弹药**：待核验（3–5 年期末股数趋势、SBC、ATM/可转债/Warrants；回购按 Rule 10b-18 日均成交额 ≤25% 折算，CFO 最新表态高于历史规律）
 9. **周期顶部双面核验（如适用）**：待核验（交期/Book-to-Bill/长协/配给是否隐含重复下单，交叉核对月度营收、现货价与“利好不创新高”）
 10. **债务到期结构与利率敏感度**：待核验
 
@@ -540,13 +657,13 @@ def _build_equity_template(
 6. 期后现金消耗、债务或 ATM/SBC 股本稀释是否侵蚀股东权益？
 7. 该论点历史上最近一次被证伪的案例是什么？核心领先证伪指标与预期差失效阈值在哪？（具体日线/30min 止损位交由第四层设定）
 
-#### 红队 Pre-Mortem（假设 6 个月后此笔头寸大亏，提前写死 3~5 条具体失败路径）
+#### 红队 Pre-Mortem（假设 6 个月后此笔头寸大亏，提前写死 3–5 条具体失败路径）
 - 失败路径 1：待填写（具体触发事件 → 传导后果 → 对应领先监控指标）
 - 失败路径 2：待填写
 - 失败路径 3：待填写
 
 ### 第三层客观研究结论（不含下单与仓位决策）
-- **研究方向与置信度**：待定（中长线以做多为主；列明 `L1/L2` 证据支撑与待核验项）
+- **研究方向与置信度**：{conclusion_dir}
 - **核心风险与证伪条件**：待定
 
 ---
@@ -574,10 +691,14 @@ def render_thesis_template(
     name: str = "",
     subtype: str = "",
     thesis_summary: str = "",
+    direction_bias: str = "neutral",
+    primary_driver: str = "",
+    secondary_driver: str = "",
+    confidence: str | float | None = None,
 ) -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     title_name = f" ({name})" if name else ""
-    summary_line = thesis_summary or "待补充：一句话核心交易论点与 1Q~1Y 预期差来源。"
+    summary_line = thesis_summary or "待补充：一句话核心交易论点与 1Q–1Y 预期差来源。"
 
     if market == "FX" or asset_class == "fx":
         return _build_fx_template(
@@ -587,6 +708,10 @@ def render_thesis_template(
             title_name=title_name,
             subtype=subtype,
             summary_line=summary_line,
+            direction_bias=direction_bias,
+            primary_driver=primary_driver,
+            secondary_driver=secondary_driver,
+            confidence=confidence,
         )
 
     if asset_class in ("commodity", "cn_future") or market in ("COMMODITIES", "CN_FUTURES"):
@@ -597,6 +722,10 @@ def render_thesis_template(
             title_name=title_name,
             subtype=subtype,
             summary_line=summary_line,
+            direction_bias=direction_bias,
+            primary_driver=primary_driver,
+            secondary_driver=secondary_driver,
+            confidence=confidence,
         )
 
     return _build_equity_template(
@@ -606,6 +735,10 @@ def render_thesis_template(
         title_name=title_name,
         subtype=subtype,
         summary_line=summary_line,
+        direction_bias=direction_bias,
+        primary_driver=primary_driver,
+        secondary_driver=secondary_driver,
+        confidence=confidence,
     )
 
 
@@ -620,8 +753,33 @@ def init_archive(
     research_root: str | None = None,
     market_override: str | None = None,
     overwrite: bool = False,
+    direction_bias: str = "neutral",
+    layer1_primary: str | None = None,
+    layer1_secondary: str | None = None,
+    confidence: str | int | float | None = None,
 ) -> dict:
     """Create research/<MARKET>/<SYMBOL>/{thesis.md, evidence.jsonl, state.json} atomically under lock."""
+    norm_dir = _normalize_direction_bias(direction_bias)
+    norm_conf = _normalize_confidence(confidence)
+    if layer1_primary is not None and not isinstance(layer1_primary, str):
+        raise ValueError(f"Field 'layer1_primary' must be a string, got {layer1_primary!r}")
+    if layer1_secondary is not None and not isinstance(layer1_secondary, str):
+        raise ValueError(f"Field 'layer1_secondary' must be a string, got {layer1_secondary!r}")
+    if thesis_summary is not None and not isinstance(thesis_summary, str):
+        raise ValueError(f"Field 'thesis_summary' must be a string, got {thesis_summary!r}")
+
+    eff_primary = (
+        layer1_primary.strip()
+        if isinstance(layer1_primary, str) and layer1_primary.strip()
+        else str(primary_driver or "").strip()
+    )
+    eff_secondary = (
+        layer1_secondary.strip()
+        if isinstance(layer1_secondary, str) and layer1_secondary.strip()
+        else str(secondary_driver or "").strip()
+    )
+    clean_summary = (thesis_summary or "").strip()
+
     folder, market, norm_sym, asset_class = resolve_archive_dir(
         raw_symbol, research_root=research_root, market_override=market_override
     )
@@ -635,10 +793,22 @@ def init_archive(
                 existing_state = json.load(f)
             return {"status": "exists", "archive_dir": folder, "state": existing_state}
 
+        next_revision = 1
+        if overwrite and os.path.exists(state_path):
+            try:
+                _apply_wal_unlocked(folder)
+                with open(state_path, "r", encoding="utf-8") as f:
+                    prev_state = json.load(f)
+                prev_rev = prev_state.get("revision") if isinstance(prev_state, dict) else None
+                if isinstance(prev_rev, int) and not isinstance(prev_rev, bool) and prev_rev >= 1:
+                    next_revision = prev_rev + 1
+            except (OSError, ValueError, TypeError):
+                next_revision = 1
+
         now = utc_now_str()
         state = {
             "schema_version": 1,
-            "revision": 1,
+            "revision": next_revision,
             "instrument": {
                 "market": market,
                 "symbol": norm_sym,
@@ -648,12 +818,13 @@ def init_archive(
                 "cik": cik,
             },
             "status": "watchlist",
-            "direction_bias": "neutral",
+            "direction_bias": norm_dir,
+            "confidence": norm_conf,
             "layer1_drivers": {
-                "primary": primary_driver,
-                "secondary": secondary_driver,
+                "primary": eff_primary,
+                "secondary": eff_secondary,
             },
-            "thesis_summary": thesis_summary or "待补充核心论点",
+            "thesis_summary": clean_summary or "待补充核心论点",
             "chanlun_anchors": {
                 "as_of_bar": None,
                 "zhongshu_level": None,
@@ -689,7 +860,11 @@ def init_archive(
                     asset_class=asset_class,
                     name=name,
                     subtype=subtype,
-                    thesis_summary=thesis_summary,
+                    thesis_summary=clean_summary,
+                    direction_bias=norm_dir,
+                    primary_driver=eff_primary,
+                    secondary_driver=eff_secondary,
+                    confidence=norm_conf,
                 ),
             )
             if not os.path.exists(evidence_path) or overwrite:
@@ -867,13 +1042,26 @@ def append_evidence(
 def _validate_state_patch(patch: dict[str, Any]) -> None:
     if not isinstance(patch, dict):
         raise ValueError("Patch must be a JSON object")
-    if "status" in patch and patch["status"] not in VALID_STATUSES:
-        raise ValueError(f"Invalid status {patch['status']!r}; expected one of {sorted(VALID_STATUSES)}")
-    if "direction_bias" in patch and patch["direction_bias"] not in VALID_DIRECTIONS:
-        raise ValueError(f"Invalid direction_bias {patch['direction_bias']!r}; expected one of {sorted(VALID_DIRECTIONS)}")
+    if "status" in patch:
+        _normalize_status(patch["status"])
+    if "direction_bias" in patch:
+        _normalize_direction_bias(patch["direction_bias"])
+    if "confidence" in patch:
+        _normalize_confidence(patch["confidence"])
+    if "thesis_summary" in patch and not isinstance(patch["thesis_summary"], str):
+        raise ValueError(f"Field 'thesis_summary' must be a string, got {patch['thesis_summary']!r}")
+    for shorthand_key in ("layer1_primary", "layer1_secondary"):
+        if shorthand_key in patch and not isinstance(patch[shorthand_key], str):
+            raise ValueError(f"Field {shorthand_key!r} must be a string, got {patch[shorthand_key]!r}")
     for dict_key in ("instrument", "layer1_drivers", "chanlun_anchors", "valuation_or_balance", "source_watermarks"):
         if dict_key in patch and not isinstance(patch[dict_key], dict):
             raise ValueError(f"Field {dict_key!r} must be a JSON object")
+    if "layer1_drivers" in patch:
+        for drv_k in ("primary", "secondary"):
+            if drv_k in patch["layer1_drivers"] and not isinstance(patch["layer1_drivers"][drv_k], str):
+                raise ValueError(
+                    f"Field 'layer1_drivers.{drv_k}' must be a string, got {patch['layer1_drivers'][drv_k]!r}"
+                )
     for list_key in ("triggers", "pending_verifications", "events"):
         if list_key in patch and not isinstance(patch[list_key], list):
             raise ValueError(f"Field {list_key!r} must be a JSON array")
@@ -970,9 +1158,36 @@ def update_state(
             )
 
         dict_merge_keys = {"instrument", "layer1_drivers", "chanlun_anchors", "valuation_or_balance", "source_watermarks"}
+        normalized_patch: dict[str, Any] = {}
+        shorthand_drivers: dict[str, str] = {}
         for k, v in patch.items():
             if k in ("schema_version", "revision", "created_at_utc", "updated_at_utc"):
                 continue
+            if k == "layer1_primary":
+                shorthand_drivers["primary"] = v.strip()
+            elif k == "layer1_secondary":
+                shorthand_drivers["secondary"] = v.strip()
+            elif k == "status":
+                normalized_patch[k] = _normalize_status(v)
+            elif k == "direction_bias":
+                normalized_patch[k] = _normalize_direction_bias(v)
+            elif k == "confidence":
+                normalized_patch[k] = _normalize_confidence(v)
+            elif k == "thesis_summary":
+                normalized_patch[k] = v.strip()
+            elif k == "layer1_drivers":
+                clean_drv = {dk: (dv.strip() if isinstance(dv, str) else dv) for dk, dv in v.items()}
+                normalized_patch[k] = clean_drv
+            else:
+                normalized_patch[k] = v
+
+        if shorthand_drivers:
+            base_drv = normalized_patch.get("layer1_drivers")
+            merged_drv = dict(base_drv) if isinstance(base_drv, dict) else {}
+            merged_drv.update(shorthand_drivers)
+            normalized_patch["layer1_drivers"] = merged_drv
+
+        for k, v in normalized_patch.items():
             if k in dict_merge_keys and isinstance(v, dict) and isinstance(state.get(k), dict):
                 state[k] = {**state[k], **v}
             else:
@@ -1636,6 +1851,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--thesis", default="")
     p_init.add_argument("--primary-driver", default="")
     p_init.add_argument("--secondary-driver", default="")
+    p_init.add_argument("--layer1-primary", default=None)
+    p_init.add_argument("--layer1-secondary", default=None)
+    p_init.add_argument("--direction-bias", default="neutral", choices=sorted(VALID_DIRECTIONS))
+    p_init.add_argument("--confidence", default=None)
     p_init.add_argument("--cik", default=None)
     p_init.add_argument("--overwrite", action="store_true")
 
@@ -1670,6 +1889,13 @@ def main(argv: list[str] | None = None):
 
     try:
         if args.cmd == "init":
+            raw_conf = args.confidence
+            parsed_conf: str | float | None = raw_conf
+            if isinstance(raw_conf, str):
+                try:
+                    parsed_conf = float(raw_conf)
+                except ValueError:
+                    parsed_conf = raw_conf
             res = init_archive(
                 args.symbol,
                 name=args.name,
@@ -1680,6 +1906,10 @@ def main(argv: list[str] | None = None):
                 cik=args.cik,
                 research_root=args.root,
                 overwrite=args.overwrite,
+                direction_bias=args.direction_bias,
+                layer1_primary=args.layer1_primary,
+                layer1_secondary=args.layer1_secondary,
+                confidence=parsed_conf,
             )
         elif args.cmd == "load":
             res = load_archive(args.symbol, research_root=args.root, evidence_limit=args.evidence_limit)

@@ -5,8 +5,12 @@ import {
   ArrowUpRight,
   BookOpen,
   CalendarClock,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Crosshair,
   History,
+  Loader2,
   PlusCircle,
   RefreshCw,
   RotateCcw,
@@ -17,7 +21,14 @@ import {
   XCircle,
 } from "lucide-react";
 import { api, errorMessage, parseTaskEvent } from "../api/client";
-import type { PortfolioSummaryResponse, Position, SentinelHolding, SentinelResponse, UpcomingEvent } from "../api/types";
+import type {
+  PortfolioSummaryResponse,
+  Position,
+  ScaleInResponse,
+  SentinelHolding,
+  SentinelResponse,
+  UpcomingEvent,
+} from "../api/types";
 import {
   canVoidMistakenPosition,
   ClosePositionDialog,
@@ -29,6 +40,7 @@ import {
   TrimPositionDialog,
   VoidPositionDialog,
 } from "../components/portfolio/PortfolioDialogs";
+import { ScaleInPositionDialog } from "../components/portfolio/ScaleInPositionDialog";
 import {
   DirectionBadge,
   SentinelStatusBadge,
@@ -36,8 +48,18 @@ import {
   StatusBadge,
 } from "../components/ui/StatusBadge";
 import { SymbolLabel } from "../components/ui/SymbolLabel";
-import { fmtMoney, fmtPct, fmtPrice, shortTime, toNum } from "../lib/format";
-import { getSymbolName } from "../lib/symbols";
+import {
+  cleanSentinelText,
+  fmtEventSource,
+  fmtLeaderRole,
+  fmtMoney,
+  fmtNum,
+  fmtPct,
+  fmtPrice,
+  shortTime,
+  toNum,
+} from "../lib/format";
+import { formatSymbolWithCode, getSymbolName } from "../lib/symbols";
 
 const JOURNAL_ACTION_ZH: Record<string, string> = {
   init_account: "初始化账本",
@@ -71,8 +93,9 @@ export function SentinelView({
   const [portfolio, setPortfolio] = useState<PortfolioSummaryResponse | null>(null);
   const [sentinel, setSentinel] = useState<SentinelResponse | null>(null);
   const [includeWatchlist, setIncludeWatchlist] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [expandedAlerts, setExpandedAlerts] = useState<Record<string, boolean>>({});
   const [verifyBusy, setVerifyBusy] = useState(false);
   const [verifyTaskId, setVerifyTaskId] = useState<string | null>(null);
   const [verifyTargetLabel, setVerifyTargetLabel] = useState<string>("");
@@ -94,6 +117,10 @@ export function SentinelView({
     rationale?: string;
   } | null>(null);
   const [trimTarget, setTrimTarget] = useState<{ position: Position; lastPrice?: number | null } | null>(null);
+  const [scaleInTarget, setScaleInTarget] = useState<{ position: Position; currentPrice?: number | null } | null>(
+    null,
+  );
+  const [actionBanner, setActionBanner] = useState<string | null>(null);
   const [rotateTarget, setRotateTarget] = useState<{ position: Position; lastPrice?: number | null } | null>(null);
   const [closeTarget, setCloseTarget] = useState<{
     position: Position;
@@ -114,11 +141,16 @@ export function SentinelView({
       const ctrl = new AbortController();
       loadAbortRef.current = ctrl;
       const reqId = ++loadReqIdRef.current;
+      let timedOut = false;
+      const timeoutId = window.setTimeout(() => {
+        timedOut = true;
+        ctrl.abort();
+      }, 60_000);
 
       setLoading(true);
       setError(null);
       try {
-        const [pf, sn] = await Promise.all([
+        const [pfRes, snRes] = await Promise.allSettled([
           api.portfolioSummary(ctrl.signal),
           api.sentinel(
             {
@@ -130,23 +162,45 @@ export function SentinelView({
             ctrl.signal,
           ),
         ]);
-        if (ctrl.signal.aborted || reqId !== loadReqIdRef.current) return;
-        setPortfolio(pf);
-        setSentinel(sn);
+        if (!mountedRef.current || reqId !== loadReqIdRef.current) return;
+        if (ctrl.signal.aborted && !timedOut) return;
+
+        const errs: string[] = [];
+        if (pfRes.status === "fulfilled") {
+          setPortfolio(pfRes.value);
+        } else if (timedOut) {
+          errs.push("持仓账本连接超时（后端可能正在重启或响应缓慢）");
+        } else {
+          errs.push(`持仓账本：${errorMessage(pfRes.reason)}`);
+        }
+
+        if (snRes.status === "fulfilled") {
+          setSentinel(snRes.value);
+        } else if (timedOut) {
+          errs.push("哨兵巡检请求超时（后端可能正在重启或行情源响应缓慢）");
+        } else {
+          errs.push(`哨兵巡检：${errorMessage(snRes.reason)}`);
+        }
+
+        if (errs.length > 0) {
+          setError(errs.join("；"));
+        }
       } catch (ex) {
-        if (
-          ctrl.signal.aborted ||
-          (ex instanceof DOMException && ex.name === "AbortError") ||
-          reqId !== loadReqIdRef.current
-        ) {
+        if (!mountedRef.current || reqId !== loadReqIdRef.current) return;
+        if (!timedOut && (ctrl.signal.aborted || (ex instanceof DOMException && ex.name === "AbortError"))) {
           return;
         }
-        setError(errorMessage(ex));
+        setError(
+          timedOut
+            ? "请求超时（后端服务可能正在重启或网络异常），请点击重试"
+            : errorMessage(ex),
+        );
       } finally {
-        if (reqId === loadReqIdRef.current) {
-          if (loadAbortRef.current === ctrl) {
-            loadAbortRef.current = null;
-          }
+        window.clearTimeout(timeoutId);
+        if (loadAbortRef.current === ctrl) {
+          loadAbortRef.current = null;
+        }
+        if (mountedRef.current && reqId === loadReqIdRef.current) {
           setLoading(false);
         }
       }
@@ -171,6 +225,26 @@ export function SentinelView({
       void loadAll(true);
     }
   }, [loadAll, onPortfolioMutated]);
+
+  const handleScaleInDone = useCallback(
+    (res: ScaleInResponse) => {
+      const symLabel = formatSymbolWithCode(res.position?.symbol);
+      const addQtyStr = fmtNum(res.add_quantity, 6);
+      const newAvgStr = fmtPrice(res.new_entry_price);
+      const newQtyStr = fmtNum(res.new_quantity, 6);
+      const stopPart =
+        res.new_stop_loss != null &&
+        res.old_stop_loss != null &&
+        Math.abs(res.new_stop_loss - res.old_stop_loss) > 1e-9
+          ? ` · 30m 止损收紧至 ${fmtPrice(res.new_stop_loss)}`
+          : "";
+      setActionBanner(
+        `已执行浮盈加仓：${symLabel} +${addQtyStr}（新总仓位 ${newQtyStr} · 新均价 ${newAvgStr}${stopPart}）`,
+      );
+      handleMutationSuccess();
+    },
+    [handleMutationSuccess],
+  );
 
   const summary = portfolio?.summary;
   const openPositionsById = useMemo(() => {
@@ -380,6 +454,16 @@ export function SentinelView({
     return Math.min(100, Math.max(0, (summary.total_open_risk_amount / summary.max_total_open_risk_cap) * 100));
   }, [summary]);
 
+  const maxRiskCapPct = useMemo(() => {
+    if (!summary || !summary.equity || summary.equity <= 0 || !summary.max_total_open_risk_cap) return null;
+    return (summary.max_total_open_risk_cap / summary.equity) * 100;
+  }, [summary]);
+
+  const isPortfolioLoading = loading && portfolio === null;
+  const isSentinelLoading = loading && sentinel === null;
+  const hasPortfolioError = !loading && portfolio === null && Boolean(error);
+  const hasSentinelError = !loading && sentinel === null && Boolean(error);
+
   return (
     <div className="flex flex-col gap-4">
       {/* Compact Precision Header */}
@@ -431,6 +515,25 @@ export function SentinelView({
         </div>
       </div>
 
+      {actionBanner ? (
+        <div
+          role="status"
+          className="card flex flex-wrap items-center justify-between gap-2 border-bull/45 bg-bull/10 px-4 py-2.5 text-xs text-ink"
+        >
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-bull" aria-hidden="true" />
+            <span>{actionBanner}</span>
+          </div>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm text-muted"
+            onClick={() => setActionBanner(null)}
+          >
+            关闭
+          </button>
+        </div>
+      ) : null}
+
       {verifyBusy || verifyMessage || verifyError ? (
         <div
           role={verifyError ? "alert" : "status"}
@@ -465,8 +568,26 @@ export function SentinelView({
       ) : null}
 
       {error ? (
-        <div role="alert" className="card border-critical/50 bg-critical/10 px-4 py-2.5 text-xs text-ink">
-          <strong>哨兵总控加载异常：</strong> {error}
+        <div
+          role="alert"
+          className="card flex flex-wrap items-center justify-between gap-3 border-critical/55 bg-critical/12 px-4 py-3 text-xs text-ink"
+        >
+          <div className="flex min-w-0 flex-1 items-start gap-2">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-critical" aria-hidden="true" />
+            <div className="min-w-0">
+              <div className="font-semibold text-ink">哨兵总控连接异常（后端服务可能正在重启或网络中断）</div>
+              <div className="mt-0.5 break-words text-ink-2">{cleanSentinelText(error)}</div>
+            </div>
+          </div>
+          <button
+            type="button"
+            className="btn btn-sm btn-primary shrink-0"
+            disabled={loading}
+            onClick={() => void loadAll(true)}
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden="true" />
+            <span>{loading ? "重连中…" : "重新连接 / 重试巡检"}</span>
+          </button>
         </div>
       ) : null}
 
@@ -485,22 +606,40 @@ export function SentinelView({
             ) : null}
           </div>
           <div className="kpi-value mt-2 text-ink">
-            {summary ? fmtMoney(summary.equity, summary.base_currency) : "未初始化"}
+            {summary
+              ? fmtMoney(summary.equity, summary.base_currency)
+              : isPortfolioLoading
+                ? "连接账本中…"
+                : hasPortfolioError
+                  ? "连接中断"
+                  : "未初始化"}
           </div>
           <div className="tnum mt-2 text-[11.5px] text-muted">
             {summary
               ? `回撤 ${fmtPct(summary.drawdown_pct, 2)} · 仓位档 ${fmtPct(summary.risk_scale * 100, 0)}`
-              : "初始化后启用风险预算"}
+              : isPortfolioLoading
+                ? "正在同步本地持仓账本…"
+                : hasPortfolioError
+                  ? "服务暂不可达，请点击上方重新连接"
+                  : "初始化后启用风险预算"}
           </div>
         </div>
 
         <div className="flex flex-col justify-between p-4">
           <div className="flex items-center justify-between gap-2">
-            <span className="section-title">总敞口风险占用</span>
-            {summary ? <span className="font-mono text-[11px] text-muted">{fmtPct(riskUtilPct, 0)}</span> : null}
+            <span className="section-title">总在途风险敞口</span>
+            {summary ? (
+              <span
+                className="tnum rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 font-mono text-[10.5px] text-ink-2"
+                title="已用在途风险占账户总风险上限的比例"
+              >
+                占上限 {fmtPct(riskUtilPct, 0)}
+                {maxRiskCapPct != null ? ` · 上限 ${fmtPct(maxRiskCapPct, 0)}` : ""}
+              </span>
+            ) : null}
           </div>
           <div className="kpi-value mt-2 text-ink">
-            {summary ? fmtPct(summary.total_open_risk_pct, 2) : "—"}
+            {summary ? fmtPct(summary.total_open_risk_pct, 2) : isPortfolioLoading ? "…" : "—"}
           </div>
           <div className="mt-2 space-y-1.5">
             {summary ? (
@@ -510,8 +649,12 @@ export function SentinelView({
             ) : null}
             <div className="tnum text-[11.5px] text-muted">
               {summary
-                ? `${fmtMoney(summary.total_open_risk_amount, summary.base_currency)} / 上限 ${fmtMoney(summary.max_total_open_risk_cap, summary.base_currency)}`
-                : "过保本自动释放风险额"}
+                ? `已用 ${fmtMoney(summary.total_open_risk_amount, summary.base_currency)} / 上限 ${fmtMoney(summary.max_total_open_risk_cap, summary.base_currency)}`
+                : isPortfolioLoading
+                  ? "正在计算在途风险敞口…"
+                  : hasPortfolioError
+                    ? "暂无法获取风险敞口"
+                    : "过保本自动释放风险额"}
             </div>
           </div>
         </div>
@@ -519,12 +662,16 @@ export function SentinelView({
         <div className="flex flex-col justify-between p-4">
           <div className="section-title">单板块龙头风险上限</div>
           <div className="kpi-value mt-2 text-ink">
-            {summary ? fmtMoney(summary.single_sector_risk_cap, summary.base_currency) : "—"}
+            {summary ? fmtMoney(summary.single_sector_risk_cap, summary.base_currency) : isPortfolioLoading ? "…" : "—"}
           </div>
           <div className="tnum mt-2 text-[11.5px] text-muted">
             {summary
               ? `在途 ${summary.open_positions_count} 笔 · 占用 ${sectorEntries.length} 个主驱动板块`
-              : "每板块限 1 只真龙头"}
+              : isPortfolioLoading
+                ? "正在同步板块席位…"
+                : hasPortfolioError
+                  ? "暂无法获取板块席位"
+                  : "每板块限 1 只真龙头"}
           </div>
         </div>
 
@@ -532,21 +679,27 @@ export function SentinelView({
           <div className="section-title">今日红 / 黄 / 绿哨兵计数</div>
           <div className="mt-2 grid grid-cols-3 gap-2">
             <div>
-              <div className="kpi-value text-critical">{sentinel?.summary?.red_count ?? 0}</div>
+              <div className="kpi-value text-critical">
+                {sentinel ? (sentinel.summary?.red_count ?? 0) : isSentinelLoading ? "…" : "—"}
+              </div>
               <div className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-muted">
                 <span className="h-1.5 w-1.5 rounded-full bg-critical" aria-hidden="true" />
                 <span>撤离</span>
               </div>
             </div>
             <div>
-              <div className="kpi-value text-warning">{sentinel?.summary?.yellow_count ?? 0}</div>
+              <div className="kpi-value text-warning">
+                {sentinel ? (sentinel.summary?.yellow_count ?? 0) : isSentinelLoading ? "…" : "—"}
+              </div>
               <div className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-muted">
                 <span className="h-1.5 w-1.5 rounded-full bg-warning" aria-hidden="true" />
                 <span>警戒</span>
               </div>
             </div>
             <div>
-              <div className="kpi-value text-bull">{sentinel?.summary?.green_count ?? 0}</div>
+              <div className="kpi-value text-bull">
+                {sentinel ? (sentinel.summary?.green_count ?? 0) : isSentinelLoading ? "…" : "—"}
+              </div>
               <div className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-muted">
                 <span className="h-1.5 w-1.5 rounded-full bg-bull" aria-hidden="true" />
                 <span>持有</span>
@@ -554,7 +707,13 @@ export function SentinelView({
             </div>
           </div>
           <div className="tnum mt-1.5 font-mono text-[11px] text-muted">
-            {sentinel?.checked_at_utc ? `巡检 ${shortTime(sentinel.checked_at_utc)} UTC` : "等待巡检…"}
+            {sentinel?.checked_at_utc
+              ? `巡检 ${shortTime(sentinel.checked_at_utc)} UTC`
+              : isSentinelLoading
+                ? "正在连接账本与哨兵巡检…"
+                : hasSentinelError
+                  ? "巡检连接中断，待重试"
+                  : "等待巡检…"}
           </div>
         </div>
       </section>
@@ -579,25 +738,67 @@ export function SentinelView({
 
       {/* Red / Yellow / Green Sentinel Holdings Matrix */}
       <section className="flex flex-col gap-2.5" aria-label="红黄绿持仓哨兵矩阵">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between gap-2">
           <span className="section-title">
-            在途持仓每日必检矩阵（{sentinel?.holdings?.length ?? 0} 笔）
+            在途持仓每日必检矩阵（
+            {isSentinelLoading
+              ? "巡检加载中…"
+              : hasSentinelError
+                ? "连接异常"
+                : `${sentinel?.holdings?.length ?? 0} 笔`}
+            ）
           </span>
           {sentinel?.discovery_errors && sentinel.discovery_errors.length > 0 ? (
-            <span className="text-xs text-warning">发现提示：{sentinel.discovery_errors.join("；")}</span>
+            <span className="text-xs text-warning">
+              发现提示：{sentinel.discovery_errors.map((e) => cleanSentinelText(e)).join("；")}
+            </span>
           ) : null}
         </div>
 
-        {(sentinel?.holdings?.length ?? 0) === 0 ? (
+        {isSentinelLoading ? (
+          <div className="card flex flex-col gap-3 p-6">
+            <div className="flex items-center gap-2 text-xs font-medium text-ink-2">
+              <Loader2 className="h-4 w-4 animate-spin text-accent" aria-hidden="true" />
+              <span>正在连接账本与哨兵巡检引擎，拉取 30min/日线缠论防线与高频触发器…</span>
+            </div>
+            <div className="grid grid-cols-1 gap-3 xl:grid-cols-2" aria-hidden="true">
+              <div className="h-36 animate-pulse rounded-lg border border-hairline-soft bg-sunken/70" />
+              <div className="h-36 animate-pulse rounded-lg border border-hairline-soft bg-sunken/70" />
+            </div>
+          </div>
+        ) : hasSentinelError ? (
+          <div className="card flex flex-wrap items-center justify-between gap-3 border-warning/45 bg-warning/10 p-5 text-xs text-ink">
+            <div className="space-y-1">
+              <div className="font-semibold text-ink">暂无法获取持仓哨兵巡检结果</div>
+              <div className="text-ink-2">
+                后端服务可能正在重启或网络连接中断，当前不会误判为空仓或未初始化。
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn btn-sm btn-primary shrink-0"
+              disabled={loading}
+              onClick={() => void loadAll(true)}
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} aria-hidden="true" />
+              <span>重新连接 / 重试巡检</span>
+            </button>
+          </div>
+        ) : (sentinel?.holdings?.length ?? 0) === 0 ? (
           <div className="card p-6 text-center text-xs text-muted">
-            暂无 <code>holding</code> 持仓标的。可在「缠论战情室」完成四象限算仓后录入持仓，或点击右上角「新增持仓」。
+            暂无在途持仓标的。可在「缠论战情室」完成四象限算仓后录入持仓，或点击右上角「新增持仓」。
           </div>
         ) : (
           <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
             {(sentinel?.holdings ?? []).map((h) => {
+              const cardKey = `${h.symbol}-${h.position_id ?? "arch"}`;
               const pos = findPosition(h);
               const sug = h.suggested_trail_stop;
               const canTrail = Boolean(pos && sug?.suggested_stop != null);
+              const isScaleInUnprofitable =
+                typeof h.unrealized_pnl_pct === "number" &&
+                Number.isFinite(h.unrealized_pnl_pct) &&
+                h.unrealized_pnl_pct <= 0;
               const edgeCls =
                 h.status === "RED_EXIT"
                   ? "border-l-[3px] border-l-critical"
@@ -605,9 +806,35 @@ export function SentinelView({
                     ? "border-l-[3px] border-l-warning"
                     : "border-l-[3px] border-l-bull";
 
+              const prioritizedAlerts = [
+                ...h.red_alerts.map((alert, idx) => ({
+                  key: `r-${idx}`,
+                  severity: "red" as const,
+                  alert,
+                })),
+                ...h.yellow_alerts.map((alert, idx) => ({
+                  key: `y-${idx}`,
+                  severity: "yellow" as const,
+                  alert,
+                })),
+              ];
+              const MAX_COLLAPSED_ALERTS = 2;
+              const isAlertsExpanded = Boolean(expandedAlerts[cardKey]);
+              const hiddenAlertsCount = Math.max(0, prioritizedAlerts.length - MAX_COLLAPSED_ALERTS);
+              const visibleAlerts = isAlertsExpanded
+                ? prioritizedAlerts
+                : prioritizedAlerts.slice(0, MAX_COLLAPSED_ALERTS);
+              const visibleInfoNotes = isAlertsExpanded
+                ? h.info_notes
+                : prioritizedAlerts.length >= MAX_COLLAPSED_ALERTS
+                  ? []
+                  : h.info_notes.slice(0, 2);
+              const hiddenInfoCount = Math.max(0, h.info_notes.length - visibleInfoNotes.length);
+              const canToggleAlerts = hiddenAlertsCount > 0 || hiddenInfoCount > 0 || isAlertsExpanded;
+
               return (
                 <article
-                  key={`${h.symbol}-${h.position_id ?? "arch"}`}
+                  key={cardKey}
                   className={`card flex flex-col gap-3 p-4 ${edgeCls}`}
                 >
                   <div className="flex flex-wrap items-start justify-between gap-2">
@@ -622,7 +849,9 @@ export function SentinelView({
                         ) : null}
                       </div>
                       {h.action_headline ? (
-                        <p className="m-0 mt-1 text-xs font-medium text-ink-2">{h.action_headline}</p>
+                        <p className="m-0 mt-1 text-xs font-medium text-ink-2">
+                          {cleanSentinelText(h.action_headline)}
+                        </p>
                       ) : null}
                     </div>
                     <SentinelStatusBadge status={h.status} labelZh={h.status_zh} />
@@ -654,39 +883,44 @@ export function SentinelView({
                     </div>
                   </div>
 
-                  {/* Alerts */}
-                  {h.red_alerts.length > 0 || h.yellow_alerts.length > 0 || h.info_notes.length > 0 ? (
+                  {/* Alerts (prioritized & collapsible when > 2) */}
+                  {prioritizedAlerts.length > 0 || h.info_notes.length > 0 ? (
                     <div className="space-y-1.5 text-xs">
-                      {h.red_alerts.map((a, i) => (
-                        <div
-                          key={`r-${i}`}
-                          className="flex items-start gap-1.5 rounded border border-critical/45 bg-critical/10 px-2.5 py-1.5 text-ink"
-                        >
-                          <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-critical" aria-hidden="true" />
-                          <div className="min-w-0 flex-1">
-                            <div>{a.message || a.detail || a.code}</div>
-                            {a.detail && a.detail !== a.message ? (
-                              <div className="mt-0.5 break-words text-[11px] text-muted">{a.detail}</div>
-                            ) : null}
-                          </div>
-                        </div>
-                      ))}
-                      {h.yellow_alerts.map((a, i) => {
+                      {visibleAlerts.map(({ key, severity, alert: a }) => {
+                        const msgText = cleanSentinelText(a.message || a.detail || a.code);
+                        const detailText =
+                          a.detail && a.detail !== a.message ? cleanSentinelText(a.detail) : "";
+                        if (severity === "red") {
+                          return (
+                            <div
+                              key={key}
+                              className="flex items-start gap-1.5 rounded border border-critical/45 bg-critical/10 px-2.5 py-1.5 text-ink"
+                            >
+                              <XCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-critical" aria-hidden="true" />
+                              <div className="min-w-0 flex-1">
+                                <div>{msgText}</div>
+                                {detailText && detailText !== msgText ? (
+                                  <div className="mt-0.5 break-words text-[11px] text-muted">{detailText}</div>
+                                ) : null}
+                              </div>
+                            </div>
+                          );
+                        }
                         const canAiVerifyHere =
                           a.code === "unevaluated_triggers" &&
                           Array.isArray(h.verifiable_trigger_ids) &&
                           h.verifiable_trigger_ids.length > 0;
                         return (
                           <div
-                            key={`y-${i}`}
+                            key={key}
                             className="flex items-start justify-between gap-2 rounded border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-ink"
                           >
                             <div className="flex min-w-0 flex-1 items-start gap-1.5">
                               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
                               <div className="min-w-0 flex-1">
-                                <div>{a.message || a.detail || a.code}</div>
-                                {a.detail && a.detail !== a.message ? (
-                                  <div className="mt-0.5 break-words text-[11px] text-muted">{a.detail}</div>
+                                <div>{msgText}</div>
+                                {detailText && detailText !== msgText ? (
+                                  <div className="mt-0.5 break-words text-[11px] text-muted">{detailText}</div>
                                 ) : null}
                               </div>
                             </div>
@@ -712,11 +946,37 @@ export function SentinelView({
                           </div>
                         );
                       })}
-                      {h.info_notes.slice(0, 3).map((n, i) => (
+                      {visibleInfoNotes.map((n, i) => (
                         <div key={`i-${i}`} className="text-[11px] text-muted">
-                          • {n}
+                          • {cleanSentinelText(n)}
                         </div>
                       ))}
+                      {canToggleAlerts ? (
+                        <button
+                          type="button"
+                          className="inline-flex cursor-pointer items-center gap-1 rounded border border-hairline-soft bg-sunken px-2.5 py-1 text-[11px] font-medium text-ink-2 transition-colors hover:bg-elevated hover:text-ink"
+                          aria-expanded={isAlertsExpanded}
+                          onClick={() =>
+                            setExpandedAlerts((prev) => ({ ...prev, [cardKey]: !prev[cardKey] }))
+                          }
+                        >
+                          {isAlertsExpanded ? (
+                            <>
+                              <span>收起告警</span>
+                              <ChevronUp className="h-3 w-3" aria-hidden="true" />
+                            </>
+                          ) : (
+                            <>
+                              <span>
+                                {hiddenAlertsCount > 0
+                                  ? `展开其余 ${hiddenAlertsCount} 条告警${hiddenInfoCount > 0 ? `及 ${hiddenInfoCount} 条提示` : ""}`
+                                  : `展开其余 ${hiddenInfoCount} 条提示`}
+                              </span>
+                              <ChevronDown className="h-3 w-3" aria-hidden="true" />
+                            </>
+                          )}
+                        </button>
+                      ) : null}
                     </div>
                   ) : null}
 
@@ -726,7 +986,7 @@ export function SentinelView({
                       <span>
                         <strong>浮盈推保护建议：</strong>将 30m 止损收紧至{" "}
                         <strong className="font-mono">{fmtPrice(sug.suggested_stop)}</strong>
-                        {sug.rationale ? `（${sug.rationale}）` : ""}
+                        {sug.rationale ? `（${cleanSentinelText(sug.rationale)}）` : ""}
                       </span>
                       {canTrail && pos ? (
                         <button
@@ -782,6 +1042,22 @@ export function SentinelView({
                         </button>
                         <button
                           type="button"
+                          className={`btn btn-sm${isScaleInUnprofitable ? " text-muted opacity-65" : ""}`}
+                          title={
+                            isScaleInUnprofitable
+                              ? "当前处于浮亏/平价，纪律禁止摊平（需严格浮盈确认后加仓；点击可查看纪律说明或输入更高触发价预演）"
+                              : "严格浮盈确认后执行 T2/T3 顺势加仓，支持同步收紧 30m 保护止损"
+                          }
+                          onClick={() => setScaleInTarget({ position: pos, currentPrice: h.last_price })}
+                        >
+                          <PlusCircle
+                            className={`h-3 w-3 ${isScaleInUnprofitable ? "text-muted" : "text-bull"}`}
+                            aria-hidden="true"
+                          />
+                          <span>浮盈加仓</span>
+                        </button>
+                        <button
+                          type="button"
                           className="btn btn-sm"
                           onClick={() => setTrimTarget({ position: pos, lastPrice: h.last_price })}
                         >
@@ -815,7 +1091,7 @@ export function SentinelView({
                             setCloseTarget({
                               position: pos,
                               lastPrice: h.last_price,
-                              reason: h.red_alerts[0]?.message || h.action_headline,
+                              reason: cleanSentinelText(h.red_alerts[0]?.message || h.action_headline),
                             })
                           }
                         >
@@ -854,11 +1130,19 @@ export function SentinelView({
               <tbody>
                 {sectorEntries.length === 0 ? (
                   <tr>
-                    <th scope="row">暂无占用</th>
+                    <th scope="row">
+                      {isPortfolioLoading ? "加载中…" : hasPortfolioError ? "连接异常" : "暂无占用"}
+                    </th>
                     <td data-label="在途龙头标的">—</td>
-                    <td data-label="席位角色">空闲（每板块限 1 龙头或 2 双寡头）</td>
+                    <td data-label="席位角色">
+                      {isPortfolioLoading
+                        ? "正在同步板块席位…"
+                        : hasPortfolioError
+                          ? "服务暂不可达，请重试连接"
+                          : "空闲（每板块限 1 龙头或 2 双寡头）"}
+                    </td>
                     <td data-label="已用风险" className="num">
-                      0
+                      {summary ? "0" : "—"}
                     </td>
                     <td data-label="板块上限" className="num">
                       {summary ? fmtMoney(summary.single_sector_risk_cap, summary.base_currency) : "—"}
@@ -870,7 +1154,9 @@ export function SentinelView({
                     const rolePos = slot.symbols
                       .map((s) => openPositionsBySym.get(s.toUpperCase()))
                       .filter((x): x is Position => Boolean(x));
-                    const roles = Array.from(new Set(rolePos.map((p) => p.leader_role || "sole_leader"))).join(", ");
+                    const rawRoles = Array.from(new Set(rolePos.map((p) => p.leader_role || "sole_leader")));
+                    const primaryRole = rawRoles.includes("co_leader") ? "co_leader" : (rawRoles[0] ?? "sole_leader");
+                    const roleLabel = fmtLeaderRole(primaryRole, slot.count, slot.max_slots);
                     const macros = Array.from(new Set(rolePos.flatMap((p) => p.macro_factors ?? [])));
                     return (
                       <tr key={theme}>
@@ -894,9 +1180,7 @@ export function SentinelView({
                             })}
                           </div>
                         </td>
-                        <td data-label="席位角色">
-                          {roles} ({slot.count}/{slot.max_slots})
-                        </td>
+                        <td data-label="席位角色">{roleLabel}</td>
                         <td data-label="已用风险" className="num">
                           {fmtMoney(slot.open_risk_amount, summary?.base_currency)}
                         </td>
@@ -954,7 +1238,7 @@ export function SentinelView({
                       <span className="truncate text-ink">{ev.title}</span>
                     </div>
                     <div className="tnum mt-0.5 font-mono text-[11px] text-muted">
-                      {ev.date} {ev.source ? `· ${ev.source}` : ""}
+                      {ev.date} {ev.source ? `· ${fmtEventSource(ev.source)}` : ""}
                     </div>
                   </div>
                   <StatusBadge
@@ -1071,6 +1355,7 @@ export function SentinelView({
                           const noteText = String(
                             j.exit_reason ??
                               j.reason ??
+                              j.note ??
                               j.notes ??
                               (rawAct === "init_account"
                                 ? `初始净值 ${fmtMoney(j.equity, String(j.base_currency || summary?.base_currency || ""))}`
@@ -1088,7 +1373,7 @@ export function SentinelView({
                                       ? "serious"
                                       : rawAct.includes("open") || rawAct.includes("rotate")
                                         ? "info"
-                                        : rawAct.includes("trail")
+                                        : rawAct.includes("trail") || rawAct === "add_on_profit"
                                           ? "good"
                                           : "neutral"
                                   }
@@ -1117,7 +1402,7 @@ export function SentinelView({
                                   : "—"}
                               </td>
                               <td data-label="复盘归因与依据" className="text-ink-2">
-                                {noteText}
+                                {cleanSentinelText(noteText)}
                               </td>
                             </tr>
                           );
@@ -1161,6 +1446,14 @@ export function SentinelView({
         onSuccess={handleMutationSuccess}
         position={trimTarget?.position ?? null}
         lastPrice={trimTarget?.lastPrice}
+      />
+      <ScaleInPositionDialog
+        open={scaleInTarget !== null}
+        onClose={() => setScaleInTarget(null)}
+        onDone={handleScaleInDone}
+        position={scaleInTarget?.position ?? null}
+        currentPrice={scaleInTarget?.currentPrice}
+        accountCurrency={summary?.base_currency}
       />
       <RotatePositionDialog
         open={rotateTarget !== null}

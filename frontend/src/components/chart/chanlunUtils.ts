@@ -34,6 +34,14 @@ export interface IndexedBar {
   hist: number | null;
 }
 
+export interface SignalCalloutItem {
+  time: Time;
+  price: number;
+  position: "aboveBar" | "belowBar";
+  text: string;
+  color: string;
+}
+
 export interface PreparedChanlunSeries {
   bars: IndexedBar[];
   byTimeKey: Map<string, IndexedBar>;
@@ -51,6 +59,7 @@ export interface PreparedChanlunSeries {
   latestStrokeZhongshu: Zhongshu | null;
   latestSegmentZhongshu: Zhongshu | null;
   markers: SeriesMarker<Time>[];
+  signalCallout: SignalCalloutItem | null;
 }
 
 function toChartTime(raw: string | number): Time {
@@ -687,6 +696,7 @@ export function prepareChanlunSeries(
   }
 
   /* Directional Buy / Sell marker strictly governed by signal_meta.direction & signal_meta.confirmed */
+  let signalCallout: SignalCalloutItem | null = null;
   const meta = signalSummary?.signal_meta;
   if (meta && (meta.direction === "long" || meta.direction === "short")) {
     const conciseLabel = extractDirectionalLabel(meta, signalSummary?.summary, tf?.signals);
@@ -697,17 +707,25 @@ export function prepareChanlunSeries(
         ? resolve(meta.signal_timestamp)
         : resolve(tf?.latest_fractal?.date);
       if (sigBar) {
+        const sigColor = isLong ? palette.bull : palette.bear;
+        const sigPosition: "belowBar" | "aboveBar" = isLong ? "belowBar" : "aboveBar";
         rawMarkers.push({
           idx: sigBar.idx,
           marker: {
             time: sigBar.time,
-            position: isLong ? "belowBar" : "aboveBar",
+            position: sigPosition,
             shape: isLong ? "arrowUp" : "arrowDown",
-            color: isLong ? palette.bull : palette.bear,
-            text: `${conciseLabel}${isConfirmed ? "·已确认" : "(待确认)"}`,
+            color: sigColor,
             size: 1.25,
           },
         });
+        signalCallout = {
+          time: sigBar.time,
+          price: isLong ? sigBar.low : sigBar.high,
+          position: sigPosition,
+          text: `${conciseLabel}${isConfirmed ? "·已确认" : "(待确认)"}`,
+          color: sigColor,
+        };
       }
     }
   }
@@ -736,5 +754,6 @@ export function prepareChanlunSeries(
     latestStrokeZhongshu,
     latestSegmentZhongshu,
     markers: rawMarkers.map((x) => x.marker),
+    signalCallout,
   };
 }

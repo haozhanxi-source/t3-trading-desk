@@ -471,8 +471,8 @@ def test_trade_plan_manual_b_structure_live_and_validation(client: TestClient, m
         "/api/portfolio/init",
         json={"equity": 250_000.0, "base_currency": "USD", "default_risk_per_trade_pct": 1.0},
     )
-    for seeded_sym in ("SPY", "CU0"):
-        ra.init_archive(seeded_sym)
+    for seeded_sym, seeded_dir in (("SPY", "long"), ("CU0", "short")):
+        ra.init_archive(seeded_sym, direction_bias=seeded_dir)
         ra.append_evidence(
             seeded_sym,
             [{"level": "L1", "kind": "fact", "metric": "verified_kpi", "value": "1"}],
@@ -1796,7 +1796,7 @@ def test_same_currency_rejects_non_unit_fx_in_planner_and_ledger(client: TestCli
 
 def test_pair_leg_verified_requires_distinct_opposite_symbol(client: TestClient):
     """Codex Round-2 HIGH #1: pair_leg_verified=True MUST require non-empty pair_leg_symbol != primary symbol."""
-    ra.init_archive("SPY")
+    ra.init_archive("SPY", direction_bias="short")
     ra.append_evidence("SPY", [{"level": "L1", "metric": "macro_anchor", "value": "ok"}])
     base_payload = {
         "symbol": "SPY",
@@ -1866,6 +1866,347 @@ def test_ledger_currency_mismatch_rejects_stale_fx_submission(client: TestClient
     )
     assert r_mismatch.status_code == 422
     assert "本位币 (CNY) 不一致" in r_mismatch.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# 9. Iteration 2A-2: Scale-in API, Archive Status Sync, Archive Init/State L1 Fields, Trade Plan Bias
+# ---------------------------------------------------------------------------
+def test_api_portfolio_scale_in_and_archive_status_sync(client: TestClient):
+    # Initialize portfolio ($100k, 1% = $1,000 single-sector risk cap)
+    assert client.post(
+        "/api/portfolio/init",
+        json={"equity": 100_000.0, "base_currency": "USD", "default_risk_per_trade_pct": 1.0},
+    ).status_code == 200
+
+    # Create research archives for NVDA and AVGO (both start as watchlist)
+    assert client.post(
+        "/api/research/archive/init",
+        json={"symbol": "NVDA", "name": "NVIDIA", "direction_bias": "long", "layer1_primary": "技术迭代"},
+    ).status_code == 200
+    assert client.post(
+        "/api/research/archive/init",
+        json={"symbol": "AVGO", "name": "Broadcom", "direction_bias": "long", "layer1_primary": "技术迭代"},
+    ).status_code == 200
+    assert client.get("/api/research/archive", params={"symbol": "NVDA"}).json()["state"]["status"] == "watchlist"
+
+    # 1) Open NVDA -> auto-syncs NVDA archive status to "holding"
+    r_open = client.post(
+        "/api/portfolio/positions/open",
+        json={
+            "symbol": "NVDA",
+            "direction": "long",
+            "sector_theme": "ai_compute",
+            "entry_price": 100.0,
+            "tactical_stop_30m": 95.0,
+            "quantity": 100,  # $500 risk (0.5%)
+            "macro_factors": ["us_real_rate"],
+        },
+    )
+    assert r_open.status_code == 200
+    open_body = r_open.json()
+    pid = open_body["position"]["position_id"]
+    assert open_body["archive_status_sync"]["synced"] is True
+    assert open_body["archive_status_sync"]["current_status"] == "holding"
+    assert client.get("/api/research/archive", params={"symbol": "NVDA"}).json()["state"]["status"] == "holding"
+
+    # 2) Scale-in validation errors MUST return HTTP 400 with clear Chinese detail
+    #    (a) Floating loss / breakeven averaging down
+    r_loss = client.post(
+        f"/api/portfolio/positions/{pid}/scale-in",
+        json={"add_quantity": 50, "add_price": 98.0},
+    )
+    assert r_loss.status_code == 400
+    assert "浮亏或平价摊平" in r_loss.json()["detail"]
+
+    r_flat = client.post(
+        f"/api/portfolio/positions/{pid}/scale-in",
+        json={"add_quantity": 50, "add_price": 100.0},
+    )
+    assert r_flat.status_code == 400
+    assert "浮亏或平价摊平" in r_flat.json()["detail"]
+
+    #    (b) Stop widening
+    r_widen = client.post(
+        f"/api/portfolio/positions/{pid}/scale-in",
+        json={"add_quantity": 50, "add_price": 110.0, "new_stop_loss": 92.0},
+    )
+    assert r_widen.status_code == 400
+    assert "移动止损只紧不松" in r_widen.json()["detail"]
+
+    #    (c) Over sector risk cap without tightening stop
+    r_over_cap = client.post(
+        f"/api/portfolio/positions/{pid}/scale-in",
+        json={"add_quantity": 100, "add_price": 115.0},
+    )
+    assert r_over_cap.status_code == 400
+    assert "保本/浮盈区释放风险额度" in r_over_cap.json()["detail"]
+
+    #    (d) Unknown position_id -> HTTP 404
+    r_404 = client.post(
+        "/api/portfolio/positions/pos_nonexistent/scale-in",
+        json={"add_quantity": 10, "add_price": 115.0},
+    )
+    assert r_404.status_code == 404
+
+    # 3) Valid scale-in with stop tightened to profit/breakeven zone -> HTTP 200 + updated summary
+    r_ok = client.post(
+        f"/api/portfolio/positions/{pid}/scale-in",
+        json={
+            "add_quantity": 50,
+            "add_price": 115.0,
+            "new_stop_loss": 106.0,
+            "note": "T2 浮盈加仓锁利",
+        },
+    )
+    assert r_ok.status_code == 200
+    body = r_ok.json()
+    assert body["new_quantity"] == 150
+    assert body["new_entry_price"] == pytest.approx(105.0, abs=1e-6)
+    assert body["new_stop_loss"] == 106.0
+    assert body["new_risk_amount"] == 0.0
+    assert body["new_risk_pct"] == 0.0
+    assert body["tranche_count"] == 2
+    assert body["summary"]["open_positions_count"] == 1
+    assert body["summary"]["total_open_risk_amount"] == 0.0
+
+    # 4) Rotate NVDA -> AVGO auto-syncs NVDA to watchlist and AVGO to holding
+    r_rot = client.post(
+        f"/api/portfolio/positions/{pid}/rotate",
+        json={
+            "exit_price": 120.0,
+            "exit_reason": "switch_to_avgo",
+            "new_position": {
+                "symbol": "AVGO",
+                "direction": "long",
+                "sector_theme": "ai_compute",
+                "entry_price": 180.0,
+                "tactical_stop_30m": 170.0,
+                "quantity": 50,
+            },
+        },
+    )
+    assert r_rot.status_code == 200
+    avgo_pid = r_rot.json()["opened_position"]["position_id"]
+    assert client.get("/api/research/archive", params={"symbol": "NVDA"}).json()["state"]["status"] == "watchlist"
+    assert client.get("/api/research/archive", params={"symbol": "AVGO"}).json()["state"]["status"] == "holding"
+
+    # 5) Close AVGO -> AVGO returns to watchlist
+    r_close = client.post(
+        f"/api/portfolio/positions/{avgo_pid}/close",
+        json={"exit_price": 190.0, "exit_reason": "take_profit"},
+    )
+    assert r_close.status_code == 200
+    assert client.get("/api/research/archive", params={"symbol": "AVGO"}).json()["state"]["status"] == "watchlist"
+
+    # 6) Open & void NVDA -> NVDA returns from holding to watchlist
+    r_open2 = client.post(
+        "/api/portfolio/positions/open",
+        json={
+            "symbol": "NVDA",
+            "direction": "long",
+            "sector_theme": "ai_compute",
+            "entry_price": 120.0,
+            "tactical_stop_30m": 115.0,
+            "quantity": 50,
+        },
+    )
+    assert r_open2.status_code == 200
+    pid2 = r_open2.json()["position"]["position_id"]
+    assert client.get("/api/research/archive", params={"symbol": "NVDA"}).json()["state"]["status"] == "holding"
+    r_void = client.post(f"/api/portfolio/positions/{pid2}/void", json={"reason": "误录作废"})
+    assert r_void.status_code == 200
+    assert client.get("/api/research/archive", params={"symbol": "NVDA"}).json()["state"]["status"] == "watchlist"
+
+
+def test_api_archive_init_and_state_direction_and_l1_drivers(client: TestClient):
+    # 1) Init archive with direction_bias, layer1_primary, layer1_secondary, thesis_summary, confidence
+    r_init = client.post(
+        "/api/research/archive/init",
+        json={
+            "symbol": "CU0",
+            "name": "沪铜",
+            "direction_bias": "short",
+            "layer1_primary": "商品供需平衡预期",
+            "layer1_secondary": "宏观双核",
+            "thesis_summary": "强现实弱预期劈叉，远期冶炼投产过剩",
+            "confidence": "high",
+        },
+    )
+    assert r_init.status_code == 200
+    init_state = r_init.json()["state"]
+    assert init_state["direction_bias"] == "short"
+    assert init_state["layer1_drivers"]["primary"] == "商品供需平衡预期"
+    assert init_state["layer1_drivers"]["secondary"] == "宏观双核"
+    assert init_state["thesis_summary"] == "强现实弱预期劈叉，远期冶炼投产过剩"
+    assert init_state["confidence"] == "high"
+
+    # Confirm persisted on disk via GET
+    loaded = client.get("/api/research/archive", params={"symbol": "CU0"}).json()
+    assert loaded["state"]["direction_bias"] == "short"
+    assert loaded["state"]["layer1_drivers"]["primary"] == "商品供需平衡预期"
+    rev = loaded["state"]["revision"]
+
+    # 2) PATCH with flat top-level fields (direction_bias, thesis_summary, layer1_primary, layer1_secondary, status, confidence)
+    r_flat = client.patch(
+        "/api/research/archive/state",
+        json={
+            "symbol": "CU0",
+            "expected_revision": rev,
+            "direction_bias": "long",
+            "thesis_summary": "矿端扰动超预期转缺口",
+            "layer1_primary": "地缘与资源国政策",
+            "layer1_secondary": "库存周期",
+            "status": "actionable_long",
+            "confidence": "medium",
+        },
+    )
+    assert r_flat.status_code == 200
+    st_flat = r_flat.json()
+    assert st_flat["direction_bias"] == "long"
+    assert st_flat["thesis_summary"] == "矿端扰动超预期转缺口"
+    assert st_flat["layer1_drivers"]["primary"] == "地缘与资源国政策"
+    assert st_flat["layer1_drivers"]["secondary"] == "库存周期"
+    assert st_flat["status"] == "actionable_long"
+    assert st_flat["confidence"] == "medium"
+
+    # 3) PATCH with nested patch containing layer1_primary / layer1_secondary / layer1_drivers
+    r_nested = client.patch(
+        "/api/research/archive/state",
+        json={
+            "symbol": "CU0",
+            "expected_revision": st_flat["revision"],
+            "patch": {
+                "direction_bias": "neutral",
+                "layer1_primary": "宏观双核",
+                "confidence": "low",
+            },
+        },
+    )
+    assert r_nested.status_code == 200
+    st_nested = r_nested.json()
+    assert st_nested["direction_bias"] == "neutral"
+    assert st_nested["layer1_drivers"]["primary"] == "宏观双核"
+    assert st_nested["layer1_drivers"]["secondary"] == "库存周期"
+    assert st_nested["confidence"] == "low"
+
+    # 4) Invalid direction_bias -> HTTP 422
+    r_bad = client.patch(
+        "/api/research/archive/state",
+        json={"symbol": "CU0", "direction_bias": "bullish_invalid"},
+    )
+    assert r_bad.status_code == 422
+
+
+def test_api_trade_plan_forwards_archive_direction_bias(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    client.post(
+        "/api/research/archive/init",
+        json={
+            "symbol": "CU0",
+            "direction_bias": "short",
+            "layer1_primary": "商品供需平衡预期",
+            "thesis_summary": "远期过剩",
+        },
+    )
+    ra.append_evidence("CU0", [{"level": "L1", "kind": "fact", "metric": "smelter_cap", "value": "100"}])
+
+    captured: dict[str, Any] = {}
+    orig_build = tp.build_trade_plan
+
+    def spy_build(args: Any) -> dict[str, Any]:
+        captured["research_direction"] = getattr(args, "research_direction", None)
+        captured["research_direction_bias"] = getattr(args, "research_direction_bias", None)
+        captured["direction_bias"] = getattr(args, "direction_bias", None)
+        return orig_build(args)
+
+    monkeypatch.setattr(tp, "build_trade_plan", spy_build)
+
+    # 1) Archived symbol aligned direction: archive="short", plan="short" -> actionable_short
+    r_arch = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "CU0",
+            "direction": "short",
+            "live": False,
+            "entry_price": 75000.0,
+            "tactical_stop_30m": 76000.0,
+            "target_price": 70000.0,
+            "account_equity": 1_000_000.0,
+            "account_currency": "CNY",
+            "alignment_status": "aligned_trigger",
+        },
+    )
+    assert r_arch.status_code == 200
+    assert captured["research_direction"] == "short"
+    assert captured["research_direction_bias"] == "short"
+    assert captured["direction_bias"] == "short"
+    body_arch = r_arch.json()
+    assert body_arch["research_direction_bias"] == "short"
+    assert body_arch["archive_context"]["exists"] is True
+    assert body_arch["archive_context"]["direction_bias"] == "short"
+    assert body_arch["four_quadrant_gate"]["decision"] == "actionable_short"
+
+    # 2) Archived symbol conflicting direction: archive="short", plan="long" -> rejected_direction_conflict
+    r_conflict = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "CU0",
+            "direction": "long",
+            "live": False,
+            "entry_price": 75000.0,
+            "tactical_stop_30m": 74000.0,
+            "target_price": 80000.0,
+            "account_equity": 1_000_000.0,
+            "account_currency": "CNY",
+            "alignment_status": "aligned_trigger",
+        },
+    )
+    assert r_conflict.status_code == 200
+    assert r_conflict.json()["four_quadrant_gate"]["decision"] == "rejected_direction_conflict"
+    assert r_conflict.json()["four_quadrant_gate"]["actionable"] is False
+
+    # 3) Archived symbol neutral direction -> watchlist_research_pending
+    client.post("/api/research/archive/init", json={"symbol": "GC=F", "direction_bias": "neutral"})
+    ra.append_evidence("GC=F", [{"level": "L1", "kind": "fact", "metric": "real_yield", "value": "1.8"}])
+    r_neutral = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "GC=F",
+            "direction": "long",
+            "live": False,
+            "entry_price": 2500.0,
+            "tactical_stop_30m": 2480.0,
+            "target_price": 2600.0,
+            "account_equity": 500_000.0,
+            "account_currency": "USD",
+            "alignment_status": "aligned_trigger",
+        },
+    )
+    assert r_neutral.status_code == 200
+    assert r_neutral.json()["four_quadrant_gate"]["decision"] == "watchlist_research_pending"
+    assert r_neutral.json()["four_quadrant_gate"]["actionable"] is False
+
+    # 4) Unarchived symbol: request-supplied direction_bias forwarded losslessly
+    r_unarch = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "NVDA",
+            "direction": "long",
+            "live": False,
+            "entry_price": 120.0,
+            "tactical_stop_30m": 115.0,
+            "target_price": 140.0,
+            "account_equity": 100_000.0,
+            "account_currency": "USD",
+            "direction_bias": "long",
+            "alignment_status": "aligned_trigger",
+        },
+    )
+    assert r_unarch.status_code == 200
+    assert captured["research_direction"] == "long"
+    assert captured["research_direction_bias"] == "long"
+    assert captured["direction_bias"] == "long"
+    assert r_unarch.json()["research_direction_bias"] == "long"
+    assert r_unarch.json()["archive_context"]["exists"] is False
 
 
 def test_market_dual_does_not_cache_intraday_error_response(client: TestClient, monkeypatch: pytest.MonkeyPatch):
@@ -1944,3 +2285,151 @@ def test_market_dual_does_not_cache_intraday_error_response(client: TestClient, 
     hit, val = local_cache.get(("dual", "LC0"))
     assert hit is True
     assert val == {"ok": True}
+
+
+def test_p1_3_pair_trade_enforces_us_short_and_blocks_a_share_short_leg(client: TestClient):
+    """P1-3: Pair trade MUST NOT bypass Option A US-short verdict or allow an A-share short opposing leg."""
+    # Case 1: NVDA archive is direction_bias="pair" with L1 -> us_short_thesis_verified=False -> MUST NOT return pair_trade
+    ra.init_archive("NVDA", direction_bias="pair")
+    ra.append_evidence("NVDA", [{"level": "L1", "metric": "capex_check", "value": "ok"}])
+    r_nvda = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "NVDA",
+            "direction": "short",
+            "live": False,
+            "entry_price": 120.0,
+            "tactical_stop_30m": 125.0,
+            "target_price": 100.0,
+            "account_equity": 1000000.0,
+            "account_currency": "USD",
+            "alignment_status": "aligned_trigger",
+            "pair_trade": True,
+            "pair_leg_verified": True,
+            "pair_leg_symbol": "AMD",
+        },
+    )
+    assert r_nvda.status_code == 200
+    gate_nvda = r_nvda.json()["four_quadrant_gate"]
+    assert gate_nvda["decision"] == "watchlist"
+    assert gate_nvda["actionable"] is False
+
+    # Case 2: Long PWR + opposing A-share short leg 600519 -> MUST unconditionally reject
+    ra.init_archive("PWR", direction_bias="long")
+    ra.append_evidence("PWR", [{"level": "L1", "metric": "grid_backlog", "value": "record"}])
+    r_a_opp = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "PWR",
+            "direction": "long",
+            "live": False,
+            "entry_price": 300.0,
+            "tactical_stop_30m": 285.0,
+            "target_price": 360.0,
+            "account_equity": 1000000.0,
+            "account_currency": "USD",
+            "alignment_status": "aligned_trigger",
+            "pair_trade": True,
+            "pair_leg_verified": True,
+            "pair_leg_symbol": "600519",
+        },
+    )
+    assert r_a_opp.status_code == 200
+    gate_a = r_a_opp.json()["four_quadrant_gate"]
+    assert gate_a["decision"] == "rejected"
+    assert gate_a["actionable"] is False
+    assert "A 股受限严格仅做多" in gate_a["reason"]
+
+    # Case 3: Long PWR + opposing US short leg AMD (no short verdict) -> watchlist; after AMD short + L1 -> pair_trade
+    r_us_opp_blocked = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "PWR",
+            "direction": "long",
+            "live": False,
+            "entry_price": 300.0,
+            "tactical_stop_30m": 285.0,
+            "target_price": 360.0,
+            "account_equity": 1000000.0,
+            "account_currency": "USD",
+            "alignment_status": "aligned_trigger",
+            "pair_trade": True,
+            "pair_leg_verified": True,
+            "pair_leg_symbol": "AMD",
+        },
+    )
+    assert r_us_opp_blocked.status_code == 200
+    assert r_us_opp_blocked.json()["four_quadrant_gate"]["decision"] == "watchlist"
+    assert r_us_opp_blocked.json()["four_quadrant_gate"]["actionable"] is False
+
+    ra.init_archive("AMD", direction_bias="short")
+    ra.append_evidence("AMD", [{"level": "L1", "metric": "margin_compression", "value": "confirmed"}])
+    r_us_opp_ok = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "PWR",
+            "direction": "long",
+            "live": False,
+            "entry_price": 300.0,
+            "tactical_stop_30m": 285.0,
+            "target_price": 360.0,
+            "account_equity": 1000000.0,
+            "account_currency": "USD",
+            "alignment_status": "aligned_trigger",
+            "pair_trade": True,
+            "pair_leg_verified": True,
+            "pair_leg_symbol": "AMD",
+        },
+    )
+    assert r_us_opp_ok.status_code == 200
+    assert r_us_opp_ok.json()["four_quadrant_gate"]["decision"] == "pair_trade"
+    assert r_us_opp_ok.json()["four_quadrant_gate"]["actionable"] is True
+
+
+def test_p2_4_archive_init_single_write_and_overwrite_increments_revision(client: TestClient):
+    """P2-4: /api/research/archive/init must stay at revision=1 on creation and increment revision on overwrite=True."""
+    r1 = client.post(
+        "/api/research/archive/init",
+        json={
+            "symbol": "ETN",
+            "name": "Eaton",
+            "direction_bias": "long",
+            "layer1_primary": "维度3电力电网瓶颈",
+            "layer1_secondary": "维度1美国制造业回流",
+            "confidence": "HIGH",
+            "thesis_summary": "电网变压器与数据中心配电核心龙头",
+        },
+    )
+    assert r1.status_code == 200
+    st1 = r1.json()["state"]
+    assert st1["revision"] == 1
+    assert st1["direction_bias"] == "long"
+    assert st1["confidence"] == "high"
+    assert st1["layer1_drivers"]["primary"] == "维度3电力电网瓶颈"
+    assert st1["layer1_drivers"]["secondary"] == "维度1美国制造业回流"
+
+    # Overwrite=True MUST increment revision to 2 (not reset to 1)
+    r2 = client.post(
+        "/api/research/archive/init",
+        json={
+            "symbol": "ETN",
+            "name": "Eaton Rebuilt",
+            "direction_bias": "short",
+            "layer1_primary": "维度4产能过剩",
+            "confidence": "medium",
+            "thesis_summary": "重建档案",
+            "overwrite": True,
+        },
+    )
+    assert r2.status_code == 200
+    st2 = r2.json()["state"]
+    assert st2["revision"] == 2
+    assert st2["direction_bias"] == "short"
+
+    # Stale client holding expected_revision=1 MUST get HTTP 409 Conflict
+    r_stale = client.patch(
+        "/api/research/archive/state",
+        json={"symbol": "ETN", "expected_revision": 1, "confidence": "low"},
+    )
+    assert r_stale.status_code == 409
+

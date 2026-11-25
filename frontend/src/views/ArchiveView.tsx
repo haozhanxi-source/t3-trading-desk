@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -74,7 +74,384 @@ const TRIGGER_ACTION_ZH: Record<string, string> = {
   alert: "指标松动预警",
 };
 
+interface TriggerMetricPreset {
+  key: string;
+  label: string;
+  defaultOp: string;
+  placeholder: string;
+  note: string;
+}
+
+const CUSTOM_METRIC_SENTINEL = "__custom__";
+
+const TRIGGER_METRICS_BY_KIND: Record<string, TriggerMetricPreset[]> = {
+  chanlun: [
+    {
+      key: "close",
+      label: "最新收盘价 / 实盘价 (close)",
+      defaultOp: "<",
+      placeholder: "如 114000",
+      note: "哨兵实时拉取标的最新价校验，最适合设置 30m 止损或日线 ZD/ZG 价格红线",
+    },
+    {
+      key: "daily_zd",
+      label: "日线中枢下沿 ZD (daily_zd)",
+      defaultOp: "<",
+      placeholder: "如 114610",
+      note: "监控最新日线中枢下沿 ZD 是否下移破位",
+    },
+    {
+      key: "daily_zg",
+      label: "日线中枢上沿 ZG (daily_zg)",
+      defaultOp: ">",
+      placeholder: "如 123690",
+      note: "监控最新日线中枢上沿 ZG 突破或上移",
+    },
+    {
+      key: "intraday_30m_zd",
+      label: "30m 中枢下沿 ZD (intraday_30m_zd)",
+      defaultOp: "<",
+      placeholder: "如 114000",
+      note: "监控 30 分钟级别中枢下沿 ZD 防线变化",
+    },
+    {
+      key: "intraday_30m_zg",
+      label: "30m 中枢上沿 ZG (intraday_30m_zg)",
+      defaultOp: ">",
+      placeholder: "如 120900",
+      note: "监控 30 分钟级别中枢上沿 ZG 压力位变化",
+    },
+    {
+      key: "daily_signal",
+      label: "日线缠论信号摘要 (daily_signal)",
+      defaultOp: "contains",
+      placeholder: "如 三卖 或 顶背驰",
+      note: "按文本包含匹配日线最新缠论结构结论",
+    },
+    {
+      key: "intraday_30m_signal",
+      label: "30m 缠论信号摘要 (intraday_30m_signal)",
+      defaultOp: "contains",
+      placeholder: "如 三卖 或 顶背驰",
+      note: "按文本包含匹配 30m 最新缠论结构结论",
+    },
+    {
+      key: "return_1d_pct",
+      label: "单日涨跌幅 % (return_1d_pct)",
+      defaultOp: "<",
+      placeholder: "如 -3",
+      note: "单日急跌/急拉百分比阈值（单位 %）",
+    },
+    {
+      key: "return_5d_pct",
+      label: "近 5 日涨跌幅 % (return_5d_pct)",
+      defaultOp: "<",
+      placeholder: "如 -8",
+      note: "近 5 个交易日累计涨跌幅阈值（单位 %）",
+    },
+    {
+      key: "atr14",
+      label: "日线 ATR14 波动幅度 (atr14)",
+      defaultOp: ">",
+      placeholder: "如 3500",
+      note: "波动率异常放大告警",
+    },
+  ],
+  supply_demand: [
+    {
+      key: "inventory_chg_pct",
+      label: "显性库存变动 % (inventory_chg_pct)",
+      defaultOp: ">",
+      placeholder: "如 15",
+      note: "交易所显性库存近期环比变动百分比（多头防累库用 >，空头防去库用 <）",
+    },
+    {
+      key: "inventory_latest",
+      label: "最新显性库存量 (inventory_latest)",
+      defaultOp: ">",
+      placeholder: "如 30000",
+      note: "交易所最新显性库存绝对数量",
+    },
+    {
+      key: "cftc_mm_net",
+      label: "CFTC 基金净持仓 (cftc_mm_net)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "海外商品 Managed Money 净持仓手数",
+    },
+    {
+      key: "cftc_mm_net_pct_oi",
+      label: "CFTC 基金净持仓占比 % (cftc_mm_net_pct_oi)",
+      defaultOp: "<",
+      placeholder: "如 -5",
+      note: "海外商品基金净头寸占总持仓比例（%）",
+    },
+    {
+      key: "etf_flow_5d_m",
+      label: "现货 ETF 5 日净流 M$ (etf_flow_5d_m)",
+      defaultOp: "<",
+      placeholder: "如 -200",
+      note: "加密现货 ETF 近 5 个交易日净流入/流出（百万美元）",
+    },
+    {
+      key: "stablecoin_chg_7d_pct",
+      label: "稳定币 7 日市值变化 % (stablecoin_chg_7d_pct)",
+      defaultOp: "<",
+      placeholder: "如 -1.5",
+      note: "加密市场稳定币 7 日流动性扩张/收缩幅度（%）",
+    },
+  ],
+  term_structure: [
+    {
+      key: "basis_pct",
+      label: "现货基差 % (basis_pct)",
+      defaultOp: "<",
+      placeholder: "如 -3",
+      note: "现货相对主力合约升贴水百分比（负值代表现货贴水）",
+    },
+    {
+      key: "roll_yield_near_pct",
+      label: "近月年化展期收益 % (roll_yield_near_pct)",
+      defaultOp: "<",
+      placeholder: "如 -15",
+      note: "近月展期年化收益率（正值=Backwardation 升水，负值=Contango 贴水）",
+    },
+    {
+      key: "roll_yield_curve_pct",
+      label: "全曲线年化展期 % (roll_yield_curve_pct)",
+      defaultOp: "<",
+      placeholder: "如 -10",
+      note: "全活跃期限曲线年化展期收益率（%）",
+    },
+    {
+      key: "front_far_spread",
+      label: "近远月价差 (front_far_spread)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "近月减去远月绝对价差",
+    },
+    {
+      key: "curve_structure",
+      label: "期限曲线形态 (curve_structure)",
+      defaultOp: "contains",
+      placeholder: "如 Contango 或 Backwardation",
+      note: "监控曲线是否从 Backwardation 转为 Contango",
+    },
+    {
+      key: "spot_price",
+      label: "现货参考价 (spot_price)",
+      defaultOp: "<",
+      placeholder: "如 114000",
+      note: "生意社/现货基准报价",
+    },
+    {
+      key: "perp_funding_ann_pct",
+      label: "永续合约年化资金费率 % (perp_funding_ann_pct)",
+      defaultOp: ">",
+      placeholder: "如 30",
+      note: "加密永续合约多头拥挤度年化费率（%）",
+    },
+  ],
+  rate_diff: [
+    {
+      key: "rate_diff_10y_bp",
+      label: "10Y 国债利差 bp (rate_diff_10y_bp)",
+      defaultOp: "<",
+      placeholder: "如 150",
+      note: "两国 10 年期国债利差（基点 bp）",
+    },
+    {
+      key: "rate_diff_2y_bp",
+      label: "2Y 国债利差 bp (rate_diff_2y_bp)",
+      defaultOp: "<",
+      placeholder: "如 120",
+      note: "两国 2 年期国债利差（基点 bp）",
+    },
+    {
+      key: "tff_lev_money_net",
+      label: "CFTC 杠杆基金净头寸 (tff_lev_money_net)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "外汇期货 TFF 杠杆基金净头寸",
+    },
+    {
+      key: "tff_pair_aligned_net",
+      label: "CFTC 报价同向净头寸 (tff_pair_aligned_net)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "已按直盘/反向报价换算对齐后的净持仓方向",
+    },
+  ],
+  fundamental: [
+    {
+      key: "forward_pe",
+      label: "前瞻 PE (forward_pe)",
+      defaultOp: ">",
+      placeholder: "如 35",
+      note: "一致预期前瞻市盈率估值上限/下限",
+    },
+    {
+      key: "pe_ttm_pctile_5y",
+      label: "5 年 PE 历史分位 % (pe_ttm_pctile_5y)",
+      defaultOp: ">",
+      placeholder: "如 85",
+      note: "A 股 5 年滚动 PE 估值历史分位（0~100）",
+    },
+    {
+      key: "pb_pctile_5y",
+      label: "5 年 PB 历史分位 % (pb_pctile_5y)",
+      defaultOp: ">",
+      placeholder: "如 85",
+      note: "A 股 5 年 PB 估值历史分位（0~100）",
+    },
+    {
+      key: "pe_ttm",
+      label: "滚动 PE(TTM) (pe_ttm)",
+      defaultOp: ">",
+      placeholder: "如 30",
+      note: "当前滚动市盈率",
+    },
+    {
+      key: "short_pct_float",
+      label: "做空占流通股比例 % (short_pct_float)",
+      defaultOp: ">",
+      placeholder: "如 10",
+      note: "美股空头仓位占比（%）",
+    },
+    {
+      key: "target_mean_price",
+      label: "卖方一致目标均价 (target_mean_price)",
+      defaultOp: "<",
+      placeholder: "如 200",
+      note: "华尔街/机构一致目标均价",
+    },
+    {
+      key: "days_to_earnings",
+      label: "距下次财报天数 (days_to_earnings)",
+      defaultOp: "<=",
+      placeholder: "如 7",
+      note: "财报窗口临近风控提醒（天）",
+    },
+  ],
+  policy: [
+    {
+      key: "close",
+      label: "政策证伪价格防线 (close)",
+      defaultOp: "<",
+      placeholder: "如 114000",
+      note: "资源国政策（如印尼配额/出口禁令）若不及预期，以价格破位作为硬证伪红线",
+    },
+    {
+      key: "inventory_chg_pct",
+      label: "抢出口/累库证伪 % (inventory_chg_pct)",
+      defaultOp: ">",
+      placeholder: "如 15",
+      note: "监控政策生效前抢出口冲库导致的显性库存暴增（%）",
+    },
+    {
+      key: "basis_pct",
+      label: "现货紧张度证伪基差 % (basis_pct)",
+      defaultOp: "<",
+      placeholder: "如 -3",
+      note: "政策供应收缩是否真正传导至现货升贴水（%）",
+    },
+  ],
+  spread: [
+    {
+      key: "cross_spread_primary",
+      label: "品种主跨市价差 (cross_spread_primary)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "当前品种对应的核心国内外/跨区价差",
+    },
+    {
+      key: "spread_cu_hg_vat_excl_cny_t",
+      label: "沪铜-COMEX 铜不含税价差 (spread_cu_hg_vat_excl_cny_t)",
+      defaultOp: "<",
+      placeholder: "如 -1500",
+      note: "人民币元/吨",
+    },
+    {
+      key: "spread_sc_brent_usd_bbl",
+      label: "上海原油-布伦特价差 (spread_sc_brent_usd_bbl)",
+      defaultOp: "<",
+      placeholder: "如 -2",
+      note: "美元/桶",
+    },
+    {
+      key: "spread_brent_wti_usd",
+      label: "布伦特-WTI 价差 (spread_brent_wti_usd)",
+      defaultOp: "<",
+      placeholder: "如 2",
+      note: "美元/桶",
+    },
+    {
+      key: "spread_au_gc_cny_g",
+      label: "沪金-COMEX 金价差 (spread_au_gc_cny_g)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "人民币元/克",
+    },
+    {
+      key: "spread_ag_si_cny_kg",
+      label: "沪银-COMEX 银价差 (spread_ag_si_cny_kg)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "人民币元/千克",
+    },
+    {
+      key: "spread_sr_sb_cny_t",
+      label: "郑糖-ICE 原糖价差 (spread_sr_sb_cny_t)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "人民币元/吨",
+    },
+    {
+      key: "spread_cf_ct_cny_t",
+      label: "郑棉-ICE 美棉价差 (spread_cf_ct_cny_t)",
+      defaultOp: "<",
+      placeholder: "如 0",
+      note: "人民币元/吨",
+    },
+  ],
+  freight: [
+    { key: "bdi", label: "波罗的海干散货指数 (bdi)", defaultOp: "<", placeholder: "如 1200", note: "干散货海运景气基准" },
+    { key: "bci", label: "好望角型船运价指数 (bci)", defaultOp: "<", placeholder: "如 1800", note: "铁矿石/煤炭海运核心指数" },
+    { key: "bsi", label: "超灵便型船运价指数 (bsi)", defaultOp: "<", placeholder: "如 900", note: "粮油糖/小宗散货运价" },
+    { key: "bdti", label: "原油油轮运价指数 (bdti)", defaultOp: "<", placeholder: "如 800", note: "原油海运运价与咽喉风险" },
+    { key: "bcti", label: "成品油油轮运价指数 (bcti)", defaultOp: "<", placeholder: "如 600", note: "成品油海运运价" },
+  ],
+  macro: [
+    {
+      key: "rate_diff_10y_bp",
+      label: "10Y 中美/跨境国债利差 bp (rate_diff_10y_bp)",
+      defaultOp: "<",
+      placeholder: "如 150",
+      note: "10 年期国债利差（基点 bp）",
+    },
+    {
+      key: "close",
+      label: "宏观承压价格红线 (close)",
+      defaultOp: "<",
+      placeholder: "如 114000",
+      note: "宏观预期转向时的标的硬价格防线",
+    },
+    {
+      key: "return_5d_pct",
+      label: "近 5 日宏观冲击幅度 % (return_5d_pct)",
+      defaultOp: "<",
+      placeholder: "如 -5",
+      note: "短期宏观流动性冲击跌幅阈值（%）",
+    },
+  ],
+};
+
 const METRIC_ZH_HINTS: Record<string, string> = {
+  ...Object.fromEntries(
+    Object.values(TRIGGER_METRICS_BY_KIND)
+      .flat()
+      .map((p) => [p.key.toLowerCase(), p.label.replace(/\s*\([^)]+\)\s*$/, "")]),
+  ),
   vix: "VIX 恐慌指数",
   dxy: "美元指数 DXY",
   us10y_yield: "10Y 美债收益率",
@@ -211,13 +588,51 @@ export function ArchiveView({
   const [savingThesis, setSavingThesis] = useState(false);
 
   /* Visual Trigger & Event builder states */
+  const trigHintId = useId();
   const [trigKind, setTrigKind] = useState("chanlun");
-  const [trigMetric, setTrigMetric] = useState("");
+  const [trigMetric, setTrigMetric] = useState("close");
+  const [trigCustomMode, setTrigCustomMode] = useState(false);
   const [trigOp, setTrigOp] = useState("<");
   const [trigThreshold, setTrigThreshold] = useState("");
   const [trigAction, setTrigAction] = useState("exit_review");
   const [trigDesc, setTrigDesc] = useState("");
   const [trigBusy, setTrigBusy] = useState(false);
+
+  const activeKindPresets = useMemo(
+    () => TRIGGER_METRICS_BY_KIND[trigKind] ?? TRIGGER_METRICS_BY_KIND.chanlun,
+    [trigKind],
+  );
+  const activeMetricPreset = useMemo(
+    () => (trigCustomMode ? null : activeKindPresets.find((p) => p.key === trigMetric) ?? null),
+    [trigCustomMode, activeKindPresets, trigMetric],
+  );
+
+  const handleSelectTrigKind = (nextKind: string) => {
+    setTrigKind(nextKind);
+    const presets = TRIGGER_METRICS_BY_KIND[nextKind] ?? [];
+    if (presets.length > 0 && presets[0]) {
+      setTrigCustomMode(false);
+      setTrigMetric(presets[0].key);
+      setTrigOp(presets[0].defaultOp);
+    } else {
+      setTrigCustomMode(true);
+      setTrigMetric("");
+    }
+  };
+
+  const handleSelectMetricPreset = (nextVal: string) => {
+    if (nextVal === CUSTOM_METRIC_SENTINEL) {
+      setTrigCustomMode(true);
+      setTrigMetric("");
+      return;
+    }
+    setTrigCustomMode(false);
+    setTrigMetric(nextVal);
+    const preset = activeKindPresets.find((p) => p.key === nextVal);
+    if (preset) {
+      setTrigOp(preset.defaultOp);
+    }
+  };
 
   const [evDate, setEvDate] = useState("");
   const [evTitle, setEvTitle] = useState("");
@@ -626,7 +1041,9 @@ export function ArchiveView({
     try {
       await api.archiveState(targetSym, { triggers: nextTriggers }, detail.state.revision, targetMkt);
       if (selectionTokenRef.current === token) {
-        setTrigMetric("");
+        if (trigCustomMode) {
+          setTrigMetric("");
+        }
         setTrigThreshold("");
         setTrigDesc("");
         await loadDetail(targetSym, targetMkt, undefined, token);
@@ -1228,7 +1645,12 @@ export function ArchiveView({
               <form onSubmit={handleAddTrigger} className="grid grid-cols-1 items-end gap-2.5 sm:grid-cols-2 lg:grid-cols-12">
                 <label className="field lg:col-span-2">
                   <span>监控维度</span>
-                  <select className="input" value={trigKind} onChange={(e) => setTrigKind(e.target.value)}>
+                  <select
+                    className="input"
+                    name="trigger_kind"
+                    value={trigKind}
+                    onChange={(e) => handleSelectTrigKind(e.target.value)}
+                  >
                     {TRIGGER_KIND_OPTIONS.map((opt) => (
                       <option key={opt.value} value={opt.value}>
                         {opt.label}
@@ -1237,18 +1659,46 @@ export function ArchiveView({
                   </select>
                 </label>
                 <label className="field lg:col-span-3">
-                  <span>指标键名 (metric) *</span>
-                  <input
-                    className="input font-mono"
-                    required
-                    placeholder="如 us10y_yield / vix / close_30m"
-                    value={trigMetric}
-                    onChange={(e) => setTrigMetric(e.target.value)}
-                  />
+                  <span>监控指标 *</span>
+                  <select
+                    className="input"
+                    name="trigger_metric_preset"
+                    value={trigCustomMode ? CUSTOM_METRIC_SENTINEL : trigMetric}
+                    onChange={(e) => handleSelectMetricPreset(e.target.value)}
+                  >
+                    {activeKindPresets.map((p) => (
+                      <option key={p.key} value={p.key}>
+                        {p.label}
+                      </option>
+                    ))}
+                    <option value={CUSTOM_METRIC_SENTINEL}>自定义指标键名…</option>
+                  </select>
                 </label>
+                {trigCustomMode ? (
+                  <label className="field lg:col-span-3">
+                    <span>自定义键名 (metric) *</span>
+                    <input
+                      className="input font-mono"
+                      name="trigger_metric_custom"
+                      required
+                      autoFocus
+                      autoCorrect="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                      placeholder="输入哨兵指标键名，如 close"
+                      value={trigMetric}
+                      onChange={(e) => setTrigMetric(e.target.value)}
+                    />
+                  </label>
+                ) : null}
                 <label className="field lg:col-span-1">
                   <span>条件</span>
-                  <select className="input font-mono" value={trigOp} onChange={(e) => setTrigOp(e.target.value)}>
+                  <select
+                    className="input font-mono"
+                    name="trigger_operator"
+                    value={trigOp}
+                    onChange={(e) => setTrigOp(e.target.value)}
+                  >
                     <option value="<">&lt;</option>
                     <option value="<=">&lt;=</option>
                     <option value=">">&gt;</option>
@@ -1261,15 +1711,23 @@ export function ArchiveView({
                   <span>阈值 *</span>
                   <input
                     className="input font-mono"
+                    name="trigger_threshold"
+                    inputMode={trigOp === "contains" || trigOp === "event" ? "text" : "decimal"}
                     required
-                    placeholder="如 4.6"
+                    aria-describedby={trigHintId}
+                    placeholder={activeMetricPreset?.placeholder || "如 114000"}
                     value={trigThreshold}
                     onChange={(e) => setTrigThreshold(e.target.value)}
                   />
                 </label>
                 <label className="field lg:col-span-2">
                   <span>触发动作</span>
-                  <select className="input" value={trigAction} onChange={(e) => setTrigAction(e.target.value)}>
+                  <select
+                    className="input"
+                    name="trigger_action"
+                    value={trigAction}
+                    onChange={(e) => setTrigAction(e.target.value)}
+                  >
                     <option value="exit_review">果断撤离重审</option>
                     <option value="trim_or_exit">减仓或撤离</option>
                     <option value="alert">指标松动预警</option>
@@ -1281,6 +1739,11 @@ export function ArchiveView({
                     <span>添加触发器</span>
                   </button>
                 </div>
+                <p id={trigHintId} className="m-0 text-[11px] text-muted sm:col-span-2 lg:col-span-12">
+                  {activeMetricPreset
+                    ? `哨兵自动校验键名 ${activeMetricPreset.key}：${activeMetricPreset.note}`
+                    : "自定义模式：请输入每日哨兵 observations 支持的精确指标键名，否则会被标为待校验。"}
+                </p>
               </form>
 
               <div tabIndex={0} role="region" aria-label="档案撤离触发器配置表" className="table-wrapper">

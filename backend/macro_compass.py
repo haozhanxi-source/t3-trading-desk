@@ -574,11 +574,134 @@ def collect_macro_overview(
 
 
 # ---------------------------------------------------------------------------
-# Layer 1 AI 7-Dimension Strategic Synthesis
+# Layer 1 AI 7-Dimension Strategic Synthesis (Blind Top-Down Sector First)
 # ---------------------------------------------------------------------------
-def _load_portfolio_and_archive_context() -> dict[str, Any]:
-    """Read compact current holdings and watchlist themes so Layer 1 avoids blind duplication."""
-    holdings: list[dict[str, Any]] = []
+_UNIVERSE_MATCH_RULES: dict[str, tuple[set[str], tuple[str, ...]]] = {
+    "commodities_energy": (
+        {"commodities", "cross_asset"},
+        ("原油", "石油", "天然气", "成品油", "柴油", "燃料油", "裂解", "能源", "oil", "crude", "gas", "energy", "opec"),
+    ),
+    "commodities_precious": (
+        {"commodities", "cross_asset"},
+        ("黄金", "白银", "贵金属", "铂金", "钯金", "gold", "silver", "precious"),
+    ),
+    "commodities_base": (
+        {"commodities", "cross_asset"},
+        ("铜", "铝", "锌", "镍", "锡", "铅", "有色", "基本金属", "工业金属", "copper", "aluminum", "nickel", "zinc", "tin"),
+    ),
+    "commodities_ferrous": (
+        {"commodities", "cross_asset"},
+        ("铁矿", "螺纹", "热卷", "钢铁", "焦炭", "焦煤", "黑色", "硅铁", "锰硅", "iron ore", "steel", "ferrous", "coking"),
+    ),
+    "commodities_grains_oilseeds": (
+        {"commodities", "cross_asset"},
+        ("大豆", "豆粕", "豆油", "棕榈油", "菜油", "玉米", "小麦", "谷物", "油脂", "农产品", "grain", "soy", "palm", "corn", "wheat"),
+    ),
+    "commodities_softs": (
+        {"commodities", "cross_asset"},
+        ("咖啡", "可可", "白糖", "原糖", "棉花", "软商品", "coffee", "cocoa", "sugar", "cotton"),
+    ),
+    "commodities_livestock": (
+        {"commodities", "cross_asset"},
+        ("生猪", "猪周期", "活牛", "畜牧", "养殖", "hog", "cattle", "livestock"),
+    ),
+    "commodities_chem_newenergy": (
+        {"commodities", "cross_asset"},
+        ("碳酸锂", "锂", "工业硅", "多晶硅", "光伏硅料", "纯碱", "玻璃", "甲醇", "pta", "pvc", "橡胶", "化工", "lithium", "polysilicon", "chemical"),
+    ),
+    "shipping": (
+        {"commodities", "cross_asset"},
+        ("航运", "集运", "运价", "油轮", "散货船", "海运", "shipping", "freight", "container", "tanker"),
+    ),
+    "metals_equities": (
+        {"us_equities", "a_shares", "cross_asset"},
+        ("矿业股", "铜矿股", "金矿股", "资源股", "有色股", "稀土", "mining", "miners"),
+    ),
+    "us_power_grid": (
+        {"us_equities", "cross_asset"},
+        ("电力", "电网", "核电", "公用事业", "变压器", "燃气轮机", "power", "grid", "utilities", "nuclear"),
+    ),
+    "us_semis_ai": (
+        {"us_equities", "cross_asset"},
+        ("半导体", "芯片", "算力", "存储", "光模块", "晶圆", "semiconductor", "chip", "ai", "memory", "hbm"),
+    ),
+    "us_megacap_cashflow": (
+        {"us_equities", "cross_asset"},
+        ("大型科技", "科技巨头", "云厂商", "超大规模", "megacap", "hyperscaler", "cloud"),
+    ),
+    "us_sectors": (
+        {"us_equities", "cross_asset"},
+        ("美股", "军工", "航天", "医药", "生物医药", "金融", "工业", "消费", "防御", "defense", "healthcare", "financial", "industrial"),
+    ),
+    "a_shares_etfs": (
+        {"a_shares", "cross_asset"},
+        ("a股", "红利", "高股息", "沪深300", "科创", "券商", "煤炭", "中国股市", "china equity", "dividend"),
+    ),
+    "a_shares_themes": (
+        {"a_shares", "cross_asset"},
+        ("a股主题", "机器人", "国产替代", "新能源车", "中国核心资产"),
+    ),
+    "fx_majors": (
+        {"fx", "cross_asset"},
+        ("外汇", "汇率", "美元", "日元", "欧元", "英镑", "澳元", "人民币", "加元", "套息", "fx", "currency", "yen", "eur", "aud", "cny", "usd"),
+    ),
+    "crypto_majors": (
+        {"crypto", "cross_asset"},
+        ("加密", "比特币", "以太坊", "数字资产", "稳定币", "crypto", "bitcoin", "btc", "eth", "stablecoin"),
+    ),
+}
+
+
+def map_sector_to_universes(
+    *,
+    title: str,
+    asset_scope: str,
+    keywords: list[str],
+    reference_anchors: list[str],
+    universes: dict[str, Any],
+) -> list[str]:
+    """Deterministically map a blind Layer 1 sector thesis to existing universes.json pools post-hoc."""
+    haystack = " ".join([title, *keywords]).lower()
+    anchor_upper = {s.strip().upper() for s in reference_anchors if s.strip()}
+
+    scored: list[tuple[int, str]] = []
+    for key, pool in universes.items():
+        if not isinstance(pool, dict):
+            continue
+        score = 0
+        pool_syms = {str(s).strip().upper() for s in (pool.get("symbols") or [])}
+        if anchor_upper and (anchor_upper & pool_syms):
+            score += 4
+
+        rule = _UNIVERSE_MATCH_RULES.get(key)
+        if rule is not None:
+            allowed_scopes, tokens = rule
+            if asset_scope in allowed_scopes:
+                hits = sum(1 for tok in tokens if tok in haystack)
+                if hits > 0:
+                    score += 2 * hits
+        else:
+            # Custom user-saved universes: match by pool description / key tokens
+            desc_l = f"{key} {pool.get('description') or ''}".lower()
+            kw_hits = sum(1 for kw in keywords if len(kw.strip()) >= 2 and kw.strip().lower() in desc_l)
+            if kw_hits > 0:
+                score += 3 * kw_hits
+
+        if score >= 2:
+            scored.append((score, key))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    # Keep up to 2 most specific pools; drop broad ETF anchor pools if a specific thematic pool already matched
+    top_keys = [k for _, k in scored[:3]]
+    specific = [k for k in top_keys if k not in ("us_sectors", "a_shares_etfs")]
+    if specific:
+        return specific[:2]
+    return top_keys[:2]
+
+
+def _load_open_positions_for_post_check() -> list[dict[str, str]]:
+    """Read current holdings strictly AFTER AI synthesis to surface informational overlap badges."""
+    holdings: list[dict[str, str]] = []
     try:
         summary = portfolio_manager.portfolio_summary()
         for pos in summary.get("positions") or []:
@@ -586,50 +709,57 @@ def _load_portfolio_and_archive_context() -> dict[str, Any]:
                 continue
             holdings.append(
                 {
-                    "symbol": pos.get("symbol"),
-                    "direction": pos.get("direction"),
-                    "sector_theme": pos.get("sector_theme"),
-                    "leader_role": pos.get("leader_role"),
+                    "symbol": str(pos.get("symbol") or "").strip(),
+                    "direction": str(pos.get("direction") or "").strip().lower(),
+                    "sector_theme": str(pos.get("sector_theme") or "").strip(),
                 }
             )
     except Exception:
         pass
+    return holdings
 
-    archives: list[dict[str, Any]] = []
-    try:
-        for item in research_archive.list_archives()[:30]:
-            if not isinstance(item, dict):
-                continue
-            archives.append(
-                {
-                    "symbol": item.get("symbol"),
-                    "market": item.get("market"),
-                    "status": item.get("status"),
-                    "direction_bias": item.get("direction_bias"),
-                    "thesis_summary": str(item.get("thesis_summary") or "")[:120],
-                }
-            )
-    except Exception:
-        pass
 
-    return {"open_positions": holdings, "existing_archives": archives}
+def _detect_portfolio_overlap(
+    *,
+    title: str,
+    keywords: list[str],
+    matched_universes: list[str],
+    universes: dict[str, Any],
+    open_positions: list[dict[str, str]],
+) -> list[str]:
+    if not open_positions:
+        return []
+    haystack = " ".join([title, *keywords]).lower()
+    pool_syms: set[str] = set()
+    for u in matched_universes:
+        pool = universes.get(u)
+        if isinstance(pool, dict):
+            for s in pool.get("symbols") or []:
+                pool_syms.add(str(s).strip().upper())
+
+    overlaps: list[str] = []
+    for pos in open_positions:
+        sym = pos["symbol"].upper()
+        theme = pos["sector_theme"]
+        dir_lbl = "空" if pos["direction"] == "short" else "多"
+        hit = False
+        if sym and sym in pool_syms:
+            hit = True
+        elif theme and len(theme) >= 2 and (theme.lower() in haystack or any(kw.lower() in theme.lower() for kw in keywords if len(kw) >= 2)):
+            hit = True
+        if hit:
+            label = f"{pos['symbol']}({dir_lbl}·{theme})" if theme else f"{pos['symbol']}({dir_lbl})"
+            if label not in overlaps:
+                overlaps.append(label)
+    return overlaps
 
 
 def build_compass_brief(
     *,
     macro_overview: dict[str, Any],
-    universes: dict[str, Any],
     focus_prompt: str = "",
 ) -> dict[str, Any]:
-    """Assemble the zero-fabrication brief JSON passed into the headless Layer 1 strategist."""
-    compact_universes = {
-        key: {
-            "description": str((pool or {}).get("description") or ""),
-            "symbols": list((pool or {}).get("symbols") or []),
-        }
-        for key, pool in universes.items()
-        if isinstance(pool, dict)
-    }
+    """Assemble a strictly unanchored macro brief (NO existing_universes, NO current holdings)."""
     return sanitize(
         {
             "generated_at_utc": _utc_iso(),
@@ -644,8 +774,6 @@ def build_compass_brief(
                 "china_macro": macro_overview.get("china_macro"),
                 "cross_asset_anchors": (macro_overview.get("anchors") or {}).get("items") or [],
             },
-            "existing_universes": compact_universes,
-            "portfolio_context": _load_portfolio_and_archive_context(),
         }
     )
 
@@ -655,69 +783,60 @@ def build_compass_prompt(*, brief_path: str, focus_prompt: str = "") -> str:
     focus_block = f"\n【用户指定的本次推演侧重点】\n{focus_prompt.strip()}\n" if focus_prompt.strip() else ""
     return (
         f"你是 T3 Trading Desk（中低频多智能体投研台 · 缠论版）的第一层（Layer 1）全球自上而下首席策略师。今天是 {today}。\n"
-        f"请先使用 Read 工具读取当前目录下的宏观简报文件 `{brief_path}`，再使用 WebSearch / WebFetch 检索近 2~4 周全球最新的宏观政策、地缘事件、资源国动态、大宗商品供需平衡与科技产业迭代，\n"
-        "严格遵循本系统的自上而下投资哲学，为用户回答：**“在当下真实宏观环境下，未来 1 个季度至 1 年（1Q~1Y）最有逻辑、最值得优先聚焦的多空方向和核心板块是什么？该重点盯哪只真龙头？又该回避哪些逆风板块？”**\n\n"
-        "【不可违背的第一层交易哲学铁律】\n"
-        "1. **大逻辑先行（严禁凭短线涨跌或超买超卖倒推逻辑）**：不使用 RSI/布林带/均值回归作为推荐依据，只做真正具备 1Q~1Y 基本面预期差、供需失衡或宏观流动性共振的方向。\n"
-        "2. **7 维驱动共振门槛（强制 ≥2 个不同维度共振，且均须有非空摘要）**：每个推荐方向必须明确标注主驱动维度 + 不同的次驱动维度，且必须从以下 7 维规范名中选取：\n"
+        f"请先使用 Read 工具读取当前目录下的纯宏观简报文件 `{brief_path}`，再以**空白大脑（无任何预设标的池锚定）**执行实时 WebSearch / WebFetch，\n"
+        "从当下真实世界正在发生的最大级别宏观、地缘、政策、供需与产业变化出发，只回答第一层最核心的战略问题：\n"
+        "**“在当前环境下，未来 1 个季度至 1 年（1Q~1Y）最有逻辑的多空方向和核心板块（Sector / Theme）是什么？产业链该切哪个环节？又该回避哪些逆风板块？”**\n\n"
+        "【Layer 1 职责边界与铁律（严格遵守）】\n"
+        "1. **只选方向与板块，不代用户硬选具体个股/唯一龙头**：Layer 1 负责把宏观大局、多空方向、核心板块及产业链选龙头抓手（`value_chain_focus`）讲透；具体挑哪只真龙头并做日线缠论验证，交由用户在下方 Layer 2 自主完成。你可以可选填 0~2 个板块基准定价锚（如一级行业 ETF 或主流商品/汇率基准代码），但绝不要越俎代庖替用户锁定某一只个股。\n"
+        "2. **彻底去锚定、先看全球最大矛盾**：严禁盯着固定老题材打转。先广泛检索当下全球流动性与央行路径、中国宏观政策脉动、地缘冲突与主产国政策变化、全球主要大宗商品未来 1Q~1Y 投产/过剩/缺口预期、以及科技/制造业正在发生的真实景气拐点，按逻辑强弱自然浮现板块。\n"
+        "3. **大逻辑先行（严禁凭短线涨跌或超买超卖倒推逻辑）**：不使用 RSI/布林带/均值回归作为推荐依据，只做真正具备 1Q~1Y 基本面预期差、供需失衡或宏观流动性共振的板块。\n"
+        "4. **7 维驱动共振门槛（强制 ≥2 个不同维度共振，且均须有非空摘要）**：每个板块必须明确标注主驱动维度 + 不同的次驱动维度，规范名限定为：\n"
         "   - `宏观双核`（美国利率/美债/美元流动性 + 中国财政/地产/信用周期）\n"
-        "   - `地缘与资源国政策`（地缘冲突、航运咽喉、资源国出口禁令/配额/矿业税/收储、关税壁垒）\n"
-        "   - `技术与产业迭代`（AI算力/存储代际切换、电力电网瓶颈、机器人/智驾、新能源迭代）\n"
-        "   - `商品供需平衡与库存周期`（未来1Q~1Y投产爬坡 vs 需求增量/坍塌、产能出清、天气气候）\n"
-        "   - `产业政策与监管`（财政补贴、国内限产反内卷、生物柴油政策、法案/ETF审批）\n"
-        "   - `资金流与市场结构`（ETF申赎、CFTC极端持仓、套息平仓、资金费率极值）\n"
-        "   - `突发供给冲击`（矿难、罢工、港口封锁、疫病、主产国突发禁令）\n"
-        "3. **跨资产多空非对称 + 大 B 结构不否决做空**：\n"
-        "   - **股票（美股 / A股）严格禁止做空（包括配对中的空头腿）**，仅允许做多（`long`）或配对中的多头腿；\n"
-        "   - **大宗商品（海外+国内期货）、外汇（FX）、加密货币**多空完全对称，`short` 做空与 `pair` 同板块多空配对与 `long` 同等重要！若当前存在明确的供需过剩/弱预期品种（即使当下低库存呈大 B 结构），必须敢于给出做空或配对方向，绝不只堆砌清一色做多。\n"
-        "4. **单一板块龙头独占制（源头控制相关性）**：\n"
-        "   - 单向方向（`long` / `short`）只给 **1 只唯一龙头或最多 2 只双寡头**（且必须全同向）；`pair` 配对必须严格包含**多头腿 1 只 + 非股票空头腿 1 只**。\n"
-        "   - 标的代码必须使用本系统可执行的真实代码格式（美股如 `PWR`/`NVDA`/`COPX`，A股如 `601899.SS`/`300750.SZ`，国内期货主力连续如 `CU0`/`LC0`/`RB0`/`EC0`/`SC0`，海外期货如 `GC=F`/`HG=F`/`CL=F`，外汇如 `USDJPY=X`/`AUDUSD=X`，加密如 `BTC/USDT`）。\n"
-        "   - 优先映射 `brief.json` 中 `existing_universes` 的准确池名到 `recommended_universes`；**若推演出极具价值但 `existing_universes` 尚未收录的新细分板块，将 `is_new_theme` 设为 `true`，并提供不与已有池重名的英文下划线 `suggested_pool_name` 和中文 `suggested_pool_description`**。\n"
-        "5. **0-编造红线**：引用宏观数据必须与 `brief.json` 一致；每个方向必须给出 **≥2 条**真实证据，含精确 `YYYY-MM-DD` 日期、来源机构名称、`L1~L4` 证据等级与可验证的 `https://` 链接。\n"
+        "   - `地缘与资源国政策`（地缘冲突、贸易与航运咽喉、资源国出口/配额/矿业税/收储政策、关税壁垒）\n"
+        "   - `技术与产业迭代`（核心技术代际切换、卡脖子基础设施瓶颈、商业化景气拐点）\n"
+        "   - `商品供需平衡与库存周期`（未来1Q~1Y新增产能投产爬坡 vs 下游需求增量或坍塌、产能出清、气候冲击）\n"
+        "   - `产业政策与监管`（财政补贴、限产/反内卷与产能整合、行业监管或法案审批）\n"
+        "   - `资金流与市场结构`（机构配置/ETF申赎、衍生品持仓拥挤度、套息交易平仓）\n"
+        "   - `突发供给冲击`（主产区不可抗力、停产、物流封锁或突发禁令）\n"
+        "5. **跨资产多空非对称 + 大 B 结构不否决做空**：\n"
+        "   - **股票板块（美股 / A股）严格禁止做空（包括配对中的空头腿）**，仅允许做多（`long`）或配对中的多头板块腿；\n"
+        "   - **大宗商品、外汇（FX）、加密货币**多空完全对称，`short` 做空与 `pair` 同产业链多空配对与 `long` 同等重要！若某商品存在明确的未来供需过剩/弱预期（即使当下低库存呈大 B 结构），必须敢于给出做空或配对方向，绝不只堆砌清一色做多。\n"
+        "6. **0-编造红线**：引用宏观数据必须与 `brief.json` 一致；每个板块必须给出 **≥2 条**真实联网证据，含精确 `YYYY-MM-DD` 日期、来源机构名、`L1~L4` 证据等级与可验证的 `https://` 链接。\n"
         f"{focus_block}\n"
         "【输出格式铁律】\n"
         "你的最终回复必须**仅包含一个合法的 JSON 对象**（可用 ```json ... ``` 包裹，JSON 外不要输出任何额外说明文字），严格遵循以下 schema：\n"
         "```json\n"
         "{\n"
         '  "regime_title": "15~32字精炼概括当前全球宏观总定调",\n'
-        '  "regime_summary": "2~4句清晰判断当下美国利率/美元 + 中国信用/财政双核所处象限，以及未来1Q~1Y资金主战场与整体仓位姿态",\n'
+        '  "regime_summary": "2~4句清晰判断当下美国利率/美元 + 中国信用/财政双核所处象限，以及未来1Q~1Y资金主战场与整体攻守姿态",\n'
         '  "macro_signals": {\n'
         '    "us_macro": "美国利率/通胀/美元流动性现状与未来1~2季路径（1句）",\n'
-        '    "china_macro": "中国财政/地产/PMI/出口脉动与对黑色化工有色的含义（1句）",\n'
-        '    "geopolitics_supply": "地缘冲突/关税/资源国政策核心焦点（1句）",\n'
-        '    "tech_industry": "AI算力/电力基建/核心产业迭代所处阶段（1句）"\n'
+        '    "china_macro": "中国财政/地产/PMI/出口脉动与对周期及股市的含义（1句）",\n'
+        '    "geopolitics_supply": "当前全球最关键的地缘/关税/资源国供给焦点（1句）",\n'
+        '    "tech_industry": "当前科技与制造业产业链最核心的景气迭代主线（1句）"\n'
         "  },\n"
         '  "avoid_sectors": [\n'
         '    {"sector": "当下最应回避的逆风板块/方向", "reason": "1句讲清为何处于逆风或预期证伪，避免白费精力"}\n'
         "  ],\n"
         '  "directions": [\n'
         "    {\n"
-        '      "id": "dir_unique_snake_case",\n'
+        '      "id": "sector_unique_snake_case",\n'
         '      "rank": 1,\n'
-        '      "title": "板块/主线名称（简洁有力，<=24字）",\n'
+        '      "title": "核心板块/赛道名称（聚焦板块而非单只股票，<=24字）",\n'
         '      "direction": "long | short | pair",\n'
         '      "horizon": "1Q | 1Q~2Q | 2Q~1Y | 1Q~1Y",\n'
         '      "conviction": "high | medium",\n'
         '      "asset_scope": "commodities | us_equities | a_shares | fx | crypto | cross_asset",\n'
         '      "primary_driver": {"dimension": "7维规范名之一", "summary": "主驱动逻辑核心要点（1句，必填）"},\n'
         '      "secondary_driver": {"dimension": "另1个不同的7维规范名", "summary": "次驱动共振要点（1句，必填）"},\n'
-        '      "thesis": "2~3句讲透未来1Q~1Y核心预期差、供需/盈利传导链与为什么现在是最优方向",\n'
+        '      "thesis": "2~3句讲透未来1Q~1Y该板块的核心预期差、供需/盈利传导链与为什么现在是最优方向",\n'
+        '      "value_chain_focus": "1~2句明确产业链最该切入的环节及 Layer 2 选真龙头的硬标准（如上游资源壁垒/成本曲线左端/订单兑现纯度）",\n'
+        '      "long_leg_sector": "仅 pair 配对必填：做多哪一细分板块/品种环节",\n'
+        '      "short_leg_sector": "仅 pair 配对必填（严禁为股票）：做空哪一非股票过剩/弱势环节",\n'
+        '      "sector_keywords": ["板块中英文核心关键词1", "关键词2", "关键词3"],\n'
+        '      "reference_anchors": ["可选0~2个板块基准定价锚代码，用于辅助定位，可空数组"],\n'
         '      "key_catalyst": "未来1~3个月具体催化事件与时间节点",\n'
-        '      "invalidation": "明确可证伪红线（什么数据/政策/事件出现即放弃此方向）",\n'
-        '      "recommended_universes": ["从 existing_universes 中精准选取的池名，可空数组"],\n'
-        '      "is_new_theme": false,\n'
-        '      "suggested_pool_name": "",\n'
-        '      "suggested_pool_description": "",\n'
-        '      "leaders": [\n'
-        "        {\n"
-        '          "symbol": "CU0",\n'
-        '          "name": "沪铜",\n'
-        '          "leg": "long | short",\n'
-        '          "role": "sole_leader | co_leader",\n'
-        '          "reason": "1句说明为何是该板块定价权最强/受益最纯的真龙头"\n'
-        "        }\n"
-        "      ],\n"
+        '      "invalidation": "明确可证伪红线（什么数据/政策/事件出现即放弃该板块）",\n'
         '      "evidence": [\n'
         "        {\n"
         '          "fact": "具体可核验的近期硬事实或数据（带数字/时间）",\n'
@@ -732,7 +851,7 @@ def build_compass_prompt(*, brief_path: str, focus_prompt: str = "") -> str:
         '  "risk_warnings": ["1~3条当前宏观与跨资产层面最需警惕的尾部风险或因子重叠提醒"]\n'
         "}\n"
         "```\n"
-        "要求：`directions` 输出 **4~6 个**按优先级排序（`rank` 1..N）的高共振方向，务必体现全球跨资产视野（覆盖真正有逻辑的做多、商品/外汇做空或同板块多空配对），每个方向至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据，且严格遵守股票禁空与单一板块龙头独占制。"
+        "要求：`directions` 输出 **4~6 个**按优先级排序（`rank` 1..N）的高共振板块方向，涵盖真正有逻辑的做多板块、商品/外汇/加密做空板块或同产业链配对，每个板块至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据，严格遵守股票禁空铁律。"
     )
 
 
@@ -801,8 +920,10 @@ def normalize_compass_output(
     payload: dict[str, Any],
     *,
     valid_universes: set[str],
+    universes: dict[str, Any] | None = None,
+    open_positions: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
-    """Strictly validate and sanitize parsed AI output against CLAUDE.md Layer 1 iron rules."""
+    """Strictly validate blind Layer 1 sector output and perform post-hoc universe/portfolio mapping."""
     if not isinstance(payload, dict):
         raise ValueError("战略推演输出必须是 JSON 对象")
 
@@ -831,7 +952,11 @@ def normalize_compass_output(
 
     raw_dirs = payload.get("directions")
     if not isinstance(raw_dirs, list) or len(raw_dirs) == 0:
-        raise ValueError("战略推演未输出任何有效方向卡片（directions 为空）")
+        raise ValueError("战略推演未输出任何有效板块方向卡片（directions 为空）")
+
+    universes_map = universes if isinstance(universes, dict) else {k: {"symbols": [], "description": ""} for k in valid_universes}
+    effective_valid_univs = set(valid_universes) | set(universes_map.keys())
+    positions_list = open_positions if open_positions is not None else []
 
     directions: list[dict[str, Any]] = []
     rejected_reasons: list[str] = []
@@ -843,7 +968,7 @@ def normalize_compass_output(
         title = str(raw_d.get("title") or "").strip()
         thesis = str(raw_d.get("thesis") or "").strip()
         if not title or not thesis:
-            rejected_reasons.append(f"#{idx}: 缺少标题或核心论点")
+            rejected_reasons.append(f"#{idx}: 缺少板块名称或核心论点")
             continue
 
         raw_dir = str(raw_d.get("direction") or "").strip().lower()
@@ -855,9 +980,12 @@ def normalize_compass_output(
         raw_scope = str(raw_d.get("asset_scope") or "cross_asset").strip().lower()
         asset_scope = raw_scope if raw_scope in VALID_ASSET_SCOPES else "cross_asset"
 
-        # Equities (US / A-shares) NEVER allowed as pure short direction
+        # Equities (US / A-shares) NEVER allowed as pure short direction or pure equity pair short
         if direction == "short" and asset_scope in ("us_equities", "a_shares"):
             rejected_reasons.append(f"{title}: 违反股票禁空铁律")
+            continue
+        if direction == "pair" and asset_scope in ("us_equities", "a_shares"):
+            rejected_reasons.append(f"{title}: 纯股票配对违反股票禁空铁律")
             continue
 
         # Enforce 2 DISTINCT valid driving dimensions with non-empty summaries
@@ -870,11 +998,37 @@ def normalize_compass_output(
             rejected_reasons.append(f"{title}: 主次驱动维度相同（未达成 >=2 维共振）")
             continue
 
-        # Normalize & validate leaders by canonical (asset_class, normalized_symbol)
+        value_chain_focus = str(raw_d.get("value_chain_focus") or "").strip()
+        long_leg_sector = str(raw_d.get("long_leg_sector") or "").strip()
+        short_leg_sector = str(raw_d.get("short_leg_sector") or "").strip()
+
+        # Optional reference anchors (normalized, equity short forbidden)
+        reference_anchors: list[str] = []
+        seen_anchors: set[tuple[str, str]] = set()
+        for raw_a in raw_d.get("reference_anchors") or []:
+            s = str(raw_a or "").strip()
+            if not s:
+                continue
+            try:
+                norm_s, ac = market_snapshot.normalize_symbol(s)
+            except Exception:
+                continue
+            if direction == "short" and ac in EQUITY_ASSET_CLASSES:
+                continue
+            key = (ac, norm_s.upper())
+            if key in seen_anchors:
+                continue
+            seen_anchors.add(key)
+            reference_anchors.append(norm_s)
+            if len(reference_anchors) >= 2:
+                break
+
+        # Optional legacy/hint leaders (strictly validated if present, NEVER required in sector-first mode)
+        raw_leaders_input = raw_d.get("leaders") or []
         long_leaders: list[dict[str, str]] = []
         short_leaders: list[dict[str, str]] = []
         seen_canonical: set[tuple[str, str]] = set()
-        for raw_l in raw_d.get("leaders") or []:
+        for raw_l in raw_leaders_input:
             if not isinstance(raw_l, dict):
                 continue
             raw_sym = str(raw_l.get("symbol") or "").strip()
@@ -891,12 +1045,8 @@ def normalize_compass_output(
             leg_raw = str(raw_l.get("leg") or ("short" if direction == "short" else "long")).strip().lower()
             if leg_raw not in ("long", "short"):
                 continue
-
-            # CLAUDE.md iron rule: stocks (US / A-share) strictly prohibited on short legs
             if leg_raw == "short" and ac in EQUITY_ASSET_CLASSES:
                 continue
-
-            # Unidirectional cards only accept matching-direction leaders
             if direction == "long" and leg_raw != "long":
                 continue
             if direction == "short" and leg_raw != "short":
@@ -916,7 +1066,6 @@ def normalize_compass_output(
                 if len(long_leaders) >= 2:
                     continue
                 if len(long_leaders) == 1 and role != "co_leader":
-                    # Second leader in same direction is only allowed as co-leader
                     entry["role"] = "co_leader"
                 seen_canonical.add(canonical_key)
                 long_leaders.append(entry)
@@ -928,21 +1077,27 @@ def normalize_compass_output(
                 seen_canonical.add(canonical_key)
                 short_leaders.append(entry)
 
-        if direction == "long":
-            if not long_leaders:
-                rejected_reasons.append(f"{title}: 做多方向无有效多头龙头")
+        # If caller/model explicitly provided leaders, enforce strict leg hygiene; otherwise allow sector-only cards
+        if raw_leaders_input:
+            if direction == "long" and not long_leaders:
+                rejected_reasons.append(f"{title}: 做多方向无有效多头标的")
                 continue
-            leaders = long_leaders
-        elif direction == "short":
-            if not short_leaders:
-                rejected_reasons.append(f"{title}: 做空方向无有效非股票空头龙头")
+            if direction == "short" and not short_leaders:
+                rejected_reasons.append(f"{title}: 做空方向无有效非股票空头标的")
                 continue
-            leaders = short_leaders
-        else:  # pair
-            if not long_leaders or not short_leaders:
+            if direction == "pair" and (not long_leaders or not short_leaders):
                 rejected_reasons.append(f"{title}: 配对方向缺少多头或非股票空头腿")
                 continue
-            leaders = [*long_leaders[:1], *short_leaders[:1]]
+            leaders = [*long_leaders[:1], *short_leaders[:1]] if direction == "pair" else (long_leaders if direction == "long" else short_leaders)
+        else:
+            leaders = []
+            if direction == "pair":
+                if not long_leg_sector or not short_leg_sector:
+                    rejected_reasons.append(f"{title}: 配对板块必须明确多头腿与非股票空头腿")
+                    continue
+                if any(tok in short_leg_sector.lower() for tok in ("美股", "a股", "股票", "个股", "stock", "equity", "equities")):
+                    rejected_reasons.append(f"{title}: 配对空头腿禁止为股票")
+                    continue
 
         # Enforce >=2 valid evidence items with ISO date + non-empty source + strict URL hygiene
         evidence: list[dict[str, str]] = []
@@ -976,7 +1131,7 @@ def normalize_compass_output(
             rejected_reasons.append(f"{title}: 有效证据不足 2 条（需含有效日期、来源与 L1~L4 等级）")
             continue
 
-        did = _sanitize_pool_slug(str(raw_d.get("id") or f"dir_{idx}")) or f"dir_{idx}"
+        did = _sanitize_pool_slug(str(raw_d.get("id") or f"sector_{idx}")) or f"sector_{idx}"
         while did in seen_ids:
             did = f"{did}_{idx}"
         seen_ids.add(did)
@@ -987,23 +1142,46 @@ def normalize_compass_output(
         raw_conv = str(raw_d.get("conviction") or "medium").strip().lower()
         conviction = raw_conv if raw_conv in VALID_CONVICTIONS else "medium"
 
-        # Recommended universes: strictly keep existing valid keys
+        sector_keywords = [
+            str(k).strip()
+            for k in (raw_d.get("sector_keywords") or [])
+            if str(k or "").strip()
+        ][:8]
+
+        # Post-hoc deterministic mapping to existing universes.json (AI never saw existing_universes!)
         rec_univs: list[str] = []
         for u in raw_d.get("recommended_universes") or []:
             us = str(u or "").strip()
-            if us and us in valid_universes and us not in rec_univs:
+            if us and us in effective_valid_univs and us not in rec_univs:
                 rec_univs.append(us)
+        if not rec_univs and universes_map:
+            anchor_syms = [*reference_anchors, *(leader["symbol"] for leader in leaders)]
+            rec_univs = map_sector_to_universes(
+                title=title,
+                asset_scope=asset_scope,
+                keywords=[*sector_keywords, long_leg_sector, short_leg_sector],
+                reference_anchors=anchor_syms,
+                universes=universes_map,
+            )
 
         is_new_theme = bool(raw_d.get("is_new_theme")) or len(rec_univs) == 0
         raw_slug = str(raw_d.get("suggested_pool_name") or "").strip()
         suggested_pool_name = (
-            _make_non_colliding_slug(raw_slug or f"theme_{did}", valid_universes)
+            _make_non_colliding_slug(raw_slug or f"theme_{did}", effective_valid_univs)
             if is_new_theme
             else ""
         )
         suggested_pool_description = str(raw_d.get("suggested_pool_description") or "").strip()
         if is_new_theme and not suggested_pool_description:
             suggested_pool_description = f"{title}（{primary_driver['dimension']} + {secondary_driver['dimension']}）"
+
+        portfolio_overlap = _detect_portfolio_overlap(
+            title=title,
+            keywords=sector_keywords,
+            matched_universes=rec_univs,
+            universes=universes_map,
+            open_positions=positions_list,
+        )
 
         rank_val = raw_d.get("rank")
         rank = int(rank_val) if isinstance(rank_val, (int, float)) and rank_val >= 1 else idx
@@ -1020,19 +1198,25 @@ def normalize_compass_output(
                 "primary_driver": primary_driver,
                 "secondary_driver": secondary_driver,
                 "thesis": thesis,
+                "value_chain_focus": value_chain_focus,
+                "long_leg_sector": long_leg_sector,
+                "short_leg_sector": short_leg_sector,
+                "sector_keywords": sector_keywords,
+                "reference_anchors": reference_anchors,
                 "key_catalyst": str(raw_d.get("key_catalyst") or "").strip(),
                 "invalidation": str(raw_d.get("invalidation") or "").strip(),
                 "recommended_universes": rec_univs,
                 "is_new_theme": is_new_theme,
                 "suggested_pool_name": suggested_pool_name,
                 "suggested_pool_description": suggested_pool_description,
+                "portfolio_overlap": portfolio_overlap,
                 "leaders": leaders,
                 "evidence": evidence,
             }
         )
 
     if not directions:
-        detail = "；".join(rejected_reasons[:4]) if rejected_reasons else "无合法方向卡片"
+        detail = "；".join(rejected_reasons[:4]) if rejected_reasons else "无合法板块方向卡片"
         raise ValueError(f"战略推演输出未通过纪律校验：{detail}")
 
     directions.sort(key=lambda d: (d["rank"], d["id"]))
@@ -1174,14 +1358,12 @@ def run_macro_compass(
     emit("step", {"stage": "collect_macro", "message": "采集全球中美宏观双核与 17 个跨资产定价锚…"})
 
     macro_overview = collect_macro_overview(refresh=refresh_macro)
-    universes = scan_opportunities.load_universes()
     _check_cancel()
     emit("progress", {"done": 1, "total": total_steps})
 
-    emit("step", {"stage": "build_brief", "message": "封装 0-编造宏观简报与现有板块池目录…"})
+    emit("step", {"stage": "build_brief", "message": "封装纯宏观双核简报（去标的池/持仓锚定）…"})
     brief = build_compass_brief(
         macro_overview=macro_overview,
-        universes=universes,
         focus_prompt=focus_prompt,
     )
     _check_cancel()
@@ -1191,7 +1373,7 @@ def run_macro_compass(
         "step",
         {
             "stage": "agent_synthesize",
-            "message": f"启动 {engine.upper()} 联网检索并按 7 维框架推演 1Q~1Y 最优多空板块…",
+            "message": f"启动 {engine.upper()} 盲推演联网检索，按 7 维框架筛选 1Q~1Y 最优多空板块…",
         },
     )
 
@@ -1214,12 +1396,16 @@ def run_macro_compass(
 
     _check_cancel()
     emit("progress", {"done": 3, "total": total_steps})
-    emit("step", {"stage": "validate_and_persist", "message": "校验 7 维共振结构、股票禁空与真龙头代码并落盘…"})
+    emit("step", {"stage": "validate_and_persist", "message": "校验板块逻辑、自动映射本地池与持仓重叠并落盘…"})
 
+    universes = scan_opportunities.load_universes()
+    open_positions = _load_open_positions_for_post_check()
     raw_payload = deep_research.extract_json_payload(raw_text)
     normalized = normalize_compass_output(
         raw_payload,
         valid_universes=set(universes.keys()),
+        universes=universes,
+        open_positions=open_positions,
     )
 
     finished_at = _utc_iso()

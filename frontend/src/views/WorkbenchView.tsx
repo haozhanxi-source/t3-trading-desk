@@ -237,8 +237,12 @@ export function WorkbenchView({
     symbols: string[];
   } | null>(null);
 
+  /* Staged Layer 1 sector context carried into manual Layer 2 leader selection */
+  const [stagedCompassContext, setStagedCompassContext] = useState<CompassScanContext | null>(null);
+
   const esRef = useRef<EventSource | null>(null);
   const layer2Ref = useRef<HTMLDivElement | null>(null);
+  const customInputRef = useRef<HTMLInputElement | null>(null);
   const launchingRef = useRef(false);
   const scanReqSeqRef = useRef(0);
 
@@ -571,8 +575,34 @@ export function WorkbenchView({
   const handleLaunch = async (e: FormEvent) => {
     e.preventDefault();
     const customSyms = parseSymbolList(customSymbolsText);
-    await launchScanRequest({ universes: selectedPools, symbols: customSyms, compassContext: null });
+    await launchScanRequest({
+      universes: selectedPools,
+      symbols: customSyms,
+      compassContext: stagedCompassContext,
+    });
   };
+
+  const handleSelectSectorForLayer2 = useCallback(
+    (opts: {
+      universes: string[];
+      referenceSymbols: string[];
+      label: string;
+      compassContext: CompassScanContext;
+    }) => {
+      setStagedCompassContext(opts.compassContext);
+      setSelectedPools(opts.universes);
+      setCustomSymbolsText(opts.universes.length === 0 ? opts.referenceSymbols.join(", ") : "");
+      setPickerExpanded(true);
+      setErr(null);
+      window.setTimeout(() => {
+        layer2Ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+        if (opts.universes.length === 0) {
+          customInputRef.current?.focus();
+        }
+      }, 60);
+    },
+    [],
+  );
 
   const handleCompassScanLeaders = useCallback(
     (opts: {
@@ -581,6 +611,7 @@ export function WorkbenchView({
       label: string;
       compassContext: CompassScanContext;
     }) => {
+      setStagedCompassContext(opts.compassContext);
       void launchScanRequest({
         universes: opts.universes ?? [],
         symbols: opts.symbols ?? [],
@@ -810,6 +841,7 @@ export function WorkbenchView({
       {/* Layer 1: Top-Down Macro Dual-Core + 7-Dimension Strategic Compass */}
       <Layer1CompassPanel
         scanBusy={launching}
+        onSelectSectorForLayer2={handleSelectSectorForLayer2}
         onScanLeaders={handleCompassScanLeaders}
         onSaveTheme={handleCompassSaveTheme}
         onJumpWarRoom={onJumpWarRoom}
@@ -825,7 +857,7 @@ export function WorkbenchView({
             </span>
             <h2 className="m-0 text-sm font-semibold text-ink">日线缠论龙头过筛台</h2>
             <span className="text-xs text-muted">
-              由上方 Layer 1 方向卡片一键驱动，或展开下方手动选择本地池 / 临时切入标的
+              选定上方 Layer 1 板块后，在此自主勾选板块池或输入你认可的真龙头执行日线缠论过筛
             </span>
           </div>
         </div>
@@ -882,6 +914,35 @@ export function WorkbenchView({
                 ) : null}
               </div>
             </div>
+
+            {stagedCompassContext ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-accent/30 bg-accent/8 px-3 py-1.5 text-xs">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="rounded border border-accent/35 bg-surface px-1.5 py-0.5 font-mono text-[10px] font-semibold text-accent">
+                    已带入 L1 板块
+                  </span>
+                  <span className="font-semibold text-ink">
+                    {stagedCompassContext.direction_title || "Layer 1 板块"}
+                  </span>
+                  <span className="text-muted">
+                    · 方向：
+                    {stagedCompassContext.direction === "short"
+                      ? "做空 SHORT"
+                      : stagedCompassContext.direction === "pair"
+                        ? "多空配对 PAIR"
+                        : "做多 LONG"}
+                    （扫描结果将自动按此方向校验）
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="cursor-pointer border-0 bg-transparent p-0 text-[11px] text-muted hover:text-ink"
+                  onClick={() => setStagedCompassContext(null)}
+                >
+                  取消绑定
+                </button>
+              </div>
+            ) : null}
 
             {pickerExpanded ? (
               <form onSubmit={handleLaunch} className="flex flex-col gap-3 border-t border-hairline-soft pt-3">
@@ -948,6 +1009,7 @@ export function WorkbenchView({
                   <label className="field md:col-span-5">
                     <span>临时切入新细分板块真龙头（空格或逗号分隔）</span>
                     <input
+                      ref={customInputRef}
                       className="input"
                       placeholder="如 NVDA, PWR, CU0, AUDUSD=X"
                       value={customSymbolsText}

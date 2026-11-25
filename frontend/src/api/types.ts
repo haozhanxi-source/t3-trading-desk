@@ -1044,12 +1044,18 @@ export interface CompassDirectionCard {
   primary_driver: CompassDriverItem;
   secondary_driver: CompassDriverItem;
   thesis: string;
+  value_chain_focus?: string;
+  long_leg_sector?: string;
+  short_leg_sector?: string;
+  sector_keywords?: string[];
+  reference_anchors?: string[];
   key_catalyst: string;
   invalidation: string;
   recommended_universes: string[];
   is_new_theme: boolean;
   suggested_pool_name: string;
   suggested_pool_description: string;
+  portfolio_overlap?: string[];
   leaders: CompassLeaderItem[];
   evidence: CompassEvidenceItem[];
 }

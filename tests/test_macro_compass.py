@@ -210,6 +210,122 @@ def test_normalize_compass_rejects_equity_shorts_single_sided_pairs_bad_drivers_
         macro_compass.normalize_compass_output(bad_payload, valid_universes=set())
 
 
+def test_blind_brief_and_prompt_contain_zero_universe_or_portfolio_anchoring():
+    brief = macro_compass.build_compass_brief(
+        macro_overview={"fetched_at_utc": "2026-11-25T08:00:00+00:00", "headline_metrics": []},
+        focus_prompt="",
+    )
+    assert "existing_universes" not in brief
+    assert "portfolio_context" not in brief
+
+    prompt = macro_compass.build_compass_prompt(brief_path="/tmp/brief.json", focus_prompt="")
+    for anchor_token in ("existing_universes", "NI0", "AUDUSD", "RKAB", "霍尔木兹", "GEV", "XLU", "PWR"):
+        assert anchor_token not in prompt, f"Prompt should not anchor AI with {anchor_token!r}"
+    assert "不代用户硬选具体个股" in prompt
+
+
+def test_sector_first_cards_without_leaders_and_posthoc_universe_portfolio_mapping():
+    universes = {
+        "commodities_base": {"description": "有色金属", "symbols": ["CU0", "AL0", "HG=F"]},
+        "commodities_energy": {"description": "原油能源", "symbols": ["CL=F", "SC0"]},
+        "fx_majors": {"description": "主流外汇", "symbols": ["USDJPY=X", "AUDUSD=X"]},
+    }
+    open_positions = [
+        {"symbol": "CU0", "direction": "long", "sector_theme": "铜矿供给收缩"},
+    ]
+    sector_only_payload = {
+        "regime_title": "高真实利率分化：硬供给约束板块占优",
+        "regime_summary": "美债高利率压制长久期泡沫，供给硬约束资源与过剩周期品形成多空分化。",
+        "directions": [
+            {
+                "id": "global_copper_supply",
+                "rank": 1,
+                "title": "全球铜与基本金属供给约束板块",
+                "direction": "long",
+                "horizon": "2Q~1Y",
+                "conviction": "high",
+                "asset_scope": "commodities",
+                "primary_driver": {"dimension": "地缘与资源国政策", "summary": "主产国供给扰动频发。"},
+                "secondary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "全球显性库存低位。"},
+                "thesis": "未来四个季度新矿投产缺口持续。",
+                "value_chain_focus": "优先关注上游矿端自给率高的品种与成本曲线左端标的。",
+                "sector_keywords": ["铜", "基本金属", "copper"],
+                "reference_anchors": ["HG=F"],
+                "key_catalyst": "季度产销报告。",
+                "invalidation": "显性库存连涨八周。",
+                "evidence": [
+                    {"fact": "矿端冶炼加工费维持低位", "level": "L2", "date": "2026-11-20", "source": "ICSG"},
+                    {"fact": "主要产区产量指引下调", "level": "L1", "date": "2026-11-22", "source": "矿业季报"},
+                ],
+            },
+            {
+                "id": "energy_pair",
+                "rank": 2,
+                "title": "能源产业链多强空弱配对",
+                "direction": "pair",
+                "horizon": "1Q~2Q",
+                "conviction": "medium",
+                "asset_scope": "commodities",
+                "primary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "成品油裂解偏紧而上游过剩。"},
+                "secondary_driver": {"dimension": "宏观双核", "summary": "全球工业增速分化。"},
+                "thesis": "成品油库存低位与原油过剩形成跨品种套利机会。",
+                "value_chain_focus": "多裂解紧缺端、空过剩原油基准。",
+                "long_leg_sector": "海外成品油与柴油裂解端",
+                "short_leg_sector": "全球过剩原油期货基准",
+                "sector_keywords": ["原油", "柴油", "能源"],
+                "key_catalyst": "周度库存报告。",
+                "invalidation": "产油国宣布超预期联合减产。",
+                "evidence": [
+                    {"fact": "馏分油库存低于五年均值", "level": "L1", "date": "2026-11-20", "source": "EIA"},
+                    {"fact": "非OPEC原油产量继续爬坡", "level": "L1", "date": "2026-11-18", "source": "IEA"},
+                ],
+            },
+            {
+                "id": "biotech_glp1_new",
+                "rank": 3,
+                "title": "新一代代谢创新药出海板块",
+                "direction": "long",
+                "horizon": "2Q~1Y",
+                "conviction": "medium",
+                "asset_scope": "a_shares",
+                "primary_driver": {"dimension": "技术与产业迭代", "summary": "临床数据验证代际升级。"},
+                "secondary_driver": {"dimension": "产业政策与监管", "summary": "医保与海外授权加速。"},
+                "thesis": "对外授权首付款兑现打开远期盈利空间。",
+                "value_chain_focus": "优先选已有海外大药企 BD 授权兑现的核心创新药龙头。",
+                "sector_keywords": ["代谢创新药", "GLP-1", "医药出海"],
+                "key_catalyst": "核心临床三期读数。",
+                "invalidation": "海外授权终止或临床不及预期。",
+                "evidence": [
+                    {"fact": "行业对外授权交易额创新高", "level": "L2", "date": "2026-11-15", "source": "医药行业协会"},
+                    {"fact": "监管审批周期同比缩短", "level": "L1", "date": "2026-11-12", "source": "药监局"},
+                ],
+            },
+        ],
+    }
+
+    norm = macro_compass.normalize_compass_output(
+        sector_only_payload,
+        valid_universes=set(universes.keys()),
+        universes=universes,
+        open_positions=open_positions,
+    )
+    assert len(norm["directions"]) == 3
+
+    d1, d2, d3 = norm["directions"]
+    assert d1["leaders"] == []
+    assert d1["recommended_universes"] == ["commodities_base"]
+    assert d1["is_new_theme"] is False
+    assert any("CU0" in item for item in d1["portfolio_overlap"])
+
+    assert d2["direction"] == "pair"
+    assert d2["long_leg_sector"] == "海外成品油与柴油裂解端"
+    assert d2["recommended_universes"] == ["commodities_energy"]
+
+    assert d3["recommended_universes"] == []
+    assert d3["is_new_theme"] is True
+    assert d3["suggested_pool_name"] == "theme_biotech_glp1_new"
+
+
 def test_url_validator_rejects_backslash_and_userinfo():
     assert research_archive.is_valid_http_url("https://icsg.org/report?id=1") is True
     assert research_archive.is_valid_http_url(r"https://elsewhere.example\@official.example/path") is False

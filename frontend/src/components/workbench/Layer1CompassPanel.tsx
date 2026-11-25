@@ -63,16 +63,16 @@ interface ActiveCompassRun {
 
 const COMPASS_STAGES = [
   { key: "collect_macro", label: "采集宏观双核与定价锚" },
-  { key: "build_brief", label: "封装 0-编造简报" },
-  { key: "agent_synthesize", label: "AI 联网 7 维推演" },
-  { key: "validate_and_persist", label: "校验真龙头并落盘" },
+  { key: "build_brief", label: "封装纯宏观简报(去锚定)" },
+  { key: "agent_synthesize", label: "AI 盲推演 7 维板块" },
+  { key: "validate_and_persist", label: "校验板块并自动映池" },
 ];
 
 const FOCUS_PRESETS = [
-  { label: "全市场均衡多空", text: "" },
-  { label: "侧重大宗商品多空与配对", text: "重点深挖国内外大宗商品未来1Q~1Y供需平衡预期，兼顾供给收缩做多与过剩弱预期做空/同板块配对" },
-  { label: "侧重中美科技·电力·资源股", text: "重点聚焦美股与A股AI算力/电力电网瓶颈、资源国政策红利以及尚未收录的高景气细分龙头" },
-  { label: "侧重宏观汇率与避险资产", text: "重点围绕中美利差、美元与日元/澳元汇率周期、贵金属与加密流动性主线推演多空方向" },
+  { label: "全市场盲推演（推荐）", text: "" },
+  { label: "侧重大宗商品供需多空", text: "重点深挖全球大宗商品未来 1Q~1Y 供需平衡与产能投产预期，兼顾供给收缩做多与过剩弱预期做空/配对板块" },
+  { label: "侧重中美产业与景气拐点", text: "重点聚焦美股与 A 股具备 1~3 年远期预期差的产业迭代与制造业出海板块（仅限做多方向）" },
+  { label: "侧重宏观利率与外汇周期", text: "重点围绕中美及主要央行货币政策分化、汇率周期与全球流动性传导推演多空方向" },
 ];
 
 function assetScopeLabel(scope: string): string {
@@ -190,6 +190,12 @@ function buildCompassScanContext(
 
 export interface Layer1CompassPanelProps {
   scanBusy?: boolean;
+  onSelectSectorForLayer2: (opts: {
+    universes: string[];
+    referenceSymbols: string[];
+    label: string;
+    compassContext: CompassScanContext;
+  }) => void;
   onScanLeaders: (opts: {
     symbols: string[];
     universes?: string[];
@@ -203,6 +209,7 @@ export interface Layer1CompassPanelProps {
 
 export function Layer1CompassPanel({
   scanBusy = false,
+  onSelectSectorForLayer2,
   onScanLeaders,
   onSaveTheme,
   onJumpWarRoom,
@@ -742,11 +749,11 @@ export function Layer1CompassPanel({
                 Layer 1
               </span>
               <h2 className="m-0 text-[15px] font-semibold text-ink">
-                7 维自上而下战略罗盘 · 最优多空方向与真龙头
+                7 维自上而下板块罗盘 · 最优多空方向与板块
               </h2>
             </div>
             <p className="m-0 mt-0.5 text-xs text-muted">
-              结合实时宏观双核与全网最新催化，强制 ≥2 维驱动共振筛出未来 1Q~1Y 最值得投入精力的板块与单一真龙头，一键送入下方日线过筛
+              去标的池锚定盲推演：先选出未来 1Q~1Y 最具逻辑的多空板块与产业链切入点 → 带入下方 Layer 2 由你自主挑池/选龙头跑日线缠论
             </p>
           </div>
 
@@ -898,7 +905,7 @@ export function Layer1CompassPanel({
                 尚未生成本期 Layer 1 自上而下战略定调
               </div>
               <p className="m-0 mt-1 text-xs leading-relaxed text-muted">
-                不要在本地板块池里凭感觉盲选。点击下方按钮，系统将基于上方中美宏观双核硬数据 + 实时联网检索，严格按 7 维驱动框架推演出当下未来 1Q~1Y 最具逻辑的做多、做空（商品/外汇/加密）及多空配对主线，并直接给出每个板块的真龙头与一键日线过筛入口。
+                不提前喂入本地标的池与持仓，彻底避免锚定偏差。点击下方按钮，AI 将纯基于上方中美宏观双核与实时全网检索，按 7 维驱动框架筛出未来 1Q~1Y 最具逻辑的多空板块与产业链切入点；选定板块后，具体真龙头交由你在下方 Layer 2 自主筛选与日线过筛。
               </p>
             </div>
             {!isRunActive ? (
@@ -1018,7 +1025,7 @@ export function Layer1CompassPanel({
                 ))}
               </div>
               <span className="text-[11px] text-muted">
-                每板块严格锁定 1~2 只真龙头 · 点击「送入日线过筛」自动触发下方 Layer 2 缠论验证
+                Layer 1 只定最优多空板块与产业链切入点 · 点击「带入 Layer 2 自选龙头」在下方自由挑池或填龙头
               </span>
             </div>
 
@@ -1092,6 +1099,40 @@ export function Layer1CompassPanel({
                       {/* Core Thesis */}
                       <p className="m-0 text-xs leading-relaxed text-ink">{card.thesis}</p>
 
+                      {/* Pair Legs Breakdown (for pair sector cards) */}
+                      {card.direction === "pair" && (card.long_leg_sector || card.short_leg_sector) ? (
+                        <div className="grid grid-cols-1 gap-1.5 text-[11px] sm:grid-cols-2">
+                          {card.long_leg_sector ? (
+                            <div className="rounded border border-bull/30 bg-bull/8 px-2.5 py-1.5">
+                              <span className="font-semibold text-bull">做多板块腿：</span>
+                              <span className="text-ink-2">{card.long_leg_sector}</span>
+                            </div>
+                          ) : null}
+                          {card.short_leg_sector ? (
+                            <div className="rounded border border-bear/30 bg-bear/8 px-2.5 py-1.5">
+                              <span className="font-semibold text-bear">做空板块腿：</span>
+                              <span className="text-ink-2">{card.short_leg_sector}</span>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+
+                      {/* Value Chain Focus & Leader-Picking Criteria */}
+                      {card.value_chain_focus ? (
+                        <div className="rounded-md border border-accent/25 bg-accent/6 px-2.5 py-2 text-[11px]">
+                          <span className="font-semibold text-accent">产业链切入与选龙头抓手：</span>
+                          <span className="text-ink">{card.value_chain_focus}</span>
+                        </div>
+                      ) : null}
+
+                      {/* Post-hoc Portfolio Overlap Notice (strictly informational, never fed to AI) */}
+                      {(card.portfolio_overlap ?? []).length > 0 ? (
+                        <div className="flex flex-wrap items-center gap-1.5 rounded border border-warning/30 bg-warning/8 px-2.5 py-1 text-[11px] text-warning">
+                          <AlertTriangle className="h-3 w-3 shrink-0" aria-hidden="true" />
+                          <span>当前已有相关持仓：{(card.portfolio_overlap ?? []).join("、")}（注意单板块龙头独占）</span>
+                        </div>
+                      ) : null}
+
                       {/* Catalyst & Invalidation */}
                       <div className="grid grid-cols-1 gap-1.5 text-[11px] sm:grid-cols-2">
                         {card.key_catalyst ? (
@@ -1108,61 +1149,81 @@ export function Layer1CompassPanel({
                         ) : null}
                       </div>
 
-                      {/* Single-Sector True Leaders */}
-                      <div className="flex flex-col gap-1.5">
-                        <div className="text-[11px] font-semibold text-ink-2">
-                          单一板块真龙头（{card.leaders.length}）
-                        </div>
-                        <div className="flex flex-col gap-1.5">
-                          {card.leaders.map((leader) => (
-                            <div
-                              key={`${card.id}-${leader.symbol}`}
-                              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline-soft bg-sunken/70 px-2.5 py-1.5"
+                      {/* Optional Reference Anchors (pricing reference only) */}
+                      {(card.reference_anchors ?? []).length > 0 ? (
+                        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                          <span className="text-muted">板块基准参考锚：</span>
+                          {(card.reference_anchors ?? []).map((sym) => (
+                            <button
+                              key={`${card.id}-anc-${sym}`}
+                              type="button"
+                              className="chip py-0.5 text-[11px]"
+                              onClick={() => onJumpWarRoom(sym)}
+                              title={`查看 ${sym} 日线与 30min 缠论基准走势`}
                             >
-                              <div className="min-w-0 flex-1">
-                                <div className="flex flex-wrap items-center gap-1.5">
-                                  <span
-                                    className={`rounded px-1 py-0.2 font-mono text-[10px] font-semibold ${
-                                      leader.leg === "short"
-                                        ? "bg-bear/15 text-bear"
-                                        : "bg-bull/15 text-bull"
-                                    }`}
-                                  >
-                                    {leader.leg === "short" ? "空" : "多"}
-                                  </span>
-                                  <SymbolLabel symbol={leader.symbol} name={leader.name} size="sm" />
-                                  <span className="text-[10px] text-muted">
-                                    {leader.role === "co_leader" ? "双寡头" : "唯一龙头"}
-                                  </span>
-                                </div>
-                                {leader.reason ? (
-                                  <div className="mt-0.5 text-[11px] text-muted">{leader.reason}</div>
-                                ) : null}
-                              </div>
-                              <div className="flex shrink-0 items-center gap-1">
-                                <button
-                                  type="button"
-                                  className="btn btn-sm px-2"
-                                  onClick={() => onJumpWarRoom(leader.symbol)}
-                                  title="打开 30min + 日线缠论战情室"
-                                >
-                                  <Crosshair className="h-3 w-3 text-accent" aria-hidden="true" />
-                                  <span>战情</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  className="btn btn-sm px-2"
-                                  onClick={() => onJumpArchive(leader.symbol)}
-                                  title="进入研报档案（Layer 3 深度研究）"
-                                >
-                                  <BookOpen className="h-3 w-3" aria-hidden="true" />
-                                  <span>档案</span>
-                                </button>
-                              </div>
-                            </div>
+                              <SymbolLabel symbol={sym} size="sm" />
+                            </button>
                           ))}
                         </div>
-                      </div>
+                      ) : null}
+
+                      {/* Legacy Leaders Section (only shown if historical run populated leaders) */}
+                      {card.leaders.length > 0 ? (
+                        <div className="flex flex-col gap-1.5">
+                          <div className="text-[11px] font-semibold text-ink-2">
+                            历史记录参考标的（{card.leaders.length}）
+                          </div>
+                          <div className="flex flex-col gap-1.5">
+                            {card.leaders.map((leader) => (
+                              <div
+                                key={`${card.id}-${leader.symbol}`}
+                                className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline-soft bg-sunken/70 px-2.5 py-1.5"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex flex-wrap items-center gap-1.5">
+                                    <span
+                                      className={`rounded px-1 py-0.2 font-mono text-[10px] font-semibold ${
+                                        leader.leg === "short"
+                                          ? "bg-bear/15 text-bear"
+                                          : "bg-bull/15 text-bull"
+                                      }`}
+                                    >
+                                      {leader.leg === "short" ? "空" : "多"}
+                                    </span>
+                                    <SymbolLabel symbol={leader.symbol} name={leader.name} size="sm" />
+                                    <span className="text-[10px] text-muted">
+                                      {leader.role === "co_leader" ? "双寡头" : "唯一龙头"}
+                                    </span>
+                                  </div>
+                                  {leader.reason ? (
+                                    <div className="mt-0.5 text-[11px] text-muted">{leader.reason}</div>
+                                  ) : null}
+                                </div>
+                                <div className="flex shrink-0 items-center gap-1">
+                                  <button
+                                    type="button"
+                                    className="btn btn-sm px-2"
+                                    onClick={() => onJumpWarRoom(leader.symbol)}
+                                    title="打开 30min + 日线缠论战情室"
+                                  >
+                                    <Crosshair className="h-3 w-3 text-accent" aria-hidden="true" />
+                                    <span>战情</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="btn btn-sm px-2"
+                                    onClick={() => onJumpArchive(leader.symbol)}
+                                    title="进入研报档案（Layer 3 深度研究）"
+                                  >
+                                    <BookOpen className="h-3 w-3" aria-hidden="true" />
+                                    <span>档案</span>
+                                  </button>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
 
                       {/* Evidence Disclosure (Native <details>, no heading inside <summary>) */}
                       {card.evidence.length > 0 ? (
@@ -1212,28 +1273,26 @@ export function Layer1CompassPanel({
                       ) : null}
                     </div>
 
-                    {/* Card Action Footer: One-Click Handoff into Layer 2 */}
+                    {/* Card Action Footer: Sector-First Handoff into Manual Layer 2 Selection */}
                     <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline-soft pt-2.5">
                       <div className="flex flex-wrap items-center gap-1.5">
-                        {leaderSymbols.length > 0 ? (
-                          <button
-                            type="button"
-                            className="btn btn-sm btn-primary"
-                            disabled={scanBusy}
-                            onClick={() =>
-                              onScanLeaders({
-                                symbols: leaderSymbols,
-                                universes: [],
-                                label: `${card.title} 真龙头`,
-                                compassContext: buildCompassScanContext(currentRun?.run_id, card),
-                              })
-                            }
-                          >
-                            <Play className="h-3 w-3" aria-hidden="true" />
-                            <span>{scanBusy ? "扫描启动中…" : `送入日线过筛 (${leaderSymbols.length})`}</span>
-                            <ArrowRight className="h-3 w-3" aria-hidden="true" />
-                          </button>
-                        ) : null}
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-primary"
+                          onClick={() =>
+                            onSelectSectorForLayer2({
+                              universes: card.recommended_universes,
+                              referenceSymbols:
+                                leaderSymbols.length > 0 ? leaderSymbols : card.reference_anchors ?? [],
+                              label: card.title,
+                              compassContext: buildCompassScanContext(currentRun?.run_id, card),
+                            })
+                          }
+                          title="带着本板块的 Layer 1 方向校验进入下方 Layer 2，由你自行选池或输入心仪的真龙头"
+                        >
+                          <span>带入 Layer 2 自选龙头</span>
+                          <ArrowRight className="h-3 w-3" aria-hidden="true" />
+                        </button>
 
                         {card.recommended_universes.length > 0 ? (
                           <button
@@ -1248,17 +1307,23 @@ export function Layer1CompassPanel({
                                 compassContext: buildCompassScanContext(currentRun?.run_id, card),
                               })
                             }
-                            title={`扫描对应本地池：${card.recommended_universes.map((u) => getUniverseLabel(u)).join("、")}`}
+                            title={`直接扫描后端匹配到的本地板块池：${card.recommended_universes.map((u) => getUniverseLabel(u)).join("、")}`}
                           >
-                            <span>扫全池：{getUniverseLabel(card.recommended_universes[0])}</span>
-                            {card.recommended_universes.length > 1 ? (
-                              <span>+{card.recommended_universes.length - 1}</span>
-                            ) : null}
+                            <Play className="h-3 w-3" aria-hidden="true" />
+                            <span>
+                              {scanBusy
+                                ? "启动中…"
+                                : `直接扫池：${getUniverseLabel(card.recommended_universes[0])}${
+                                    card.recommended_universes.length > 1
+                                      ? ` +${card.recommended_universes.length - 1}`
+                                      : ""
+                                  }`}
+                            </span>
                           </button>
                         ) : null}
                       </div>
 
-                      {card.is_new_theme && leaderSymbols.length > 0 ? (
+                      {card.is_new_theme ? (
                         <button
                           type="button"
                           className="btn btn-sm border-accent/35 text-accent"
@@ -1266,12 +1331,13 @@ export function Layer1CompassPanel({
                             onSaveTheme({
                               name: card.suggested_pool_name,
                               description: card.suggested_pool_description,
-                              symbols: leaderSymbols,
+                              symbols:
+                                leaderSymbols.length > 0 ? leaderSymbols : card.reference_anchors ?? [],
                             })
                           }
                         >
                           <BookmarkPlus className="h-3 w-3" aria-hidden="true" />
-                          <span>沉淀为新池</span>
+                          <span>沉淀新板块池</span>
                         </button>
                       ) : null}
                     </div>
@@ -1300,13 +1366,13 @@ export function Layer1CompassPanel({
       <ModalDialog
         open={launchOpen}
         onClose={() => setLaunchOpen(false)}
-        title="运行 Layer 1 · 7 维自上而下战略推演"
-        subtitle="基于中美宏观双核与实时联网检索，锁定未来 1Q~1Y 最优多空板块与真龙头"
+        title="运行 Layer 1 · 7 维自上而下板块盲推演"
+        subtitle="不喂本地标的池与持仓，纯从宏观与全网催化推演 1Q~1Y 最优多空板块"
         lightDismiss
       >
         <form onSubmit={handleStartCompass} className="flex flex-col gap-3.5 p-5">
           <p className="m-0 text-xs leading-relaxed text-muted">
-            后端将先汇总最新中美宏观双核（FRED / 国家统计局 / 17 个跨资产定价锚）与现有标的池目录，再调用本地 AI 引擎实时联网检索全球催化，按 7 维共振框架生成 1Q~1Y 最优多空板块与真龙头清单并持久化落盘（预计耗时 1~3 分钟）。
+            后端仅向 AI 提供客观中美宏观双核与大类基准硬数据（不传入现有标的池和持仓，彻底杜绝锚定偏差），由 AI 实时全网检索并按 7 维框架选出 1Q~1Y 最优多空板块与产业链切入点；推演完成后由程序自动匹配本地池，具体真龙头留给你在下方 Layer 2 自主筛选。
           </p>
 
           {/* Engine Selector */}

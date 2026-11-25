@@ -1074,6 +1074,8 @@ export interface CompassDirectionCard {
   primary_driver: CompassDriverItem;
   secondary_driver: CompassDriverItem;
   thesis: string;
+  priced_in_already?: string;
+  unpriced_gap?: string;
   value_chain_focus?: string;
   long_leg_sector?: string;
   short_leg_sector?: string;

@@ -193,6 +193,8 @@ def test_normalize_compass_allows_us_equity_shorts_but_rejects_a_share_shorts_ba
                 "primary_driver": {"dimension": "宏观双核", "summary": "实际利率维持高位压制久期估值。"},
                 "secondary_driver": {"dimension": "技术与产业迭代", "summary": "数据中心审批延宕引发 CapEx 下修。"},
                 "thesis": "盈利与估值同步下修形成戴维斯双杀，美股芯片 ETF 可顺势做空。",
+                "priced_in_already": "12 月美联储加息与近 20 日芯片板块回调已部分计价。",
+                "unpriced_gap": "云厂 2027 年 CapEx 实际下修幅度与 BIS 宽限期到期冲击尚未充分定价。",
                 "value_chain_focus": "优先挑选估值最高、CapEx 依赖度最重的芯片 ETF 或高弹性算力链。",
                 "reference_anchors": ["SMH"],
                 "evidence": [
@@ -222,6 +224,8 @@ def test_normalize_compass_allows_us_equity_shorts_but_rejects_a_share_shorts_ba
     assert len(norm_us["directions"]) == 2
     assert norm_us["directions"][0]["direction"] == "short"
     assert norm_us["directions"][0]["reference_anchors"] == ["SMH"]
+    assert "12 月美联储加息" in norm_us["directions"][0]["priced_in_already"]
+    assert "CapEx 实际下修" in norm_us["directions"][0]["unpriced_gap"]
     assert norm_us["directions"][1]["direction"] == "pair"
     assert norm_us["avoid_sectors"][0]["short_proxy_hint"] == ""
 
@@ -309,6 +313,9 @@ def test_blind_brief_and_prompt_contain_zero_universe_or_portfolio_anchoring():
         assert anchor_token not in prompt, f"Prompt should not anchor AI with {anchor_token!r}"
     assert "不代用户硬选具体个股" in prompt
     assert "滞后 1~2 个月" in prompt
+    assert "priced_in_already" in prompt
+    assert "unpriced_gap" in prompt
+    assert "允许 4~5 张方向卡全是纯空头" not in prompt
 
     # Multi-select focus_scopes: deduped, unknown dropped, injected into prompt
     clean_scopes = macro_compass.normalize_focus_scopes(

@@ -1213,6 +1213,24 @@ export function Layer1CompassPanel({
                       {/* Core Thesis */}
                       <p className="m-0 text-xs leading-relaxed text-ink">{card.thesis}</p>
 
+                      {/* Forward Expectation Gap (Priced-In vs Unpriced 1Q~1Y Delta) */}
+                      {card.priced_in_already || card.unpriced_gap ? (
+                        <div className="flex flex-col gap-1 rounded-md border border-hairline-soft bg-sunken/45 px-2.5 py-2 text-[11px] leading-snug">
+                          {card.priced_in_already ? (
+                            <div className="text-muted">
+                              <span className="font-semibold text-ink-2">已计价：</span>
+                              <span>{card.priced_in_already}</span>
+                            </div>
+                          ) : null}
+                          {card.unpriced_gap ? (
+                            <div className="text-ink-2">
+                              <span className="font-semibold text-accent">未计价预期差：</span>
+                              <span>{card.unpriced_gap}</span>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+
                       {/* Pair Legs Breakdown (for pair sector cards) */}
                       {card.direction === "pair" && (card.long_leg_sector || card.short_leg_sector) ? (
                         <div className="grid grid-cols-1 gap-1.5 text-[11px] sm:grid-cols-2">

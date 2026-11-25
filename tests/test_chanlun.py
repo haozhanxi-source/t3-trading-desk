@@ -1448,6 +1448,26 @@ class TestChanlunEngine(unittest.TestCase):
         self.assertEqual(lvl_stale, "stroke")
         self.assertEqual(chosen_stale[0].zs_id, 3)
 
+        # Even if seg ended Jan 17 (after nine_upgrade_date Jan 16, before oscillation_end_date Jan 20), must NOT override
+        seg_mid_stale = Zhongshu(
+            zs_id=2, direction="up", zd=101.0, zg=109.0, dd=99.0, gg=111.0,
+            start_date="2025-12-20", end_date="2026-01-17", stroke_count=3,
+            is_extended=False, status="broken_up",
+        )
+        lvl_mid, _, chosen_mid = select_active_zhongshus([st_upgraded], [seg_mid_stale], [], timeframe_label="日线")
+        self.assertEqual(lvl_mid, "stroke")
+        self.assertEqual(chosen_mid[0].zs_id, 3)
+
+        # Once seg reaches >= oscillation_end_date (Jan 20) with price overlap, upgrade succeeds
+        seg_fresh = Zhongshu(
+            zs_id=3, direction="up", zd=101.0, zg=109.0, dd=99.0, gg=111.0,
+            start_date="2025-12-20", end_date="2026-01-20", stroke_count=3,
+            is_extended=False, status="active",
+        )
+        lvl_fresh, _, chosen_fresh = select_active_zhongshus([st_upgraded], [seg_fresh], [], timeframe_label="日线")
+        self.assertEqual(lvl_fresh, "segment")
+        self.assertEqual(chosen_fresh[0].zs_id, 3)
+
         # 3) Sub-4dp FX precision: Z1.zg=1.000040 vs Z2.zd=1.000047 stays consistent between detector and signals
         fx_strokes = [
             mk_st(0, "up", 0.999000, 1.000060, "2026-01-01", "2026-01-02"),

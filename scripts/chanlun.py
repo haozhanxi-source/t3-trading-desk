@@ -1148,12 +1148,19 @@ def select_active_zhongshus(
     if needs_upgrade and segment_zss:
         latest_seg = segment_zss[-1]
         seg_reach = latest_seg.oscillation_end_date or latest_seg.end_date
-        # Segment Zhongshu must cover at least the 9-stroke upgrade date / active extension horizon
-        st_upgrade_anchor = (
-            latest_st.nine_upgrade_date
-            or latest_st.oscillation_end_date
-            or latest_st.end_date
-        )
+        # An active Segment Zhongshu only needs to reach nine_upgrade_date/end_date (later strokes
+        # may belong to the still-unconfirmed live segment); an already-broken Segment Zhongshu
+        # must reach the latest stroke-box horizon or it is stale and cannot govern.
+        if latest_seg.status == "active":
+            st_upgrade_anchor = latest_st.nine_upgrade_date or latest_st.end_date
+        else:
+            st_candidates = [
+                ts for ts in (latest_st.end_date, latest_st.nine_upgrade_date, latest_st.oscillation_end_date) if ts
+            ]
+            st_upgrade_anchor = st_candidates[0]
+            for ts in st_candidates[1:]:
+                if _ts_ge(ts, st_upgrade_anchor):
+                    st_upgrade_anchor = ts
         seg_dd, seg_gg = _effective_extremes(latest_seg)
         st_dd, st_gg = _effective_extremes(latest_st)
         price_overlaps = seg_dd <= st_gg and seg_gg >= st_dd

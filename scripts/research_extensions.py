@@ -24,6 +24,7 @@ import math
 import re
 import sys
 import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -2572,6 +2573,7 @@ POLYMARKET_CATEGORY_SPECS: tuple[dict[str, Any], ...] = (
         "max_events": 5,
         "min_volume_total": 50_000.0,
         "min_volume_24h": 5_000.0,
+        "specificity": 1,
     },
     {
         "key": "trade_tariffs",
@@ -2579,8 +2581,9 @@ POLYMARKET_CATEGORY_SPECS: tuple[dict[str, Any], ...] = (
         "tag_slug": "tariffs",
         "fetch_limit": 10,
         "max_events": 3,
-        "min_volume_total": 15_000.0,
+        "min_volume_total": 10_000.0,
         "min_volume_24h": 1_500.0,
+        "specificity": 3,
     },
     {
         "key": "geopolitics",
@@ -2590,20 +2593,43 @@ POLYMARKET_CATEGORY_SPECS: tuple[dict[str, Any], ...] = (
         "max_events": 4,
         "min_volume_total": 100_000.0,
         "min_volume_24h": 15_000.0,
+        "specificity": 2,
     },
 )
 
 _POLYMARKET_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_POLYMARKET_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_POLYMARKET_DATE_LABEL_RE = re.compile(
+    r"\b("
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?|"
+    r"q[1-4]|20\d{2}"
+    r")\b",
+    re.IGNORECASE,
+)
+_POLYMARKET_LADDER_TITLE_RE = re.compile(
+    r"(continues?\s+through|by\s*\.\.\.|before\s*\.\.\.|through\s*\.\.\.)",
+    re.IGNORECASE,
+)
+# Exclude non-macro entertainment/sports/gossip/single-stock-cap noise without blocking policy events (e.g. TikTok ban)
 _POLYMARKET_NOISE_RE = re.compile(
     r"\b("
     r"largest company|market cap|stock close|share price|earnings beat|"
-    r"ceo|affair|tweets?|aliens?|ufo|gta|oscar|grammy|emmy|spotify|youtube|tiktok|"
+    r"ceo|affair|tweets?|aliens?|ufo|gta|oscar|grammy|emmy|spotify|youtube|"
     r"nba|nfl|nhl|mlb|ufc|fifa|world cup|super bowl|premier league|counter-strike|esports|"
     r"celebrity|divorce|wedding|movie|box office|album|song|taylor swift|mrbeast|"
     r"mayor"
     r")\b",
     re.IGNORECASE,
 )
+
+# Bounded non-blocking executor & per-tag single-flight dedup for Polymarket Gamma fetches
+_POLYMARKET_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=6,
+    thread_name_prefix="polymarket-gamma",
+)
+_POLYMARKET_INFLIGHT_LOCK = threading.Lock()
+_POLYMARKET_INFLIGHT: dict[str, concurrent.futures.Future[list[dict[str, Any]]]] = {}
 
 
 def _pm_to_float(val: Any) -> float | None:
@@ -2637,29 +2663,82 @@ def _pm_parse_json_list(raw: Any) -> list[Any]:
     return []
 
 
-def _pm_extract_yes_prob(outcomes: list[Any], prices: list[Any]) -> tuple[str, float | None]:
-    """Extract primary ('Yes' if present, else first) outcome label and probability in [0, 1]."""
-    if not prices:
-        return "Yes", None
+def _pm_extract_iso_date(raw: Any) -> str | None:
+    s = str(raw or "").strip()
+    if len(s) >= 10 and _POLYMARKET_ISO_DATE_RE.match(s[:10]):
+        return s[:10]
+    return None
+
+
+def _pm_extract_yes_prob(
+    outcomes: list[Any],
+    prices: list[Any],
+    *,
+    require_yes: bool = False,
+) -> tuple[str | None, float | None, bool]:
+    """Strictly extract primary outcome label, probability in [0, 1], and whether index 0 was used.
+
+    Validates 1-to-1 alignment between ``outcomes`` and ``prices`` so malformed or reversed
+    vectors can never turn a 'No' price into a 'Yes' probability.
+    """
+    if len(outcomes) < 2 or len(outcomes) != len(prices):
+        return None, None, False
     yes_idx: int | None = None
     for idx, label in enumerate(outcomes):
         if str(label or "").strip().lower() == "yes":
             yes_idx = idx
             break
-    target_idx = yes_idx if yes_idx is not None and yes_idx < len(prices) else 0
+    if require_yes and yes_idx is None:
+        return None, None, False
+
+    target_idx = yes_idx if yes_idx is not None else 0
+    lbl = str(outcomes[target_idx] or "").strip()
+    if not lbl:
+        return None, None, False
     raw_prob = _pm_to_float(prices[target_idx])
     if raw_prob is None or raw_prob < 0.0 or raw_prob > 1.0:
-        return "Yes", None
-    lbl = str(outcomes[target_idx]).strip() if target_idx < len(outcomes) and str(outcomes[target_idx]).strip() else "Yes"
-    return lbl, raw_prob
+        return None, None, False
+    return lbl, raw_prob, (target_idx == 0)
 
 
-def _pm_priced_in_band(prob_pct: float) -> str:
+def _pm_valid_delta_pp(raw_delta: Any, *, trust_sign: bool) -> float | None:
+    if not trust_sign:
+        return None
+    val = _pm_to_float(raw_delta)
+    if val is None or val < -1.0 or val > 1.0:
+        return None
+    return round(val * 100.0, 1)
+
+
+def _pm_consensus_band(prob_pct: float, *, market_type: str = "multi") -> str:
+    if market_type == "date_ladder":
+        return "ladder"
     if prob_pct >= 80.0:
         return "consensus"
     if prob_pct >= 30.0:
         return "contested"
     return "tail_risk"
+
+
+def _pm_detect_date_ladder(
+    raw_event: dict[str, Any],
+    parsed_outcomes: list[dict[str, Any]],
+) -> bool:
+    """Identify multi-deadline non-mutually-exclusive date ladders (e.g. ceasefire through Nov 30 / Dec 15 / Dec 31)."""
+    if len(parsed_outcomes) < 2:
+        return False
+    neg_risk = raw_event.get("negRisk")
+    if neg_risk is True:
+        return False
+    unique_dates = {o["end_date"] for o in parsed_outcomes if o.get("end_date")}
+    date_label_hits = sum(1 for o in parsed_outcomes if _POLYMARKET_DATE_LABEL_RE.search(str(o.get("label") or "")))
+    prob_sum = sum(float(o["prob_pct"]) for o in parsed_outcomes)
+    title = str(raw_event.get("title") or "")
+    if len(unique_dates) >= 2 and (date_label_hits >= 2 or neg_risk is False or prob_sum > 115.0):
+        return True
+    if neg_risk is False and date_label_hits >= 2 and (_POLYMARKET_LADDER_TITLE_RE.search(title) or prob_sum > 115.0):
+        return True
+    return False
 
 
 def _parse_single_polymarket_event(
@@ -2669,6 +2748,7 @@ def _parse_single_polymarket_event(
     category_label: str,
     min_volume_total: float,
     min_volume_24h: float,
+    today_utc: str,
 ) -> dict[str, Any] | None:
     if not isinstance(raw_event, dict):
         return None
@@ -2683,7 +2763,8 @@ def _parse_single_polymarket_event(
 
     vol_24h = _pm_to_float(raw_event.get("volume24hr")) or 0.0
     vol_total = _pm_to_float(raw_event.get("volume")) or 0.0
-    if vol_total < min_volume_total and vol_24h < min_volume_24h:
+    # Require genuine recent 24h trading activity AND reasonable cumulative depth (never pass stale dead pools)
+    if vol_24h < min_volume_24h or vol_total < min_volume_total:
         return None
 
     raw_markets = raw_event.get("markets")
@@ -2693,61 +2774,136 @@ def _parse_single_polymarket_event(
     active_markets = [
         m
         for m in raw_markets
-        if isinstance(m, dict) and m.get("closed") is not True and m.get("active") is not False and m.get("archived") is not True
+        if isinstance(m, dict)
+        and m.get("closed") is not True
+        and m.get("active") is not False
+        and m.get("archived") is not True
+        and m.get("acceptingOrders") is not False
     ]
     if not active_markets:
         return None
 
-    is_binary = len(active_markets) == 1
+    # Distinguish true single binary events from grouped events (even when only 1 active sub-market remains!)
+    has_group_titles = any(
+        bool(str(m.get("groupItemTitle") or "").strip())
+        and str(m.get("groupItemTitle") or "").strip().lower() not in ("yes", "no")
+        for m in active_markets
+    )
+    is_grouped = len(raw_markets) > 1 or len(active_markets) > 1 or has_group_titles
+
     parsed_outcomes: list[dict[str, Any]] = []
     for m in active_markets:
         outcomes_list = _pm_parse_json_list(m.get("outcomes"))
         prices_list = _pm_parse_json_list(m.get("outcomePrices"))
-        primary_lbl, prob = _pm_extract_yes_prob(outcomes_list, prices_list)
-        if prob is None:
+        primary_lbl, prob, is_idx_zero = _pm_extract_yes_prob(
+            outcomes_list,
+            prices_list,
+            require_yes=is_grouped,
+        )
+        if primary_lbl is None or prob is None:
             continue
         prob_pct = round(prob * 100.0, 1)
-        chg_1d = _pm_to_float(m.get("oneDayPriceChange"))
-        chg_7d = _pm_to_float(m.get("oneWeekPriceChange"))
-        m_vol = _pm_to_float(m.get("volume")) or 0.0
+        m_vol = _pm_to_float(m.get("volumeNum"))
+        if m_vol is None:
+            m_vol = _pm_to_float(m.get("volume")) or 0.0
+        m_vol_24h = _pm_to_float(m.get("volume24hr"))
+        m_liq = _pm_to_float(m.get("liquidityNum"))
+        if m_liq is None:
+            m_liq = _pm_to_float(m.get("liquidity"))
+        m_end_date = _pm_extract_iso_date(m.get("endDateIso")) or _pm_extract_iso_date(m.get("endDate"))
+        m_question = str(m.get("question") or "").strip()[:160]
 
-        if is_binary:
+        if not is_grouped:
             opt_label = primary_lbl
         else:
-            opt_label = str(m.get("groupItemTitle") or "").strip() or str(m.get("question") or "").strip() or primary_lbl
+            opt_label = str(m.get("groupItemTitle") or "").strip() or m_question or primary_lbl
 
         parsed_outcomes.append(
             {
                 "label": opt_label[:64],
+                "question": m_question,
                 "prob_pct": prob_pct,
-                "chg_1d_pp": round(chg_1d * 100.0, 1) if chg_1d is not None else None,
-                "chg_7d_pp": round(chg_7d * 100.0, 1) if chg_7d is not None else None,
+                "chg_1d_pp": _pm_valid_delta_pp(m.get("oneDayPriceChange"), trust_sign=is_idx_zero),
+                "chg_7d_pp": _pm_valid_delta_pp(m.get("oneWeekPriceChange"), trust_sign=is_idx_zero),
                 "volume_usd": round(m_vol, 0),
+                "volume_24h_usd": round(m_vol_24h, 0) if m_vol_24h is not None else None,
+                "liquidity_usd": round(m_liq, 0) if m_liq is not None else None,
+                "end_date": m_end_date,
+                "accepting_orders": m.get("acceptingOrders") is not False,
             }
         )
 
     if not parsed_outcomes:
         return None
 
-    parsed_outcomes.sort(key=lambda o: (-float(o["prob_pct"]), -float(o.get("volume_usd") or 0.0)))
-    if not is_binary:
-        # Keep top 3 meaningful options; drop ultra-tiny <0.5% tail options once we have >=2 items
+    is_date_ladder = is_grouped and _pm_detect_date_ladder(raw_event, parsed_outcomes)
+    if not is_grouped:
+        market_type = "binary"
+        top_outcomes = parsed_outcomes[:1]
+        leading = top_outcomes[0]
+    elif is_date_ladder:
+        market_type = "date_ladder"
+        # Preserve chronological deadline order so term-structure semantics stay intact
+        parsed_outcomes.sort(
+            key=lambda o: (
+                o.get("end_date") or "9999-99-99",
+                -float(o.get("volume_24h_usd") or 0.0),
+                -float(o["prob_pct"]),
+            )
+        )
+        # Drop dead tail nodes (<1% with negligible 24h flow) when >=2 meaningful deadlines exist
+        meaningful = [
+            o
+            for o in parsed_outcomes
+            if float(o["prob_pct"]) >= 1.0 or (o.get("volume_24h_usd") is not None and float(o["volume_24h_usd"]) >= 500.0)
+        ]
+        pool_nodes = meaningful if meaningful else parsed_outcomes
+        # Keep up to 3 evenly representative / nearest-to-furthest deadlines
+        if len(pool_nodes) <= 3:
+            top_outcomes = pool_nodes
+        else:
+            top_outcomes = [pool_nodes[0], pool_nodes[len(pool_nodes) // 2], pool_nodes[-1]]
+        # Headline representative for a date ladder: pick furthest active deadline in contested zone [15%, 90%], else furthest displayed deadline
+        contested_nodes = [o for o in top_outcomes if 15.0 <= float(o["prob_pct"]) <= 90.0]
+        leading = contested_nodes[-1] if contested_nodes else top_outcomes[-1]
+    else:
+        market_type = "multi"
+        parsed_outcomes.sort(
+            key=lambda o: (
+                -float(o["prob_pct"]),
+                -float(o.get("volume_24h_usd") or 0.0),
+                -float(o.get("volume_usd") or 0.0),
+            )
+        )
         trimmed: list[dict[str, Any]] = []
-        for item in parsed_outcomes[:5]:
+        for item in parsed_outcomes[:6]:
             if len(trimmed) >= 3:
                 break
             if len(trimmed) >= 2 and float(item["prob_pct"]) < 0.5:
                 continue
+            if (
+                len(trimmed) >= 1
+                and float(item["prob_pct"]) < 1.0
+                and item.get("volume_24h_usd") is not None
+                and float(item["volume_24h_usd"]) < 100.0
+            ):
+                continue
             trimmed.append(item)
-        top_outcomes = trimmed
-    else:
-        top_outcomes = parsed_outcomes[:1]
+        top_outcomes = trimmed or parsed_outcomes[:1]
+        leading = top_outcomes[0]
 
-    leading = top_outcomes[0]
     slug = str(raw_event.get("slug") or "").strip()
     url = f"https://polymarket.com/event/{slug}" if slug and _POLYMARKET_SLUG_RE.match(slug) else ""
-    end_raw = str(raw_event.get("endDate") or "").strip()
-    end_date = end_raw[:10] if len(end_raw) >= 10 and re.match(r"^\d{4}-\d{2}-\d{2}$", end_raw[:10]) else None
+    event_end_date = _pm_extract_iso_date(raw_event.get("endDate"))
+    leading_end_date = leading.get("end_date") or event_end_date
+    end_date_passed = bool(event_end_date and event_end_date < today_utc)
+    event_liq = _pm_to_float(raw_event.get("liquidity"))
+    raw_tags = [
+        str(t.get("slug") or t.get("label") or "").strip()
+        for t in (raw_event.get("tags") or [])
+        if isinstance(t, dict) and str(t.get("slug") or t.get("label") or "").strip()
+    ]
+    band = _pm_consensus_band(float(leading["prob_pct"]), market_type=market_type)
 
     return {
         "id": str(raw_event.get("id") or slug or title[:32]),
@@ -2756,58 +2912,30 @@ def _parse_single_polymarket_event(
         "title": title[:140],
         "slug": slug,
         "url": url,
-        "end_date": end_date,
-        "market_type": "binary" if is_binary else "multi",
+        "end_date": event_end_date,
+        "leading_end_date": leading_end_date,
+        "end_date_passed": end_date_passed,
+        "accepting_orders": True,
+        "market_type": market_type,
         "volume_24h_usd": round(vol_24h, 0),
         "volume_total_usd": round(vol_total, 0),
+        "liquidity_usd": round(event_liq, 0) if event_liq is not None else None,
         "leading_option": leading["label"],
         "leading_prob_pct": leading["prob_pct"],
         "leading_chg_1d_pp": leading.get("chg_1d_pp"),
         "leading_chg_7d_pp": leading.get("chg_7d_pp"),
-        "priced_in_band": _pm_priced_in_band(float(leading["prob_pct"])),
+        "consensus_band": band,
+        "priced_in_band": band,
         "top_outcomes": top_outcomes,
+        "source_tags": raw_tags[:8],
     }
 
 
-def parse_polymarket_events(
-    raw_by_category: dict[str, list[dict[str, Any]]],
-    *,
-    category_errors: dict[str, str] | None = None,
-    fetched_at_utc: str | None = None,
-) -> dict[str, Any]:
-    """Normalize, deduplicate and filter Polymarket Gamma API event payloads across macro categories."""
-    now_iso = fetched_at_utc or datetime.now(timezone.utc).isoformat(timespec="seconds")
-    seen_ids: set[str] = set()
-    events: list[dict[str, Any]] = []
-    by_cat: dict[str, list[dict[str, Any]]] = {}
-    ok_cats = 0
-    errors = dict(category_errors or {})
-
-    for spec in POLYMARKET_CATEGORY_SPECS:
-        cat_key = spec["key"]
-        raw_list = raw_by_category.get(cat_key)
-        if raw_list is None:
-            continue
-        ok_cats += 1
-        cat_events: list[dict[str, Any]] = []
-        for raw_ev in raw_list:
-            if len(cat_events) >= int(spec["max_events"]):
-                break
-            parsed = _parse_single_polymarket_event(
-                raw_ev,
-                category=cat_key,
-                category_label=spec["label"],
-                min_volume_total=float(spec["min_volume_total"]),
-                min_volume_24h=float(spec["min_volume_24h"]),
-            )
-            if parsed is None or parsed["id"] in seen_ids:
-                continue
-            seen_ids.add(parsed["id"])
-            cat_events.append(parsed)
-            events.append(parsed)
-        by_cat[cat_key] = cat_events
-
-    # Pick up to 4 headline signals ensuring cross-category coverage (1 top per category, then top remaining by 24h volume)
+def _build_polymarket_headlines(
+    by_cat: dict[str, list[dict[str, Any]]],
+    ordered_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Select up to 4 headline events ensuring cross-category coverage with explicit 24h volume ordering."""
     headline: list[dict[str, Any]] = []
     headline_ids: set[str] = set()
     for spec in POLYMARKET_CATEGORY_SPECS:
@@ -2817,24 +2945,86 @@ def parse_polymarket_events(
             headline.append(top)
             headline_ids.add(top["id"])
     remaining = sorted(
-        [ev for ev in events if ev["id"] not in headline_ids],
-        key=lambda e: (-float(e.get("volume_24h_usd") or 0.0), -float(e.get("volume_total_usd") or 0.0)),
+        [ev for ev in ordered_events if ev["id"] not in headline_ids],
+        key=lambda e: (-float(e.get("volume_24h_usd") or 0.0), -float(e.get("volume_total_usd") or 0.0), str(e.get("id") or "")),
     )
     for ev in remaining:
         if len(headline) >= 4:
             break
         headline.append(ev)
         headline_ids.add(ev["id"])
+    return headline
 
+
+def parse_polymarket_events(
+    raw_by_category: dict[str, list[dict[str, Any]]],
+    *,
+    category_errors: dict[str, str] | None = None,
+    fetched_at_utc: str | None = None,
+) -> dict[str, Any]:
+    """Normalize, deduplicate (by category specificity), sort and filter Polymarket Gamma API event payloads."""
+    now_iso = fetched_at_utc or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    today_utc = now_iso[:10] if len(now_iso) >= 10 and _POLYMARKET_ISO_DATE_RE.match(now_iso[:10]) else datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Assign overlapping events to the MORE SPECIFIC category first (trade_tariffs > geopolitics > macro_rates)
+    specs_by_specificity = sorted(
+        POLYMARKET_CATEGORY_SPECS,
+        key=lambda s: -int(s.get("specificity") or 0),
+    )
+    seen_ids: set[str] = set()
+    by_cat: dict[str, list[dict[str, Any]]] = {}
+    ok_cats = 0
+    errors = dict(category_errors or {})
+
+    for spec in specs_by_specificity:
+        cat_key = spec["key"]
+        raw_list = raw_by_category.get(cat_key)
+        if raw_list is None:
+            continue
+        ok_cats += 1
+        candidates: list[dict[str, Any]] = []
+        local_seen: set[str] = set()
+        for raw_ev in raw_list:
+            parsed = _parse_single_polymarket_event(
+                raw_ev,
+                category=cat_key,
+                category_label=spec["label"],
+                min_volume_total=float(spec["min_volume_total"]),
+                min_volume_24h=float(spec["min_volume_24h"]),
+                today_utc=today_utc,
+            )
+            if parsed is None or parsed["id"] in seen_ids or parsed["id"] in local_seen:
+                continue
+            local_seen.add(parsed["id"])
+            candidates.append(parsed)
+        # Explicit deterministic sort by 24h volume then cumulative volume (never rely on upstream order)
+        candidates.sort(
+            key=lambda e: (
+                -float(e.get("volume_24h_usd") or 0.0),
+                -float(e.get("volume_total_usd") or 0.0),
+                str(e.get("id") or ""),
+            )
+        )
+        selected = candidates[: int(spec["max_events"])]
+        for ev in selected:
+            seen_ids.add(ev["id"])
+        by_cat[cat_key] = selected
+
+    # Emit final events in canonical display order (macro_rates -> trade_tariffs -> geopolitics)
+    events: list[dict[str, Any]] = []
+    for spec in POLYMARKET_CATEGORY_SPECS:
+        events.extend(by_cat.get(spec["key"]) or [])
+
+    headline = _build_polymarket_headlines(by_cat, events)
     total_specs = len(POLYMARKET_CATEGORY_SPECS)
     if ok_cats == 0:
         status = "error"
-    elif ok_cats == total_specs and len(events) > 0:
+    elif ok_cats == total_specs and not errors:
         status = "ok"
-    elif len(events) > 0:
+    elif ok_cats > 0:
         status = "partial"
     else:
-        status = "error" if errors else "ok"
+        status = "error"
 
     out: dict[str, Any] = {
         "status": status,
@@ -2843,6 +3033,8 @@ def parse_polymarket_events(
         "total_events": len(events),
         "categories_ok": ok_cats,
         "categories_total": total_specs,
+        "categories_by_key": by_cat,
+        "stale_categories": [],
         "headline_events": headline,
         "events": events,
     }
@@ -2851,16 +3043,21 @@ def parse_polymarket_events(
     return _sanitize_for_json(out)
 
 
-def fetch_polymarket_macro_odds(timeout_seconds: float = 6.0) -> dict[str, Any]:
-    """Fetch keyless real-money prediction market odds from Polymarket Gamma API for Layer 1 macro/tariffs/geopolitics."""
-    read_to = max(1.0, min(10.0, float(timeout_seconds)))
-    conn_to = min(3.0, read_to)
+def _submit_polymarket_tag_dedup(
+    spec: dict[str, Any],
+    *,
+    http_budget_seconds: float,
+) -> concurrent.futures.Future[list[dict[str, Any]]]:
+    """Submit a bounded Gamma API request reusing any still-running in-flight future for the same tag."""
+    tag_slug = str(spec["tag_slug"])
+    read_to = max(0.1, min(8.0, float(http_budget_seconds)))
+    conn_to = max(0.1, min(2.5, read_to))
 
-    def _fetch_one(spec: dict[str, Any]) -> list[dict[str, Any]]:
+    def _fetch_one() -> list[dict[str, Any]]:
         params = {
             "active": "true",
             "closed": "false",
-            "tag_slug": spec["tag_slug"],
+            "tag_slug": tag_slug,
             "limit": int(spec["fetch_limit"]),
             "order": "volume24hr",
             "ascending": "false",
@@ -2874,24 +3071,48 @@ def fetch_polymarket_macro_odds(timeout_seconds: float = 6.0) -> dict[str, Any]:
         resp.raise_for_status()
         payload = resp.json()
         if not isinstance(payload, list):
-            raise ValueError(f"Unexpected Gamma API response type for {spec['tag_slug']}")
+            raise ValueError(f"Unexpected Gamma API response type for {tag_slug}")
         return payload
+
+    with _POLYMARKET_INFLIGHT_LOCK:
+        existing = _POLYMARKET_INFLIGHT.get(tag_slug)
+        if existing is not None and not existing.done():
+            return existing
+        fut = _POLYMARKET_EXECUTOR.submit(_fetch_one)
+        _POLYMARKET_INFLIGHT[tag_slug] = fut
+
+    def _cleanup(_f: concurrent.futures.Future[list[dict[str, Any]]], _t: str = tag_slug) -> None:
+        with _POLYMARKET_INFLIGHT_LOCK:
+            if _POLYMARKET_INFLIGHT.get(_t) is _f:
+                _POLYMARKET_INFLIGHT.pop(_t, None)
+
+    fut.add_done_callback(_cleanup)
+    return fut
+
+
+def fetch_polymarket_macro_odds(timeout_seconds: float = 6.0) -> dict[str, Any]:
+    """Fetch keyless real-money prediction market odds from Polymarket Gamma API within a strict monotonic deadline."""
+    budget = max(0.05, min(10.0, float(timeout_seconds)))
+    deadline = time.monotonic() + budget
+
+    fut_map: dict[concurrent.futures.Future[list[dict[str, Any]]], dict[str, Any]] = {
+        _submit_polymarket_tag_dedup(spec, http_budget_seconds=budget): spec
+        for spec in POLYMARKET_CATEGORY_SPECS
+    }
+    remaining = max(0.01, deadline - time.monotonic())
+    done, not_done = concurrent.futures.wait(list(fut_map.keys()), timeout=remaining)
 
     raw_by_cat: dict[str, list[dict[str, Any]]] = {}
     cat_errors: dict[str, str] = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(POLYMARKET_CATEGORY_SPECS)) as pool:
-        fut_map = {pool.submit(_fetch_one, spec): spec for spec in POLYMARKET_CATEGORY_SPECS}
-        done, not_done = concurrent.futures.wait(list(fut_map.keys()), timeout=read_to + 1.0)
-        for fut in done:
-            spec = fut_map[fut]
-            try:
-                raw_by_cat[spec["key"]] = fut.result(timeout=0)
-            except Exception as exc:  # noqa: BLE001
-                cat_errors[spec["key"]] = str(exc)
-        for fut in not_done:
-            spec = fut_map[fut]
-            fut.cancel()
-            cat_errors[spec["key"]] = f"timeout after {read_to:.1f}s"
+    for fut in done:
+        spec = fut_map[fut]
+        try:
+            raw_by_cat[spec["key"]] = fut.result(timeout=0)
+        except Exception as exc:  # noqa: BLE001
+            cat_errors[spec["key"]] = str(exc)
+    for fut in not_done:
+        spec = fut_map[fut]
+        cat_errors[spec["key"]] = f"timeout after {budget:.2f}s"
 
     return parse_polymarket_events(raw_by_cat, category_errors=cat_errors)
 

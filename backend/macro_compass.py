@@ -42,7 +42,15 @@ Emit = Callable[[str, dict[str, Any]], None]
 CommitResultFn = Callable[[Callable[[], Any]], Any]
 
 TTL_COMPASS_MACRO_SECONDS = 600.0
+TTL_COMPASS_MACRO_POLYMARKET_DEGRADED_SECONDS = 120.0
 TTL_COMPASS_MACRO_DEGRADED_SECONDS = 30.0
+CORE_MACRO_SOURCES: tuple[str, ...] = (
+    "live_macro",
+    "us_fred",
+    "cn_macro",
+    "cross_asset_anchors",
+    "cn_futures_anchors",
+)
 DEFAULT_MACRO_DEADLINE_SECONDS = 18.0
 COMPASS_STAGE_TIMEOUT_SECONDS = 480
 
@@ -184,6 +192,7 @@ _MACRO_INFLIGHT_LOCK = threading.Lock()
 _MACRO_INFLIGHT_FUTURE: concurrent.futures.Future[dict[str, Any]] | None = None
 _LAST_GOOD_LOCK = threading.Lock()
 _LAST_GOOD_MACRO_SOURCES: dict[str, dict[str, Any]] = {}
+_LAST_GOOD_POLYMARKET_CATS: dict[str, dict[str, Any]] = {}
 
 # Fallback memory ring buffer used when SQLite data_store is disabled (e.g., pytest)
 _FALLBACK_LOCK = threading.RLock()
@@ -231,6 +240,7 @@ def clear_macro_source_cache() -> None:
     """Reset per-source last-known-good macro cache (primarily for isolated tests)."""
     with _LAST_GOOD_LOCK:
         _LAST_GOOD_MACRO_SOURCES.clear()
+        _LAST_GOOD_POLYMARKET_CATS.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +815,138 @@ def _merge_anchor_items_preserving_fresher(
     return merged
 
 
+def _resolve_polymarket_source(
+    raw_val: Any,
+    err_str: str | None,
+    now_iso: str,
+) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+    """Resolve Polymarket odds per-category so partial failures never clobber complete snapshots.
+
+    Guarantees outer ``sources_status["polymarket_odds"]`` and inner ``polymarket_odds["status"]``
+    stay strictly consistent across ok / partial / stale / error states.
+    """
+    spec_keys = [str(s["key"]) for s in research_extensions.POLYMARKET_CATEGORY_SPECS]
+    total_cats = len(spec_keys)
+    val = raw_val if isinstance(raw_val, dict) else {}
+    raw_status = str(val.get("status") or "")
+    cat_errors: dict[str, str] = {}
+    if isinstance(val.get("category_errors"), dict):
+        cat_errors.update({str(k): str(v) for k, v in val["category_errors"].items()})
+    if err_str:
+        cat_errors.setdefault("_all", err_str)
+
+    # Extract freshly fetched categories from raw_val (either categories_by_key or grouped from events)
+    fresh_by_cat: dict[str, list[dict[str, Any]]] = {}
+    if not err_str and raw_status in ("ok", "partial"):
+        raw_by_key = val.get("categories_by_key")
+        if isinstance(raw_by_key, dict):
+            for ck in spec_keys:
+                if ck in raw_by_key and isinstance(raw_by_key[ck], list) and ck not in cat_errors:
+                    fresh_by_cat[ck] = [ev for ev in raw_by_key[ck] if isinstance(ev, dict)]
+        else:
+            # Backward compatibility for simple mocked payloads without categories_by_key
+            raw_events = val.get("events") if isinstance(val.get("events"), list) else []
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for ev in raw_events:
+                if isinstance(ev, dict):
+                    ck = str(ev.get("category") or "")
+                    if ck in spec_keys:
+                        grouped.setdefault(ck, []).append(ev)
+            if raw_status == "ok":
+                for ck in spec_keys:
+                    if ck not in cat_errors:
+                        fresh_by_cat[ck] = grouped.get(ck, [])
+            else:
+                for ck, evs in grouped.items():
+                    if ck not in cat_errors:
+                        fresh_by_cat[ck] = evs
+
+    merged_by_cat: dict[str, list[dict[str, Any]]] = {}
+    stale_categories: list[str] = []
+    oldest_good_at: str | None = None
+    newest_good_at: str | None = None
+
+    with _LAST_GOOD_LOCK:
+        for ck, evs in fresh_by_cat.items():
+            _LAST_GOOD_POLYMARKET_CATS[ck] = {
+                "events": [dict(ev) for ev in evs],
+                "fetched_at_utc": str(val.get("fetched_at_utc") or now_iso),
+            }
+
+        for ck in spec_keys:
+            if ck in fresh_by_cat:
+                merged_by_cat[ck] = [{**ev, "stale_fallback": False} for ev in fresh_by_cat[ck]]
+            else:
+                prior_cat = _LAST_GOOD_POLYMARKET_CATS.get(ck)
+                if prior_cat is not None:
+                    prior_ts = str(prior_cat.get("fetched_at_utc") or "")
+                    if prior_ts:
+                        oldest_good_at = prior_ts if oldest_good_at is None else min(oldest_good_at, prior_ts)
+                        newest_good_at = prior_ts if newest_good_at is None else max(newest_good_at, prior_ts)
+                    merged_by_cat[ck] = [
+                        {**ev, "stale_fallback": True}
+                        for ev in (prior_cat.get("events") or [])
+                        if isinstance(ev, dict)
+                    ]
+                    stale_categories.append(ck)
+
+    ordered_events: list[dict[str, Any]] = []
+    for ck in spec_keys:
+        ordered_events.extend(merged_by_cat.get(ck) or [])
+    headlines = research_extensions._build_polymarket_headlines(merged_by_cat, ordered_events)
+
+    fresh_count = len(fresh_by_cat)
+    err_summary = err_str or (
+        "; ".join(f"{k}: {v}" for k, v in cat_errors.items())
+        if cat_errors
+        else (str(val.get("error")) if val.get("error") else "fetch failed")
+    )
+
+    if fresh_count == total_cats and not cat_errors:
+        resolved_status = "ok"
+        stale_info: dict[str, Any] | None = None
+    elif fresh_count > 0:
+        resolved_status = "partial"
+        stale_info = {
+            "last_good_at_utc": newest_good_at,
+            "error": err_summary,
+            "stale_categories": stale_categories,
+        }
+    elif stale_categories:
+        resolved_status = "stale"
+        stale_info = {
+            "last_good_at_utc": newest_good_at,
+            "error": err_summary,
+            "stale_categories": stale_categories,
+        }
+    else:
+        resolved_status = "error"
+        stale_info = {
+            "last_good_at_utc": None,
+            "error": err_summary,
+        }
+
+    out: dict[str, Any] = {
+        "status": resolved_status,
+        "source": "Polymarket Gamma API",
+        "fetched_at_utc": str(val.get("fetched_at_utc") or now_iso) if fresh_count > 0 else (newest_good_at or now_iso),
+        "total_events": len(ordered_events),
+        "categories_ok": fresh_count,
+        "categories_total": total_cats,
+        "stale_categories": stale_categories,
+        "stale_fallback": resolved_status == "stale",
+        "headline_events": headlines,
+        "events": ordered_events,
+    }
+    if resolved_status in ("partial", "stale") and oldest_good_at:
+        out["last_good_at_utc"] = oldest_good_at
+    if cat_errors:
+        out["category_errors"] = cat_errors
+    if resolved_status == "error":
+        out["error"] = err_summary
+    return out, resolved_status, stale_info
+
+
 def fetch_polymarket_macro_odds(*, timeout_seconds: float = 6.0) -> dict[str, Any]:
     """Fetch keyless Polymarket Gamma API odds for macro rates, tariffs and geopolitics."""
     return research_extensions.fetch_polymarket_macro_odds(timeout_seconds=timeout_seconds)
@@ -925,17 +1067,10 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
         {"status": "error", "items": [], "ok_count": 0, "total": len(CN_FUTURES_ANCHORS), "error": errors.get("cn_futures_anchors", "unavailable")},
         lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
     )
-    polymarket_odds, st_pm, stale_pm = _resolve_source(
-        "polymarket_odds",
-        {
-            "status": "error",
-            "source": "Polymarket Gamma API",
-            "total_events": 0,
-            "headline_events": [],
-            "events": [],
-            "error": errors.get("polymarket_odds", "unavailable"),
-        },
-        lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
+    polymarket_odds, st_pm, stale_pm = _resolve_polymarket_source(
+        raw_results.get("polymarket_odds"),
+        errors.get("polymarket_odds"),
+        now_iso,
     )
 
     merged_items: list[dict[str, Any]] = [
@@ -978,8 +1113,14 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
     }
 
     headline_metrics, regime_tags = _build_headline_metrics_and_tags(live_ctx, fred_macro, china_macro)
-    all_fresh = all(v in ("ok", "partial") for v in sources_status.values())
-    ttl = TTL_COMPASS_MACRO_SECONDS if all_fresh else TTL_COMPASS_MACRO_DEGRADED_SECONDS
+    core_fresh = all(sources_status.get(k) in ("ok", "partial") for k in CORE_MACRO_SOURCES)
+    pm_fresh = sources_status.get("polymarket_odds") == "ok"
+    if core_fresh and pm_fresh:
+        ttl = TTL_COMPASS_MACRO_SECONDS
+    elif core_fresh:
+        ttl = TTL_COMPASS_MACRO_POLYMARKET_DEGRADED_SECONDS
+    else:
+        ttl = TTL_COMPASS_MACRO_DEGRADED_SECONDS
 
     bundle = sanitize(
         {
@@ -1243,20 +1384,39 @@ def build_compass_brief(
     pm_compact: dict[str, Any] = {
         "status": str(pm_raw.get("status") or "unavailable") if isinstance(pm_raw, dict) else "unavailable",
         "fetched_at_utc": pm_raw.get("fetched_at_utc") if isinstance(pm_raw, dict) else None,
+        "stale_fallback": bool(pm_raw.get("stale_fallback")) if isinstance(pm_raw, dict) else False,
+        "stale_categories": list(pm_raw.get("stale_categories") or []) if isinstance(pm_raw, dict) else [],
         "events": [
             {
                 "category": ev.get("category"),
                 "category_label": ev.get("category_label"),
                 "title": ev.get("title"),
+                "market_type": ev.get("market_type"),
                 "end_date": ev.get("end_date"),
+                "leading_end_date": ev.get("leading_end_date"),
+                "end_date_passed": bool(ev.get("end_date_passed")),
                 "volume_24h_usd": ev.get("volume_24h_usd"),
                 "volume_total_usd": ev.get("volume_total_usd"),
-                "priced_in_band": ev.get("priced_in_band"),
+                "liquidity_usd": ev.get("liquidity_usd"),
+                "consensus_band": ev.get("consensus_band") or ev.get("priced_in_band"),
                 "leading_option": ev.get("leading_option"),
                 "leading_prob_pct": ev.get("leading_prob_pct"),
                 "leading_chg_1d_pp": ev.get("leading_chg_1d_pp"),
                 "leading_chg_7d_pp": ev.get("leading_chg_7d_pp"),
-                "top_outcomes": ev.get("top_outcomes") or [],
+                "stale_fallback": bool(ev.get("stale_fallback")),
+                "top_outcomes": [
+                    {
+                        "label": o.get("label"),
+                        "question": o.get("question"),
+                        "prob_pct": o.get("prob_pct"),
+                        "chg_1d_pp": o.get("chg_1d_pp"),
+                        "chg_7d_pp": o.get("chg_7d_pp"),
+                        "end_date": o.get("end_date"),
+                        "volume_24h_usd": o.get("volume_24h_usd"),
+                    }
+                    for o in (ev.get("top_outcomes") or [])
+                    if isinstance(o, dict)
+                ],
                 "url": ev.get("url") or "",
             }
             for ev in ((pm_raw.get("events") or []) if isinstance(pm_raw, dict) else [])
@@ -1318,7 +1478,7 @@ def build_compass_prompt(
         "   - 简报中的月度宏观数据（如 `CN_PMI`、`FEDFUNDS`、`PCOPPUSDM`）天然滞后 1~2 个月，仅作背景参考；**实时市场定价（`tape_movers` 极端领涨/领跌榜、`cross_asset_anchors` 含国内核心期货锚的近 5D/20D/60D 异动、`VIX`/`US10Y`/`DXY`）与你通过 WebSearch 检索到的近 1~2 周最新变化享有绝对最高优先级**。\n"
         "   - **强制动作**：先逐一审视 `brief.json` 里的 `tape_movers.top_losers` 和 `top_gainers`！凡是 20D/60D 出现 **≥15% 单边走势**的品种/板块（无论海外资产还是国内期货锚），背后往往是**资金方向的高度一致（未背驰主趋势段）**，必须主动联网查清多维度真实驱动，彻底打破脑海里残留的卖方旧共识钢印（例如“某金属长期短缺”或“某赛道长期高增”）。\n"
         "   - **警惕两种极端**：① 严禁凭“跌多了就该涨”的均值回归思维机械否定正在延续的主趋势；② 同样严禁**后视镜线性外推**——把过去 60 天跌幅榜前几名原样照搬成未来 1 年的结论！查清驱动后，必须前瞻追问：**“市场已经计价了什么（`priced_in_already`）？未来 1Q~1Y 还有哪些尚未被充分定价的增量预期差或二阶传导（`unpriced_gap`）？”**\n"
-        "   - **预测市场隐含概率交叉校验（`polymarket_odds`）**：`brief.json` 已附带 Polymarket 真实资金预测市场的宏观利率、关税贸易与地缘事件隐含概率及 1D/7D 赔率变动（`pp`）。请用它直接量化校验“市场已计价程度”（如 ≥80% 共识已反映在资产价格中，而 30%~70% 博弈分歧区或 7D 显著重定价的政策/地缘变量往往隐含更大二阶预期差）；但预测市场仅作概率定价参考，必须与权威宏观数据及最新新闻交叉核验，勿盲从低流动性盘口。\n"
+        "   - **预测市场事件概率参考（`polymarket_odds` · 不等同于资产已计价！）**：`brief.json` 附带 Polymarket 真实资金盘口对宏观利率、关税贸易与地缘事件的发生概率及 1D/7D 赔率变动（`pp`）。其中 `market_type == \"date_ladder\"` 表示多期限阶梯（每个子盘口对应独立截止日期 `end_date`，严禁将近期截止日的高概率混同为远期截止日）。请将高概率/显著 7D 重定价作为**事件发生概率的盘口共识与边际预期变化线索**，**严禁把盘口高概率（如 ≥80%）直接等同于相关资产价格已经充分计价**——判断 `priced_in_already` 与 `unpriced_gap` 时，必须用相关资产价格走势、利率/期货期限结构、估值分位或事件窗口市场反应独立核验，且留意标注了 `stale_fallback` 或较低 24h 成交量的盘口。\n"
         "2. **只选方向与板块，不代用户硬选具体个股/唯一龙头**：Layer 1 负责把宏观大局、多空方向、核心板块及产业链选龙头抓手（`value_chain_focus`）讲透；具体挑哪只真龙头并做日线缠论验证，交由用户在下方 Layer 2 自主完成。你可以可选填 0~2 个板块基准定价锚（如一级行业 ETF 或主流商品/汇率基准代码），但绝不要越俎代庖替用户锁定某一只个股。\n"
         "3. **大逻辑先行（严禁凭 RSI/超买超卖逆势猜底摸顶）**：不使用 RSI/布林带/均值回归作为推荐依据，只做真正具备 1Q~1Y 基本面预期差、戴维斯双击/双杀、供需失衡或宏观流动性共振的板块。\n"
         "4. **7 维驱动共振门槛（强制 ≥2 个不同维度共振，且均须有非空摘要）**：每个板块必须明确标注主驱动维度 + 不同的次驱动维度，规范名限定为：\n"

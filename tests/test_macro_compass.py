@@ -1138,7 +1138,7 @@ def test_polymarket_parser_filters_noise_parses_odds_and_injects_into_brief_and_
     # Headline selection ensures all 3 categories are represented
     assert {ev["category"] for ev in parsed["headline_events"]} == {"macro_rates", "trade_tariffs", "geopolitics"}
 
-    # Brief & prompt integration (zero hardcoded ticker anchoring)
+    # Brief & prompt integration (zero hardcoded ticker anchoring & no event-prob == asset-priced-in fallacy)
     brief = macro_compass.build_compass_brief(
         macro_overview={
             "fetched_at_utc": "2026-11-26T08:00:00+00:00",
@@ -1148,10 +1148,334 @@ def test_polymarket_parser_filters_noise_parses_odds_and_injects_into_brief_and_
     )
     assert brief["polymarket_odds"]["status"] == "ok"
     assert len(brief["polymarket_odds"]["events"]) == 3
+    # Single remaining grouped option ('5-15%') MUST keep its groupItemTitle instead of collapsing to 'Yes'
+    tariff_ev = parsed["events"][1]
+    assert tariff_ev["market_type"] == "multi"
+    assert tariff_ev["leading_option"] == "5-15%"
+
     prompt = macro_compass.build_compass_prompt(brief_path="/tmp/brief.json")
     assert "polymarket_odds" in prompt
+    assert "共识已反映在资产价格中" not in prompt
+    assert "严禁把盘口高概率" in prompt
     for anchor_token in ("existing_universes", "NI0", "AUDUSD", "RKAB", "霍尔木兹", "GEV", "XLU", "PWR"):
         assert anchor_token not in prompt
+
+
+def test_polymarket_codex_review_regressions_ladder_malformed_vectors_timeout_and_per_cat_fallback():
+    # 1. Date ladder preserves per-deadline semantics & does NOT mislabel Nov 30 (94.5%) under Dec 31 consensus
+    #    Cross-tag overlap prefers more specific category (trade_tariffs over macro_rates)
+    #    Policy event containing "TikTok" is NOT blocked by entertainment noise filter
+    #    Malformed/reversed price vectors & out-of-range deltas & acceptingOrders=False & low-24h dead pools handled strictly
+    raw_by_category = {
+        "macro_rates": [
+            # Duplicate of tariff event -> must be claimed by trade_tariffs (higher specificity)
+            {
+                "id": "dup-tariff-1",
+                "title": "U.S. tariff rate on China on December 31, 2026?",
+                "slug": "us-tariff-china",
+                "active": True,
+                "closed": False,
+                "negRisk": True,
+                "volume24hr": 25_000,
+                "volume": 80_000,
+                "endDate": "2026-12-31T00:00:00Z",
+                "markets": [
+                    {
+                        "groupItemTitle": "5-15%",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.885", "0.115"]',
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    }
+                ],
+            },
+            # Policy event mentioning TikTok must NOT be filtered out as entertainment noise
+            {
+                "id": "policy-tiktok",
+                "title": "U.S. enforces TikTok divestiture rule by Q2?",
+                "slug": "us-tiktok-divestiture-q2",
+                "active": True,
+                "closed": False,
+                "volume24hr": 30_000,
+                "volume": 200_000,
+                "endDate": "2027-06-30T00:00:00Z",
+                "markets": [
+                    {
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.40", "0.60"]',
+                        "oneDayPriceChange": 2.5,  # Out-of-range -> MUST become None
+                        "oneWeekPriceChange": -0.05,
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    }
+                ],
+            },
+            # Malformed vectors: length mismatch ("No","Yes" vs ["0.9"]) MUST be dropped; reversed ("No","Yes" vs ["0.9","0.1"]) keeps Yes=10% & drops untrusted delta
+            {
+                "id": "vec-edge",
+                "title": "ECB rate decision next quarter?",
+                "slug": "ecb-rate-decision",
+                "active": True,
+                "closed": False,
+                "negRisk": True,
+                "volume24hr": 18_000,
+                "volume": 120_000,
+                "endDate": "2027-03-31T00:00:00Z",
+                "markets": [
+                    {
+                        "groupItemTitle": "Broken vector",
+                        "outcomes": '["No", "Yes"]',
+                        "outcomePrices": '["0.9"]',
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    },
+                    {
+                        "groupItemTitle": "Reversed Yes",
+                        "outcomes": '["No", "Yes"]',
+                        "outcomePrices": '["0.9", "0.1"]',
+                        "oneDayPriceChange": 0.05,
+                        "oneWeekPriceChange": 0.12,
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    },
+                    {
+                        "groupItemTitle": "Halted market",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.80", "0.20"]',
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": False,
+                    },
+                ],
+            },
+        ],
+        "trade_tariffs": [
+            {
+                "id": "dup-tariff-1",
+                "title": "U.S. tariff rate on China on December 31, 2026?",
+                "slug": "us-tariff-china",
+                "active": True,
+                "closed": False,
+                "negRisk": True,
+                "volume24hr": 25_000,
+                "volume": 80_000,
+                "endDate": "2026-12-31T00:00:00Z",
+                "markets": [
+                    {
+                        "groupItemTitle": "5-15%",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.885", "0.115"]',
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    }
+                ],
+            },
+            # High historical volume but dead 24h volume ($750 < $1,500) -> MUST be filtered out
+            {
+                "id": "stale-vol-tariff",
+                "title": "US-Canada tariff reduction by December?",
+                "slug": "us-canada-tariff",
+                "active": True,
+                "closed": False,
+                "volume24hr": 750,
+                "volume": 500_000,
+                "markets": [
+                    {
+                        "groupItemTitle": "December 31",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.225", "0.775"]',
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    }
+                ],
+            },
+        ],
+        "geopolitics": [
+            # Multi-deadline non-mutually-exclusive date ladder
+            {
+                "id": "ladder-ceasefire",
+                "title": "Israel x Iran ceasefire continues through...?",
+                "slug": "israel-iran-ceasefire",
+                "active": True,
+                "closed": False,
+                "negRisk": False,
+                "volume24hr": 330_000,
+                "volume": 62_000_000,
+                "endDate": "2026-12-31T20:29:00Z",
+                "markets": [
+                    {
+                        "groupItemTitle": "December 31",
+                        "question": "Ceasefire continues through December 31?",
+                        "endDateIso": "2026-12-31",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.745", "0.255"]',
+                        "oneWeekPriceChange": 0.09,
+                        "volume24hr": 120_000,
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    },
+                    {
+                        "groupItemTitle": "November 30",
+                        "question": "Ceasefire continues through November 30?",
+                        "endDateIso": "2026-11-30",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.945", "0.055"]',
+                        "oneWeekPriceChange": 0.10,
+                        "volume24hr": 110_000,
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    },
+                    {
+                        "groupItemTitle": "December 15",
+                        "question": "Ceasefire continues through December 15?",
+                        "endDateIso": "2026-12-15",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.825", "0.175"]',
+                        "oneWeekPriceChange": 0.09,
+                        "volume24hr": 100_000,
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    },
+                ],
+            },
+            # Past upstream endDate while still acceptingOrders=True -> flagged explicitly
+            {
+                "id": "past-end-date",
+                "title": "Major election outcome?",
+                "slug": "major-election-outcome",
+                "active": True,
+                "closed": False,
+                "negRisk": True,
+                "volume24hr": 100_000,
+                "volume": 5_000_000,
+                "endDate": "2026-10-28T03:59:00Z",
+                "markets": [
+                    {
+                        "groupItemTitle": "Candidate A",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.75", "0.25"]',
+                        "active": True,
+                        "closed": False,
+                        "acceptingOrders": True,
+                    }
+                ],
+            },
+        ],
+    }
+
+    parsed = research_extensions.parse_polymarket_events(
+        raw_by_category,
+        fetched_at_utc="2026-11-26T08:00:00+00:00",
+    )
+    by_id = {ev["id"]: ev for ev in parsed["events"]}
+
+    # Cross-tag dedup assigns tariff event to trade_tariffs, NOT macro_rates
+    assert by_id["dup-tariff-1"]["category"] == "trade_tariffs"
+    # Dead 24h tariff pool excluded
+    assert "stale-vol-tariff" not in by_id
+    # Policy TikTok event preserved, out-of-range 1D delta stripped to None
+    assert "policy-tiktok" in by_id
+    assert by_id["policy-tiktok"]["leading_chg_1d_pp"] is None
+    assert by_id["policy-tiktok"]["leading_chg_7d_pp"] == -5.0
+
+    # Malformed vector dropped, halted market dropped, reversed Yes extracted accurately with untrusted delta cleared
+    vec_ev = by_id["vec-edge"]
+    assert len(vec_ev["top_outcomes"]) == 1
+    assert vec_ev["top_outcomes"][0]["label"] == "Reversed Yes"
+    assert vec_ev["top_outcomes"][0]["prob_pct"] == 10.0
+    assert vec_ev["top_outcomes"][0]["chg_1d_pp"] is None
+    assert vec_ev["top_outcomes"][0]["chg_7d_pp"] is None
+
+    # Date ladder preserves chronological order & binds headline probability to its OWN deadline (Dec 31 74.5%, not Nov 30 94.5%)
+    ladder = by_id["ladder-ceasefire"]
+    assert ladder["market_type"] == "date_ladder"
+    assert ladder["consensus_band"] == "ladder"
+    assert [o["label"] for o in ladder["top_outcomes"]] == ["November 30", "December 15", "December 31"]
+    assert [o["end_date"] for o in ladder["top_outcomes"]] == ["2026-11-30", "2026-12-15", "2026-12-31"]
+    assert ladder["leading_option"] == "December 31"
+    assert ladder["leading_prob_pct"] == 74.5
+    assert ladder["leading_end_date"] == "2026-12-31"
+
+    # Past upstream endDate flagged
+    assert by_id["past-end-date"]["end_date_passed"] is True
+
+    # 2. Strict non-blocking timeout in fetch_polymarket_macro_odds (must NOT hang on executor shutdown!)
+    def slow_get(*_args, **_kwargs):
+        time.sleep(0.8)
+        raise TimeoutError("slow")
+
+    with research_extensions._POLYMARKET_INFLIGHT_LOCK:
+        research_extensions._POLYMARKET_INFLIGHT.clear()
+    with patch.object(research_extensions.requests, "get", side_effect=slow_get):
+        t0 = time.monotonic()
+        pm_timeout_res = research_extensions.fetch_polymarket_macro_odds(timeout_seconds=0.12)
+        elapsed = time.monotonic() - t0
+    assert elapsed < 0.45, f"fetch_polymarket_macro_odds blocked past deadline ({elapsed:.2f}s)"
+    assert pm_timeout_res["status"] == "error"
+
+    # 3. Per-category last-known-good preservation across ok(3) -> partial(1) -> error
+    CACHE.clear()
+    macro_compass.clear_macro_source_cache()
+    fake_live = {"VIX": {"last": 20.0, "chg_1d_pct": 0.0, "as_of": "2026-11-26"}}
+    fake_fred = {"status": "ok", "series": {}}
+    fake_cn = {"status": "ok", "pmi": {"status": "error"}}
+    fake_anc = {"status": "ok", "ok_count": 1, "total": 1, "items": []}
+    fake_cn_anc = {"status": "ok", "ok_count": 1, "total": 1, "items": []}
+
+    pm_ok = research_extensions.parse_polymarket_events(
+        {
+            "macro_rates": [raw_by_category["macro_rates"][1]],
+            "trade_tariffs": [raw_by_category["trade_tariffs"][0]],
+            "geopolitics": [raw_by_category["geopolitics"][0]],
+        },
+        fetched_at_utc="2026-11-26T08:00:00+00:00",
+    )
+    pm_partial = research_extensions.parse_polymarket_events(
+        {"macro_rates": [raw_by_category["macro_rates"][1]]},
+        category_errors={"trade_tariffs": "timeout", "geopolitics": "502"},
+        fetched_at_utc="2026-11-26T08:05:00+00:00",
+    )
+    pm_err = {"status": "error", "source": "Polymarket Gamma API", "total_events": 0, "events": [], "error": "down"}
+
+    with (
+        patch.object(macro_compass.market_snapshot, "fetch_macro_context", return_value=fake_live),
+        patch.object(macro_compass.research_data, "fetch_fred_macro", return_value=fake_fred),
+        patch.object(macro_compass.research_data, "fetch_china_macro_core", return_value=fake_cn),
+        patch.object(macro_compass, "fetch_cross_asset_anchors", return_value=fake_anc),
+        patch.object(macro_compass, "fetch_cn_futures_anchors", return_value=fake_cn_anc),
+    ):
+        with patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=pm_ok):
+            res_ok = macro_compass.collect_macro_overview(refresh=True)
+            assert res_ok["sources_status"]["polymarket_odds"] == "ok"
+            assert res_ok["polymarket_odds"]["status"] == "ok"
+            assert res_ok["polymarket_odds"]["total_events"] == 3
+
+        with patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=pm_partial):
+            res_partial = macro_compass.collect_macro_overview(refresh=True)
+            assert res_partial["sources_status"]["polymarket_odds"] == "partial"
+            assert res_partial["polymarket_odds"]["status"] == "partial"
+            # Must preserve all 3 categories by carrying over prior cached categories!
+            assert res_partial["polymarket_odds"]["total_events"] == 3
+            assert set(res_partial["polymarket_odds"]["stale_categories"]) == {"trade_tariffs", "geopolitics"}
+
+        with patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=pm_err):
+            res_err = macro_compass.collect_macro_overview(refresh=True)
+            # Outer & inner statuses strictly aligned as 'stale', and ALL 3 events still preserved!
+            assert res_err["sources_status"]["polymarket_odds"] == "stale"
+            assert res_err["polymarket_odds"]["status"] == "stale"
+            assert res_err["polymarket_odds"]["stale_fallback"] is True
+            assert res_err["polymarket_odds"]["total_events"] == 3
+            assert all(ev.get("stale_fallback") is True for ev in res_err["polymarket_odds"]["events"])
+
 
 
 

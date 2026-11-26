@@ -1081,10 +1081,15 @@ export interface CompassTapeMovers {
 
 export interface PolymarketOutcomeItem {
   label: string;
+  question?: string;
   prob_pct: number;
   chg_1d_pp?: number | null;
   chg_7d_pp?: number | null;
   volume_usd?: number | null;
+  volume_24h_usd?: number | null;
+  liquidity_usd?: number | null;
+  end_date?: string | null;
+  accepting_orders?: boolean;
 }
 
 export interface PolymarketEventItem {
@@ -1095,14 +1100,20 @@ export interface PolymarketEventItem {
   slug?: string;
   url?: string;
   end_date?: string | null;
-  market_type: "binary" | "multi" | string;
+  leading_end_date?: string | null;
+  end_date_passed?: boolean;
+  accepting_orders?: boolean;
+  market_type: "binary" | "multi" | "date_ladder" | string;
   volume_24h_usd?: number | null;
   volume_total_usd?: number | null;
+  liquidity_usd?: number | null;
   leading_option: string;
   leading_prob_pct: number;
   leading_chg_1d_pp?: number | null;
   leading_chg_7d_pp?: number | null;
-  priced_in_band?: "consensus" | "contested" | "tail_risk" | string;
+  consensus_band?: "consensus" | "contested" | "tail_risk" | "ladder" | string;
+  priced_in_band?: "consensus" | "contested" | "tail_risk" | "ladder" | string;
+  stale_fallback?: boolean;
   top_outcomes: PolymarketOutcomeItem[];
 }
 
@@ -1110,9 +1121,12 @@ export interface PolymarketMacroOdds {
   status: "ok" | "partial" | "stale" | "error" | string;
   source?: string;
   fetched_at_utc?: string | null;
+  last_good_at_utc?: string | null;
   total_events?: number;
   categories_ok?: number;
   categories_total?: number;
+  stale_categories?: string[];
+  stale_fallback?: boolean;
   headline_events?: PolymarketEventItem[];
   events?: PolymarketEventItem[];
   error?: string;

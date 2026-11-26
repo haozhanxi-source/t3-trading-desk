@@ -145,6 +145,16 @@ function formatCompactUsd(val: number | null | undefined): string {
   return `$${Math.round(val)}`;
 }
 
+function clampProbPct(val: number | null | undefined): number | null {
+  if (val === null || val === undefined || !Number.isFinite(val)) return null;
+  return Math.max(0, Math.min(100, val));
+}
+
+function formatProbPct(val: number | null | undefined): string {
+  const pct = clampProbPct(val);
+  return pct === null ? "—" : `${pct.toFixed(1)}%`;
+}
+
 function formatPpDelta(val: number | null | undefined): string | null {
   if (val === null || val === undefined || !Number.isFinite(val)) return null;
   const rounded = Math.round(val * 10) / 10;
@@ -152,18 +162,26 @@ function formatPpDelta(val: number | null | undefined): string | null {
   return `${rounded > 0 ? "+" : ""}${rounded.toFixed(1)}pp`;
 }
 
+function ppDeltaToneClass(val: number | null | undefined): string {
+  if (val === null || val === undefined || !Number.isFinite(val)) return "text-muted";
+  // Neutral styling: probability spikes on tariffs/geopolitics are NOT asset bullish/bearish signals
+  return Math.abs(val) >= 5 ? "text-warning font-medium" : "text-muted";
+}
+
 function isSafePolymarketUrl(url: string | undefined): url is string {
   return typeof url === "string" && /^https:\/\/polymarket\.com\/event\/[A-Za-z0-9_-]+$/.test(url);
 }
 
-function pricedInBandMeta(band: string | undefined) {
+function consensusBandMeta(band: string | undefined) {
   switch (band) {
     case "consensus":
-      return { label: "已高度计价", cls: "border-accent/35 bg-accent/10 text-accent" };
+      return { label: "盘口隐含概率较高", cls: "border-accent/35 bg-accent/10 text-accent" };
     case "contested":
-      return { label: "博弈分歧", cls: "border-warning/40 bg-warning/10 text-warning" };
+      return { label: "盘口博弈分歧", cls: "border-warning/40 bg-warning/10 text-warning" };
+    case "ladder":
+      return { label: "多期限阶梯", cls: "border-hairline bg-elevated text-ink-2" };
     default:
-      return { label: "尾部风险", cls: "border-hairline bg-elevated text-ink-2" };
+      return { label: "低概率尾部", cls: "border-hairline bg-elevated text-muted" };
   }
 }
 
@@ -960,30 +978,51 @@ export function Layer1CompassPanel({
           </div>
         ) : null}
 
-        {/* Compact Prediction Market Priced-In Radar (Polymarket Keyless Gamma API) */}
+        {/* Compact Prediction Market Event Odds Strip (Polymarket Keyless Gamma API) */}
         {polymarketHeadlines.length > 0 ? (
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-hairline-soft bg-sunken/40 px-2.5 py-1.5 text-[11px]">
-            <span className="font-semibold text-ink-2">预测市场定价 · Polymarket</span>
+            <span className="font-semibold text-ink-2">预测市场赔率 · Polymarket</span>
+            {macro?.polymarket_odds?.status === "stale" ||
+            (macro?.polymarket_odds?.stale_categories?.length ?? 0) > 0 ? (
+              <span
+                className="inline-flex items-center gap-1 rounded border border-warning/35 bg-warning/10 px-1.5 py-0.2 text-[9.5px] font-medium text-warning"
+                title={
+                  macro?.polymarket_odds?.last_good_at_utc
+                    ? `部分或全部盘口沿用 ${shortTime(macro.polymarket_odds.last_good_at_utc)} 缓存`
+                    : "当前包含缓存降级盘口"
+                }
+              >
+                <Clock className="h-2.5 w-2.5" aria-hidden="true" />
+                <span>{macro?.polymarket_odds?.status === "stale" ? "缓存沿用" : "部分缓存"}</span>
+              </span>
+            ) : null}
             {polymarketHeadlines.map((ev) => {
               const d7 = formatPpDelta(ev.leading_chg_7d_pp);
               const d1 = formatPpDelta(ev.leading_chg_1d_pp);
               const deltaText = d7 ?? d1;
               const deltaTag = d7 ? "7D" : d1 ? "1D" : "";
               const deltaNum = d7 ? ev.leading_chg_7d_pp : ev.leading_chg_1d_pp;
-              const band = pricedInBandMeta(ev.priced_in_band);
+              const band = consensusBandMeta(ev.consensus_band ?? ev.priced_in_band);
+              const probText = formatProbPct(ev.leading_prob_pct);
+              const optPrefix = ev.market_type === "date_ladder" ? "截至 " : "";
               const pillBody = (
                 <>
                   <span className="max-w-[165px] truncate font-sans text-ink">{ev.title}</span>
-                  <span className="font-sans text-[10px] text-muted">· {ev.leading_option}</span>
-                  <span className="font-semibold text-accent">{ev.leading_prob_pct.toFixed(1)}%</span>
+                  <span className="font-sans text-[10px] text-muted">
+                    · {optPrefix}
+                    {ev.leading_option}
+                  </span>
+                  <span className="font-semibold text-accent">{probText}</span>
                   {deltaText ? (
-                    <span className={`text-[10px] ${signedToneClass(deltaNum ?? null)}`}>
+                    <span className={`text-[10px] ${ppDeltaToneClass(deltaNum ?? null)}`}>
                       ({deltaTag} {deltaText})
                     </span>
                   ) : null}
                 </>
               );
-              const tip = `${ev.category_label} · ${ev.title} | 主导：${ev.leading_option} ${ev.leading_prob_pct.toFixed(1)}% (${band.label}) | 24h成交 ${formatCompactUsd(ev.volume_24h_usd)} / 累计 ${formatCompactUsd(ev.volume_total_usd)}`;
+              const deadlineNote = ev.leading_end_date ? ` · 对应期限 ${ev.leading_end_date}` : "";
+              const staleNote = ev.stale_fallback ? " · [缓存降级]" : "";
+              const tip = `${ev.category_label} · ${ev.title} | 盘口：${optPrefix}${ev.leading_option} ${probText} (${band.label})${deadlineNote} | 24h成交 ${formatCompactUsd(ev.volume_24h_usd)} / 累计 ${formatCompactUsd(ev.volume_total_usd)}${staleNote}`;
               return isSafePolymarketUrl(ev.url) ? (
                 <a
                   key={`pm-head-${ev.id}`}
@@ -1012,7 +1051,13 @@ export function Layer1CompassPanel({
         {polymarketGroups.length > 0 ? (
           <details className="border-t border-hairline-soft pt-2">
             <summary className="cursor-pointer select-none text-[11px] font-medium text-muted hover:text-ink">
-              展开 Polymarket 宏观利率 / 关税 / 地缘预测市场赔率（{macro?.polymarket_odds?.total_events ?? 0} 个高流动性活跃盘口 · 免费免 Key）
+              展开 Polymarket 宏观利率 / 关税 / 地缘事件赔率（{macro?.polymarket_odds?.total_events ?? 0} 个盘口 ·{" "}
+              {macro?.polymarket_odds?.status === "stale"
+                ? "缓存降级"
+                : macro?.polymarket_odds?.status === "partial"
+                  ? "部分分类缓存"
+                  : "实时"}{" "}
+              · 仅事件概率参考，不等同于资产已计价）
             </summary>
             <div className="mt-2.5 grid grid-cols-1 gap-3 lg:grid-cols-3">
               {polymarketGroups.map((grp) => (
@@ -1023,7 +1068,7 @@ export function Layer1CompassPanel({
                   </div>
                   <div className="flex flex-col divide-y divide-hairline-soft">
                     {grp.rows.map((ev) => {
-                      const band = pricedInBandMeta(ev.priced_in_band);
+                      const band = consensusBandMeta(ev.consensus_band ?? ev.priced_in_band);
                       return (
                         <div key={ev.id} className="flex flex-col gap-1.5 py-2 first:pt-0 last:pb-0">
                           <div className="flex items-start justify-between gap-2">
@@ -1044,50 +1089,84 @@ export function Layer1CompassPanel({
                                 </span>
                               )}
                             </div>
-                            <span
-                              className={`shrink-0 rounded border px-1 py-0.2 text-[9.5px] font-medium ${band.cls}`}
-                            >
-                              {band.label}
-                            </span>
+                            <div className="flex shrink-0 items-center gap-1">
+                              {ev.stale_fallback ? (
+                                <span className="rounded border border-warning/35 bg-warning/10 px-1 py-0.2 text-[9px] font-medium text-warning">
+                                  缓存
+                                </span>
+                              ) : null}
+                              <span
+                                className={`rounded border px-1 py-0.2 text-[9.5px] font-medium ${band.cls}`}
+                              >
+                                {band.label}
+                              </span>
+                            </div>
                           </div>
                           <div className="flex flex-col gap-1">
                             {ev.top_outcomes.map((o) => {
                               const d1 = formatPpDelta(o.chg_1d_pp);
                               const d7 = formatPpDelta(o.chg_7d_pp);
-                              const pct = Math.max(0, Math.min(100, o.prob_pct));
+                              const pct = clampProbPct(o.prob_pct);
+                              const barPct = pct ?? 0;
+                              const showSubDate =
+                                Boolean(o.end_date) &&
+                                (ev.market_type === "date_ladder" || o.end_date !== ev.end_date);
                               return (
-                                <div key={`${ev.id}-${o.label}`} className="flex flex-col gap-0.5">
-                                  <div className="flex items-center justify-between gap-1.5 text-[10.5px] font-mono tabular-nums">
-                                    <span className="truncate font-sans text-ink-2">{o.label}</span>
+                                <div key={`${ev.id}-${o.label}-${o.end_date ?? ""}`} className="flex flex-col gap-0.5">
+                                  <div
+                                    className="flex items-center justify-between gap-1.5 text-[10.5px] font-mono tabular-nums"
+                                    title={o.question || o.label}
+                                  >
+                                    <span className="flex min-w-0 items-center gap-1 truncate font-sans text-ink-2">
+                                      <span className="truncate">{o.label}</span>
+                                      {showSubDate ? (
+                                        <span className="shrink-0 font-mono text-[9.5px] text-muted">
+                                          ({o.end_date})
+                                        </span>
+                                      ) : null}
+                                    </span>
                                     <span className="flex shrink-0 items-center gap-1.5">
                                       {d1 ? (
-                                        <span className={`text-[9.5px] ${signedToneClass(o.chg_1d_pp ?? null)}`} title="24小时赔率变化">
+                                        <span className={`text-[9.5px] ${ppDeltaToneClass(o.chg_1d_pp ?? null)}`} title="24小时盘口概率变化（中性色，不代表资产多空）">
                                           1D {d1}
                                         </span>
                                       ) : null}
                                       {d7 ? (
-                                        <span className={`text-[9.5px] ${signedToneClass(o.chg_7d_pp ?? null)}`} title="7日赔率变化">
+                                        <span className={`text-[9.5px] ${ppDeltaToneClass(o.chg_7d_pp ?? null)}`} title="7日盘口概率变化（中性色，不代表资产多空）">
                                           7D {d7}
                                         </span>
                                       ) : null}
-                                      <span className="w-10 text-right font-semibold text-ink">{pct.toFixed(1)}%</span>
+                                      <span className="w-10 text-right font-semibold text-ink">
+                                        {formatProbPct(o.prob_pct)}
+                                      </span>
                                     </span>
                                   </div>
                                   <div className="h-1 w-full overflow-hidden rounded-full bg-hairline-soft">
                                     <div
                                       className="h-full rounded-full bg-accent/70"
-                                      style={{ width: `${pct}%` }}
+                                      style={{ width: `${barPct}%` }}
                                     />
                                   </div>
                                 </div>
                               );
                             })}
                           </div>
-                          <div className="flex items-center justify-between font-mono text-[9.5px] text-muted">
+                          <div className="flex flex-wrap items-center justify-between gap-1 font-mono text-[9.5px] text-muted">
                             <span>
                               24h {formatCompactUsd(ev.volume_24h_usd)} · 累计 {formatCompactUsd(ev.volume_total_usd)}
+                              {ev.liquidity_usd && ev.liquidity_usd > 0
+                                ? ` · 深度 ${formatCompactUsd(ev.liquidity_usd)}`
+                                : ""}
                             </span>
-                            {ev.end_date ? <span>截止 {ev.end_date}</span> : null}
+                            {ev.end_date ? (
+                              <span className={ev.end_date_passed ? "text-warning" : undefined}>
+                                {ev.end_date_passed
+                                  ? `原定 ${ev.end_date} (仍可交易)`
+                                  : ev.market_type === "date_ladder"
+                                    ? `最远期限 ${ev.end_date}`
+                                    : `截止 ${ev.end_date}`}
+                              </span>
+                            ) : null}
                           </div>
                         </div>
                       );

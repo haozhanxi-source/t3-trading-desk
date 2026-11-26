@@ -190,6 +190,8 @@ _CN_ANCHOR_INFLIGHT_LOCK = threading.Lock()
 _CN_ANCHOR_INFLIGHT: dict[str, concurrent.futures.Future[dict[str, Any]]] = {}
 _MACRO_INFLIGHT_LOCK = threading.Lock()
 _MACRO_INFLIGHT_FUTURE: concurrent.futures.Future[dict[str, Any]] | None = None
+_PM_RETRY_INFLIGHT_LOCK = threading.Lock()
+_PM_RETRY_INFLIGHT_FUTURE: concurrent.futures.Future[tuple[dict[str, Any], str, dict[str, Any] | None]] | None = None
 _LAST_GOOD_LOCK = threading.Lock()
 _LAST_GOOD_MACRO_SOURCES: dict[str, dict[str, Any]] = {}
 _LAST_GOOD_POLYMARKET_CATS: dict[str, dict[str, Any]] = {}
@@ -1180,45 +1182,75 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
     return bundle
 
 
-def _refresh_polymarket_into_cached_overview(
-    cached: dict[str, Any],
-    *,
-    timeout_seconds: float = 6.0,
+def _overlay_polymarket_on_overview(
+    base: dict[str, Any],
+    pm_tuple: tuple[dict[str, Any], str, dict[str, Any] | None],
 ) -> dict[str, Any]:
-    """Independently retry degraded Polymarket odds without invalidating or re-fetching the core 5 macro sources."""
-    now_iso = _utc_iso()
-    try:
-        raw_pm = fetch_polymarket_macro_odds(timeout_seconds=min(6.0, max(0.2, timeout_seconds)))
-        err_pm = None
-    except Exception as exc:  # noqa: BLE001
-        raw_pm = None
-        err_pm = str(exc)
-
-    pm_odds, st_pm, stale_pm = _resolve_polymarket_source(raw_pm, err_pm, now_iso)
-    pm_ttl = TTL_COMPASS_MACRO_SECONDS if st_pm == "ok" else TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS
-    CACHE.set(("compass_polymarket_odds",), (pm_odds, st_pm, stale_pm), pm_ttl)
-
-    new_sources_status = {**(cached.get("sources_status") or {}), "polymarket_odds": st_pm}
-    new_stale = dict(cached.get("stale_sources") or {})
+    """Return a fresh, atomically consistent overview dict combining immutable core snapshot + Polymarket tuple."""
+    pm_odds, st_pm, stale_pm = pm_tuple
+    new_sources_status = {**(base.get("sources_status") or {}), "polymarket_odds": st_pm}
+    new_stale = dict(base.get("stale_sources") or {})
     if stale_pm is not None:
         new_stale["polymarket_odds"] = stale_pm
     else:
         new_stale.pop("polymarket_odds", None)
-
-    updated = sanitize(
+    return sanitize(
         {
-            **cached,
+            **base,
             "cache_hit": True,
             "sources_status": new_sources_status,
             "stale_sources": new_stale,
             "polymarket_odds": pm_odds,
         }
     )
-    # Mutate cached dict fields in-place so the core 5 sources' original cache expiry is preserved untouched
-    cached["sources_status"] = updated["sources_status"]
-    cached["stale_sources"] = updated["stale_sources"]
-    cached["polymarket_odds"] = updated["polymarket_odds"]
-    return updated
+
+
+def _refresh_polymarket_singleflight(
+    *,
+    timeout_seconds: float = 6.0,
+) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+    """Coalesce concurrent independent Polymarket retries into a single upstream fetch without mutating cached core data."""
+    global _PM_RETRY_INFLIGHT_FUTURE
+    pm_cache_key = ("compass_polymarket_odds",)
+    hit, existing_pm = CACHE.get(pm_cache_key)
+    if hit and isinstance(existing_pm, tuple) and len(existing_pm) == 3:
+        return existing_pm
+
+    leader = False
+    with _PM_RETRY_INFLIGHT_LOCK:
+        if _PM_RETRY_INFLIGHT_FUTURE is not None and not _PM_RETRY_INFLIGHT_FUTURE.done():
+            shared_future = _PM_RETRY_INFLIGHT_FUTURE
+        else:
+            shared_future = concurrent.futures.Future()
+            _PM_RETRY_INFLIGHT_FUTURE = shared_future
+            leader = True
+
+    if not leader:
+        return shared_future.result(timeout=max(0.5, timeout_seconds + 2.0))
+
+    try:
+        now_iso = _utc_iso()
+        try:
+            raw_pm = fetch_polymarket_macro_odds(timeout_seconds=min(6.0, max(0.2, timeout_seconds)))
+            err_pm = None
+        except Exception as exc:  # noqa: BLE001
+            raw_pm = None
+            err_pm = str(exc)
+
+        pm_tuple = _resolve_polymarket_source(raw_pm, err_pm, now_iso)
+        _, st_pm, _ = pm_tuple
+        pm_ttl = TTL_COMPASS_MACRO_SECONDS if st_pm == "ok" else TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS
+        CACHE.set(pm_cache_key, pm_tuple, pm_ttl)
+        shared_future.set_result(pm_tuple)
+        return pm_tuple
+    except BaseException as exc:
+        if not shared_future.done():
+            shared_future.set_exception(exc)
+        raise
+    finally:
+        with _PM_RETRY_INFLIGHT_LOCK:
+            if _PM_RETRY_INFLIGHT_FUTURE is shared_future:
+                _PM_RETRY_INFLIGHT_FUTURE = None
 
 
 def collect_macro_overview(
@@ -1232,13 +1264,14 @@ def collect_macro_overview(
     if not refresh:
         hit, cached = CACHE.get(cache_key)
         if hit and isinstance(cached, dict):
+            pm_hit, pm_tuple = CACHE.get(("compass_polymarket_odds",))
+            if pm_hit and isinstance(pm_tuple, tuple) and len(pm_tuple) == 3:
+                return _overlay_polymarket_on_overview(cached, pm_tuple)
             if (cached.get("sources_status") or {}).get("polymarket_odds") != "ok":
-                pm_hit, _ = CACHE.get(("compass_polymarket_odds",))
-                if not pm_hit:
-                    return _refresh_polymarket_into_cached_overview(
-                        cached,
-                        timeout_seconds=min(6.0, deadline_seconds * 0.85),
-                    )
+                fresh_pm_tuple = _refresh_polymarket_singleflight(
+                    timeout_seconds=min(6.0, deadline_seconds * 0.85),
+                )
+                return _overlay_polymarket_on_overview(cached, fresh_pm_tuple)
             return {**cached, "cache_hit": True}
 
     leader = False

@@ -2636,15 +2636,20 @@ def _pm_to_float(val: Any) -> float | None:
     if val is None or isinstance(val, bool):
         return None
     if isinstance(val, (int, float)):
-        f = float(val)
+        try:
+            f = float(val)
+        except OverflowError:
+            return None
         return f if math.isfinite(f) else None
+    if not isinstance(val, str):
+        return None
     try:
-        s = str(val).strip()
+        s = val.strip()
         if not s:
             return None
         f = float(s)
         return f if math.isfinite(f) else None
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -2687,7 +2692,9 @@ def _pm_extract_yes_prob(
     cleaned_prices: list[float] = []
     yes_idx: int | None = None
     for idx, (label, raw_price) in enumerate(zip(outcomes, prices)):
-        lbl = str(label or "").strip()
+        if not isinstance(label, str):
+            return None, None, False
+        lbl = label.strip()
         prob = _pm_to_float(raw_price)
         if not lbl or prob is None or prob < 0.0 or prob > 1.0:
             return None, None, False

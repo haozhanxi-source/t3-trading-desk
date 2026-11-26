@@ -1527,6 +1527,9 @@ def test_polymarket_round2_regressions_missing_subdate_full_vector_dedup_ttl_and
                     {"groupItemTitle": "EmptyOtherLabel", "outcomes": '["Yes", ""]', "outcomePrices": '["0.6", "0.4"]', "active": True, "closed": False},
                     {"groupItemTitle": "NullOtherPrice", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.6", null]', "active": True, "closed": False},
                     {"groupItemTitle": "OverOneOtherPrice", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.6", "1.2"]', "active": True, "closed": False},
+                    {"groupItemTitle": "DictLabel", "outcomes": ["Yes", {"bad": 1}], "outcomePrices": [0.6, 0.4], "active": True, "closed": False},
+                    {"groupItemTitle": "IntLabel", "outcomes": ["Yes", 123], "outcomePrices": [0.6, 0.4], "active": True, "closed": False},
+                    {"groupItemTitle": "HugeIntPrice", "outcomes": ["Yes", "No"], "outcomePrices": [0.6, 10**400], "active": True, "closed": False},
                 ],
             },
         ],
@@ -1625,14 +1628,45 @@ def test_polymarket_round2_regressions_missing_subdate_full_vector_dedup_ttl_and
         assert ttl_by_key[("compass_macro_overview",)] == macro_compass.TTL_COMPASS_MACRO_SECONDS
         assert ttl_by_key[("compass_polymarket_odds",)] == macro_compass.TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS
 
-        # Simulate independent Polymarket slot expiring while main overview cache is still hot -> ONLY Polymarket retries!
+        # Simulate independent Polymarket slot expiring while main overview cache is still hot:
+        # 4 concurrent callers MUST coalesce into ONE Polymarket retry, NEVER re-fetch core 5 sources,
+        # and EVERY caller MUST observe atomically consistent outer/inner Polymarket status!
         CACHE.invalidate(("compass_polymarket_odds",))
         live_before = core_calls["live"]
-        with patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=pm_full):
-            r3 = macro_compass.collect_macro_overview(refresh=False)
-            assert core_calls["live"] == live_before
-            assert r3["sources_status"]["polymarket_odds"] == "ok"
-            assert r3["polymarket_odds"]["status"] == "ok"
+        pm_retry_calls = {"count": 0}
+
+        def slow_pm_recover(*_args, **_kwargs):
+            pm_retry_calls["count"] += 1
+            time.sleep(0.05)
+            return pm_full
+
+        with patch.object(macro_compass, "fetch_polymarket_macro_odds", side_effect=slow_pm_recover):
+            concurrent_results: list[dict] = []
+            threads = [
+                threading.Thread(
+                    target=lambda: concurrent_results.append(macro_compass.collect_macro_overview(refresh=False))
+                )
+                for _ in range(4)
+            ]
+            for th in threads:
+                th.start()
+            for th in threads:
+                th.join(timeout=2.0)
+
+        assert core_calls["live"] == live_before
+        assert pm_retry_calls["count"] == 1
+        assert len(concurrent_results) == 4
+        for res in concurrent_results:
+            assert res["sources_status"]["polymarket_odds"] == "ok"
+            assert res["polymarket_odds"]["status"] == "ok"
+            assert "polymarket_odds" not in (res.get("stale_sources") or {})
+
+        # Subsequent cached read serves overlaid 'ok' Polymarket state with 0 upstream calls
+        with patch.object(macro_compass, "fetch_polymarket_macro_odds", side_effect=AssertionError("should hit independent cache")):
+            r4 = macro_compass.collect_macro_overview(refresh=False)
+            assert r4["sources_status"]["polymarket_odds"] == "ok"
+            assert r4["polymarket_odds"]["status"] == "ok"
+            assert "polymarket_odds" not in (r4.get("stale_sources") or {})
 
 
 

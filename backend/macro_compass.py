@@ -26,6 +26,7 @@ import market_snapshot
 import portfolio_manager
 import research_archive
 import research_data
+import research_extensions
 import scan_opportunities
 
 from . import deep_research
@@ -804,6 +805,11 @@ def _merge_anchor_items_preserving_fresher(
     return merged
 
 
+def fetch_polymarket_macro_odds(*, timeout_seconds: float = 6.0) -> dict[str, Any]:
+    """Fetch keyless Polymarket Gamma API odds for macro rates, tariffs and geopolitics."""
+    return research_extensions.fetch_polymarket_macro_odds(timeout_seconds=timeout_seconds)
+
+
 def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = False) -> dict[str, Any]:
     """Execute one bounded parallel macro overview fetch without blocking on timed-out threads."""
     now_iso = _utc_iso()
@@ -814,6 +820,7 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
             return fn()
 
     cn_timeout = max(0.2, min(9.0, deadline_seconds * 0.9))
+    pm_timeout = max(0.2, min(6.0, deadline_seconds * 0.85))
     fut_map: dict[concurrent.futures.Future[Any], str] = {
         _MACRO_EXECUTOR.submit(_wrapped, market_snapshot.fetch_macro_context): "live_macro",
         _MACRO_EXECUTOR.submit(_wrapped, research_data.fetch_fred_macro): "us_fred",
@@ -822,6 +829,9 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
         _MACRO_EXECUTOR.submit(
             lambda: fetch_cn_futures_anchors(refresh=refresh, timeout_seconds=cn_timeout)
         ): "cn_futures_anchors",
+        _MACRO_EXECUTOR.submit(
+            lambda: fetch_polymarket_macro_odds(timeout_seconds=pm_timeout)
+        ): "polymarket_odds",
     }
 
     done, not_done = concurrent.futures.wait(
@@ -915,6 +925,18 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
         {"status": "error", "items": [], "ok_count": 0, "total": len(CN_FUTURES_ANCHORS), "error": errors.get("cn_futures_anchors", "unavailable")},
         lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
     )
+    polymarket_odds, st_pm, stale_pm = _resolve_source(
+        "polymarket_odds",
+        {
+            "status": "error",
+            "source": "Polymarket Gamma API",
+            "total_events": 0,
+            "headline_events": [],
+            "events": [],
+            "error": errors.get("polymarket_odds", "unavailable"),
+        },
+        lambda v: isinstance(v, dict) and str(v.get("status") or "") in ("ok", "partial"),
+    )
 
     merged_items: list[dict[str, Any]] = [
         *(yf_anchors.get("items") or []),
@@ -940,6 +962,7 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
         "cn_macro": st_cn,
         "cross_asset_anchors": st_anc,
         "cn_futures_anchors": st_cn_anc,
+        "polymarket_odds": st_pm,
     }
     stale_sources = {
         k: info
@@ -949,6 +972,7 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
             ("cn_macro", stale_cn),
             ("cross_asset_anchors", stale_anc),
             ("cn_futures_anchors", stale_cn_anc),
+            ("polymarket_odds", stale_pm),
         )
         if info is not None
     }
@@ -970,6 +994,7 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
             "china_macro": china_macro,
             "anchors": anchors,
             "tape_movers": tape_movers,
+            "polymarket_odds": polymarket_odds,
         }
     )
     CACHE.set(("compass_macro_overview",), bundle, ttl)
@@ -1214,6 +1239,30 @@ def build_compass_brief(
     clean_scopes = normalize_focus_scopes(focus_scopes or [])
     anchor_items = (macro_overview.get("anchors") or {}).get("items") or []
     tape_movers = macro_overview.get("tape_movers") or compute_tape_movers(anchor_items)
+    pm_raw = macro_overview.get("polymarket_odds")
+    pm_compact: dict[str, Any] = {
+        "status": str(pm_raw.get("status") or "unavailable") if isinstance(pm_raw, dict) else "unavailable",
+        "fetched_at_utc": pm_raw.get("fetched_at_utc") if isinstance(pm_raw, dict) else None,
+        "events": [
+            {
+                "category": ev.get("category"),
+                "category_label": ev.get("category_label"),
+                "title": ev.get("title"),
+                "end_date": ev.get("end_date"),
+                "volume_24h_usd": ev.get("volume_24h_usd"),
+                "volume_total_usd": ev.get("volume_total_usd"),
+                "priced_in_band": ev.get("priced_in_band"),
+                "leading_option": ev.get("leading_option"),
+                "leading_prob_pct": ev.get("leading_prob_pct"),
+                "leading_chg_1d_pp": ev.get("leading_chg_1d_pp"),
+                "leading_chg_7d_pp": ev.get("leading_chg_7d_pp"),
+                "top_outcomes": ev.get("top_outcomes") or [],
+                "url": ev.get("url") or "",
+            }
+            for ev in ((pm_raw.get("events") or []) if isinstance(pm_raw, dict) else [])
+            if isinstance(ev, dict)
+        ],
+    }
     return sanitize(
         {
             "generated_at_utc": _utc_iso(),
@@ -1224,6 +1273,7 @@ def build_compass_brief(
             "focus_prompt": focus_prompt.strip(),
             "seven_dimensions": list(SEVEN_DIMENSIONS),
             "tape_movers": tape_movers,
+            "polymarket_odds": pm_compact,
             "macro_overview": {
                 "fetched_at_utc": macro_overview.get("fetched_at_utc"),
                 "sources_status": macro_overview.get("sources_status"),
@@ -1268,6 +1318,7 @@ def build_compass_prompt(
         "   - 简报中的月度宏观数据（如 `CN_PMI`、`FEDFUNDS`、`PCOPPUSDM`）天然滞后 1~2 个月，仅作背景参考；**实时市场定价（`tape_movers` 极端领涨/领跌榜、`cross_asset_anchors` 含国内核心期货锚的近 5D/20D/60D 异动、`VIX`/`US10Y`/`DXY`）与你通过 WebSearch 检索到的近 1~2 周最新变化享有绝对最高优先级**。\n"
         "   - **强制动作**：先逐一审视 `brief.json` 里的 `tape_movers.top_losers` 和 `top_gainers`！凡是 20D/60D 出现 **≥15% 单边走势**的品种/板块（无论海外资产还是国内期货锚），背后往往是**资金方向的高度一致（未背驰主趋势段）**，必须主动联网查清多维度真实驱动，彻底打破脑海里残留的卖方旧共识钢印（例如“某金属长期短缺”或“某赛道长期高增”）。\n"
         "   - **警惕两种极端**：① 严禁凭“跌多了就该涨”的均值回归思维机械否定正在延续的主趋势；② 同样严禁**后视镜线性外推**——把过去 60 天跌幅榜前几名原样照搬成未来 1 年的结论！查清驱动后，必须前瞻追问：**“市场已经计价了什么（`priced_in_already`）？未来 1Q~1Y 还有哪些尚未被充分定价的增量预期差或二阶传导（`unpriced_gap`）？”**\n"
+        "   - **预测市场隐含概率交叉校验（`polymarket_odds`）**：`brief.json` 已附带 Polymarket 真实资金预测市场的宏观利率、关税贸易与地缘事件隐含概率及 1D/7D 赔率变动（`pp`）。请用它直接量化校验“市场已计价程度”（如 ≥80% 共识已反映在资产价格中，而 30%~70% 博弈分歧区或 7D 显著重定价的政策/地缘变量往往隐含更大二阶预期差）；但预测市场仅作概率定价参考，必须与权威宏观数据及最新新闻交叉核验，勿盲从低流动性盘口。\n"
         "2. **只选方向与板块，不代用户硬选具体个股/唯一龙头**：Layer 1 负责把宏观大局、多空方向、核心板块及产业链选龙头抓手（`value_chain_focus`）讲透；具体挑哪只真龙头并做日线缠论验证，交由用户在下方 Layer 2 自主完成。你可以可选填 0~2 个板块基准定价锚（如一级行业 ETF 或主流商品/汇率基准代码），但绝不要越俎代庖替用户锁定某一只个股。\n"
         "3. **大逻辑先行（严禁凭 RSI/超买超卖逆势猜底摸顶）**：不使用 RSI/布林带/均值回归作为推荐依据，只做真正具备 1Q~1Y 基本面预期差、戴维斯双击/双杀、供需失衡或宏观流动性共振的板块。\n"
         "4. **7 维驱动共振门槛（强制 ≥2 个不同维度共振，且均须有非空摘要）**：每个板块必须明确标注主驱动维度 + 不同的次驱动维度，规范名限定为：\n"

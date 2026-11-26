@@ -1079,6 +1079,45 @@ export interface CompassTapeMovers {
   };
 }
 
+export interface PolymarketOutcomeItem {
+  label: string;
+  prob_pct: number;
+  chg_1d_pp?: number | null;
+  chg_7d_pp?: number | null;
+  volume_usd?: number | null;
+}
+
+export interface PolymarketEventItem {
+  id: string;
+  category: "macro_rates" | "trade_tariffs" | "geopolitics" | string;
+  category_label: string;
+  title: string;
+  slug?: string;
+  url?: string;
+  end_date?: string | null;
+  market_type: "binary" | "multi" | string;
+  volume_24h_usd?: number | null;
+  volume_total_usd?: number | null;
+  leading_option: string;
+  leading_prob_pct: number;
+  leading_chg_1d_pp?: number | null;
+  leading_chg_7d_pp?: number | null;
+  priced_in_band?: "consensus" | "contested" | "tail_risk" | string;
+  top_outcomes: PolymarketOutcomeItem[];
+}
+
+export interface PolymarketMacroOdds {
+  status: "ok" | "partial" | "stale" | "error" | string;
+  source?: string;
+  fetched_at_utc?: string | null;
+  total_events?: number;
+  categories_ok?: number;
+  categories_total?: number;
+  headline_events?: PolymarketEventItem[];
+  events?: PolymarketEventItem[];
+  error?: string;
+}
+
 export interface CompassMacroOverview {
   fetched_at_utc: string;
   cache_hit?: boolean;
@@ -1093,6 +1132,7 @@ export interface CompassMacroOverview {
     items: CrossAssetAnchorItem[];
   };
   tape_movers?: CompassTapeMovers;
+  polymarket_odds?: PolymarketMacroOdds;
 }
 
 export interface CompassDriverItem {

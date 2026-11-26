@@ -29,6 +29,7 @@ import type {
   CompassScanContext,
   CrossAssetAnchorItem,
   DeepResearchEngine,
+  PolymarketEventItem,
   ResearchEnginesResponse,
   TaskEventEnvelope,
   TaskRecord,
@@ -135,6 +136,35 @@ function formatHeadlineValue(value: number | null, unit: string): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "—";
   if (unit === "$/t") return `$${Math.round(value).toLocaleString("en-US")}/t`;
   return `${value.toFixed(unit === "%" ? 2 : 1)}${unit}`;
+}
+
+function formatCompactUsd(val: number | null | undefined): string {
+  if (val === null || val === undefined || !Number.isFinite(val) || val <= 0) return "$0";
+  if (val >= 1_000_000) return `$${(val / 1_000_000).toFixed(1)}M`;
+  if (val >= 1_000) return `$${Math.round(val / 1_000)}K`;
+  return `$${Math.round(val)}`;
+}
+
+function formatPpDelta(val: number | null | undefined): string | null {
+  if (val === null || val === undefined || !Number.isFinite(val)) return null;
+  const rounded = Math.round(val * 10) / 10;
+  if (Math.abs(rounded) < 0.1) return null;
+  return `${rounded > 0 ? "+" : ""}${rounded.toFixed(1)}pp`;
+}
+
+function isSafePolymarketUrl(url: string | undefined): url is string {
+  return typeof url === "string" && /^https:\/\/polymarket\.com\/event\/[A-Za-z0-9_-]+$/.test(url);
+}
+
+function pricedInBandMeta(band: string | undefined) {
+  switch (band) {
+    case "consensus":
+      return { label: "已高度计价", cls: "border-accent/35 bg-accent/10 text-accent" };
+    case "contested":
+      return { label: "博弈分歧", cls: "border-warning/40 bg-warning/10 text-warning" };
+    default:
+      return { label: "尾部风险", cls: "border-hairline bg-elevated text-ink-2" };
+  }
 }
 
 const MONTHLY_MACRO_KEYS = new Set(["PCOPPUSDM", "FEDFUNDS", "M2SL", "CN_PMI"]);
@@ -742,6 +772,24 @@ export function Layer1CompassPanel({
     return Array.from(map.values());
   }, [macro]);
 
+  const polymarketGroups = useMemo(() => {
+    const events = macro?.polymarket_odds?.events ?? [];
+    const map = new Map<string, { key: string; label: string; rows: PolymarketEventItem[] }>();
+    for (const ev of events) {
+      const g = map.get(ev.category) ?? { key: ev.category, label: ev.category_label || ev.category, rows: [] };
+      g.rows.push(ev);
+      map.set(ev.category, g);
+    }
+    return Array.from(map.values());
+  }, [macro]);
+
+  const polymarketHeadlines = useMemo(() => {
+    const pm = macro?.polymarket_odds;
+    if (!pm) return [];
+    if (pm.headline_events && pm.headline_events.length > 0) return pm.headline_events.slice(0, 4);
+    return (pm.events ?? []).slice(0, 4);
+  }, [macro]);
+
   const payload = currentRun?.result ?? null;
   const directions = payload?.directions ?? [];
 
@@ -801,7 +849,7 @@ export function Layer1CompassPanel({
               className="btn btn-sm"
               disabled={macroLoading}
               onClick={() => void loadMacro(true)}
-              title="重新拉取 FRED / 国家统计局 / 25 个跨资产与国内期货定价锚（免费硬数据，零 AI 消耗）"
+              title="重新拉取 FRED / 国家统计局 / 25 个跨资产与国内期货定价锚 / Polymarket 预测市场赔率（免费硬数据，零 AI 消耗）"
             >
               <RefreshCw className={`h-3 w-3 ${macroLoading ? "animate-spin" : ""}`} aria-hidden="true" />
               <span>刷新宏观</span>
@@ -910,6 +958,145 @@ export function Layer1CompassPanel({
               </button>
             ))}
           </div>
+        ) : null}
+
+        {/* Compact Prediction Market Priced-In Radar (Polymarket Keyless Gamma API) */}
+        {polymarketHeadlines.length > 0 ? (
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-hairline-soft bg-sunken/40 px-2.5 py-1.5 text-[11px]">
+            <span className="font-semibold text-ink-2">预测市场定价 · Polymarket</span>
+            {polymarketHeadlines.map((ev) => {
+              const d7 = formatPpDelta(ev.leading_chg_7d_pp);
+              const d1 = formatPpDelta(ev.leading_chg_1d_pp);
+              const deltaText = d7 ?? d1;
+              const deltaTag = d7 ? "7D" : d1 ? "1D" : "";
+              const deltaNum = d7 ? ev.leading_chg_7d_pp : ev.leading_chg_1d_pp;
+              const band = pricedInBandMeta(ev.priced_in_band);
+              const pillBody = (
+                <>
+                  <span className="max-w-[165px] truncate font-sans text-ink">{ev.title}</span>
+                  <span className="font-sans text-[10px] text-muted">· {ev.leading_option}</span>
+                  <span className="font-semibold text-accent">{ev.leading_prob_pct.toFixed(1)}%</span>
+                  {deltaText ? (
+                    <span className={`text-[10px] ${signedToneClass(deltaNum ?? null)}`}>
+                      ({deltaTag} {deltaText})
+                    </span>
+                  ) : null}
+                </>
+              );
+              const tip = `${ev.category_label} · ${ev.title} | 主导：${ev.leading_option} ${ev.leading_prob_pct.toFixed(1)}% (${band.label}) | 24h成交 ${formatCompactUsd(ev.volume_24h_usd)} / 累计 ${formatCompactUsd(ev.volume_total_usd)}`;
+              return isSafePolymarketUrl(ev.url) ? (
+                <a
+                  key={`pm-head-${ev.id}`}
+                  href={ev.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 rounded border border-hairline bg-elevated/70 px-1.5 py-0.5 font-mono text-[10.5px] no-underline hover:border-accent/55"
+                  title={tip}
+                >
+                  {pillBody}
+                </a>
+              ) : (
+                <span
+                  key={`pm-head-${ev.id}`}
+                  className="inline-flex items-center gap-1 rounded border border-hairline bg-elevated/70 px-1.5 py-0.5 font-mono text-[10.5px]"
+                  title={tip}
+                >
+                  {pillBody}
+                </span>
+              );
+            })}
+          </div>
+        ) : null}
+
+        {/* On-demand Native Disclosure: Polymarket Macro / Tariffs / Geopolitics Odds */}
+        {polymarketGroups.length > 0 ? (
+          <details className="border-t border-hairline-soft pt-2">
+            <summary className="cursor-pointer select-none text-[11px] font-medium text-muted hover:text-ink">
+              展开 Polymarket 宏观利率 / 关税 / 地缘预测市场赔率（{macro?.polymarket_odds?.total_events ?? 0} 个高流动性活跃盘口 · 免费免 Key）
+            </summary>
+            <div className="mt-2.5 grid grid-cols-1 gap-3 lg:grid-cols-3">
+              {polymarketGroups.map((grp) => (
+                <div key={grp.key} className="rounded-md border border-hairline-soft bg-sunken/50 p-2.5">
+                  <div className="mb-2 flex items-center justify-between text-[11px] font-semibold text-ink-2">
+                    <span>{grp.label}</span>
+                    <span className="font-mono text-[10px] font-normal text-muted">{grp.rows.length} 项</span>
+                  </div>
+                  <div className="flex flex-col divide-y divide-hairline-soft">
+                    {grp.rows.map((ev) => {
+                      const band = pricedInBandMeta(ev.priced_in_band);
+                      return (
+                        <div key={ev.id} className="flex flex-col gap-1.5 py-2 first:pt-0 last:pb-0">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="min-w-0 flex-1">
+                              {isSafePolymarketUrl(ev.url) ? (
+                                <a
+                                  href={ev.url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1 text-[11.5px] font-medium leading-snug text-ink no-underline hover:text-accent"
+                                >
+                                  <span className="line-clamp-2">{ev.title}</span>
+                                  <ExternalLink className="h-2.5 w-2.5 shrink-0 opacity-65" aria-hidden="true" />
+                                </a>
+                              ) : (
+                                <span className="line-clamp-2 text-[11.5px] font-medium leading-snug text-ink">
+                                  {ev.title}
+                                </span>
+                              )}
+                            </div>
+                            <span
+                              className={`shrink-0 rounded border px-1 py-0.2 text-[9.5px] font-medium ${band.cls}`}
+                            >
+                              {band.label}
+                            </span>
+                          </div>
+                          <div className="flex flex-col gap-1">
+                            {ev.top_outcomes.map((o) => {
+                              const d1 = formatPpDelta(o.chg_1d_pp);
+                              const d7 = formatPpDelta(o.chg_7d_pp);
+                              const pct = Math.max(0, Math.min(100, o.prob_pct));
+                              return (
+                                <div key={`${ev.id}-${o.label}`} className="flex flex-col gap-0.5">
+                                  <div className="flex items-center justify-between gap-1.5 text-[10.5px] font-mono tabular-nums">
+                                    <span className="truncate font-sans text-ink-2">{o.label}</span>
+                                    <span className="flex shrink-0 items-center gap-1.5">
+                                      {d1 ? (
+                                        <span className={`text-[9.5px] ${signedToneClass(o.chg_1d_pp ?? null)}`} title="24小时赔率变化">
+                                          1D {d1}
+                                        </span>
+                                      ) : null}
+                                      {d7 ? (
+                                        <span className={`text-[9.5px] ${signedToneClass(o.chg_7d_pp ?? null)}`} title="7日赔率变化">
+                                          7D {d7}
+                                        </span>
+                                      ) : null}
+                                      <span className="w-10 text-right font-semibold text-ink">{pct.toFixed(1)}%</span>
+                                    </span>
+                                  </div>
+                                  <div className="h-1 w-full overflow-hidden rounded-full bg-hairline-soft">
+                                    <div
+                                      className="h-full rounded-full bg-accent/70"
+                                      style={{ width: `${pct}%` }}
+                                    />
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                          <div className="flex items-center justify-between font-mono text-[9.5px] text-muted">
+                            <span>
+                              24h {formatCompactUsd(ev.volume_24h_usd)} · 累计 {formatCompactUsd(ev.volume_total_usd)}
+                            </span>
+                            {ev.end_date ? <span>截止 {ev.end_date}</span> : null}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </details>
         ) : null}
 
         {/* On-demand Native Disclosure: 25 Cross-Asset & CN Futures Pricing Anchors (20D / 60D Relative Strength) */}

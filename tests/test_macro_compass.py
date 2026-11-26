@@ -17,6 +17,7 @@ from backend import deep_research, macro_compass
 from backend.cache import CACHE
 import data_store
 import research_archive
+import research_extensions
 import scan_opportunities
 
 
@@ -514,6 +515,16 @@ def test_collect_macro_overview_nonblocking_timeout_stale_fallback_and_coalescin
     fake_cn = {"status": "ok", "pmi": {"status": "ok", "records": [{"月份": "2026年10月份", "制造业-指数": 49.5}]}}
     fake_anc = {"status": "ok", "ok_count": 1, "total": 1, "items": []}
     fake_cn_anc = {"status": "ok", "ok_count": 1, "total": 1, "items": []}
+    fake_pm = {
+        "status": "ok",
+        "source": "Polymarket Gamma API",
+        "fetched_at_utc": "2026-11-26T00:00:00+00:00",
+        "total_events": 1,
+        "categories_ok": 3,
+        "categories_total": 3,
+        "headline_events": [],
+        "events": [],
+    }
 
     # Seed last-known-good first
     with (
@@ -522,9 +533,11 @@ def test_collect_macro_overview_nonblocking_timeout_stale_fallback_and_coalescin
         patch.object(macro_compass.research_data, "fetch_china_macro_core", return_value=fake_cn),
         patch.object(macro_compass, "fetch_cross_asset_anchors", return_value=fake_anc),
         patch.object(macro_compass, "fetch_cn_futures_anchors", return_value=fake_cn_anc),
+        patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=fake_pm),
     ):
         good = macro_compass.collect_macro_overview(refresh=True)
         assert good["sources_status"]["cn_macro"] == "ok"
+        assert good["sources_status"]["polymarket_odds"] == "ok"
 
     # Now make cn_macro sleep 0.35s while overall deadline is 0.06s -> must return promptly & mark stale!
     call_counter = {"live": 0}
@@ -545,6 +558,7 @@ def test_collect_macro_overview_nonblocking_timeout_stale_fallback_and_coalescin
         patch.object(macro_compass.research_data, "fetch_china_macro_core", side_effect=slow_cn),
         patch.object(macro_compass, "fetch_cross_asset_anchors", return_value=fake_anc),
         patch.object(macro_compass, "fetch_cn_futures_anchors", return_value=fake_cn_anc),
+        patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=fake_pm),
     ):
         t0 = time.monotonic()
         # Concurrent callers must coalesce into ONE upstream batch
@@ -967,5 +981,177 @@ def test_codex_review_regressions_a_share_bypasses_stale_breadth_mixed_radar_and
     ):
         cs = macro_compass._read_cached_cn_future_close("CU0")
     assert cs is not None and len(cs) == 80
+
+
+def test_polymarket_parser_filters_noise_parses_odds_and_injects_into_brief_and_prompt():
+    raw_by_category = {
+        "macro_rates": [
+            {
+                "id": "770450",
+                "title": "Fed Decision in December?",
+                "slug": "fed-decision-in-december",
+                "active": True,
+                "closed": False,
+                "volume24hr": 5_000_000,
+                "volume": 60_000_000,
+                "endDate": "2026-12-10T04:59:00Z",
+                "markets": [
+                    {
+                        "groupItemTitle": "25 bps increase",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.935", "0.065"]',
+                        "oneDayPriceChange": 0.005,
+                        "oneWeekPriceChange": 0.02,
+                        "volume": "13000000",
+                        "active": True,
+                        "closed": False,
+                    },
+                    {
+                        "groupItemTitle": "No change",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.038", "0.962"]',
+                        "oneDayPriceChange": -0.005,
+                        "oneWeekPriceChange": -0.015,
+                        "volume": "16000000",
+                        "active": True,
+                        "closed": False,
+                    },
+                    {
+                        "groupItemTitle": "50+ bps decrease",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.002", "0.998"]',
+                        "volume": "9000000",
+                        "active": True,
+                        "closed": False,
+                    },
+                    {
+                        "groupItemTitle": "Closed option",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["1", "0"]',
+                        "volume": "5000000",
+                        "active": True,
+                        "closed": True,
+                    },
+                ],
+            },
+            # Noise: market cap game -> MUST be filtered out
+            {
+                "id": "noise-mcap",
+                "title": "Largest Company end of December 2026?",
+                "slug": "largest-company-dec-2026",
+                "active": True,
+                "closed": False,
+                "volume24hr": 900_000,
+                "volume": 12_000_000,
+                "markets": [
+                    {"groupItemTitle": "Apple", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.91", "0.09"]', "active": True, "closed": False}
+                ],
+            },
+            # Noise: tiny illiquid market -> MUST be filtered out
+            {
+                "id": "illiquid-1",
+                "title": "Minor GDP revision?",
+                "slug": "minor-gdp-revision",
+                "active": True,
+                "closed": False,
+                "volume24hr": 100,
+                "volume": 500,
+                "markets": [
+                    {"outcomes": '["Yes", "No"]', "outcomePrices": '["0.5", "0.5"]', "active": True, "closed": False}
+                ],
+            },
+        ],
+        "trade_tariffs": [
+            {
+                "id": "1065849",
+                "title": "U.S. tariff rate on China on December 31, 2026?",
+                "slug": "us-tariff-rate-on-china",
+                "active": True,
+                "closed": False,
+                "volume24hr": 21_000,
+                "volume": 52_000,
+                "endDate": "2026-12-31T00:00:00Z",
+                "markets": [
+                    {
+                        "groupItemTitle": "5-15%",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.885", "0.115"]',
+                        "oneDayPriceChange": 0.195,
+                        "oneWeekPriceChange": -0.03,
+                        "volume": "20718",
+                        "active": True,
+                        "closed": False,
+                    }
+                ],
+            },
+        ],
+        "geopolitics": [
+            # Test bad slug URL stripping on binary event
+            {
+                "id": "geo-1",
+                "title": "Major regional ceasefire holds through Q1?",
+                "slug": "bad/slug?evil=1",
+                "active": True,
+                "closed": False,
+                "volume24hr": 250_000,
+                "volume": 3_000_000,
+                "endDate": "2027-03-31T00:00:00Z",
+                "markets": [
+                    {
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.52", "0.48"]',
+                        "oneDayPriceChange": -0.04,
+                        "oneWeekPriceChange": 0.08,
+                        "volume": "3000000",
+                        "active": True,
+                        "closed": False,
+                    }
+                ],
+            },
+        ],
+    }
+
+    parsed = research_extensions.parse_polymarket_events(
+        raw_by_category,
+        fetched_at_utc="2026-11-26T08:00:00+00:00",
+    )
+    assert parsed["status"] == "ok"
+    assert parsed["total_events"] == 3
+    assert [ev["id"] for ev in parsed["events"]] == ["770450", "1065849", "geo-1"]
+
+    fed = parsed["events"][0]
+    assert fed["leading_option"] == "25 bps increase"
+    assert fed["leading_prob_pct"] == 93.5
+    assert fed["leading_chg_7d_pp"] == 2.0
+    assert fed["priced_in_band"] == "consensus"
+    assert fed["url"] == "https://polymarket.com/event/fed-decision-in-december"
+    # Closed option excluded, <0.5% 3rd option dropped once >=2 options present
+    assert len(fed["top_outcomes"]) == 2
+
+    geo = parsed["events"][2]
+    assert geo["market_type"] == "binary"
+    assert geo["priced_in_band"] == "contested"
+    assert geo["leading_prob_pct"] == 52.0
+    # Unsafe slug MUST NOT produce a URL
+    assert geo["url"] == ""
+
+    # Headline selection ensures all 3 categories are represented
+    assert {ev["category"] for ev in parsed["headline_events"]} == {"macro_rates", "trade_tariffs", "geopolitics"}
+
+    # Brief & prompt integration (zero hardcoded ticker anchoring)
+    brief = macro_compass.build_compass_brief(
+        macro_overview={
+            "fetched_at_utc": "2026-11-26T08:00:00+00:00",
+            "headline_metrics": [],
+            "polymarket_odds": parsed,
+        }
+    )
+    assert brief["polymarket_odds"]["status"] == "ok"
+    assert len(brief["polymarket_odds"]["events"]) == 3
+    prompt = macro_compass.build_compass_prompt(brief_path="/tmp/brief.json")
+    assert "polymarket_odds" in prompt
+    for anchor_token in ("existing_universes", "NI0", "AUDUSD", "RKAB", "霍尔木兹", "GEV", "XLU", "PWR"):
+        assert anchor_token not in prompt
+
 
 

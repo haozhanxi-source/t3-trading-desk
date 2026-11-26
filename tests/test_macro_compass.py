@@ -1668,6 +1668,46 @@ def test_polymarket_round2_regressions_missing_subdate_full_vector_dedup_ttl_and
             assert r4["polymarket_odds"]["status"] == "ok"
             assert "polymarket_odds" not in (r4.get("stale_sources") or {})
 
+        # Double-checked locking race: caller A sees outer cache miss and pauses BEFORE acquiring
+        # _PM_RETRY_INFLIGHT_LOCK while caller B completes the refresh & clears future -> A MUST reuse B's cached result!
+        CACHE.invalidate(("compass_polymarket_odds",))
+        dcl_calls = {"count": 0}
+        a_saw_miss = threading.Event()
+        b_finished = threading.Event()
+        orig_cache_get = CACHE.get
+        outer_miss_holder = {"seen": False}
+
+        def staged_cache_get(key):
+            res = orig_cache_get(key)
+            if key == ("compass_polymarket_odds",) and not res[0] and not outer_miss_holder["seen"]:
+                outer_miss_holder["seen"] = True
+                a_saw_miss.set()
+                b_finished.wait(timeout=2.0)
+            return res
+
+        def counted_pm_fetch(*_args, **_kwargs):
+            dcl_calls["count"] += 1
+            return pm_full
+
+        dcl_results: dict[str, dict] = {}
+        with (
+            patch.object(CACHE, "get", side_effect=staged_cache_get),
+            patch.object(macro_compass, "fetch_polymarket_macro_odds", side_effect=counted_pm_fetch),
+        ):
+            t_a = threading.Thread(target=lambda: dcl_results.__setitem__("a", macro_compass._overlay_polymarket_on_overview(r2, macro_compass._refresh_polymarket_singleflight())))
+            t_a.start()
+            assert a_saw_miss.wait(timeout=2.0)
+            # Caller B runs to completion while Caller A is paused before taking _PM_RETRY_INFLIGHT_LOCK
+            dcl_results["b"] = macro_compass._overlay_polymarket_on_overview(
+                r2,
+                macro_compass._refresh_polymarket_singleflight(),
+            )
+            b_finished.set()
+            t_a.join(timeout=2.0)
+
+        assert dcl_calls["count"] == 1
+        assert dcl_results["a"]["polymarket_odds"] == dcl_results["b"]["polymarket_odds"]
+
 
 
 

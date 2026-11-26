@@ -1218,6 +1218,11 @@ def _refresh_polymarket_singleflight(
 
     leader = False
     with _PM_RETRY_INFLIGHT_LOCK:
+        # Double-check inside the lock so a caller paused between the outer cache miss
+        # and acquiring the lock reuses the snapshot populated by an earlier winner.
+        hit2, existing_pm2 = CACHE.get(pm_cache_key)
+        if hit2 and isinstance(existing_pm2, tuple) and len(existing_pm2) == 3:
+            return existing_pm2
         if _PM_RETRY_INFLIGHT_FUTURE is not None and not _PM_RETRY_INFLIGHT_FUTURE.done():
             shared_future = _PM_RETRY_INFLIGHT_FUTURE
         else:

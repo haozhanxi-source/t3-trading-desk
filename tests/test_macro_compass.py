@@ -1477,5 +1477,164 @@ def test_polymarket_codex_review_regressions_ladder_malformed_vectors_timeout_an
             assert all(ev.get("stale_fallback") is True for ev in res_err["polymarket_odds"]["events"])
 
 
+def test_polymarket_round2_regressions_missing_subdate_full_vector_dedup_ttl_and_accepting():
+    # 1. Date ladder whose representative sub-market lacks end_date MUST NOT backfill parent endDate
+    #    Full price/outcome vector validation rejects malformed OTHER side (empty label, null, >1.0)
+    #    Missing acceptingOrders MUST yield accepting_orders=False (not True)
+    raw = {
+        "geopolitics": [
+            {
+                "id": "ladder-missing-subdate",
+                "title": "Ceasefire continues through...?",
+                "slug": "ceasefire-missing-subdate",
+                "active": True,
+                "closed": False,
+                "negRisk": False,
+                "volume24hr": 200_000,
+                "volume": 2_000_000,
+                "endDate": "2026-12-31T00:00:00Z",
+                "markets": [
+                    {
+                        "groupItemTitle": "November 30",
+                        "endDateIso": "2026-11-30",
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.95", "0.05"]',
+                        "active": True,
+                        "closed": False,
+                    },
+                    {
+                        "groupItemTitle": "December 15",
+                        # Missing endDate / endDateIso on purpose!
+                        "outcomes": '["Yes", "No"]',
+                        "outcomePrices": '["0.70", "0.30"]',
+                        "active": True,
+                        "closed": False,
+                    },
+                ],
+            },
+        ],
+        "macro_rates": [
+            {
+                "id": "bad-other-side",
+                "title": "Malformed counterparty vectors?",
+                "slug": "malformed-counterparty",
+                "active": True,
+                "closed": False,
+                "negRisk": True,
+                "volume24hr": 50_000,
+                "volume": 500_000,
+                "markets": [
+                    {"groupItemTitle": "EmptyOtherLabel", "outcomes": '["Yes", ""]', "outcomePrices": '["0.6", "0.4"]', "active": True, "closed": False},
+                    {"groupItemTitle": "NullOtherPrice", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.6", null]', "active": True, "closed": False},
+                    {"groupItemTitle": "OverOneOtherPrice", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.6", "1.2"]', "active": True, "closed": False},
+                ],
+            },
+        ],
+    }
+    parsed = research_extensions.parse_polymarket_events(raw, fetched_at_utc="2026-11-26T08:00:00+00:00")
+    by_id = {ev["id"]: ev for ev in parsed["events"]}
+    assert "bad-other-side" not in by_id
+
+    ladder = by_id["ladder-missing-subdate"]
+    assert ladder["market_type"] == "date_ladder"
+    assert ladder["leading_option"] == "December 15"
+    assert ladder["leading_prob_pct"] == 70.0
+    # Must NOT borrow parent event endDate '2026-12-31'
+    assert ladder["leading_end_date"] is None
+    # Missing acceptingOrders must NOT fabricate True
+    assert ladder["accepting_orders"] is False
+
+    # 2. Cross-category dedup across fresh + cached fallback: same event ID MUST NEVER duplicate in events or headlines
+    #    AND core 5-source 600s TTL MUST NOT shrink when only Polymarket degrades, while Polymarket retries independently
+    CACHE.clear()
+    macro_compass.clear_macro_source_cache()
+    shared_event_old = {
+        "id": "shared-tariff-99",
+        "title": "U.S. tariff rate on China?",
+        "slug": "us-tariff-rate-99",
+        "active": True,
+        "closed": False,
+        "negRisk": True,
+        "volume24hr": 50_000,
+        "volume": 500_000,
+        "endDate": "2026-12-31T00:00:00Z",
+        "markets": [
+            {"groupItemTitle": "5-15%", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.80", "0.20"]', "active": True, "closed": False, "acceptingOrders": True}
+        ],
+    }
+    shared_event_new = {
+        **shared_event_old,
+        "markets": [
+            {"groupItemTitle": "5-15%", "outcomes": '["Yes", "No"]', "outcomePrices": '["0.88", "0.12"]', "active": True, "closed": False, "acceptingOrders": True}
+        ],
+    }
+    pm_full = research_extensions.parse_polymarket_events(
+        {"macro_rates": [shared_event_old], "trade_tariffs": [shared_event_old], "geopolitics": []},
+        fetched_at_utc="2026-11-26T08:00:00+00:00",
+    )
+    pm_partial_overlap = research_extensions.parse_polymarket_events(
+        {"macro_rates": [shared_event_new]},
+        category_errors={"trade_tariffs": "timeout", "geopolitics": "timeout"},
+        fetched_at_utc="2026-11-26T08:05:00+00:00",
+    )
+
+    core_calls = {"live": 0}
+    fake_live = {"VIX": {"last": 20.0, "chg_1d_pct": 0.0, "as_of": "2026-11-26"}}
+    fake_fred = {"status": "ok", "series": {}}
+    fake_cn = {"status": "ok", "pmi": {"status": "error"}}
+    fake_anc = {"status": "ok", "ok_count": 1, "total": 1, "items": []}
+    fake_cn_anc = {"status": "ok", "ok_count": 1, "total": 1, "items": []}
+
+    def tracked_live():
+        core_calls["live"] += 1
+        return fake_live
+
+    recorded_ttls: list[tuple[tuple, float]] = []
+    orig_cache_set = CACHE.set
+
+    def spy_cache_set(key, value, ttl):
+        recorded_ttls.append((key, ttl))
+        return orig_cache_set(key, value, ttl)
+
+    with (
+        patch.object(macro_compass.market_snapshot, "fetch_macro_context", side_effect=tracked_live),
+        patch.object(macro_compass.research_data, "fetch_fred_macro", return_value=fake_fred),
+        patch.object(macro_compass.research_data, "fetch_china_macro_core", return_value=fake_cn),
+        patch.object(macro_compass, "fetch_cross_asset_anchors", return_value=fake_anc),
+        patch.object(macro_compass, "fetch_cn_futures_anchors", return_value=fake_cn_anc),
+        patch.object(CACHE, "set", side_effect=spy_cache_set),
+    ):
+        with patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=pm_full):
+            r1 = macro_compass.collect_macro_overview(refresh=True)
+            assert [ev["id"] for ev in r1["polymarket_odds"]["events"]] == ["shared-tariff-99"]
+            assert r1["polymarket_odds"]["events"][0]["category"] == "trade_tariffs"
+
+        recorded_ttls.clear()
+        with patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=pm_partial_overlap):
+            r2 = macro_compass.collect_macro_overview(refresh=True)
+            # Zero duplicate IDs in events or headlines, ownership stays trade_tariffs with refreshed 88% odds!
+            ev_ids = [ev["id"] for ev in r2["polymarket_odds"]["events"]]
+            hl_ids = [ev["id"] for ev in r2["polymarket_odds"]["headline_events"]]
+            assert ev_ids == ["shared-tariff-99"]
+            assert hl_ids == ["shared-tariff-99"]
+            assert r2["polymarket_odds"]["events"][0]["category"] == "trade_tariffs"
+            assert r2["polymarket_odds"]["events"][0]["leading_prob_pct"] == 88.0
+
+        # Core 5 sources are all ok -> main overview cache MUST keep full 600s TTL; Polymarket slot gets 60s
+        ttl_by_key = dict(recorded_ttls)
+        assert ttl_by_key[("compass_macro_overview",)] == macro_compass.TTL_COMPASS_MACRO_SECONDS
+        assert ttl_by_key[("compass_polymarket_odds",)] == macro_compass.TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS
+
+        # Simulate independent Polymarket slot expiring while main overview cache is still hot -> ONLY Polymarket retries!
+        CACHE.invalidate(("compass_polymarket_odds",))
+        live_before = core_calls["live"]
+        with patch.object(macro_compass, "fetch_polymarket_macro_odds", return_value=pm_full):
+            r3 = macro_compass.collect_macro_overview(refresh=False)
+            assert core_calls["live"] == live_before
+            assert r3["sources_status"]["polymarket_odds"] == "ok"
+            assert r3["polymarket_odds"]["status"] == "ok"
+
+
+
 
 

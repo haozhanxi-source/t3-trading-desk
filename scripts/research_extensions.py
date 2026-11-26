@@ -2678,27 +2678,28 @@ def _pm_extract_yes_prob(
 ) -> tuple[str | None, float | None, bool]:
     """Strictly extract primary outcome label, probability in [0, 1], and whether index 0 was used.
 
-    Validates 1-to-1 alignment between ``outcomes`` and ``prices`` so malformed or reversed
-    vectors can never turn a 'No' price into a 'Yes' probability.
+    Validates 1-to-1 alignment and value bounds across EVERY element of ``outcomes`` and ``prices``
+    so malformed or reversed vectors can never leak invalid probabilities.
     """
     if len(outcomes) < 2 or len(outcomes) != len(prices):
         return None, None, False
+    cleaned_labels: list[str] = []
+    cleaned_prices: list[float] = []
     yes_idx: int | None = None
-    for idx, label in enumerate(outcomes):
-        if str(label or "").strip().lower() == "yes":
+    for idx, (label, raw_price) in enumerate(zip(outcomes, prices)):
+        lbl = str(label or "").strip()
+        prob = _pm_to_float(raw_price)
+        if not lbl or prob is None or prob < 0.0 or prob > 1.0:
+            return None, None, False
+        cleaned_labels.append(lbl)
+        cleaned_prices.append(prob)
+        if lbl.lower() == "yes" and yes_idx is None:
             yes_idx = idx
-            break
     if require_yes and yes_idx is None:
         return None, None, False
 
     target_idx = yes_idx if yes_idx is not None else 0
-    lbl = str(outcomes[target_idx] or "").strip()
-    if not lbl:
-        return None, None, False
-    raw_prob = _pm_to_float(prices[target_idx])
-    if raw_prob is None or raw_prob < 0.0 or raw_prob > 1.0:
-        return None, None, False
-    return lbl, raw_prob, (target_idx == 0)
+    return cleaned_labels[target_idx], cleaned_prices[target_idx], (target_idx == 0)
 
 
 def _pm_valid_delta_pp(raw_delta: Any, *, trust_sign: bool) -> float | None:
@@ -2829,7 +2830,7 @@ def _parse_single_polymarket_event(
                 "volume_24h_usd": round(m_vol_24h, 0) if m_vol_24h is not None else None,
                 "liquidity_usd": round(m_liq, 0) if m_liq is not None else None,
                 "end_date": m_end_date,
-                "accepting_orders": m.get("acceptingOrders") is not False,
+                "accepting_orders": m.get("acceptingOrders") is True,
             }
         )
 
@@ -2895,8 +2896,14 @@ def _parse_single_polymarket_event(
     slug = str(raw_event.get("slug") or "").strip()
     url = f"https://polymarket.com/event/{slug}" if slug and _POLYMARKET_SLUG_RE.match(slug) else ""
     event_end_date = _pm_extract_iso_date(raw_event.get("endDate"))
-    leading_end_date = leading.get("end_date") or event_end_date
+    # For date_ladder, NEVER backfill parent event endDate when the representative sub-market lacks its own end_date!
+    leading_end_date = (
+        leading.get("end_date")
+        if market_type == "date_ladder"
+        else (leading.get("end_date") or event_end_date)
+    )
     end_date_passed = bool(event_end_date and event_end_date < today_utc)
+    event_accepting = any(o.get("accepting_orders") is True for o in top_outcomes)
     event_liq = _pm_to_float(raw_event.get("liquidity"))
     raw_tags = [
         str(t.get("slug") or t.get("label") or "").strip()
@@ -2915,7 +2922,7 @@ def _parse_single_polymarket_event(
         "end_date": event_end_date,
         "leading_end_date": leading_end_date,
         "end_date_passed": end_date_passed,
-        "accepting_orders": True,
+        "accepting_orders": event_accepting,
         "market_type": market_type,
         "volume_24h_usd": round(vol_24h, 0),
         "volume_total_usd": round(vol_total, 0),
@@ -2940,10 +2947,11 @@ def _build_polymarket_headlines(
     headline_ids: set[str] = set()
     for spec in POLYMARKET_CATEGORY_SPECS:
         cat_list = by_cat.get(spec["key"]) or []
-        if cat_list:
-            top = cat_list[0]
-            headline.append(top)
-            headline_ids.add(top["id"])
+        for cand in cat_list:
+            if cand["id"] not in headline_ids:
+                headline.append(cand)
+                headline_ids.add(cand["id"])
+                break
     remaining = sorted(
         [ev for ev in ordered_events if ev["id"] not in headline_ids],
         key=lambda e: (-float(e.get("volume_24h_usd") or 0.0), -float(e.get("volume_total_usd") or 0.0), str(e.get("id") or "")),

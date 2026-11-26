@@ -42,7 +42,7 @@ Emit = Callable[[str, dict[str, Any]], None]
 CommitResultFn = Callable[[Callable[[], Any]], Any]
 
 TTL_COMPASS_MACRO_SECONDS = 600.0
-TTL_COMPASS_MACRO_POLYMARKET_DEGRADED_SECONDS = 120.0
+TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS = 60.0
 TTL_COMPASS_MACRO_DEGRADED_SECONDS = 30.0
 CORE_MACRO_SOURCES: tuple[str, ...] = (
     "live_macro",
@@ -890,10 +890,49 @@ def _resolve_polymarket_source(
                     ]
                     stale_categories.append(ck)
 
+    # Re-apply cross-category deduplication by specificity (trade_tariffs > geopolitics > macro_rates)
+    # so merging fresh lower-specificity categories with cached higher-specificity categories can NEVER emit duplicate IDs.
+    fresh_event_by_id: dict[str, dict[str, Any]] = {}
+    for ck in fresh_by_cat:
+        for ev in merged_by_cat.get(ck) or []:
+            ev_id = str(ev.get("id") or "")
+            if ev_id and ev_id not in fresh_event_by_id:
+                fresh_event_by_id[ev_id] = ev
+
+    specs_by_specificity = sorted(
+        research_extensions.POLYMARKET_CATEGORY_SPECS,
+        key=lambda s: -int(s.get("specificity") or 0),
+    )
+    dedup_seen_ids: set[str] = set()
+    deduped_by_cat: dict[str, list[dict[str, Any]]] = {}
+    for spec in specs_by_specificity:
+        ck = str(spec["key"])
+        cat_label = str(spec["label"])
+        cat_list: list[dict[str, Any]] = []
+        for ev in merged_by_cat.get(ck) or []:
+            ev_id = str(ev.get("id") or "")
+            if not ev_id or ev_id in dedup_seen_ids:
+                continue
+            dedup_seen_ids.add(ev_id)
+            # If a cached higher-specificity entry also arrived freshly in a broader tag, refresh its live odds while preserving category ownership
+            if ev.get("stale_fallback") and ev_id in fresh_event_by_id:
+                fresher = fresh_event_by_id[ev_id]
+                cat_list.append(
+                    {
+                        **fresher,
+                        "category": ck,
+                        "category_label": cat_label,
+                        "stale_fallback": False,
+                    }
+                )
+            else:
+                cat_list.append(ev)
+        deduped_by_cat[ck] = cat_list
+
     ordered_events: list[dict[str, Any]] = []
     for ck in spec_keys:
-        ordered_events.extend(merged_by_cat.get(ck) or [])
-    headlines = research_extensions._build_polymarket_headlines(merged_by_cat, ordered_events)
+        ordered_events.extend(deduped_by_cat.get(ck) or [])
+    headlines = research_extensions._build_polymarket_headlines(deduped_by_cat, ordered_events)
 
     fresh_count = len(fresh_by_cat)
     err_summary = err_str or (
@@ -1115,12 +1154,10 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
     headline_metrics, regime_tags = _build_headline_metrics_and_tags(live_ctx, fred_macro, china_macro)
     core_fresh = all(sources_status.get(k) in ("ok", "partial") for k in CORE_MACRO_SOURCES)
     pm_fresh = sources_status.get("polymarket_odds") == "ok"
-    if core_fresh and pm_fresh:
-        ttl = TTL_COMPASS_MACRO_SECONDS
-    elif core_fresh:
-        ttl = TTL_COMPASS_MACRO_POLYMARKET_DEGRADED_SECONDS
-    else:
-        ttl = TTL_COMPASS_MACRO_DEGRADED_SECONDS
+    # Core 5 sources keep full 600s TTL even if optional Polymarket Gamma API is degraded;
+    # Polymarket maintains its own independent retry cache slot below.
+    ttl = TTL_COMPASS_MACRO_SECONDS if core_fresh else TTL_COMPASS_MACRO_DEGRADED_SECONDS
+    pm_ttl = TTL_COMPASS_MACRO_SECONDS if pm_fresh else TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS
 
     bundle = sanitize(
         {
@@ -1139,7 +1176,49 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
         }
     )
     CACHE.set(("compass_macro_overview",), bundle, ttl)
+    CACHE.set(("compass_polymarket_odds",), (polymarket_odds, st_pm, stale_pm), pm_ttl)
     return bundle
+
+
+def _refresh_polymarket_into_cached_overview(
+    cached: dict[str, Any],
+    *,
+    timeout_seconds: float = 6.0,
+) -> dict[str, Any]:
+    """Independently retry degraded Polymarket odds without invalidating or re-fetching the core 5 macro sources."""
+    now_iso = _utc_iso()
+    try:
+        raw_pm = fetch_polymarket_macro_odds(timeout_seconds=min(6.0, max(0.2, timeout_seconds)))
+        err_pm = None
+    except Exception as exc:  # noqa: BLE001
+        raw_pm = None
+        err_pm = str(exc)
+
+    pm_odds, st_pm, stale_pm = _resolve_polymarket_source(raw_pm, err_pm, now_iso)
+    pm_ttl = TTL_COMPASS_MACRO_SECONDS if st_pm == "ok" else TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS
+    CACHE.set(("compass_polymarket_odds",), (pm_odds, st_pm, stale_pm), pm_ttl)
+
+    new_sources_status = {**(cached.get("sources_status") or {}), "polymarket_odds": st_pm}
+    new_stale = dict(cached.get("stale_sources") or {})
+    if stale_pm is not None:
+        new_stale["polymarket_odds"] = stale_pm
+    else:
+        new_stale.pop("polymarket_odds", None)
+
+    updated = sanitize(
+        {
+            **cached,
+            "cache_hit": True,
+            "sources_status": new_sources_status,
+            "stale_sources": new_stale,
+            "polymarket_odds": pm_odds,
+        }
+    )
+    # Mutate cached dict fields in-place so the core 5 sources' original cache expiry is preserved untouched
+    cached["sources_status"] = updated["sources_status"]
+    cached["stale_sources"] = updated["stale_sources"]
+    cached["polymarket_odds"] = updated["polymarket_odds"]
+    return updated
 
 
 def collect_macro_overview(
@@ -1153,6 +1232,13 @@ def collect_macro_overview(
     if not refresh:
         hit, cached = CACHE.get(cache_key)
         if hit and isinstance(cached, dict):
+            if (cached.get("sources_status") or {}).get("polymarket_odds") != "ok":
+                pm_hit, _ = CACHE.get(("compass_polymarket_odds",))
+                if not pm_hit:
+                    return _refresh_polymarket_into_cached_overview(
+                        cached,
+                        timeout_seconds=min(6.0, deadline_seconds * 0.85),
+                    )
             return {**cached, "cache_hit": True}
 
     leader = False

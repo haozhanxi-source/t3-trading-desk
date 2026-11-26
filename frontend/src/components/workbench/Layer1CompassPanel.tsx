@@ -1161,7 +1161,9 @@ export function Layer1CompassPanel({
                             {ev.end_date ? (
                               <span className={ev.end_date_passed ? "text-warning" : undefined}>
                                 {ev.end_date_passed
-                                  ? `原定 ${ev.end_date} (仍可交易)`
+                                  ? ev.accepting_orders === true
+                                    ? `原定 ${ev.end_date} (仍可交易)`
+                                    : `原定 ${ev.end_date} (已过原定日期)`
                                   : ev.market_type === "date_ladder"
                                     ? `最远期限 ${ev.end_date}`
                                     : `截止 ${ev.end_date}`}

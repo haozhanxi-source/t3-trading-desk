@@ -272,6 +272,7 @@ def _anchor_item_from_close_series(
             "ret_5d_pct": None,
             "ret_20d_pct": None,
             "ret_60d_pct": None,
+            "range_pos_6m_pct": None,
             "as_of": None,
         }
     n_bars = len(close_series)
@@ -280,6 +281,12 @@ def _anchor_item_from_close_series(
     p5 = _to_float(close_series.iloc[-6]) if n_bars >= 6 else None
     p20 = _to_float(close_series.iloc[-21]) if n_bars >= 21 else None
     p60 = _to_float(close_series.iloc[-61]) if n_bars >= 61 else None
+    range_pos_6m: float | None = None
+    if last is not None and n_bars >= 20:
+        hi_6m = _to_float(close_series.max())
+        lo_6m = _to_float(close_series.min())
+        if hi_6m is not None and lo_6m is not None and hi_6m > lo_6m:
+            range_pos_6m = round(max(0.0, min(100.0, (last - lo_6m) / (hi_6m - lo_6m) * 100.0)), 1)
     as_of_raw = close_series.index[-1]
     as_of = as_of_raw.strftime("%Y-%m-%d") if hasattr(as_of_raw, "strftime") else str(as_of_raw)[:10]
     is_stale = bool(stale_fallback) or _is_bar_stale(as_of)
@@ -290,6 +297,7 @@ def _anchor_item_from_close_series(
         "ret_5d_pct": _safe_pct_change(last, p5),
         "ret_20d_pct": _safe_pct_change(last, p20),
         "ret_60d_pct": _safe_pct_change(last, p60),
+        "range_pos_6m_pct": range_pos_6m,
         "as_of": as_of,
     }
     if is_stale:
@@ -385,6 +393,45 @@ def _fetch_single_cn_future_anchor(
             as_of = str(tech.get("as_of_bar") or "")[:10] or None
             if last is not None:
                 is_stale = _is_bar_stale(as_of)
+                dq = snap.get("data_quality") if isinstance(snap.get("data_quality"), dict) else {}
+                dq_degraded = bool(dq.get("quality_grade") == "degraded" or dq.get("actionable_allowed") is False)
+                cl_raw = snap.get("chanlun") if isinstance(snap.get("chanlun"), dict) else {}
+                chanlun_hint: dict[str, Any] | None = None
+                if cl_raw and not cl_raw.get("error"):
+                    sig_sum = cl_raw.get("signal_summary") if isinstance(cl_raw.get("signal_summary"), dict) else {}
+                    st_meta = sig_sum.get("signal_meta") if isinstance(sig_sum.get("signal_meta"), dict) else {}
+                    daily_cl = cl_raw.get("daily") if isinstance(cl_raw.get("daily"), dict) else {}
+                    if dq_degraded or not daily_cl or daily_cl.get("error"):
+                        chanlun_hint = {
+                            "direction": "unknown",
+                            "confirmed": False,
+                            "zd": None,
+                            "zg": None,
+                            "shield_state": "unknown_structure",
+                        }
+                    else:
+                        lz = daily_cl.get("latest_zhongshu") if isinstance(daily_cl.get("latest_zhongshu"), dict) else {}
+                        zd_v = _to_float(lz.get("zd"))
+                        zg_v = _to_float(lz.get("zg"))
+                        cl_dir = str(st_meta.get("direction") or "neutral")
+                        cl_conf = bool(st_meta.get("confirmed"))
+                        if zd_v is None:
+                            shield_state = "unknown_structure"
+                        elif last < zd_v:
+                            shield_state = "below_zd_breakdown"
+                        elif cl_dir == "short" and cl_conf:
+                            shield_state = "high_sell_above_zd_watch"
+                        elif cl_dir == "long":
+                            shield_state = "bullish_shield_intact"
+                        else:
+                            shield_state = "unknown_structure"
+                        chanlun_hint = {
+                            "direction": cl_dir,
+                            "confirmed": cl_conf,
+                            "zd": zd_v,
+                            "zg": zg_v,
+                            "shield_state": shield_state,
+                        }
                 item: dict[str, Any] = {
                     **meta,
                     "status": "stale" if is_stale else "ok",
@@ -392,8 +439,11 @@ def _fetch_single_cn_future_anchor(
                     "ret_5d_pct": _to_float(tech.get("return_5d_pct")),
                     "ret_20d_pct": _to_float(tech.get("return_20d_pct")),
                     "ret_60d_pct": _to_float(tech.get("return_60d_pct")),
+                    "range_pos_6m_pct": None,
                     "as_of": as_of,
                 }
+                if chanlun_hint is not None:
+                    item["chanlun_hint"] = chanlun_hint
                 if is_stale:
                     item["stale_fallback"] = True
                 return item
@@ -1499,6 +1549,244 @@ def _detect_portfolio_overlap(
     return overlaps
 
 
+_RESOLVED_CHANLUN_SHIELD_STATES = frozenset(
+    {"bullish_shield_intact", "high_sell_above_zd_watch", "below_zd_breakdown"}
+)
+MAX_COMPASS_DIRECTIONS = 5
+
+
+def compute_constitutional_diagnostics(
+    *,
+    macro_overview: dict[str, Any],
+    anchor_items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Derive deterministic, zero-latency telemetry for the 4 Ratified Constitutional Articles."""
+    sources_status = macro_overview.get("sources_status") if isinstance(macro_overview.get("sources_status"), dict) else {}
+    stale_sources = macro_overview.get("stale_sources") if isinstance(macro_overview.get("stale_sources"), dict) else {}
+    fred_is_stale = ("us_fred" in stale_sources) or (sources_status.get("us_fred") == "stale")
+    live_is_stale = ("live_macro" in stale_sources) or (sources_status.get("live_macro") == "stale")
+
+    fred_series = ((macro_overview.get("us_fred") or {}).get("series") or {}) if isinstance(macro_overview.get("us_fred"), dict) else {}
+    live_macro = macro_overview.get("live_macro") if isinstance(macro_overview.get("live_macro"), dict) else {}
+
+    def _is_obs_fresh(obs_dt: str | None, *, max_age_days: int = 10) -> bool:
+        if not obs_dt or not _is_valid_iso_date(obs_dt):
+            return False
+        return not _is_bar_stale(obs_dt[:10], max_age_days=max_age_days)
+
+    def _fval(sid: str) -> tuple[float | None, float | None, str | None]:
+        row = fred_series.get(sid)
+        if not isinstance(row, dict) or row.get("status") != "ok":
+            return None, None, None
+        v = _to_float(row.get("latest_value") if row.get("latest_value") is not None else row.get("latest"))
+        dt = str(row.get("latest_date") or "").strip()[:10] or None
+        return v, _to_float(row.get("change")), dt
+
+    dfii10, dfii10_chg, dfii10_dt = _fval("DFII10")
+    t10yie, _, t10yie_dt = _fval("T10YIE")
+    dgs10, dgs10_chg, dgs10_dt = _fval("DGS10")
+    fedfunds, _, fedfunds_dt = _fval("FEDFUNDS")
+
+    dfii10_fresh = (dfii10 is not None) and (not fred_is_stale) and _is_obs_fresh(dfii10_dt, max_age_days=10)
+    t10yie_fresh = (t10yie is not None) and (not fred_is_stale) and _is_obs_fresh(t10yie_dt, max_age_days=10)
+    dgs10_fresh = (dgs10 is not None) and (not fred_is_stale) and _is_obs_fresh(dgs10_dt, max_age_days=10)
+    fedfunds_fresh = (fedfunds is not None) and (not fred_is_stale) and _is_obs_fresh(fedfunds_dt, max_age_days=45)
+    dfii10_status = "ok" if dfii10_fresh else ("stale" if dfii10 is not None else "missing")
+
+    vix_obj = live_macro.get("VIX") if isinstance(live_macro.get("VIX"), dict) else {}
+    us10y_obj = live_macro.get("US10Y_Yield") if isinstance(live_macro.get("US10Y_Yield"), dict) else {}
+    dxy_obj = live_macro.get("DXY_USD_Index") if isinstance(live_macro.get("DXY_USD_Index"), dict) else {}
+
+    vix_live = _to_float(vix_obj.get("last"))
+    vix_as_of = str(vix_obj.get("as_of") or "")[:10] or None
+    vix_fresh = (vix_live is not None) and (not live_is_stale) and _is_obs_fresh(vix_as_of, max_age_days=7)
+
+    us10y_live = _to_float(us10y_obj.get("last"))
+    us10y_as_of = str(us10y_obj.get("as_of") or "")[:10] or None
+    us10y_fresh = (us10y_live is not None) and (not live_is_stale) and _is_obs_fresh(us10y_as_of, max_age_days=7)
+
+    dxy_chg_1d = _to_float(dxy_obj.get("chg_1d_pct"))
+    dxy_as_of = str(dxy_obj.get("as_of") or "")[:10] or None
+    dxy_fresh = (dxy_chg_1d is not None) and (not live_is_stale) and _is_obs_fresh(dxy_as_of, max_age_days=7)
+
+    if us10y_fresh:
+        nom_10y = us10y_live
+        nom_10y_as_of = us10y_as_of
+        nom_10y_stale = False
+    elif dgs10_fresh:
+        nom_10y = dgs10
+        nom_10y_as_of = dgs10_dt
+        nom_10y_stale = False
+    elif us10y_live is not None:
+        nom_10y = us10y_live
+        nom_10y_as_of = us10y_as_of
+        nom_10y_stale = True
+    elif dgs10 is not None:
+        nom_10y = dgs10
+        nom_10y_as_of = dgs10_dt
+        nom_10y_stale = True
+    else:
+        nom_10y = None
+        nom_10y_as_of = None
+        nom_10y_stale = False
+
+    # Article 1: Denominator Truth — explicitly distinguish missing, partial, stale, and fresh states
+    if t10yie is None or nom_10y is None:
+        art1_data_status = "missing"
+        art1_state = "unknown_macro_inputs"
+        art1_guidance = "通胀预期或名义美债数据缺失：严禁凭缺省值假定通胀稳定或失锚，请通过实时检索独立核验"
+    else:
+        unanchored_inflation = bool(
+            t10yie >= 2.75
+            and (nom_10y >= 4.35 or (dgs10_fresh and dgs10_chg is not None and dgs10_chg >= 0.15))
+        )
+        if (not t10yie_fresh) or nom_10y_stale:
+            art1_data_status = "stale"
+            art1_state = (
+                "stale_unanchored_inflation_warning"
+                if unanchored_inflation
+                else "stale_anchored_inflation_regime"
+            )
+            art1_guidance = (
+                "【数据源陈旧回退 · 须实时核验】历史快照显示通胀预期偏高叠加名义美债上行，请先联网核实最新美债与通胀预期"
+                if unanchored_inflation
+                else "【数据源陈旧回退 · 须实时核验】历史快照未见通胀失锚，请联网核实最新美债与通胀预期后再做裁决"
+            )
+        elif not dfii10_fresh:
+            art1_data_status = "stale" if dfii10 is not None else "partial"
+            art1_state = (
+                "unanchored_inflation_nominal_pressure"
+                if unanchored_inflation
+                else "anchored_inflation_real_yield_unavailable"
+            )
+            art1_guidance = (
+                "通胀预期偏高叠加名义美债上行：警惕因高通胀压缩算出的低/负实际利率假象（注：10Y实际利率观测陈旧或缺失已置空，请联网复核）"
+                if unanchored_inflation
+                else "通胀预期未失锚，但 10Y 实际利率（DFII10）缺失或观测陈旧已置空，请联网核实最新实际利率后再对比分子与分母量级"
+            )
+        else:
+            art1_data_status = "ok"
+            art1_state = (
+                "unanchored_inflation_nominal_pressure"
+                if unanchored_inflation
+                else "anchored_inflation_regime"
+            )
+            art1_guidance = (
+                "通胀预期偏高叠加名义美债上行：警惕因高通胀压缩算出的低/负实际利率假象，严禁误判为货币宽松去买类债防御或高估值久期权益"
+                if unanchored_inflation
+                else "通胀预期未失锚：可正常对比分子端盈利/主权买盘与分母端实际利率量级"
+            )
+
+    # Article 2 & 3: Pricing Bellwether Shields + Panic / Deep-Hole Short-Chase Ban
+    fresh_anchors = [
+        it
+        for it in anchor_items
+        if isinstance(it, dict) and it.get("status") == "ok" and not it.get("stale_fallback")
+    ]
+    bellwether_shields: list[dict[str, Any]] = []
+    deep_hole_ban_symbols: list[dict[str, Any]] = []
+    resilient_divergence_clues: list[dict[str, Any]] = []
+
+    tightening_backdrop = bool(
+        (dfii10_fresh and dfii10 is not None and dfii10 >= 1.80)
+        or (dfii10_fresh and dfii10_chg is not None and dfii10_chg >= 0.15)
+        or (dxy_fresh and dxy_chg_1d is not None and dxy_chg_1d >= 0.5)
+    )
+
+    for it in fresh_anchors:
+        sym = str(it.get("symbol") or "")
+        name = str(it.get("name") or sym)
+        r20 = _to_float(it.get("ret_20d_pct"))
+        r60 = _to_float(it.get("ret_60d_pct"))
+        pos6m = _to_float(it.get("range_pos_6m_pct"))
+        cl_hint = it.get("chanlun_hint") if isinstance(it.get("chanlun_hint"), dict) else None
+        cl_shield = str(cl_hint.get("shield_state") or "") if cl_hint else ""
+
+        if cl_shield in _RESOLVED_CHANLUN_SHIELD_STATES:
+            posture = cl_shield
+        elif r60 is not None and r60 >= 8.0 and r20 is not None and r20 <= -5.0:
+            posture = "high_altitude_pullback_watch"
+        elif (r60 is not None and r60 <= -15.0) or (r20 is not None and r20 <= -12.0):
+            posture = "deep_hole_crash_zone"
+        elif r60 is not None and r60 <= -8.0 and (r20 is None or r20 < 0):
+            posture = "sustained_breakdown_pressure"
+        elif r60 is not None and r60 > 0 and (r20 is None or r20 >= -4.0):
+            posture = "shield_intact_uptrend"
+        else:
+            posture = "neutral_range"
+
+        bellwether_shields.append(
+            {
+                "symbol": sym,
+                "name": name,
+                "ret_20d_pct": r20,
+                "ret_60d_pct": r60,
+                "range_pos_6m_pct": pos6m,
+                "shield_posture": posture,
+                **({"chanlun_hint": cl_hint} if cl_hint else {}),
+            }
+        )
+
+        if (r60 is not None and r60 <= -15.0) or (r20 is not None and r20 <= -12.0):
+            deep_hole_ban_symbols.append(
+                {
+                    "symbol": sym,
+                    "name": name,
+                    "ret_20d_pct": r20,
+                    "ret_60d_pct": r60,
+                }
+            )
+
+        if tightening_backdrop and ((r20 is not None and r20 >= 5.0) or (r60 is not None and r60 >= 10.0)):
+            resilient_divergence_clues.append(
+                {
+                    "symbol": sym,
+                    "name": name,
+                    "ret_20d_pct": r20,
+                    "ret_60d_pct": r60,
+                    "audit_note": "逆紧缩走强侦探线索：须核查信贷与顺周期地基是否稳健，排查晚周期滞后补跌风险，严禁免检追多",
+                }
+            )
+
+    if vix_live is None:
+        vix_data_status = "missing"
+        systemic_panic = False
+    elif not vix_fresh:
+        vix_data_status = "stale"
+        systemic_panic = False
+    else:
+        vix_data_status = "ok"
+        systemic_panic = bool(vix_live >= 30.0)
+
+    return {
+        "article1_denominator_truth": {
+            "data_status": art1_data_status,
+            "state": art1_state,
+            "real_yield_10y_pct": dfii10 if dfii10_fresh else None,
+            "real_yield_10y_status": dfii10_status,
+            "real_yield_10y_as_of": dfii10_dt,
+            "breakeven_10y_pct": t10yie,
+            "breakeven_10y_as_of": t10yie_dt,
+            "nominal_10y_pct": nom_10y,
+            "nominal_10y_as_of": nom_10y_as_of,
+            "fedfunds_pct": fedfunds if fedfunds_fresh else None,
+            "guidance": art1_guidance,
+        },
+        "article2_bellwether_shields": bellwether_shields,
+        "article3_panic_pendulum_gate": {
+            "vix_data_status": vix_data_status,
+            "vix_last": vix_live,
+            "systemic_panic_active": systemic_panic,
+            "deep_hole_short_chase_ban": deep_hole_ban_symbols,
+            "put_long_unlock_rule": "深坑区无条件禁直接追空；反手做多流动性兜底必须同时满足：①央行未被高通胀绑手(短端利率停止上行/转向降息) + ②标的未处实质破ZD自由落体",
+        },
+        "subordinate_evidentiary_clues": {
+            "resilient_under_tightening": resilient_divergence_clues[:6],
+            "physical_supply_rule": "严禁凭过去涨跌幅臆测商品稀缺或产能过剩；商品多空须联网检索核实未来1Q~1Y真实新增产能投产/减产数据",
+        },
+    }
+
+
 def build_compass_brief(
     *,
     macro_overview: dict[str, Any],
@@ -1509,6 +1797,10 @@ def build_compass_brief(
     clean_scopes = normalize_focus_scopes(focus_scopes or [])
     anchor_items = (macro_overview.get("anchors") or {}).get("items") or []
     tape_movers = macro_overview.get("tape_movers") or compute_tape_movers(anchor_items)
+    constitutional_diagnostics = compute_constitutional_diagnostics(
+        macro_overview=macro_overview,
+        anchor_items=anchor_items,
+    )
     pm_raw = macro_overview.get("polymarket_odds")
     pm_compact: dict[str, Any] = {
         "status": str(pm_raw.get("status") or "unavailable") if isinstance(pm_raw, dict) else "unavailable",
@@ -1562,6 +1854,7 @@ def build_compass_brief(
             "focus_prompt": focus_prompt.strip(),
             "seven_dimensions": list(SEVEN_DIMENSIONS),
             "tape_movers": tape_movers,
+            "constitutional_diagnostics": constitutional_diagnostics,
             "polymarket_odds": pm_compact,
             "macro_overview": {
                 "fetched_at_utc": macro_overview.get("fetched_at_utc"),
@@ -1592,7 +1885,7 @@ def build_compass_prompt(
         ]
         scopes_block = (
             "\n【用户锁定的重点深挖战场（多选 · 必须严格聚焦）】\n"
-            "用户本次明确指定只深挖以下战场，请将全部 4~6 张方向卡片集中分配在这些战场内（确保每个勾选战场至少产出 1 张高质量方向卡，对比战场内部强弱分化与多空/配对机会，不要把名额浪费在未勾选市场）：\n"
+            "用户本次明确指定只深挖以下战场，请将全部方向卡片集中分配在这些战场内（仅输出真正过线的高把握方向卡 1~5 张，不要把名额浪费在未勾选市场；若所选战场为严格禁空市场且恰逢全面逆风无合规多头机会，允许行使宪法第 4 条留白权输出空数组并填写 `abstain_reason`）：\n"
             + "\n".join(lines)
             + "\n"
         )
@@ -1602,6 +1895,13 @@ def build_compass_prompt(
         f"请先使用 Read 工具读取当前目录下的简报文件 `{brief_path}`，再以**空白大脑（无任何预设标的池锚定）**执行实时 WebSearch / WebFetch，\n"
         "从当下真实世界正在发生的最大级别宏观、地缘、政策、供需与产业变化出发，只回答第一层最核心的战略问题：\n"
         "**“在当前环境下，未来 1 个季度至 1 年（1Q~1Y）最有逻辑的多空方向和核心板块（Sector / Theme）是什么？产业链该切哪个环节？又该回避哪些逆风板块？”**\n\n"
+        "【最高准则：Layer 1 思考宪法（跨半世纪正反周期违宪审查核准 · 享有最高裁决权）】\n"
+        "请结合 `brief.json` 中的 `constitutional_diagnostics` 诊断字段，严格按以下 4 条最高宪法与 2 条取证规程推演，拒绝死背静态教科书口诀：\n"
+        "- **宪法第 1 条（分母真伪辨识律 · 剥离恶性通胀与温和宽松）**：评判实际利率前先核查通胀锚是否失控——温和通胀下的低/负实际利率利好权益久期；但**因恶性高通胀失锚叠加名义长债飙升压缩算出的低/负实际利率，通杀股票与类债防御板块，此时唯独实物能源与贵金属受益**。\n"
+        "- **宪法第 2 条（统治权归属与真龙头两段式护盾律）**：先比分子与分母量级——当板块具备非线性分子爆发（如资本开支与盈利二阶加速）或主权外储刚性买盘、信贷利差平稳且**板块基准定价锚护盾完好（未出日线确认卖点，实物储备须同时处于跨年正趋势）**时，分子统治分母，豁免高利率利空；**一段护盾（高位分歧退观望）**：若基准定价锚在大中枢 `ZD` 上方首现日线确认卖点或衍生品持仓极端拥挤（>90%分位），**立即收回做多豁免权退居观望（列入 `avoid_sectors` 或留白，绝不硬推做多，也绝不在 `ZD` 上方左侧摸顶做空）**；**二段破位警报与分层空头权限**：一旦基准定价锚实质跌破大中枢 `ZD`，哪怕央行正在降息也无条件严禁凭降息惯性抄底（列入回避观察）；至于能否反手输出 `short` 或充当 `pair` 空头腿，必须严守跨资产权限与分层边界——**大宗商品/外汇/加密**在供需过剩或利差逻辑共振下可顺势做空，**美股/美股行业 ETF** 唯有同时具备“高实际利率/金融条件紧缩压制估值 + 未来 1~3 年盈利/CapEx 增长故事证伪或强周期景气见顶反转”的戴维斯双杀基本面前提方可输出空头（具体真龙头日线与 30min 缠论结构交由 Layer 2/4 独立验证），**A 股在任何情形下均严格禁止直接做空及充当 `pair` 配对空头腿**。\n"
+        "- **宪法第 3 条（恐慌反应函数二分律 · 禁空绝对化、抄底条件化）**：**上半句（无条件铁律）**：在 `VIX ≥ 30` 恐慌极值或标的已落入深坑暴跌区（见 `deep_hole_short_chase_ban`），**无条件禁止直接市价追空**（若中期仍过剩，必须在 `value_chain_focus` 注明等反抽二卖/三卖）；**下半句（双前提解锁）**：唯有同时满足“① 央行未被高通胀绑手（短端利率停止上行/转向降息）+ ② 标的未处实质破 `ZD` 自由落体”双前提时，才解锁流动性兜底做多，缺一则持币观望。\n"
+        "- **宪法第 4 条（认知谦逊与动态留白权 · 废除强凑满额方向卡）**：真正高赔率的主矛盾方向在多数时期只有 **1~4 个**（上限 5 个）。只输出确信度真正过硬的方向卡（`1~5` 张）；在全面紧缩或无主线震荡期宁可只出 **1~2 张** 狙击卡，**严禁为凑满名额塞入二流凑数多头或左侧摸顶空头**！（仅当用户锁定了单一禁空市场且恰逢全面逆风无任何合规做多机会时，才允许输出 `\"directions\": []` 并必填 `\"abstain_reason\"` 与 `\"avoid_sectors\"`）。\n"
+        "- **二级溯源与取证规程（严禁走捷径）**：① **反常劈叉仅作侦探警报**：对“逆古典宏观走强”的品种，必须先核查全市场顺周期权益与信贷地基——信贷与顺周期企稳才是真新主线；若顺周期权益与信贷已崩盘、仅剩下游高烧商品独强，必须警惕晚周期需求坍塌补跌诱多（Catch-down），严禁免检追涨；② **物理供给严禁靠 K 线臆测**：绝不凭过去涨跌幅猜“稀缺”或“过剩”，商品多空必须联网查实未来 `1Q~1Y` 真实物理新增产能投产表与成本曲线；③ **定价主权归属**：中国内需定价品种（A股/黑色建材/内盘化工）锚定国内信用与产业政策，不机械外推美联储。\n\n"
         "【Layer 1 职责边界与铁律（严格遵守）】\n"
         "1. **极端盘面异动强制归因（Tape-to-Macro Radar · 警报器而非选品清单！）**：\n"
         "   - 简报中的月度宏观数据（如 `CN_PMI`、`FEDFUNDS`、`PCOPPUSDM`）天然滞后 1~2 个月，仅作背景参考；**实时市场定价（`tape_movers` 极端领涨/领跌榜、`cross_asset_anchors` 含国内核心期货锚的近 5D/20D/60D 异动、`VIX`/`US10Y`/`DXY`）与你通过 WebSearch 检索到的近 1~2 周最新变化享有绝对最高优先级**。\n"
@@ -1618,8 +1918,8 @@ def build_compass_prompt(
         "   - `产业政策与监管`（财政补贴、限产/反内卷与产能整合、行业监管或法案审批）\n"
         "   - `资金流与市场结构`（机构配置/ETF申赎、衍生品持仓拥挤度踩踏、套息交易平仓）\n"
         "   - `突发供给冲击`（主产区不可抗力、停产、物流封锁或突发禁令）\n"
-        "5. **前瞻因子分散 + 跨资产分层权限 + 产业链传导（拒绝伪平衡，也拒绝 6 张卡全赌单一因子！）**：\n"
-        "   - **多空服从未来预期差，同时避免单一宏观因子过度拥挤**：绝不要为了显得“攻守平衡”硬凑弱逻辑多头，更**严禁把 20D/60D 正在深跌（如跌幅超 -10%）的弱势资产硬塞进 `pair` 的多头腿去对冲空头利润**！但同样严禁把全部 4~6 张卡都押在同一个宏观因子（例如全部都在赌“美联储持续鹰派紧缩”）上——主趋势中继方向只保留赔率最锋利、增量预期差最明确的代表，其余名额优先分配给**低相关独立供给/政策周期**，或正在酝酿的**下一季度宏观二阶传导/拐点方向**（例如油价过剩压低通胀后的政策边际变化）。\n"
+        "5. **前瞻因子分散 + 跨资产分层权限 + 产业链传导（拒绝伪平衡，也拒绝多张卡全赌单一因子！）**：\n"
+        "   - **多空服从未来预期差，同时避免单一宏观因子过度拥挤**：绝不要为了显得“攻守平衡”硬凑弱逻辑多头，更**严禁把 20D/60D 正在深跌（如跌幅超 -10%）的弱势资产硬塞进 `pair` 的多头腿去对冲空头利润**！但同样严禁把多张方向卡重复押在同一个宏观因子（例如全部都在赌“美联储持续鹰派紧缩”）上——主趋势中继方向只保留赔率最锋利、增量预期差最明确的代表，其余名额仅在存在**低相关独立供给/政策周期**或正在酝酿的**下一季度宏观二阶传导/拐点方向**时分配（若无则果断少出卡，行使宪法第 4 条留白权）。\n"
         "   - **跨资产分层权限（美股双杀可空 · A股严禁做空 · 商品/外汇/加密全对称）**：\n"
         "     - **美股 / 美股行业 ETF**：景气上行期做多；而在**高实际利率压制估值 + 未来 1~3 年盈利/CapEx 增长故事证伪（戴维斯双杀）**的熊市主跌段，**允许直接输出 `short` 做空方向卡（或作为 `pair` 空头腿）**！\n"
         "     - **A 股**：受限于融券制度，**严格禁止做空（含配对空头腿）**，仅允许 `long`。\n"
@@ -1682,10 +1982,11 @@ def build_compass_prompt(
         "      ]\n"
         "    }\n"
         "  ],\n"
+        '  "abstain_reason": "常规有方向卡时填空字符串；仅当行使宪法第4条战略留白(directions为空数组)时必填1~2句持币观望理由",\n'
         '  "risk_warnings": ["1~3条当前宏观与跨资产层面最需警惕的尾部风险或因子重叠提醒"]\n'
         "}\n"
         "```\n"
-        "要求：`directions` 输出 **4~6 个**按优先级排序（`rank` 1..N）的高共振板块方向，必须以**未来 1Q~1Y 尚未充分定价的增量预期差**为核心（兼顾强趋势中继与低相关独立周期/下一季度潜在二阶传导，避免 6 张卡全押同一宏观因子），每个板块至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据，严格遵守 A 股禁空铁律（美股双杀、商品、外汇、加密均允许做空）。"
+        "要求：严格遵循《Layer 1 思考宪法》，`directions` 按真实机会多寡动态输出 **1~5 个**按优先级排序（`rank` 1..N）的高共振板块方向（宁缺毋滥，全面紧缩或震荡期可仅输出 1~2 个最强主矛盾方向，绝不凑数；仅在锁定禁空战场且全面逆风时允许 `directions: []` 配合非空 `abstain_reason` 与 `avoid_sectors`），必须以**未来 1Q~1Y 尚未充分定价的增量预期差**为核心，每个板块至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据，严格遵守 A 股禁空铁律（美股双杀、商品、外汇、加密均允许做空）。"
     )
 
 
@@ -1811,6 +2112,7 @@ def normalize_compass_output(
     valid_universes: set[str],
     universes: dict[str, Any] | None = None,
     open_positions: list[dict[str, str]] | None = None,
+    focus_scopes: list[str] | None = None,
 ) -> dict[str, Any]:
     """Strictly validate blind Layer 1 sector output and perform post-hoc universe/portfolio mapping."""
     if not isinstance(payload, dict):
@@ -1829,8 +2131,10 @@ def normalize_compass_output(
         "tech_industry": str(raw_signals.get("tech_industry") or "").strip(),
     }
 
+    raw_avoid_input = payload.get("avoid_sectors")
+    avoid_iter = raw_avoid_input if isinstance(raw_avoid_input, list) else []
     avoid_sectors: list[dict[str, Any]] = []
-    for item in payload.get("avoid_sectors") or []:
+    for item in avoid_iter:
         if isinstance(item, dict):
             sec = str(item.get("sector") or item.get("name") or "").strip()
             rsn = str(item.get("reason") or "").strip()
@@ -1862,7 +2166,39 @@ def normalize_compass_output(
                 }
             )
 
+    clean_scopes = normalize_focus_scopes(focus_scopes or [])
+    raw_abstain = payload.get("abstain_reason")
+    abstain_reason = raw_abstain.strip() if isinstance(raw_abstain, str) else ""
     raw_dirs = payload.get("directions")
+    can_abstain_zero_cards = (
+        isinstance(raw_dirs, list)
+        and len(raw_dirs) == 0
+        and clean_scopes == ["a_shares"]
+        and bool(abstain_reason)
+        and isinstance(raw_avoid_input, list)
+        and len(avoid_sectors) >= 1
+    )
+    if can_abstain_zero_cards:
+        raw_warn_abstain = payload.get("risk_warnings")
+        warn_iter_abstain = raw_warn_abstain if isinstance(raw_warn_abstain, list) else []
+        risk_warnings_abstain = [
+            str(x).strip()
+            for x in warn_iter_abstain
+            if isinstance(x, str) and x.strip()
+        ][:6]
+        return sanitize(
+            {
+                "regime_title": regime_title,
+                "regime_summary": regime_summary,
+                "macro_signals": macro_signals,
+                "avoid_sectors": avoid_sectors[:6],
+                "directions": [],
+                "abstained": True,
+                "abstain_reason": abstain_reason,
+                "rejected_cards_count": 0,
+                "risk_warnings": risk_warnings_abstain,
+            }
+        )
     if not isinstance(raw_dirs, list) or len(raw_dirs) == 0:
         raise ValueError("战略推演未输出任何有效板块方向卡片（directions 为空）")
 
@@ -2148,13 +2484,16 @@ def normalize_compass_output(
         raise ValueError(f"战略推演输出未通过纪律校验：{detail}")
 
     directions.sort(key=lambda d: (d["rank"], d["id"]))
+    directions = directions[:MAX_COMPASS_DIRECTIONS]
     for i, d in enumerate(directions, start=1):
         d["rank"] = i
 
+    raw_warn_input = payload.get("risk_warnings")
+    warn_iter = raw_warn_input if isinstance(raw_warn_input, list) else []
     risk_warnings = [
         str(x).strip()
-        for x in (payload.get("risk_warnings") or [])
-        if str(x or "").strip()
+        for x in warn_iter
+        if isinstance(x, str) and x.strip()
     ][:6]
 
     return sanitize(
@@ -2164,6 +2503,8 @@ def normalize_compass_output(
             "macro_signals": macro_signals,
             "avoid_sectors": avoid_sectors[:6],
             "directions": directions,
+            "abstained": False,
+            "abstain_reason": "",
             "rejected_cards_count": len(rejected_reasons),
             "risk_warnings": risk_warnings,
         }
@@ -2341,6 +2682,7 @@ def run_macro_compass(
         valid_universes=set(universes.keys()),
         universes=universes,
         open_positions=open_positions,
+        focus_scopes=focus_scopes,
     )
 
     finished_at = _utc_iso()
@@ -2381,11 +2723,16 @@ def run_macro_compass(
         saved = _do_persist()
 
     emit("progress", {"done": total_steps, "total": total_steps})
+    done_msg = (
+        "Layer 1 战略推演已完成：触发宪法第 4 条战略留白观望并落盘"
+        if full_result.get("abstained")
+        else f"Layer 1 战略推演已完成：锁定 {len(full_result['directions'])} 个高共振方向并落盘"
+    )
     emit(
         "log",
         {
             "stage": "validate_and_persist",
-            "message": f"Layer 1 战略推演已完成：锁定 {len(full_result['directions'])} 个高共振方向并落盘",
+            "message": done_msg,
         },
     )
     return saved

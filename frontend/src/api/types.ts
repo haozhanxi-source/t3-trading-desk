@@ -1039,6 +1039,19 @@ export interface MacroRegimeTag {
   tone: "good" | "warning" | "critical" | "neutral" | string;
 }
 
+export interface CrossAssetAnchorChanlunHint {
+  direction: "long" | "short" | "neutral" | "unknown" | string;
+  confirmed: boolean;
+  zd: number | null;
+  zg: number | null;
+  shield_state:
+    | "bullish_shield_intact"
+    | "high_sell_above_zd_watch"
+    | "below_zd_breakdown"
+    | "unknown_structure"
+    | string;
+}
+
 export interface CrossAssetAnchorItem {
   symbol: string;
   name: string;
@@ -1049,6 +1062,8 @@ export interface CrossAssetAnchorItem {
   ret_5d_pct: number | null;
   ret_20d_pct: number | null;
   ret_60d_pct: number | null;
+  range_pos_6m_pct?: number | null;
+  chanlun_hint?: CrossAssetAnchorChanlunHint | null;
   as_of?: string | null;
   stale_fallback?: boolean;
 }
@@ -1220,6 +1235,8 @@ export interface CompassResultPayload {
   };
   avoid_sectors?: CompassAvoidSectorItem[];
   directions: CompassDirectionCard[];
+  abstained?: boolean;
+  abstain_reason?: string;
   risk_warnings?: string[];
   generated_at_utc?: string;
   engine?: string;

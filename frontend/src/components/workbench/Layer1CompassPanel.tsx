@@ -427,7 +427,10 @@ export function Layer1CompassPanel({
   const [refreshMacroOnRun, setRefreshMacroOnRun] = useState(true);
   const [launching, setLaunching] = useState(false);
   const [launchErr, setLaunchErr] = useState<string | null>(null);
-  const [pickerCard, setPickerCard] = useState<CompassDirectionCard | null>(null);
+  const [pickerTarget, setPickerTarget] = useState<{
+    card: CompassDirectionCard;
+    runId?: string;
+  } | null>(null);
 
   /* Live SSE task progress & concurrency/unmount guards */
   const [activeRun, setActiveRun] = useState<ActiveCompassRun | null>(null);
@@ -1254,7 +1257,8 @@ export function Layer1CompassPanel({
                 >
                   {history.map((h) => (
                     <option key={h.run_id} value={h.run_id}>
-                      {shortTime(h.finished_at_utc)} · {h.regime_title.slice(0, 18)} ({h.directions_count}向)
+                      {shortTime(h.finished_at_utc)} · {h.regime_title.slice(0, 18)} (
+                      {h.directions_count > 0 ? `${h.directions_count}向` : "留白"})
                     </option>
                   ))}
                 </select>
@@ -1504,7 +1508,12 @@ export function Layer1CompassPanel({
                                 type="button"
                                 className="btn btn-sm border-bear/35 px-2 py-0.5 text-[10.5px] text-bear"
                                 disabled={scanBusy}
-                                onClick={() => setPickerCard(buildShortCardFromHeadwind(av, i))}
+                                onClick={() =>
+                                  setPickerTarget({
+                                    card: buildShortCardFromHeadwind(av, i),
+                                    runId: currentRun?.run_id,
+                                  })
+                                }
                                 title="按此逆风逻辑挑选合规空头/代理标的并跑日线缠论过筛（A 股禁空）"
                               >
                                 <TrendingDown className="h-2.5 w-2.5" aria-hidden="true" />
@@ -1549,7 +1558,28 @@ export function Layer1CompassPanel({
               </span>
             </div>
 
-            {/* High-Resonance Direction Cards Grid */}
+            {/* High-Resonance Direction Cards Grid (or Constitutional Abstention / Empty Filter State) */}
+            {directions.length === 0 ? (
+              <div
+                role="status"
+                className="flex flex-col gap-1.5 rounded-lg border border-dashed border-accent/40 bg-sunken/50 px-4 py-5 text-xs"
+              >
+                <div className="font-semibold text-ink">
+                  本期触发《Layer 1 思考宪法》第 4 条 · 战略留白与持币观望
+                </div>
+                <p className="m-0 leading-relaxed text-ink-2">
+                  {payload.abstain_reason ||
+                    "当前锁定战场未出现符合两段式龙头护盾与两维共振门槛的高赔率方向，按宁缺毋滥原则保持空仓观望，请重点参考上方逆风回避与衍生策略。"}
+                </p>
+              </div>
+            ) : filteredDirections.length === 0 ? (
+              <div
+                role="status"
+                className="rounded-lg border border-dashed border-hairline bg-sunken/40 px-4 py-5 text-center text-xs text-muted"
+              >
+                当前筛选分类下暂无方向卡片，可切换上方方向标签查看其余高确信主线。
+              </div>
+            ) : (
             <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
               {filteredDirections.map((card) => {
                 const dm = directionMeta(card.direction);
@@ -1816,7 +1846,12 @@ export function Layer1CompassPanel({
                         type="button"
                         className="btn btn-sm btn-primary"
                         disabled={scanBusy}
-                        onClick={() => setPickerCard(card)}
+                        onClick={() =>
+                          setPickerTarget({
+                            card,
+                            runId: currentRun?.run_id,
+                          })
+                        }
                         title="在专属小池中自主挑选符合本 L1 逻辑的 1~3 只标的并做日线缠论联立过筛"
                       >
                         <span>自选标的过筛</span>
@@ -1830,6 +1865,7 @@ export function Layer1CompassPanel({
                 );
               })}
             </div>
+            )}
 
             {/* Global Risk Warnings */}
             {(payload.risk_warnings ?? []).length > 0 ? (
@@ -2009,12 +2045,12 @@ export function Layer1CompassPanel({
 
       {/* Dedicated L1 Mini-Pool Leader Picker Modal */}
       <Layer1LeaderPickerModal
-        open={pickerCard !== null}
-        card={pickerCard}
-        runId={currentRun?.run_id}
+        open={pickerTarget !== null}
+        card={pickerTarget?.card ?? null}
+        runId={pickerTarget?.runId}
         universes={universes}
         scanBusy={scanBusy}
-        onClose={() => setPickerCard(null)}
+        onClose={() => setPickerTarget(null)}
         onLaunchScan={onLaunchCompassScan}
         onUniverseSaved={onUniverseSaved}
       />

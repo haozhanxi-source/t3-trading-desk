@@ -1766,6 +1766,384 @@ def test_polymarket_round2_regressions_missing_subdate_full_vector_dedup_ttl_and
         assert lin_results["a"] == lin_results["b"]
 
 
+def test_l1_constitutional_diagnostics_prompt_and_dynamic_abstention_quota():
+    # 1. Anchor 6M range percentile computed accurately when >= 20 bars exist
+    idx = pd.date_range("2026-08-01", periods=65, freq="B")
+    s_up = pd.Series([100.0 + float(i) for i in range(65)], index=idx)
+    anc_up = macro_compass._anchor_item_from_close_series(
+        {"symbol": "SMH", "name": "半导体", "group": "us_equities"},
+        s_up,
+        stale_fallback=True,  # avoid wall-clock staleness dependence
+    )
+    assert anc_up["range_pos_6m_pct"] == 100.0
+
+    # 2. End-to-end CN future snapshot -> anchor -> brief (`chanlun.signal_summary.signal_meta` + `chanlun.daily.latest_zhongshu`)
+    today_iso = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+
+    def fake_cn_snap(sym, **_kwargs):
+        if sym == "LC0":
+            # Close 80 <= ZD 100 with confirmed short -> MUST resolve to `below_zd_breakdown`
+            return {
+                "symbol": "LC0",
+                "data_quality": {"quality_grade": "good", "actionable_allowed": True},
+                "technicals": {
+                    "last_close": 80.0,
+                    "as_of_bar": today_iso,
+                    "return_5d_pct": -6.0,
+                    "return_20d_pct": -15.2,
+                    "return_60d_pct": -31.0,
+                },
+                "chanlun": {
+                    "signal_summary": {"signal_meta": {"direction": "short", "confirmed": True}},
+                    "daily": {"latest_zhongshu": {"zd": 100.0, "zg": 115.0}},
+                },
+            }
+        if sym == "SN0":
+            # Exact boundary: Close == ZD (100.0 == 100.0) with confirmed short is inside Zhongshu per chanlun.py,
+            # so it MUST resolve to `high_sell_above_zd_watch`, NEVER `below_zd_breakdown`!
+            return {
+                "symbol": "SN0",
+                "data_quality": {"quality_grade": "good", "actionable_allowed": True},
+                "technicals": {
+                    "last_close": 100.0,
+                    "as_of_bar": today_iso,
+                    "return_5d_pct": -3.0,
+                    "return_20d_pct": -6.5,
+                    "return_60d_pct": 14.0,
+                },
+                "chanlun": {
+                    "signal_summary": {"signal_meta": {"direction": "short", "confirmed": True}},
+                    "daily": {"latest_zhongshu": {"zd": 100.0, "zg": 112.0}},
+                },
+            }
+        if sym == "I0":
+            # Close < ZD (88.0 < 100.0) with `direction="neutral"` -> MUST still report `below_zd_breakdown`!
+            return {
+                "symbol": "I0",
+                "data_quality": {"quality_grade": "good", "actionable_allowed": True},
+                "technicals": {
+                    "last_close": 88.0,
+                    "as_of_bar": today_iso,
+                    "return_5d_pct": -2.0,
+                    "return_20d_pct": -4.0,
+                    "return_60d_pct": -5.0,
+                },
+                "chanlun": {
+                    "signal_summary": {"signal_meta": {"direction": "neutral", "confirmed": False}},
+                    "daily": {"latest_zhongshu": {"zd": 100.0, "zg": 110.0}},
+                },
+            }
+        # Degraded quality or missing Zhongshu -> `unknown_structure`, MUST NOT mask return-based crash zone!
+        return {
+            "symbol": sym,
+            "data_quality": {"quality_grade": "degraded", "actionable_allowed": False},
+            "technicals": {
+                "last_close": 90.0,
+                "as_of_bar": today_iso,
+                "return_5d_pct": -4.0,
+                "return_20d_pct": -14.0,
+                "return_60d_pct": -22.0,
+            },
+            "chanlun": {
+                "signal_summary": {"signal_meta": {"direction": "short", "confirmed": True}},
+                "daily": {},
+            },
+        }
+
+    with patch.object(macro_compass.market_snapshot, "get_snapshot", side_effect=fake_cn_snap):
+        lc_anc = macro_compass._fetch_single_cn_future_anchor({"symbol": "LC0", "name": "碳酸锂", "group": "cn_futures"})
+        sn_anc = macro_compass._fetch_single_cn_future_anchor({"symbol": "SN0", "name": "沪锡", "group": "cn_futures"})
+        i0_anc = macro_compass._fetch_single_cn_future_anchor({"symbol": "I0", "name": "铁矿石", "group": "cn_futures"})
+        deg_anc = macro_compass._fetch_single_cn_future_anchor({"symbol": "NI0", "name": "沪镍", "group": "cn_futures"})
+
+    assert lc_anc["chanlun_hint"]["shield_state"] == "below_zd_breakdown"
+    assert sn_anc["chanlun_hint"]["shield_state"] == "high_sell_above_zd_watch"
+    assert i0_anc["chanlun_hint"]["shield_state"] == "below_zd_breakdown"
+    assert deg_anc["chanlun_hint"]["shield_state"] == "unknown_structure"
+
+    # 3. Constitutional diagnostics with production `DXY_USD_Index.chg_1d_pct` and fresh `latest_date`
+    mock_overview = {
+        "fetched_at_utc": f"{today_iso}T08:00:00+00:00",
+        "sources_status": {"live_macro": "ok", "us_fred": "ok"},
+        "stale_sources": {},
+        "live_macro": {
+            "VIX": {"last": 32.5, "chg_1d_pct": 18.0, "as_of": today_iso},
+            "US10Y_Yield": {"last": 4.65, "chg_1d_pct": 2.1, "as_of": today_iso},
+            "DXY_USD_Index": {"last": 106.2, "chg_1d_pct": 0.9, "as_of": today_iso},
+        },
+        "us_fred": {
+            "series": {
+                "DFII10": {"status": "ok", "latest_value": 2.25, "change": 0.22, "latest_date": today_iso},
+                "T10YIE": {"status": "ok", "latest_value": 2.85, "change": 0.14, "latest_date": today_iso},
+                "DGS10": {"status": "ok", "latest_value": 4.62, "change": 0.25, "latest_date": today_iso},
+                "FEDFUNDS": {"status": "ok", "latest_value": 4.75, "change": 0.0, "latest_date": today_iso},
+            }
+        },
+        "anchors": {
+            "items": [
+                {
+                    "symbol": "GC=F",
+                    "name": "黄金",
+                    "status": "ok",
+                    "ret_20d_pct": 6.8,
+                    "ret_60d_pct": 14.5,
+                    "range_pos_6m_pct": 92.0,
+                },
+                {
+                    "symbol": "SMH",
+                    "name": "半导体",
+                    "status": "ok",
+                    "ret_20d_pct": -7.5,
+                    "ret_60d_pct": 12.0,
+                    "range_pos_6m_pct": 68.0,
+                },
+                lc_anc,
+                sn_anc,
+                i0_anc,
+                deg_anc,
+            ]
+        },
+    }
+    brief = macro_compass.build_compass_brief(macro_overview=mock_overview, focus_prompt="")
+    cd = brief["constitutional_diagnostics"]
+    assert cd["article1_denominator_truth"]["data_status"] == "ok"
+    assert cd["article1_denominator_truth"]["state"] == "unanchored_inflation_nominal_pressure"
+    assert "假象" in cd["article1_denominator_truth"]["guidance"]
+
+    shields = {x["symbol"]: x for x in cd["article2_bellwether_shields"]}
+    assert shields["GC=F"]["shield_posture"] == "shield_intact_uptrend"
+    assert shields["SMH"]["shield_posture"] == "high_altitude_pullback_watch"
+    assert shields["LC0"]["shield_posture"] == "below_zd_breakdown"
+    assert shields["SN0"]["shield_posture"] == "high_sell_above_zd_watch"
+    assert shields["I0"]["shield_posture"] == "below_zd_breakdown"
+    # Degraded `unknown_structure` falls through to return-based `deep_hole_crash_zone`!
+    assert shields["NI0"]["shield_posture"] == "deep_hole_crash_zone"
+
+    art3 = cd["article3_panic_pendulum_gate"]
+    assert art3["vix_data_status"] == "ok"
+    assert art3["systemic_panic_active"] is True
+    assert {x["symbol"] for x in art3["deep_hole_short_chase_ban"]} == {"LC0", "NI0"}
+    assert any(x["symbol"] == "GC=F" for x in cd["subordinate_evidentiary_clues"]["resilient_under_tightening"])
+
+    # 3b. Missing FRED & Stale VIX + DXY_USD_Index tightening when DFII10 is missing
+    missing_fred_and_stale_vix = {
+        "fetched_at_utc": f"{today_iso}T08:00:00+00:00",
+        "sources_status": {"live_macro": "stale", "us_fred": "error"},
+        "stale_sources": {"live_macro": {"last_good_at_utc": "2026-11-10T00:00:00+00:00", "error": "timeout"}},
+        "live_macro": {
+            "VIX": {"last": 36.0, "chg_1d_pct": 12.0, "as_of": "2026-11-10"},
+            "DXY_USD_Index": {"last": 107.0, "chg_1d_pct": 0.85, "as_of": "2026-11-10"},
+        },
+        "us_fred": {"series": {}},
+        "anchors": {"items": [mock_overview["anchors"]["items"][0]]},
+    }
+    cd_deg = macro_compass.build_compass_brief(macro_overview=missing_fred_and_stale_vix)["constitutional_diagnostics"]
+    assert cd_deg["article1_denominator_truth"]["data_status"] == "missing"
+    assert cd_deg["article1_denominator_truth"]["state"] == "unknown_macro_inputs"
+    assert cd_deg["article3_panic_pendulum_gate"]["vix_data_status"] == "stale"
+    assert cd_deg["article3_panic_pendulum_gate"]["systemic_panic_active"] is False
+
+    # 3c. 30-day-old FRED `latest_date` despite `status="ok"` -> `data_status == "stale"` and NO false tightening clues
+    old_obs_iso = (pd.Timestamp.utcnow() - pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+    stale_fred_obs = {
+        "fetched_at_utc": f"{today_iso}T08:00:00+00:00",
+        "sources_status": {"live_macro": "ok", "us_fred": "ok"},
+        "stale_sources": {},
+        "live_macro": {},
+        "us_fred": {
+            "series": {
+                "DFII10": {"status": "ok", "latest_value": 2.25, "change": 0.25, "latest_date": old_obs_iso},
+                "T10YIE": {"status": "ok", "latest_value": 2.90, "change": 0.18, "latest_date": old_obs_iso},
+                "DGS10": {"status": "ok", "latest_value": 4.65, "change": 0.30, "latest_date": old_obs_iso},
+            }
+        },
+        "anchors": {"items": [mock_overview["anchors"]["items"][0]]},
+    }
+    cd_stale_obs = macro_compass.build_compass_brief(macro_overview=stale_fred_obs)["constitutional_diagnostics"]
+    assert cd_stale_obs["article1_denominator_truth"]["data_status"] == "stale"
+    assert cd_stale_obs["article1_denominator_truth"]["state"] == "stale_unanchored_inflation_warning"
+    assert cd_stale_obs["article1_denominator_truth"]["real_yield_10y_pct"] is None
+    assert cd_stale_obs["article1_denominator_truth"]["real_yield_10y_status"] == "stale"
+    assert cd_stale_obs["subordinate_evidentiary_clues"]["resilient_under_tightening"] == []
+
+    # 3d. Mixed freshness: ONLY `DFII10` is 30 days stale while `T10YIE` & `DGS10` are fresh today ->
+    # `real_yield_10y_pct` MUST be masked (`None`), `real_yield_10y_status == "stale"`, `data_status == "stale"`!
+    mixed_stale_dfii10 = {
+        "fetched_at_utc": f"{today_iso}T08:00:00+00:00",
+        "sources_status": {"live_macro": "ok", "us_fred": "ok"},
+        "stale_sources": {},
+        "live_macro": {},
+        "us_fred": {
+            "series": {
+                "DFII10": {"status": "ok", "latest_value": 2.25, "change": 0.25, "latest_date": old_obs_iso},
+                "T10YIE": {"status": "ok", "latest_value": 2.30, "change": -0.02, "latest_date": today_iso},
+                "DGS10": {"status": "ok", "latest_value": 4.10, "change": -0.05, "latest_date": today_iso},
+            }
+        },
+        "anchors": {"items": [mock_overview["anchors"]["items"][0]]},
+    }
+    cd_mixed = macro_compass.build_compass_brief(macro_overview=mixed_stale_dfii10)["constitutional_diagnostics"]
+    assert cd_mixed["article1_denominator_truth"]["data_status"] == "stale"
+    assert cd_mixed["article1_denominator_truth"]["state"] == "anchored_inflation_real_yield_unavailable"
+    assert cd_mixed["article1_denominator_truth"]["real_yield_10y_pct"] is None
+    assert cd_mixed["article1_denominator_truth"]["real_yield_10y_status"] == "stale"
+    assert cd_mixed["article1_denominator_truth"]["real_yield_10y_as_of"] == old_obs_iso
+    assert "置空" in cd_mixed["article1_denominator_truth"]["guidance"]
+
+    # Mixed freshness with `DFII10` missing (`partial`) + `FEDFUNDS` 45d (valid) vs 46d (masked) boundary
+    d45_iso = (pd.Timestamp.utcnow() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    d46_iso = (pd.Timestamp.utcnow() - pd.Timedelta(days=46)).strftime("%Y-%m-%d")
+    mixed_missing_dfii10 = {
+        **mixed_stale_dfii10,
+        "us_fred": {
+            "series": {
+                "T10YIE": {"status": "ok", "latest_value": 2.30, "change": -0.02, "latest_date": today_iso},
+                "DGS10": {"status": "ok", "latest_value": 4.10, "change": -0.05, "latest_date": today_iso},
+                "FEDFUNDS": {"status": "ok", "latest_value": 4.75, "change": 0.0, "latest_date": d45_iso},
+            }
+        },
+    }
+    cd_part = macro_compass.build_compass_brief(macro_overview=mixed_missing_dfii10)["constitutional_diagnostics"]
+    assert cd_part["article1_denominator_truth"]["data_status"] == "partial"
+    assert cd_part["article1_denominator_truth"]["real_yield_10y_status"] == "missing"
+    assert cd_part["article1_denominator_truth"]["fedfunds_pct"] == 4.75
+
+    mixed_stale_ff = {
+        **mixed_missing_dfii10,
+        "us_fred": {
+            "series": {
+                **mixed_missing_dfii10["us_fred"]["series"],
+                "FEDFUNDS": {"status": "ok", "latest_value": 4.75, "change": 0.0, "latest_date": d46_iso},
+            }
+        },
+    }
+    cd_ff_stale = macro_compass.build_compass_brief(macro_overview=mixed_stale_ff)["constitutional_diagnostics"]
+    assert cd_ff_stale["article1_denominator_truth"]["fedfunds_pct"] is None
+
+    # Fresh `DXY_USD_Index.chg_1d_pct >= 0.5` alone triggers tightening divergence clue even when FRED is missing
+    dxy_only_fresh = {
+        "fetched_at_utc": f"{today_iso}T08:00:00+00:00",
+        "sources_status": {"live_macro": "ok", "us_fred": "error"},
+        "stale_sources": {},
+        "live_macro": {"DXY_USD_Index": {"last": 107.0, "chg_1d_pct": 0.8, "as_of": today_iso}},
+        "us_fred": {"series": {}},
+        "anchors": {"items": [mock_overview["anchors"]["items"][0]]},
+    }
+    cd_dxy = macro_compass.build_compass_brief(macro_overview=dxy_only_fresh)["constitutional_diagnostics"]
+    assert [x["symbol"] for x in cd_dxy["subordinate_evidentiary_clues"]["resilient_under_tightening"]] == ["GC=F"]
+
+    # 4. Prompt embeds all 4 Constitutional Articles + Option A US short prerequisite + A-share pair-short ban + 1~5 quota
+    prompt = macro_compass.build_compass_prompt(brief_path="/tmp/brief.json", focus_scopes=["a_shares"])
+    for token in (
+        "宪法第 1 条",
+        "宪法第 2 条",
+        "宪法第 3 条",
+        "宪法第 4 条",
+        "戴维斯双杀基本面前提",
+        "充当 `pair` 配对空头腿",
+        "1~5 个",
+        "1~5 张",
+        "abstain_reason",
+    ):
+        assert token in prompt
+    assert "输出 **4~6 个**" not in prompt
+    assert "全部 4~6 张" not in prompt
+
+    # 5. Dynamic 1~5 card quota (5 kept, 6 truncated to 5) & strict scope-gated abstention (`focus_scopes=["a_shares"]` ONLY)
+    base_card = {
+        "id": "lithium_glut_short",
+        "rank": 1,
+        "title": "新能源锂盐产能过剩主跌",
+        "direction": "short",
+        "horizon": "1Q~2Q",
+        "conviction": "high",
+        "asset_scope": "commodities",
+        "primary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "全球盐湖与锂辉石新增产能集中爬坡。"},
+        "secondary_driver": {"dimension": "宏观双核", "summary": "实际利率走高压缩远期需求预期。"},
+        "thesis": "物理投产表证实过剩且龙头实质跌破大中枢ZD。",
+        "priced_in_already": "前期跌幅已计价部分减产传闻。",
+        "unpriced_gap": "低成本大矿山扩产放量尚未计价。",
+        "value_chain_focus": "反弹至30min二卖/三卖布局，严禁深坑追空。",
+        "evidence": [
+            {"fact": "智利与澳洲矿端季报产量环比+12%", "level": "L1", "date": "2026-11-15", "source": "矿企季报"},
+            {"fact": "国内碳酸锂显性库存累库至11万吨", "level": "L1", "date": "2026-11-22", "source": "交易所周报"},
+        ],
+    }
+    single_sniper_payload = {
+        "regime_title": "极高实际利率紧缩期：单卡精准狙击",
+        "regime_summary": "多数板块触发一段护盾退居观望，仅保留唯一实质跌破ZD的过剩空头主线。",
+        "avoid_sectors": [{"sector": "A股高估值成长", "reason": "缩量破位", "derived_strategy": "空仓规避"}],
+        "directions": [base_card],
+    }
+    norm_one = macro_compass.normalize_compass_output(single_sniper_payload, valid_universes=set())
+    assert len(norm_one["directions"]) == 1
+    assert norm_one["abstained"] is False
+
+    five_cards = [{**base_card, "id": f"sec_{i}", "rank": i, "title": f"方向卡{i}"} for i in range(1, 6)]
+    shuffled_six = [{**base_card, "id": f"sec_{r}", "rank": r, "title": f"方向卡{r}"} for r in (5, 2, 6, 1, 4, 3)]
+    norm_five = macro_compass.normalize_compass_output({**single_sniper_payload, "directions": five_cards}, valid_universes=set())
+    norm_six = macro_compass.normalize_compass_output({**single_sniper_payload, "directions": shuffled_six}, valid_universes=set())
+    assert len(norm_five["directions"]) == 5
+    assert len(norm_six["directions"]) == 5
+    assert [d["id"] for d in norm_six["directions"]] == ["sec_1", "sec_2", "sec_3", "sec_4", "sec_5"]
+    assert [d["rank"] for d in norm_six["directions"]] == [1, 2, 3, 4, 5]
+
+    abstain_payload = {
+        "regime_title": "锁定纯A股战场逢系统性缩量回调：战略留白",
+        "regime_summary": "用户仅锁定A股战场，当前全板块跌破日线中枢且受禁空铁律约束，行使宪法第4条留白权持币观望。",
+        "avoid_sectors": [
+            {
+                "sector": "A股宽基与高弹性题材",
+                "reason": "流动性收缩且真龙头未企稳",
+                "derived_strategy": "A股严禁做空，保持现金等待右侧底分型与信用脉冲拐点",
+                "short_proxy_possible": False,
+                "short_proxy_hint": "",
+            }
+        ],
+        "directions": [],
+        "abstain_reason": "锁定战场为严格禁空的A股，当下无任何板块满足两维多头共振与龙头护盾完好条件，宁缺毋滥持币观望。",
+        "risk_warnings": ["切勿在破ZD自由落体段左侧接飞刀"],
+    }
+    # Passes ONLY when focus_scopes == ["a_shares"]!
+    norm_abstain = macro_compass.normalize_compass_output(
+        abstain_payload,
+        valid_universes=set(),
+        focus_scopes=["a_shares"],
+    )
+    assert norm_abstain["abstained"] is True
+    assert norm_abstain["directions"] == []
+    assert "宁缺毋滥" in norm_abstain["abstain_reason"]
+
+    # Unscoped, US-equity scoped, multi-scoped, non-list avoid_sectors, non-string abstain_reason, or missing reason MUST all raise ValueError
+    for bad_scopes in (None, [], ["us_equities"], ["a_shares", "commodities_metals"]):
+        with pytest.raises(ValueError, match="directions 为空"):
+            macro_compass.normalize_compass_output(abstain_payload, valid_universes=set(), focus_scopes=bad_scopes)
+    for bad_avoid in ("地产", {"sector": "地产"}, None, []):
+        with pytest.raises(ValueError, match="directions 为空"):
+            macro_compass.normalize_compass_output(
+                {**abstain_payload, "avoid_sectors": bad_avoid},
+                valid_universes=set(),
+                focus_scopes=["a_shares"],
+            )
+    with pytest.raises(ValueError, match="directions 为空"):
+        macro_compass.normalize_compass_output(
+            {**abstain_payload, "abstain_reason": True},
+            valid_universes=set(),
+            focus_scopes=["a_shares"],
+        )
+    with pytest.raises(ValueError, match="directions 为空"):
+        macro_compass.normalize_compass_output(
+            {
+                "regime_title": "空数组无理由",
+                "regime_summary": "漏填方向卡。",
+                "avoid_sectors": [{"sector": "某板块", "reason": "逆风"}],
+                "directions": [],
+            },
+            valid_universes=set(),
+            focus_scopes=["a_shares"],
+        )
+
+
 
 
 

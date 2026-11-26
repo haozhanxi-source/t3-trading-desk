@@ -1708,6 +1708,63 @@ def test_polymarket_round2_regressions_missing_subdate_full_vector_dedup_ttl_and
         assert dcl_calls["count"] == 1
         assert dcl_results["a"]["polymarket_odds"] == dcl_results["b"]["polymarket_odds"]
 
+        # Linearizable publish race: while leader B is fetching, contender A pauses inside the lock
+        # right after its inner CACHE.get miss -> B MUST block on the same lock before publishing,
+        # so A always joins B's live future (1 upstream call, identical snapshot)!
+        CACHE.invalidate(("compass_polymarket_odds",))
+        lin_calls = {"count": 0}
+        b_entered_fetch = threading.Event()
+        release_b_fetch = threading.Event()
+        a_paused_in_lock = threading.Event()
+        release_a_in_lock = threading.Event()
+        orig_get_lin = CACHE.get
+        b_tid = threading.get_ident()
+
+        def lin_cache_get(key):
+            res = orig_get_lin(key)
+            # Only pause contender A on its inner lock-held CACHE.get call (when _PM_RETRY_INFLIGHT_LOCK is held by A)
+            if (
+                key == ("compass_polymarket_odds",)
+                and not res[0]
+                and threading.get_ident() != b_tid
+                and macro_compass._PM_RETRY_INFLIGHT_FUTURE is not None
+                and not a_paused_in_lock.is_set()
+            ):
+                # Check if this is the inner lock-held call by verifying lock is currently acquired
+                if macro_compass._PM_RETRY_INFLIGHT_LOCK.acquire(blocking=False):
+                    macro_compass._PM_RETRY_INFLIGHT_LOCK.release()
+                else:
+                    a_paused_in_lock.set()
+                    release_b_fetch.set()
+                    release_a_in_lock.wait(timeout=2.0)
+            return res
+
+        def lin_pm_fetch(*_args, **_kwargs):
+            lin_calls["count"] += 1
+            b_entered_fetch.set()
+            release_b_fetch.wait(timeout=2.0)
+            return pm_full
+
+        lin_results: dict[str, tuple] = {}
+        with (
+            patch.object(CACHE, "get", side_effect=lin_cache_get),
+            patch.object(macro_compass, "fetch_polymarket_macro_odds", side_effect=lin_pm_fetch),
+        ):
+            t_b = threading.Thread(target=lambda: lin_results.__setitem__("b", macro_compass._refresh_polymarket_singleflight()))
+            t_a = threading.Thread(target=lambda: lin_results.__setitem__("a", macro_compass._refresh_polymarket_singleflight()))
+            t_b.start()
+            assert b_entered_fetch.wait(timeout=2.0)
+            t_a.start()
+            assert a_paused_in_lock.wait(timeout=2.0)
+            # Give B a brief window to attempt publishing while A holds the lock -> B must wait on lock!
+            time.sleep(0.05)
+            release_a_in_lock.set()
+            t_a.join(timeout=2.0)
+            t_b.join(timeout=2.0)
+
+        assert lin_calls["count"] == 1
+        assert lin_results["a"] == lin_results["b"]
+
 
 
 

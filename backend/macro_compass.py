@@ -1218,12 +1218,14 @@ def _refresh_polymarket_singleflight(
 
     leader = False
     with _PM_RETRY_INFLIGHT_LOCK:
-        # Double-check inside the lock so a caller paused between the outer cache miss
-        # and acquiring the lock reuses the snapshot populated by an earlier winner.
+        # Linearizable check + publish under _PM_RETRY_INFLIGHT_LOCK:
+        # leader writes CACHE, completes shared_future, and clears _PM_RETRY_INFLIGHT_FUTURE
+        # atomically under this same lock, so a contender sees either the populated cache
+        # OR the live in-flight future (never a stale miss followed by a done future).
         hit2, existing_pm2 = CACHE.get(pm_cache_key)
         if hit2 and isinstance(existing_pm2, tuple) and len(existing_pm2) == 3:
             return existing_pm2
-        if _PM_RETRY_INFLIGHT_FUTURE is not None and not _PM_RETRY_INFLIGHT_FUTURE.done():
+        if _PM_RETRY_INFLIGHT_FUTURE is not None:
             shared_future = _PM_RETRY_INFLIGHT_FUTURE
         else:
             shared_future = concurrent.futures.Future()
@@ -1245,17 +1247,20 @@ def _refresh_polymarket_singleflight(
         pm_tuple = _resolve_polymarket_source(raw_pm, err_pm, now_iso)
         _, st_pm, _ = pm_tuple
         pm_ttl = TTL_COMPASS_MACRO_SECONDS if st_pm == "ok" else TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS
-        CACHE.set(pm_cache_key, pm_tuple, pm_ttl)
-        shared_future.set_result(pm_tuple)
-        return pm_tuple
-    except BaseException as exc:
-        if not shared_future.done():
-            shared_future.set_exception(exc)
-        raise
-    finally:
         with _PM_RETRY_INFLIGHT_LOCK:
+            CACHE.set(pm_cache_key, pm_tuple, pm_ttl)
+            if not shared_future.done():
+                shared_future.set_result(pm_tuple)
             if _PM_RETRY_INFLIGHT_FUTURE is shared_future:
                 _PM_RETRY_INFLIGHT_FUTURE = None
+        return pm_tuple
+    except BaseException as exc:
+        with _PM_RETRY_INFLIGHT_LOCK:
+            if not shared_future.done():
+                shared_future.set_exception(exc)
+            if _PM_RETRY_INFLIGHT_FUTURE is shared_future:
+                _PM_RETRY_INFLIGHT_FUTURE = None
+        raise
 
 
 def collect_macro_overview(

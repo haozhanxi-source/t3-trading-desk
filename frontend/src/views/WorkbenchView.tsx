@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import {
   AlertTriangle,
   BookmarkPlus,
@@ -8,9 +8,12 @@ import {
   ChevronDown,
   ChevronRight,
   Clock,
+  Compass,
   Crosshair,
   Database,
   FolderPlus,
+  History,
+  Layers,
   Play,
   RefreshCw,
   Square,
@@ -32,7 +35,9 @@ import type {
 } from "../api/types";
 import { ModalDialog } from "../components/ui/ModalDialog";
 import { signedToneClass, StatusBadge, type Tone } from "../components/ui/StatusBadge";
-import { Layer1CompassPanel } from "../components/workbench/Layer1CompassPanel";
+import { Layer1CompassPanel, type L2CardScanSummary } from "../components/workbench/Layer1CompassPanel";
+import { Layer2InlinePicker } from "../components/workbench/Layer2InlinePicker";
+import { ZhongshuMiniRuler } from "../components/workbench/ZhongshuMiniRuler";
 import {
   fmtFractalText,
   fmtMomentumVerdict,
@@ -531,6 +536,32 @@ export function WorkbenchView({
     description: string;
     symbols: string[];
   } | null>(null);
+
+  /* L1 <-> L2 seamless inline coordination & bidirectional scan summary badges */
+  const l2TabBaseId = useId();
+  const [selectedL1Track, setSelectedL1Track] = useState<{
+    card: CompassDirectionCard;
+    runId?: string;
+  } | null>(null);
+  const [l2Mode, setL2Mode] = useState<"l1_track" | "manual">("l1_track");
+  const [l2CardSummaries, setL2CardSummaries] = useState<Record<string, L2CardScanSummary>>({});
+  const [shadowState, setShadowState] = useState<{
+    runId: string;
+    loggedCardIds: string[];
+    loggingCardId: string | null;
+  }>({ runId: "", loggedCardIds: [], loggingCardId: null });
+  const [openCardDetailSignal, setOpenCardDetailSignal] = useState<{
+    card: CompassDirectionCard;
+    seq: number;
+  } | null>(null);
+  const [logCardSignal, setLogCardSignal] = useState<{ cardId: string; seq: number } | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+
+  const l2TabRefs = useRef<Record<"l1_track" | "manual", HTMLButtonElement | null>>({
+    l1_track: null,
+    manual: null,
+  });
+  const historyMenuRef = useRef<HTMLDivElement | null>(null);
 
   const esRef = useRef<EventSource | null>(null);
   const layer2Ref = useRef<HTMLDivElement | null>(null);
@@ -1127,6 +1158,66 @@ export function WorkbenchView({
     };
   }, [scanRows, activeCompassContext]);
 
+  /* Bidirectional L2 -> L1 scan summary badge sync */
+  useEffect(() => {
+    const dirId = activeCompassContext?.direction_id?.trim();
+    if (!dirId || scanRows.length === 0) return;
+    setL2CardSummaries((prev) => ({
+      ...prev,
+      [dirId]: {
+        aligned: filterCounts.aligned,
+        watch: filterCounts.watch,
+        total: filterCounts.all,
+      },
+    }));
+  }, [activeCompassContext?.direction_id, filterCounts.aligned, filterCounts.watch, filterCounts.all, scanRows.length]);
+
+  /* Close Layer 2 history popover on outside click / Escape */
+  useEffect(() => {
+    if (!historyOpen) return;
+    const onPointerDown = (ev: MouseEvent) => {
+      if (historyMenuRef.current && !historyMenuRef.current.contains(ev.target as Node)) {
+        setHistoryOpen(false);
+      }
+    };
+    const onKeyDown = (ev: globalThis.KeyboardEvent) => {
+      if (ev.key === "Escape") setHistoryOpen(false);
+    };
+    window.addEventListener("mousedown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("mousedown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [historyOpen]);
+
+  const handleSelectCardForL2 = useCallback((card: CompassDirectionCard, runId?: string) => {
+    setSelectedL1Track({ card, runId });
+    setL2Mode("l1_track");
+    window.setTimeout(() => {
+      const el = layer2Ref.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      // Only scroll gently if Layer 2 picker is below the visible viewport fold
+      if (rect.top > window.innerHeight - 180 || rect.top < 0) {
+        el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
+    }, 40);
+  }, []);
+
+  const handleL2TabKeyDown = (e: KeyboardEvent<HTMLButtonElement>, current: "l1_track" | "manual") => {
+    const order: ("l1_track" | "manual")[] = ["l1_track", "manual"];
+    const idx = order.indexOf(current);
+    let next: "l1_track" | "manual" | null = null;
+    if (e.key === "ArrowRight" || e.key === "ArrowLeft") next = order[(idx + 1) % order.length];
+    else if (e.key === "Home") next = order[0];
+    else if (e.key === "End") next = order[1];
+    if (!next) return;
+    e.preventDefault();
+    setL2Mode(next);
+    l2TabRefs.current[next]?.focus();
+  };
+
   const pairVerdict = useMemo(() => {
     if (!activeCompassContext || activeCompassContext.direction !== "pair" || scanRows.length === 0) {
       return null;
@@ -1283,31 +1374,222 @@ export function WorkbenchView({
 
       {/* Layer 1: Top-Down Macro Dual-Core + 7-Dimension Strategic Compass */}
       <Layer1CompassPanel
-        universes={universes}
-        scanBusy={launching}
-        onLaunchCompassScan={handleLaunchCompassScan}
-        onUniverseSaved={() => void loadUniverses()}
+        activeL2CardId={selectedL1Track?.card.id ?? null}
+        l2ScanSummaries={l2CardSummaries}
+        openCardDetailSignal={openCardDetailSignal}
+        logCardSignal={logCardSignal}
+        onSelectCardForL2={handleSelectCardForL2}
+        onShadowStateChange={setShadowState}
         onJumpWarRoom={onJumpWarRoom}
-        onJumpArchive={onJumpArchive}
       />
 
-      {/* Layer 2 Section Divider & Daily Chanlun Screening */}
+      {/* Layer 2 Section Divider & Daily Chanlun Screening (100% Full Width) */}
       <div ref={layer2Ref} className="flex flex-col gap-3 scroll-mt-16">
-        <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="inline-flex items-center rounded border border-hairline bg-elevated px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-ink-2">
-              Layer 2
-            </span>
-            <h2 className="m-0 text-sm font-semibold text-ink">日线缠论过筛结果 & 手动扫描台</h2>
-            <span className="text-xs text-muted">
-              上方 L1 专属小池过筛与下方手动大类池扫描完全独立，互不干扰
-            </span>
+        <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-hairline-soft pb-1 pt-1">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-1.5">
+              <span className="inline-flex items-center rounded border border-hairline bg-elevated px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-ink-2">
+                Layer 2
+              </span>
+              <h2 className="m-0 text-sm font-semibold text-ink">日线缠论过筛台</h2>
+            </div>
+
+            <div className="mwg-tablist !border-b-0" role="tablist" aria-label="第二层日线扫描模式">
+              <button
+                ref={(el) => {
+                  l2TabRefs.current.l1_track = el;
+                }}
+                type="button"
+                role="tab"
+                id={`${l2TabBaseId}-tab-l1`}
+                aria-selected={l2Mode === "l1_track"}
+                tabIndex={l2Mode === "l1_track" ? 0 : -1}
+                className="mwg-tab"
+                onClick={() => setL2Mode("l1_track")}
+                onKeyDown={(e) => handleL2TabKeyDown(e, "l1_track")}
+              >
+                <Compass className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>按 L1 轨道过筛</span>
+                {selectedL1Track ? (
+                  <span className="max-w-[140px] truncate rounded bg-accent/14 px-1.5 py-px text-[10px] font-medium text-accent">
+                    {selectedL1Track.card.title}
+                  </span>
+                ) : null}
+              </button>
+
+              <button
+                ref={(el) => {
+                  l2TabRefs.current.manual = el;
+                }}
+                type="button"
+                role="tab"
+                id={`${l2TabBaseId}-tab-manual`}
+                aria-selected={l2Mode === "manual"}
+                tabIndex={l2Mode === "manual" ? 0 : -1}
+                className="mwg-tab"
+                onClick={() => {
+                  setL2Mode("manual");
+                  setPickerExpanded(true);
+                }}
+                onKeyDown={(e) => handleL2TabKeyDown(e, "manual")}
+              >
+                <Layers className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>手动自由选池</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Compact History Dropdown Popover (replaces 248-292px right sidebar so L2 table gets 100% width) */}
+          <div ref={historyMenuRef} className="relative">
+            <button
+              type="button"
+              className="btn btn-sm"
+              aria-expanded={historyOpen}
+              aria-haspopup="menu"
+              onClick={() => setHistoryOpen((v) => !v)}
+            >
+              <History className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
+              <span>近期扫描记录 ({tasks.length})</span>
+              <ChevronDown className="h-3 w-3 text-muted" aria-hidden="true" />
+            </button>
+            {historyOpen ? (
+              <div
+                role="menu"
+                aria-label="近期扫描记录列表"
+                className="absolute right-0 top-full z-40 mt-1.5 w-[320px] max-w-[92vw] overflow-hidden rounded-lg border border-hairline bg-surface shadow-xl"
+              >
+                <div className="flex items-center justify-between border-b border-hairline-soft bg-sunken/70 px-3 py-2">
+                  <span className="text-[12px] font-semibold text-ink">历史 L2 扫描记录</span>
+                  <button
+                    type="button"
+                    className="btn btn-ghost btn-sm !min-h-[22px] !px-1.5"
+                    onClick={() => void loadTasks()}
+                    aria-label="刷新记录"
+                  >
+                    <RefreshCw className="h-3 w-3" aria-hidden="true" />
+                  </button>
+                </div>
+                <ul className="m-0 max-h-[340px] list-none divide-y divide-hairline-soft overflow-y-auto p-0">
+                  {tasks.length === 0 ? (
+                    <li className="p-4 text-center text-xs text-muted">暂无本轮扫描历史</li>
+                  ) : (
+                    tasks.map((t) => {
+                      const selected = t.id === activeTaskId;
+                      const Icon =
+                        t.status === "completed"
+                          ? CheckCircle2
+                          : t.status === "failed"
+                            ? XCircle
+                            : t.status === "cancelled"
+                              ? Square
+                              : Clock;
+                      const iconCls =
+                        t.status === "completed"
+                          ? "text-bull"
+                          : t.status === "failed"
+                            ? "text-critical"
+                            : t.status === "cancelled"
+                              ? "text-warning"
+                              : "text-accent";
+                      return (
+                        <li key={t.id}>
+                          <button
+                            type="button"
+                            role="menuitem"
+                            onClick={() => {
+                              setActiveTaskId(t.id);
+                              setHistoryOpen(false);
+                            }}
+                            className={`flex w-full cursor-pointer flex-col gap-0.5 px-3 py-2 text-left text-xs ${
+                              selected ? "bg-elevated text-ink" : "text-ink-2 hover:bg-elevated/60"
+                            }`}
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="truncate font-medium text-ink">{describeScanTaskScope(t)}</span>
+                              <Icon className={`h-3.5 w-3.5 shrink-0 ${iconCls}`} aria-hidden="true" />
+                            </div>
+                            <div className="flex items-center justify-between font-mono text-[10px] text-muted">
+                              <span>{shortTime(t.created_at)} UTC</span>
+                              <span>#{t.id.slice(0, 6)}</span>
+                            </div>
+                          </button>
+                        </li>
+                      );
+                    })
+                  )}
+                </ul>
+              </div>
+            ) : null}
           </div>
         </div>
 
-      <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-[minmax(0,1fr)_248px] 2xl:grid-cols-[minmax(0,1fr)_292px]">
-        {/* Main Column: Collapsible Pool Launcher + Wide Scan Results Table */}
-        <div className="flex min-w-0 flex-col gap-3.5">
+      <div className="flex min-w-0 flex-col gap-3.5">
+        {/* Tab Panel A: Inline L1-Track Two-Stage Leader Picker */}
+        <div
+          role="tabpanel"
+          aria-labelledby={`${l2TabBaseId}-tab-l1`}
+          hidden={l2Mode !== "l1_track"}
+        >
+          {selectedL1Track ? (
+            <Layer2InlinePicker
+              card={selectedL1Track.card}
+              runId={selectedL1Track.runId}
+              universes={universes}
+              scanBusy={launching}
+              isLoggedInShadow={
+                Boolean(selectedL1Track.runId) &&
+                selectedL1Track.runId === shadowState.runId &&
+                shadowState.loggedCardIds.includes(selectedL1Track.card.id)
+              }
+              loggingShadow={
+                Boolean(selectedL1Track.runId) &&
+                selectedL1Track.runId === shadowState.runId &&
+                shadowState.loggingCardId === selectedL1Track.card.id
+              }
+              onLogShadow={
+                selectedL1Track.runId && !selectedL1Track.card.id.startsWith("headwind_short_")
+                  ? () =>
+                      setLogCardSignal((prev) => ({
+                        cardId: selectedL1Track.card.id,
+                        seq: (prev?.seq ?? 0) + 1,
+                      }))
+                  : undefined
+              }
+              onOpenCardDetail={() =>
+                setOpenCardDetailSignal((prev) => ({
+                  card: selectedL1Track.card,
+                  seq: (prev?.seq ?? 0) + 1,
+                }))
+              }
+              onClearTrack={() => setSelectedL1Track(null)}
+              onLaunchScan={handleLaunchCompassScan}
+              onUniverseSaved={() => void loadUniverses()}
+            />
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-dashed border-hairline bg-sunken/40 px-4 py-3 text-xs text-muted">
+              <span>
+                在上方第一层任意方向卡片点击 <strong className="text-ink">「选龙头过筛」</strong>，此处将就地展开两段式（基准参照锚 + 候选真龙头槽）日线联立验证台。
+              </span>
+              <button
+                type="button"
+                className="text-accent hover:underline"
+                onClick={() => {
+                  setL2Mode("manual");
+                  setPickerExpanded(true);
+                }}
+              >
+                或切换到「手动自由选池」→
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* Tab Panel B: Manual Free Universe / Symbol Picker */}
+        <div
+          role="tabpanel"
+          aria-labelledby={`${l2TabBaseId}-tab-manual`}
+          hidden={l2Mode !== "manual"}
+        >
           <section className="card flex flex-col gap-3 p-4" aria-label="手动板块龙头池选择器">
             {/* Collapsible Summary Bar (Collapsed by default so Layer 1 leads) */}
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1467,6 +1749,7 @@ export function WorkbenchView({
               </div>
             ) : null}
           </section>
+        </div>
 
           {/* Results & Live Progress Card */}
           <section className="card flex flex-col gap-3 p-4" aria-label="扫描结果与实时进度">
@@ -1624,6 +1907,31 @@ export function WorkbenchView({
                       <StatusBadge tone={pairVerdict.tone} label={pairVerdict.label} />
                       <span className="text-[11px] text-ink-2">{pairVerdict.detail}</span>
                     </div>
+                  ) : activeTask?.status === "completed" &&
+                    filterCounts.all > 0 &&
+                    filterCounts.aligned === 0 &&
+                    activeCompassContext.direction_id &&
+                    !activeCompassContext.direction_id.startsWith("headwind_short_") &&
+                    activeCompassContext.run_id &&
+                    activeCompassContext.run_id === shadowState.runId ? (
+                    <button
+                      type="button"
+                      className="btn btn-sm !min-h-[24px] !px-2 !text-[11px] border-warning/45 bg-warning/10 text-warning hover:bg-warning/20"
+                      disabled={shadowState.loggingCardId === activeCompassContext.direction_id}
+                      onClick={() =>
+                        setLogCardSignal((prev) => ({
+                          cardId: activeCompassContext.direction_id!,
+                          seq: (prev?.seq ?? 0) + 1,
+                        }))
+                      }
+                    >
+                      <BookmarkPlus className="h-3 w-3" aria-hidden="true" />
+                      <span>
+                        {shadowState.loggedCardIds.includes(activeCompassContext.direction_id)
+                          ? "0通过 · 已入 Track C 影子账本"
+                          : "0只同向通过 · 记入 Track C 放弃归因"}
+                      </span>
+                    </button>
                   ) : null}
                 </div>
                 {filterCounts.pool_unverified > 0 ? (
@@ -1782,7 +2090,11 @@ export function WorkbenchView({
                                 </div>
                               </td>
                               <td data-label="中枢 [ZD, ZG]" className="num text-[11px]" style={{ paddingInline: 6 }}>
-                                {row.daily_zs ? `[${fmtPrice(row.daily_zs[0])}, ${fmtPrice(row.daily_zs[1])}]` : "—"}
+                                <ZhongshuMiniRuler
+                                  last={row.close}
+                                  zd={row.daily_zs?.[0]}
+                                  zg={row.daily_zs?.[1]}
+                                />
                               </td>
                               <td data-label="信号与方向建议" style={{ paddingInline: 6 }}>
                                 <div className="flex min-w-[155px] flex-col gap-1" title={rawSignalsTitle}>
@@ -1927,75 +2239,6 @@ export function WorkbenchView({
               </div>
             </details>
           </section>
-        </div>
-
-        {/* Right Sidebar: Transparent Scan History (shows pool names instead of opaque hashes) */}
-        <aside className="card flex min-w-0 flex-col overflow-hidden" aria-label="近期扫描记录">
-          <div className="flex items-center justify-between border-b border-hairline px-3.5 py-2.5">
-            <span className="text-[13px] font-semibold text-ink">近期扫描记录 ({tasks.length})</span>
-            <button
-              type="button"
-              className="btn btn-ghost btn-sm px-2"
-              onClick={() => void loadTasks()}
-              aria-label="刷新记录"
-            >
-              <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
-            </button>
-          </div>
-          <ul className="m-0 max-h-[68dvh] flex-1 list-none divide-y divide-hairline-soft overflow-y-auto p-0">
-            {tasks.length === 0 ? (
-              <li className="p-5 text-center text-xs text-muted">暂无本轮扫描历史</li>
-            ) : (
-              tasks.map((t) => {
-                const selected = t.id === activeTaskId;
-                const Icon =
-                  t.status === "completed"
-                    ? CheckCircle2
-                    : t.status === "failed"
-                      ? XCircle
-                      : t.status === "cancelled"
-                        ? Square
-                        : Clock;
-                const iconCls =
-                  t.status === "completed"
-                    ? "text-bull"
-                    : t.status === "failed"
-                      ? "text-critical"
-                      : t.status === "cancelled"
-                        ? "text-warning"
-                        : "text-accent";
-                return (
-                  <li key={t.id}>
-                    <button
-                      type="button"
-                      onClick={() => setActiveTaskId(t.id)}
-                      className={`flex w-full cursor-pointer flex-col gap-1 px-3.5 py-2.5 text-left text-xs ${
-                        selected ? "bg-elevated text-ink" : "text-ink-2 hover:bg-elevated/60"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="truncate font-medium text-ink">
-                          {describeScanTaskScope(t)}
-                        </span>
-                        <Icon className={`h-3.5 w-3.5 shrink-0 ${iconCls}`} aria-hidden="true" />
-                      </div>
-                      <div className="flex items-center justify-between font-mono text-[10.5px] text-muted">
-                        <span>{shortTime(t.created_at)} UTC</span>
-                        <span>#{t.id.slice(0, 6)}</span>
-                      </div>
-                    </button>
-                  </li>
-                );
-              })
-            )}
-          </ul>
-          <div className="border-t border-hairline-soft bg-sunken/50 px-3.5 py-2 text-[11px] text-muted">
-            <span className="inline-flex items-center gap-1">
-              <BookOpen className="h-3 w-3" aria-hidden="true" />
-              <span>单标硬数据刷新已就地集成至「研报档案」</span>
-            </span>
-          </div>
-        </aside>
       </div>
       </div>
 

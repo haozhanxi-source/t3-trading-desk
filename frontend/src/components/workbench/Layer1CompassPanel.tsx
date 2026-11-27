@@ -9,8 +9,8 @@ import {
   Clock,
   Compass,
   Crosshair,
-  ExternalLink,
   History,
+  Layers,
   Loader2,
   RefreshCw,
   Scale,
@@ -29,22 +29,24 @@ import type {
   CompassMacroOverview,
   CompassRunRecord,
   CompassRunSummary,
-  CompassScanContext,
   CrossAssetAnchorItem,
   DeepResearchEngine,
-  PolymarketEventItem,
   ResearchEnginesResponse,
   TaskEventEnvelope,
   TaskRecord,
-  UniversePool,
 } from "../../api/types";
 import { ModalDialog } from "../ui/ModalDialog";
-import { signedToneClass } from "../ui/StatusBadge";
-import { SymbolLabel } from "../ui/SymbolLabel";
-import { fmtPct, shortTime } from "../../lib/format";
-import { Layer1LeaderPickerModal } from "./Layer1LeaderPickerModal";
+import { shortTime } from "../../lib/format";
+import { MacroCockpit, signalLightTone } from "./MacroCockpit";
+import { Layer1DetailDrawer, type Layer1DrawerState } from "./Layer1DetailDrawer";
 
 type DirectionFilter = "all" | "long" | "short" | "pair";
+
+export interface L2CardScanSummary {
+  aligned: number;
+  watch: number;
+  total: number;
+}
 
 interface CompassLogLine {
   ts: string;
@@ -113,7 +115,7 @@ function assetScopeLabel(scope: string): string {
     case "fx":
       return "外汇 FX";
     case "crypto":
-      return "加密货币";
+      return "加密";
     case "cross_asset":
       return "跨资产";
     default:
@@ -135,225 +137,8 @@ function formatElapsed(ms: number): string {
   return m > 0 ? `${m}m ${String(s).padStart(2, "0")}s` : `${s}s`;
 }
 
-function formatHeadlineValue(value: number | null, unit: string): string {
-  if (value === null || value === undefined || Number.isNaN(value)) return "—";
-  if (unit === "$/t") return `$${Math.round(value).toLocaleString("en-US")}/t`;
-  return `${value.toFixed(unit === "%" ? 2 : 1)}${unit}`;
-}
-
-function formatCompactUsd(val: number | null | undefined): string {
-  if (val === null || val === undefined || !Number.isFinite(val) || val <= 0) return "$0";
-  if (val >= 1_000_000) return `$${(val / 1_000_000).toFixed(1)}M`;
-  if (val >= 1_000) return `$${Math.round(val / 1_000)}K`;
-  return `$${Math.round(val)}`;
-}
-
-function clampProbPct(val: number | null | undefined): number | null {
-  if (val === null || val === undefined || !Number.isFinite(val)) return null;
-  return Math.max(0, Math.min(100, val));
-}
-
-function formatProbPct(val: number | null | undefined): string {
-  const pct = clampProbPct(val);
-  return pct === null ? "—" : `${pct.toFixed(1)}%`;
-}
-
-function formatPpDelta(val: number | null | undefined): string | null {
-  if (val === null || val === undefined || !Number.isFinite(val)) return null;
-  const rounded = Math.round(val * 10) / 10;
-  if (Math.abs(rounded) < 0.1) return null;
-  return `${rounded > 0 ? "+" : ""}${rounded.toFixed(1)}pp`;
-}
-
-function ppDeltaToneClass(val: number | null | undefined): string {
-  if (val === null || val === undefined || !Number.isFinite(val)) return "text-muted";
-  // Neutral styling: probability spikes on tariffs/geopolitics are NOT asset bullish/bearish signals
-  return Math.abs(val) >= 5 ? "text-warning font-medium" : "text-muted";
-}
-
-function isSafePolymarketUrl(url: string | undefined): url is string {
-  return typeof url === "string" && /^https:\/\/polymarket\.com\/event\/[A-Za-z0-9_-]+$/.test(url);
-}
-
-function consensusBandMeta(band: string | undefined) {
-  switch (band) {
-    case "consensus":
-      return { label: "盘口隐含概率较高", cls: "border-accent/35 bg-accent/10 text-accent" };
-    case "contested":
-      return { label: "盘口博弈分歧", cls: "border-warning/40 bg-warning/10 text-warning" };
-    case "ladder":
-      return { label: "多期限阶梯", cls: "border-hairline bg-elevated text-ink-2" };
-    default:
-      return { label: "低概率尾部", cls: "border-hairline bg-elevated text-muted" };
-  }
-}
-
-const MONTHLY_MACRO_KEYS = new Set(["PCOPPUSDM", "FEDFUNDS", "M2SL", "CN_PMI"]);
-const MACRO_LAG_THRESHOLD_DAYS = 14;
-
-interface MacroAsOfInfo {
-  raw: string | null;
-  shortLabel: string;
-  lagDays: number | null;
-  isLagged: boolean;
-  isMonthly: boolean;
-}
-
-function isValidUtcDate(year: number, month: number, day: number): boolean {
-  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) return false;
-  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
-  const maxDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return day <= maxDay;
-}
-
-function parseMacroAsOf(
-  asOf: string | null | undefined,
-  key: string,
-  refNowMs: number,
-): MacroAsOfInfo {
-  const raw = (asOf || "").trim();
-  const keyUpper = (key || "").trim().toUpperCase();
-  const isKnownMonthly = MONTHLY_MACRO_KEYS.has(keyUpper);
-  if (!raw) {
-    return { raw: null, shortLabel: "", lagDays: null, isLagged: false, isMonthly: isKnownMonthly };
-  }
-
-  const refYear = new Date(refNowMs).getUTCFullYear();
-  const isoDay = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(raw);
-  if (isoDay) {
-    const y = Number(isoDay[1]);
-    const m = Number(isoDay[2]);
-    const d = Number(isoDay[3]);
-    if (!isValidUtcDate(y, m, d)) {
-      return {
-        raw,
-        shortLabel: raw.slice(0, 12),
-        lagDays: null,
-        isLagged: false,
-        isMonthly: isKnownMonthly,
-      };
-    }
-    // Known monthly series (e.g. PCOPPUSDM, FEDFUNDS, M2SL, CN_PMI) report month-start dates
-    // representing the whole month; unify lag calculation on month-end to match "YYYY年M月份".
-    const obsMs = isKnownMonthly ? Date.UTC(y, m, 0) : Date.UTC(y, m - 1, d);
-    const lagDays = Number.isFinite(obsMs)
-      ? Math.max(0, Math.floor((refNowMs - obsMs) / 86_400_000))
-      : null;
-    const mm = String(m).padStart(2, "0");
-    const dd = String(d).padStart(2, "0");
-    const shortLabel = isKnownMonthly
-      ? y === refYear
-        ? `${mm}月`
-        : `${y}-${mm}`
-      : y === refYear
-        ? `${mm}-${dd}`
-        : `${y}-${mm}-${dd}`;
-    return {
-      raw,
-      shortLabel,
-      lagDays,
-      isLagged: lagDays !== null && lagDays > MACRO_LAG_THRESHOLD_DAYS,
-      isMonthly: isKnownMonthly,
-    };
-  }
-
-  const ym = /^(\d{4})[年\-/](\d{1,2})(?:月份?)?/.exec(raw);
-  if (ym) {
-    const y = Number(ym[1]);
-    const m = Number(ym[2]);
-    if (!isValidUtcDate(y, m, 1)) {
-      return {
-        raw,
-        shortLabel: raw.slice(0, 12),
-        lagDays: null,
-        isLagged: false,
-        isMonthly: isKnownMonthly,
-      };
-    }
-    // Month-period observations (e.g. NBS PMI "2026年10月份") represent the whole month; measure lag from month-end.
-    const monthEndMs = Date.UTC(y, m, 0);
-    const lagDays = Number.isFinite(monthEndMs)
-      ? Math.max(0, Math.floor((refNowMs - monthEndMs) / 86_400_000))
-      : null;
-    const mm = String(m).padStart(2, "0");
-    const shortLabel = y === refYear ? `${mm}月` : `${y}-${mm}`;
-    return {
-      raw,
-      shortLabel,
-      lagDays,
-      isLagged: lagDays !== null && lagDays > MACRO_LAG_THRESHOLD_DAYS,
-      isMonthly: true,
-    };
-  }
-
-  return {
-    raw,
-    shortLabel: raw.slice(0, 12),
-    lagDays: null,
-    isLagged: false,
-    isMonthly: isKnownMonthly,
-  };
-}
-
-function regimeTagClasses(tone: string): string {
-  switch (tone) {
-    case "good":
-      return "border-bull/35 bg-bull/10 text-bull";
-    case "critical":
-      return "border-critical/40 bg-critical/10 text-critical";
-    case "warning":
-      return "border-warning/40 bg-warning/10 text-warning";
-    default:
-      return "border-hairline bg-elevated text-ink-2";
-  }
-}
-
-function directionMeta(direction: CompassDirectionCard["direction"]) {
-  if (direction === "short") {
-    return {
-      label: "做空方向",
-      code: "SHORT",
-      borderClass: "border-l-bear",
-      badgeClass: "border-bear/40 bg-bear/12 text-bear",
-      Icon: TrendingDown,
-    };
-  }
-  if (direction === "pair") {
-    return {
-      label: "多空配对",
-      code: "PAIR",
-      borderClass: "border-l-warning",
-      badgeClass: "border-warning/40 bg-warning/12 text-warning",
-      Icon: Scale,
-    };
-  }
-  return {
-    label: "做多方向",
-    code: "LONG",
-    borderClass: "border-l-bull",
-    badgeClass: "border-bull/40 bg-bull/12 text-bull",
-    Icon: TrendingUp,
-  };
-}
-
-function safeExternalUrl(raw: string | undefined | null): string | null {
-  const s = (raw || "").trim();
-  if (!s || s.includes("\\") || s.length > 2000) return null;
-  try {
-    const parsed = new URL(s);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
-    if (parsed.username || parsed.password) return null;
-    if (!parsed.hostname) return null;
-    return parsed.href;
-  } catch {
-    return null;
-  }
-}
-
-function isLegacyHeadwindShortable(item: CompassAvoidSectorItem): boolean {
-  if (typeof item.short_proxy_possible === "boolean") {
-    return item.short_proxy_possible;
-  }
+function isHeadwindShortable(item: CompassAvoidSectorItem): boolean {
+  if (typeof item.short_proxy_possible === "boolean") return item.short_proxy_possible;
   const text = `${item.sector} ${item.reason}`.toLowerCase();
   return /(美股|美国|ai|算力|芯片|科技|数据中心|纳斯达克|原油|石油|金属|锂|铝|铜|锡|镍|铁矿|黑色|地产|加密|比特币|btc|eth|外汇|汇率|商品|农产品|生猪)/.test(
     text,
@@ -388,25 +173,66 @@ function buildShortCardFromHeadwind(item: CompassAvoidSectorItem, index: number)
   };
 }
 
+function computeAnchorTemperature(
+  card: CompassDirectionCard,
+  anchorBySym: Map<string, CrossAssetAnchorItem>,
+): { kind: "aligned" | "divergent" | "neutral"; label: string; detail: string } | null {
+  const anchors = (card.reference_anchors ?? [])
+    .map((sym) => anchorBySym.get(sym.toUpperCase()))
+    .filter((it): it is CrossAssetAnchorItem => Boolean(it && it.status === "ok" && it.ret_20d_pct !== null));
+  if (anchors.length === 0) return null;
+
+  const avg20 = anchors.reduce((sum, it) => sum + (it.ret_20d_pct ?? 0), 0) / anchors.length;
+  const broken = anchors.some((it) => it.chanlun_hint?.shield_state === "below_zd_breakdown");
+  const summary = anchors
+    .map((a) => `${a.name}(20D ${a.ret_20d_pct! >= 0 ? "+" : ""}${a.ret_20d_pct!.toFixed(1)}%)`)
+    .join(" · ");
+
+  if (card.direction === "long") {
+    if (avg20 >= 0 && !broken) {
+      return { kind: "aligned", label: "锚温同向 ✓", detail: `板块参照锚 20D 均值 +${avg20.toFixed(1)}% · ${summary}` };
+    }
+    return {
+      kind: "divergent",
+      label: "锚点背离 · 需L2甄别",
+      detail: `参照锚偏弱 (${avg20.toFixed(1)}%)，切忌盲买宽基，需在 L2 甄别逆势真龙头或观望 · ${summary}`,
+    };
+  }
+  if (card.direction === "short") {
+    if (avg20 <= 0) {
+      return { kind: "aligned", label: "锚温同向 ✓", detail: `板块参照锚 20D 均值 ${avg20.toFixed(1)}% · ${summary}` };
+    }
+    return {
+      kind: "divergent",
+      label: "锚点背离 · 需L2甄别",
+      detail: `参照锚仍在上涨 (+${avg20.toFixed(1)}%)，严禁左侧摸顶，等 L2 日线跌破结构 · ${summary}`,
+    };
+  }
+  return { kind: "neutral", label: "配对锚温对照", detail: summary };
+}
+
 export interface Layer1CompassPanelProps {
-  universes: Record<string, UniversePool>;
-  scanBusy?: boolean;
-  onLaunchCompassScan: (opts: {
-    symbols: string[];
-    compassContext: CompassScanContext;
-  }) => Promise<void> | void;
-  onUniverseSaved?: () => void;
+  activeL2CardId?: string | null;
+  l2ScanSummaries?: Record<string, L2CardScanSummary>;
+  openCardDetailSignal?: { card: CompassDirectionCard; seq: number } | null;
+  logCardSignal?: { cardId: string; seq: number } | null;
+  onSelectCardForL2: (card: CompassDirectionCard, runId?: string) => void;
+  onShadowStateChange?: (state: {
+    runId: string;
+    loggedCardIds: string[];
+    loggingCardId: string | null;
+  }) => void;
   onJumpWarRoom: (symbol: string) => void;
-  onJumpArchive: (symbol: string) => void;
 }
 
 export function Layer1CompassPanel({
-  universes,
-  scanBusy = false,
-  onLaunchCompassScan,
-  onUniverseSaved,
+  activeL2CardId = null,
+  l2ScanSummaries,
+  openCardDetailSignal = null,
+  logCardSignal = null,
+  onSelectCardForL2,
+  onShadowStateChange,
   onJumpWarRoom,
-  onJumpArchive,
 }: Layer1CompassPanelProps) {
   /* Free hard-data macro foundation */
   const [macro, setMacro] = useState<CompassMacroOverview | null>(null);
@@ -419,6 +245,10 @@ export function Layer1CompassPanel({
   const [selectedRunId, setSelectedRunId] = useState<string>("");
   const [loadingRun, setLoadingRun] = useState(false);
   const [dirFilter, setDirFilter] = useState<DirectionFilter>("all");
+  const [highlightFactor, setHighlightFactor] = useState<string | null>(null);
+
+  /* Progressive disclosure non-modal right slide-over drawer */
+  const [drawer, setDrawer] = useState<Layer1DrawerState>(null);
 
   /* AI engine & launch modal */
   const [enginesInfo, setEnginesInfo] = useState<ResearchEnginesResponse | null>(null);
@@ -430,12 +260,8 @@ export function Layer1CompassPanel({
   const [refreshMacroOnRun, setRefreshMacroOnRun] = useState(true);
   const [launching, setLaunching] = useState(false);
   const [launchErr, setLaunchErr] = useState<string | null>(null);
-  const [pickerTarget, setPickerTarget] = useState<{
-    card: CompassDirectionCard;
-    runId?: string;
-  } | null>(null);
 
-  /* Track C L1 -> Shadow Opportunity Ledger 1-click logging */
+  /* Track C L1 -> Shadow Opportunity Ledger 1-click logging (hydrated + session map) */
   const [loggingOppKey, setLoggingOppKey] = useState<string | null>(null);
   const [loggedOppMap, setLoggedOppMap] = useState<Record<string, { symbol: string; idempotent?: boolean }>>({});
   const [oppLogFeedback, setOppLogFeedback] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
@@ -450,6 +276,7 @@ export function Layer1CompassPanel({
   const historyAbortRef = useRef<AbortController | null>(null);
   const latestRunIdRef = useRef<string>("");
   const viewingLatestRef = useRef<boolean>(true);
+  const lastLogSeqRef = useRef<number>(0);
 
   const loadMacro = useCallback(async (refresh = false, signal?: AbortSignal) => {
     setMacroLoading(true);
@@ -466,227 +293,230 @@ export function Layer1CompassPanel({
     }
   }, []);
 
-  const attachTaskStream = useCallback((task: TaskRecord) => {
-    if (!mountedRef.current) return;
-    if (esRef.current) {
-      esRef.current.close();
-      esRef.current = null;
-    }
-    const taskId = task.id;
-    const params = task.params ?? {};
-    const startedMs = task.started_at ? Date.parse(task.started_at) || Date.now() : Date.now();
-
-    setActiveRun({
-      taskId,
-      engine: String(params.engine || "claude"),
-      effort: String(params.effort || "medium"),
-      status: (task.status as ActiveCompassRun["status"]) || "running",
-      stage: "collect_macro",
-      done: typeof task.progress === "object" && task.progress ? task.progress.done : 0,
-      total: typeof task.progress === "object" && task.progress && task.progress.total ? task.progress.total : 4,
-      startedAtMs: startedMs,
-      logs: [],
-    });
-
-    const seenSeq = new Set<number>();
-    let closed = false;
-    let probingError = false;
-    const es = new EventSource(api.taskEventsUrl(taskId));
-    esRef.current = es;
-
-    const closeStream = () => {
-      if (closed) return;
-      closed = true;
-      es.close();
-      if (esRef.current === es) {
+  const attachTaskStream = useCallback(
+    (task: TaskRecord) => {
+      if (!mountedRef.current) return;
+      if (esRef.current) {
+        esRef.current.close();
         esRef.current = null;
       }
-    };
+      const taskId = task.id;
+      const params = task.params ?? {};
+      const startedMs = task.started_at ? Date.parse(task.started_at) || Date.now() : Date.now();
 
-    const syncCompletedRun = (saved?: CompassRunRecord) => {
-      const reqAtDone = selectionReqSeqRef.current;
-      if (saved && saved.result && Array.isArray(saved.result.directions)) {
-        latestRunIdRef.current = saved.run_id;
-        if (viewingLatestRef.current && selectionReqSeqRef.current === reqAtDone) {
-          setCurrentRun(saved);
-          setSelectedRunId(saved.run_id);
-        }
-      }
-      void api
-        .compassLatest()
-        .then((res) => {
-          if (!mountedRef.current) return;
-          setHistory(res.history ?? []);
-          if (res.latest) {
-            latestRunIdRef.current = res.latest.run_id;
-            if (viewingLatestRef.current && selectionReqSeqRef.current === reqAtDone) {
-              setCurrentRun(res.latest);
-              setSelectedRunId(res.latest.run_id);
-              setOppLogFeedback(null);
-            }
+      setActiveRun({
+        taskId,
+        engine: String(params.engine || "claude"),
+        effort: String(params.effort || "medium"),
+        status: (task.status as ActiveCompassRun["status"]) || "running",
+        stage: "collect_macro",
+        done: typeof task.progress === "object" && task.progress ? task.progress.done : 0,
+        total: typeof task.progress === "object" && task.progress && task.progress.total ? task.progress.total : 4,
+        startedAtMs: startedMs,
+        logs: [],
+      });
+
+      const seenSeq = new Set<number>();
+      let closed = false;
+      let probingError = false;
+      const es = new EventSource(api.taskEventsUrl(taskId));
+      esRef.current = es;
+
+      const closeStream = () => {
+        if (closed) return;
+        closed = true;
+        es.close();
+        if (esRef.current === es) esRef.current = null;
+      };
+
+      const syncCompletedRun = (saved?: CompassRunRecord) => {
+        const reqAtDone = selectionReqSeqRef.current;
+        if (saved && saved.result && Array.isArray(saved.result.directions)) {
+          latestRunIdRef.current = saved.run_id;
+          if (viewingLatestRef.current && selectionReqSeqRef.current === reqAtDone) {
+            setCurrentRun(saved);
+            setSelectedRunId(saved.run_id);
           }
-        })
-        .catch(() => undefined);
-      void loadMacro(false);
-    };
-
-    const applyEvents = (events: TaskEventEnvelope[]) => {
-      if (!mountedRef.current) return;
-      for (const ev of events) {
-        if (typeof ev.seq === "number") {
-          if (seenSeq.has(ev.seq)) continue;
-          seenSeq.add(ev.seq);
         }
-        const d = ev.data ?? {};
-        const t = ev.type;
-        if (t === "step" || t === "log") {
-          const msg = String(d.message || ev.message || "").trim();
-          const stg = d.stage ? String(d.stage) : undefined;
-          setActiveRun((prev) => {
-            if (!prev || prev.taskId !== taskId) return prev;
-            const nextLogs = msg
-              ? [...prev.logs, { ts: ev.ts || new Date().toISOString(), stage: stg, message: msg }].slice(-40)
-              : prev.logs;
-            return {
-              ...prev,
-              status: prev.status === "queued" ? "running" : prev.status,
-              stage: stg || prev.stage,
-              logs: nextLogs,
-            };
-          });
-        } else if (t === "progress") {
-          setActiveRun((prev) =>
-            prev && prev.taskId === taskId
-              ? {
-                  ...prev,
-                  done: typeof d.done === "number" ? Math.max(prev.done, d.done) : prev.done,
-                  total: typeof d.total === "number" && d.total > 0 ? d.total : prev.total,
-                }
-              : prev,
-          );
-        } else if (t === "done") {
-          const saved = (d.result ?? ev.result) as CompassRunRecord | undefined;
-          setActiveRun((prev) =>
-            prev && prev.taskId === taskId
-              ? { ...prev, status: "completed", done: prev.total, finishedAtMs: Date.now() }
-              : prev,
-          );
-          closeStream();
-          syncCompletedRun(saved);
-        } else if (t === "error" || t === "cancelled") {
-          const nextStatus = t === "cancelled" ? "cancelled" : "failed";
-          const errMsg = String(d.message || ev.message || (t === "cancelled" ? "已终止推演" : "推演失败"));
-          setActiveRun((prev) =>
-            prev && prev.taskId === taskId
-              ? { ...prev, status: nextStatus, error: errMsg, finishedAtMs: Date.now() }
-              : prev,
-          );
-          closeStream();
-        }
-      }
-    };
+        void api
+          .compassLatest()
+          .then((res) => {
+            if (!mountedRef.current) return;
+            setHistory(res.history ?? []);
+            if (res.latest) {
+              latestRunIdRef.current = res.latest.run_id;
+              if (viewingLatestRef.current && selectionReqSeqRef.current === reqAtDone) {
+                setCurrentRun(res.latest);
+                setSelectedRunId(res.latest.run_id);
+                setOppLogFeedback(null);
+              }
+            }
+          })
+          .catch(() => undefined);
+        void loadMacro(false);
+      };
 
-    const handler = (evType: string) => (msg: MessageEvent) => {
-      if (closed || !mountedRef.current || typeof msg.data !== "string") return;
-      const parsed = parseTaskEvent(msg.data, evType);
-      if (parsed) applyEvents([parsed]);
-    };
-
-    for (const evtName of ["step", "log", "progress", "done", "error", "cancelled", "message"]) {
-      es.addEventListener(evtName, handler(evtName) as EventListener);
-    }
-
-    /* Native transport error recovery (e.g. backend restart -> SSE 404 without data payload) */
-    es.onerror = () => {
-      if (closed || probingError || !mountedRef.current) return;
-      probingError = true;
-      void api
-        .task(taskId)
-        .then((detail) => {
-          if (!mountedRef.current || closed) return;
-          if (detail.status === "completed") {
+      const applyEvents = (events: TaskEventEnvelope[]) => {
+        if (!mountedRef.current) return;
+        for (const ev of events) {
+          if (typeof ev.seq === "number") {
+            if (seenSeq.has(ev.seq)) continue;
+            seenSeq.add(ev.seq);
+          }
+          const d = ev.data ?? {};
+          const t = ev.type;
+          if (t === "step" || t === "log") {
+            const msg = String(d.message || ev.message || "").trim();
+            const stg = d.stage ? String(d.stage) : undefined;
+            setActiveRun((prev) => {
+              if (!prev || prev.taskId !== taskId) return prev;
+              const nextLogs = msg
+                ? [...prev.logs, { ts: ev.ts || new Date().toISOString(), stage: stg, message: msg }].slice(-40)
+                : prev.logs;
+              return {
+                ...prev,
+                status: prev.status === "queued" ? "running" : prev.status,
+                stage: stg || prev.stage,
+                logs: nextLogs,
+              };
+            });
+          } else if (t === "progress") {
+            setActiveRun((prev) =>
+              prev && prev.taskId === taskId
+                ? {
+                    ...prev,
+                    done: typeof d.done === "number" ? Math.max(prev.done, d.done) : prev.done,
+                    total: typeof d.total === "number" && d.total > 0 ? d.total : prev.total,
+                  }
+                : prev,
+            );
+          } else if (t === "done") {
+            const saved = (d.result ?? ev.result) as CompassRunRecord | undefined;
             setActiveRun((prev) =>
               prev && prev.taskId === taskId
                 ? { ...prev, status: "completed", done: prev.total, finishedAtMs: Date.now() }
                 : prev,
             );
             closeStream();
-            syncCompletedRun(detail.result as CompassRunRecord | undefined);
-          } else if (detail.status === "failed" || detail.status === "cancelled") {
-            const errMsg = detail.error || (detail.status === "cancelled" ? "已终止推演" : "推演失败");
+            syncCompletedRun(saved);
+          } else if (t === "error" || t === "cancelled") {
+            const nextStatus = t === "cancelled" ? "cancelled" : "failed";
+            const errMsg = String(d.message || ev.message || (t === "cancelled" ? "已终止推演" : "推演失败"));
             setActiveRun((prev) =>
               prev && prev.taskId === taskId
-                ? {
-                    ...prev,
-                    status: detail.status === "cancelled" ? "cancelled" : "failed",
-                    error: errMsg,
-                    finishedAtMs: Date.now(),
-                  }
+                ? { ...prev, status: nextStatus, error: errMsg, finishedAtMs: Date.now() }
                 : prev,
             );
             closeStream();
           }
-        })
-        .catch(async (ex) => {
-          if (!mountedRef.current || closed) return;
-          const isMissing = ex instanceof ApiError && ex.status === 404;
-          if (isMissing || es.readyState === EventSource.CLOSED) {
-            closeStream();
-            try {
-              const latestRes = await api.compassLatest();
-              if (!mountedRef.current) return;
-              setHistory(latestRes.history ?? []);
-              const matched = latestRes.latest && latestRes.latest.run_id === taskId ? latestRes.latest : null;
-              if (matched) {
-                setActiveRun((prev) =>
-                  prev && prev.taskId === taskId
-                    ? { ...prev, status: "completed", done: prev.total, finishedAtMs: Date.now() }
-                    : prev,
-                );
-                syncCompletedRun(matched);
-                return;
-              }
-            } catch {
-              /* fall through to disconnect state */
-            }
-            setActiveRun((prev) =>
-              prev && prev.taskId === taskId
-                ? {
-                    ...prev,
-                    status: "failed",
-                    error: isMissing ? "推演任务连接已失联（服务可能已重启），可重新运行" : "SSE 连接中断，请重试",
-                    finishedAtMs: Date.now(),
-                  }
-                : prev,
-            );
-          }
-        })
-        .finally(() => {
-          probingError = false;
-        });
-    };
-  }, [loadMacro]);
-
-  const loadLatest = useCallback(async (signal?: AbortSignal) => {
-    const reqSeq = ++selectionReqSeqRef.current;
-    try {
-      const res = await api.compassLatest(signal);
-      if (!mountedRef.current || signal?.aborted) return;
-      setHistory(res.history ?? []);
-      if (res.latest) {
-        latestRunIdRef.current = res.latest.run_id;
-        if (selectionReqSeqRef.current === reqSeq && viewingLatestRef.current) {
-          setCurrentRun(res.latest);
-          setSelectedRunId(res.latest.run_id);
         }
+      };
+
+      const handler = (evType: string) => (msg: MessageEvent) => {
+        if (closed || !mountedRef.current || typeof msg.data !== "string") return;
+        const parsed = parseTaskEvent(msg.data, evType);
+        if (parsed) applyEvents([parsed]);
+      };
+
+      for (const evtName of ["step", "log", "progress", "done", "error", "cancelled", "message"]) {
+        es.addEventListener(evtName, handler(evtName) as EventListener);
       }
-      if (res.active_task && (res.active_task.status === "queued" || res.active_task.status === "running")) {
-        attachTaskStream(res.active_task);
+
+      es.onerror = () => {
+        if (closed || probingError || !mountedRef.current) return;
+        probingError = true;
+        void api
+          .task(taskId)
+          .then((detail) => {
+            if (!mountedRef.current || closed) return;
+            if (detail.status === "completed") {
+              setActiveRun((prev) =>
+                prev && prev.taskId === taskId
+                  ? { ...prev, status: "completed", done: prev.total, finishedAtMs: Date.now() }
+                  : prev,
+              );
+              closeStream();
+              syncCompletedRun(detail.result as CompassRunRecord | undefined);
+            } else if (detail.status === "failed" || detail.status === "cancelled") {
+              const errMsg = detail.error || (detail.status === "cancelled" ? "已终止推演" : "推演失败");
+              setActiveRun((prev) =>
+                prev && prev.taskId === taskId
+                  ? {
+                      ...prev,
+                      status: detail.status === "cancelled" ? "cancelled" : "failed",
+                      error: errMsg,
+                      finishedAtMs: Date.now(),
+                    }
+                  : prev,
+              );
+              closeStream();
+            }
+          })
+          .catch(async (ex) => {
+            if (!mountedRef.current || closed) return;
+            const isMissing = ex instanceof ApiError && ex.status === 404;
+            if (isMissing || es.readyState === EventSource.CLOSED) {
+              closeStream();
+              try {
+                const latestRes = await api.compassLatest();
+                if (!mountedRef.current) return;
+                setHistory(latestRes.history ?? []);
+                const matched = latestRes.latest && latestRes.latest.run_id === taskId ? latestRes.latest : null;
+                if (matched) {
+                  setActiveRun((prev) =>
+                    prev && prev.taskId === taskId
+                      ? { ...prev, status: "completed", done: prev.total, finishedAtMs: Date.now() }
+                      : prev,
+                  );
+                  syncCompletedRun(matched);
+                  return;
+                }
+              } catch {
+                /* fall through */
+              }
+              setActiveRun((prev) =>
+                prev && prev.taskId === taskId
+                  ? {
+                      ...prev,
+                      status: "failed",
+                      error: isMissing ? "推演任务连接已失联（服务可能已重启），可重新运行" : "SSE 连接中断，请重试",
+                      finishedAtMs: Date.now(),
+                    }
+                  : prev,
+              );
+            }
+          })
+          .finally(() => {
+            probingError = false;
+          });
+      };
+    },
+    [loadMacro],
+  );
+
+  const loadLatest = useCallback(
+    async (signal?: AbortSignal) => {
+      const reqSeq = ++selectionReqSeqRef.current;
+      try {
+        const res = await api.compassLatest(signal);
+        if (!mountedRef.current || signal?.aborted) return;
+        setHistory(res.history ?? []);
+        if (res.latest) {
+          latestRunIdRef.current = res.latest.run_id;
+          if (selectionReqSeqRef.current === reqSeq && viewingLatestRef.current) {
+            setCurrentRun(res.latest);
+            setSelectedRunId(res.latest.run_id);
+          }
+        }
+        if (res.active_task && (res.active_task.status === "queued" || res.active_task.status === "running")) {
+          attachTaskStream(res.active_task);
+        }
+      } catch {
+        /* ignore initial fetch error */
       }
-    } catch {
-      /* ignore initial fetch error */
-    }
-  }, [attachTaskStream]);
+    },
+    [attachTaskStream],
+  );
 
   useEffect(() => {
     mountedRef.current = true;
@@ -722,17 +552,107 @@ export function Layer1CompassPanel({
     return () => window.clearInterval(id);
   }, [isRunActive]);
 
+  /* Sync external card-detail request from Layer2InlinePicker */
+  useEffect(() => {
+    if (openCardDetailSignal?.card) {
+      setDrawer({ kind: "card", card: openCardDetailSignal.card });
+    }
+  }, [openCardDetailSignal]);
+
+  const handleLogCompassOpportunity = useCallback(
+    async (kind: "l1_direction_call" | "l1_abstention", cardId?: string) => {
+      const runId = currentRun?.run_id;
+      if (!runId || loggingOppKey) return;
+      const opKey = `${runId}:${cardId || "abstain"}`;
+      setLoggingOppKey(opKey);
+      setOppLogFeedback(null);
+      try {
+        const res = await api.logCompassOpportunity(runId, {
+          kind,
+          ...(cardId ? { card_id: cardId } : {}),
+        });
+        if (!mountedRef.current) return;
+        const sym = res.opportunity?.symbol || "";
+        setLoggedOppMap((prev) => ({
+          ...prev,
+          [opKey]: { symbol: sym, idempotent: Boolean(res.idempotent_replay) },
+        }));
+        setOppLogFeedback({
+          tone: "ok",
+          text: res.idempotent_replay
+            ? `已存在同条 L1 影子账本记录（${sym}，幂等复用）`
+            : `已记入 Track C 影子机会账本：${sym}${res.stop_is_proxy ? "（8% 结构代理止损）" : ""}`,
+        });
+      } catch (ex) {
+        if (!mountedRef.current) return;
+        setOppLogFeedback({
+          tone: "err",
+          text: `记入影子账本失败：${errorMessage(ex)}`,
+        });
+      } finally {
+        if (mountedRef.current) setLoggingOppKey(null);
+      }
+    },
+    [currentRun?.run_id, loggingOppKey],
+  );
+
+  /* Sync external Track C log request from Layer2InlinePicker */
+  useEffect(() => {
+    if (!logCardSignal || logCardSignal.seq === lastLogSeqRef.current) return;
+    lastLogSeqRef.current = logCardSignal.seq;
+    void handleLogCompassOpportunity("l1_direction_call", logCardSignal.cardId);
+  }, [logCardSignal, handleLogCompassOpportunity]);
+
+  const isCardLogged = useCallback(
+    (cardId: string): boolean => {
+      const runId = currentRun?.run_id;
+      if (!runId) return false;
+      if (loggedOppMap[`${runId}:${cardId}`]) return true;
+      return Boolean(currentRun?.logged_opportunities?.cards?.[cardId]);
+    },
+    [currentRun, loggedOppMap],
+  );
+
+  const isAbstentionLogged = useMemo(() => {
+    const runId = currentRun?.run_id;
+    if (!runId) return false;
+    if (loggedOppMap[`${runId}:abstain`]) return true;
+    return Boolean(currentRun?.logged_opportunities?.abstention_id);
+  }, [currentRun, loggedOppMap]);
+
+  /* Notify parent WorkbenchView of Track C hydrated state so Layer2InlinePicker reflects persistent status */
+  useEffect(() => {
+    if (!onShadowStateChange) return;
+    const runId = currentRun?.run_id || "";
+    const ids = new Set<string>(Object.keys(currentRun?.logged_opportunities?.cards ?? {}));
+    for (const k of Object.keys(loggedOppMap)) {
+      if (runId && k.startsWith(`${runId}:`)) {
+        const cid = k.slice(runId.length + 1);
+        if (cid && cid !== "abstain") ids.add(cid);
+      }
+    }
+    const loggingCid =
+      loggingOppKey && runId && loggingOppKey.startsWith(`${runId}:`)
+        ? loggingOppKey.slice(runId.length + 1)
+        : null;
+    onShadowStateChange({
+      runId,
+      loggedCardIds: Array.from(ids),
+      loggingCardId: loggingCid,
+    });
+  }, [currentRun, loggedOppMap, loggingOppKey, onShadowStateChange]);
+
   const handleSelectHistory = async (runId: string) => {
     if (!runId) return;
-    if (historyAbortRef.current) {
-      historyAbortRef.current.abort();
-    }
+    if (historyAbortRef.current) historyAbortRef.current.abort();
     const ctrl = new AbortController();
     historyAbortRef.current = ctrl;
     const reqSeq = ++selectionReqSeqRef.current;
     viewingLatestRef.current = runId === latestRunIdRef.current;
     setSelectedRunId(runId);
     setLoadingRun(true);
+    setDrawer(null);
+    setHighlightFactor(null);
     try {
       const detail = await api.compassHistoryDetail(runId, ctrl.signal);
       if (!mountedRef.current || ctrl.signal.aborted || selectionReqSeqRef.current !== reqSeq) return;
@@ -741,11 +661,9 @@ export function Layer1CompassPanel({
       setDirFilter("all");
       setOppLogFeedback(null);
     } catch {
-      /* ignore aborted/stale history fetches */
+      /* ignore aborted fetches */
     } finally {
-      if (mountedRef.current && selectionReqSeqRef.current === reqSeq) {
-        setLoadingRun(false);
-      }
+      if (mountedRef.current && selectionReqSeqRef.current === reqSeq) setLoadingRun(false);
     }
   };
 
@@ -792,1452 +710,755 @@ export function Layer1CompassPanel({
     }
   };
 
-  const handleLogCompassOpportunity = async (kind: "l1_direction_call" | "l1_abstention", cardId?: string) => {
-    const runId = currentRun?.run_id;
-    if (!runId || loggingOppKey) return;
-    const opKey = `${runId}:${cardId || "abstain"}`;
-    setLoggingOppKey(opKey);
-    setOppLogFeedback(null);
-    try {
-      const res = await api.logCompassOpportunity(runId, {
-        kind,
-        ...(cardId ? { card_id: cardId } : {}),
-      });
-      if (!mountedRef.current) return;
-      const sym = res.opportunity?.symbol || "";
-      setLoggedOppMap((prev) => ({
-        ...prev,
-        [opKey]: { symbol: sym, idempotent: Boolean(res.idempotent_replay) },
-      }));
-      setOppLogFeedback({
-        tone: "ok",
-        text: res.idempotent_replay
-          ? `已存在同条 L1 影子账本记录（${sym}，幂等复用）`
-          : `已记入 Track C 影子机会账本：${sym}${res.stop_is_proxy ? "（8% 结构代理止损）" : ""}`,
-      });
-    } catch (ex) {
-      if (!mountedRef.current) return;
-      setOppLogFeedback({
-        tone: "err",
-        text: `记入影子账本失败：${errorMessage(ex)}`,
-      });
-    } finally {
-      if (mountedRef.current) setLoggingOppKey(null);
-    }
-  };
+  const result = currentRun?.result ?? null;
+  const directions = useMemo(() => result?.directions ?? [], [result]);
 
-  const cftcItems = useMemo(() => {
-    const items = macro?.cftc_crowding?.items ?? [];
-    return items.filter((it) => Boolean(it && it.symbol));
-  }, [macro]);
-
-  const anchorGroups = useMemo(() => {
-    const items = macro?.anchors?.items ?? [];
-    const map = new Map<string, { label: string; rows: CrossAssetAnchorItem[] }>();
-    for (const item of items) {
-      const g = map.get(item.group) ?? { label: item.group_label, rows: [] };
-      g.rows.push(item);
-      map.set(item.group, g);
-    }
-    return Array.from(map.values());
-  }, [macro]);
-
-  const polymarketGroups = useMemo(() => {
-    const events = macro?.polymarket_odds?.events ?? [];
-    const map = new Map<string, { key: string; label: string; rows: PolymarketEventItem[] }>();
-    for (const ev of events) {
-      const g = map.get(ev.category) ?? { key: ev.category, label: ev.category_label || ev.category, rows: [] };
-      g.rows.push(ev);
-      map.set(ev.category, g);
-    }
-    return Array.from(map.values());
-  }, [macro]);
-
-  const polymarketHeadlines = useMemo(() => {
-    const pm = macro?.polymarket_odds;
-    if (!pm) return [];
-    if (pm.headline_events && pm.headline_events.length > 0) return pm.headline_events.slice(0, 4);
-    return (pm.events ?? []).slice(0, 4);
-  }, [macro]);
-
-  const payload = currentRun?.result ?? null;
-  const directions = payload?.directions ?? [];
-
-  const directionCounts = useMemo(() => {
-    let long = 0;
-    let short = 0;
-    let pair = 0;
+  const dirCounts = useMemo(() => {
+    const c = { all: directions.length, long: 0, short: 0, pair: 0 };
     for (const d of directions) {
-      if (d.direction === "short") short += 1;
-      else if (d.direction === "pair") pair += 1;
-      else long += 1;
+      if (d.direction === "long") c.long += 1;
+      else if (d.direction === "short") c.short += 1;
+      else if (d.direction === "pair") c.pair += 1;
     }
-    return { all: directions.length, long, short, pair };
+    return c;
   }, [directions]);
 
-  const filteredDirections = useMemo(() => {
+  const visibleDirections = useMemo(() => {
     if (dirFilter === "all") return directions;
     return directions.filter((d) => d.direction === dirFilter);
   }, [directions, dirFilter]);
 
+  /* Anchor map for anchor-temperature comparison */
+  const anchorBySym = useMemo(() => {
+    const map = new Map<string, CrossAssetAnchorItem>();
+    for (const it of macro?.anchors?.items ?? []) {
+      map.set(it.symbol.toUpperCase(), it);
+    }
+    return map;
+  }, [macro]);
+
+  /* Factor concentration mapping: cardId -> shared concentrated factor label */
+  const concentratedCardFactors = useMemo(() => {
+    const map = new Map<string, string[]>();
+    const fc = result?.factor_concentration;
+    if (!fc?.concentrated) return map;
+    for (const item of fc.dominant_factors ?? []) {
+      const label = item.label || item.factor_id;
+      for (const cid of item.card_ids ?? []) {
+        const list = map.get(cid) ?? [];
+        list.push(label);
+        map.set(cid, list);
+      }
+    }
+    return map;
+  }, [result]);
+
+  const concentratedFactors = useMemo(() => {
+    const fc = result?.factor_concentration;
+    if (!fc?.concentrated) return [];
+    return (fc.dominant_factors ?? [])
+      .filter((item) => (item.card_ids ?? []).length >= 2)
+      .map((item) => ({
+        name: item.label || item.factor_id,
+        count: item.count || item.card_ids.length,
+        ids: item.card_ids,
+      }));
+  }, [result]);
+
+  const auditRejectedCount = result?.constitutional_audit?.rejected_reasons?.length ?? 0;
+  const auditFlaggedCount = result?.constitutional_audit?.flagged_cards_count ?? 0;
+  const signalLights = macro?.regime_signal_lights ?? [];
+
   return (
-    <section className="flex flex-col gap-3.5" aria-label="Layer 1 自上而下战略罗盘">
-      {/* 1. Free Hard-Data Macro Dual-Core Strip */}
-      <div className="card flex flex-col gap-2.5 p-3.5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-ink">
-              <Compass className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
-              <span>中美宏观双核与市场定价锚</span>
-            </span>
-            {(macro?.regime_tags ?? []).map((tag) => (
-              <span
-                key={tag.label}
-                className={`inline-flex items-center rounded border px-1.5 py-0.5 text-[11px] font-medium ${regimeTagClasses(tag.tone)}`}
-              >
-                {tag.label}
-              </span>
-            ))}
-            {macro?.stale_sources && Object.keys(macro.stale_sources).length > 0 ? (
-              <span
-                className="inline-flex items-center gap-1 rounded border border-warning/35 bg-warning/10 px-1.5 py-0.5 text-[10px] text-warning"
-                title={Object.entries(macro.stale_sources)
-                  .map(([k, v]) => `${k}: ${v.error || "stale"}${v.last_good_at_utc ? ` (沿用 ${shortTime(v.last_good_at_utc)})` : ""}`)
-                  .join(" | ")}
-              >
-                <AlertTriangle className="h-2.5 w-2.5" aria-hidden="true" />
-                <span>{Object.keys(macro.stale_sources).length} 源降级/陈旧</span>
-              </span>
-            ) : null}
+    <section className="flex flex-col gap-3 rounded-xl border border-hairline bg-surface p-3.5 sm:p-4">
+      {/* 1. Compact Header Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5">
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="flex items-center gap-1.5">
+            <Compass className="h-4 w-4 text-accent" aria-hidden="true" />
+            <h2 className="text-[14px] font-semibold text-ink">第一层 · 宏观战略罗盘</h2>
           </div>
-          <div className="flex items-center gap-2 text-[11px] text-muted">
-            {macro?.fetched_at_utc ? (
-              <span className="font-mono">更新 {shortTime(macro.fetched_at_utc)}</span>
-            ) : null}
+          {history.length > 0 ? (
+            <div className="inline-flex items-center gap-1 rounded-md border border-hairline-soft bg-sunken px-2 py-0.5 text-[11px]">
+              <History className="h-3 w-3 text-muted" aria-hidden="true" />
+              <select
+                aria-label="切换历史 L1 推演记录"
+                value={selectedRunId}
+                onChange={(e) => void handleSelectHistory(e.target.value)}
+                disabled={loadingRun}
+                className="max-w-[220px] bg-transparent text-[11px] text-ink outline-none"
+              >
+                {history.map((h) => (
+                  <option key={h.run_id} value={h.run_id}>
+                    {shortTime(h.created_at_utc)} · {h.directions_count === 0 ? "战略留白" : `${h.directions_count}方向`} · {h.engine}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+          {(auditRejectedCount > 0 || auditFlaggedCount > 0) && result ? (
             <button
               type="button"
-              className="btn btn-sm"
-              disabled={macroLoading}
-              onClick={() => void loadMacro(true)}
-              title="重新拉取 FRED / 国家统计局 / 25 个跨资产与国内期货定价锚 / Polymarket 预测市场赔率（免费硬数据，零 AI 消耗）"
+              onClick={() => setDrawer({ kind: "audit" })}
+              className="inline-flex items-center gap-1 rounded-full border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10.5px] font-medium text-warning transition-colors hover:bg-warning/20"
+              title="点击查看宪法护栏拦截与降档明细"
             >
-              <RefreshCw className={`h-3 w-3 ${macroLoading ? "animate-spin" : ""}`} aria-hidden="true" />
-              <span>刷新宏观</span>
+              <ShieldAlert className="h-3 w-3" aria-hidden="true" />
+              <span>
+                护栏已拦截 {auditRejectedCount} 张{auditFlaggedCount > 0 ? ` · 标旗 ${auditFlaggedCount}` : ""}
+              </span>
             </button>
-          </div>
-        </div>
-
-        {macroErr ? (
-          <div className="flex items-center gap-1.5 rounded-md border border-warning/35 bg-warning/8 px-2.5 py-1.5 text-xs text-warning">
-            <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-            <span>宏观硬数据部分异常：{macroErr}</span>
-          </div>
-        ) : null}
-
-        {/* Compact Hairline Metric Strip */}
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-8">
-          {(macro?.headline_metrics ?? []).map((m) => {
-            const fetchedMs = macro?.fetched_at_utc ? Date.parse(macro.fetched_at_utc) : NaN;
-            const refMs = Number.isFinite(fetchedMs) ? Math.max(Date.now(), fetchedMs) : Date.now();
-            const asOfInfo = parseMacroAsOf(m.as_of, m.key, refMs);
-            const lagNote =
-              asOfInfo.isLagged && asOfInfo.lagDays !== null
-                ? ` · 已滞后约 ${asOfInfo.lagDays} 天（非当日实时价）`
-                : "";
-            return (
-              <div
-                key={m.key}
-                className={`flex flex-col justify-between gap-1 rounded-md border px-2.5 py-1.5 ${
-                  asOfInfo.isLagged
-                    ? "border-warning/35 bg-warning/[0.06]"
-                    : "border-hairline-soft bg-sunken/70"
-                }`}
-                title={`${m.label} · 来源 ${m.source || "—"}${m.as_of ? ` · 截至 ${m.as_of}` : ""}${lagNote}`}
-              >
-                <span className="truncate text-[10px] text-muted">{m.label}</span>
-                <div className="flex items-baseline justify-between gap-1 font-mono tabular-nums">
-                  <span className="text-[13px] font-semibold text-ink">
-                    {formatHeadlineValue(m.value, m.unit)}
-                  </span>
-                  {m.delta !== null && m.delta !== undefined ? (
-                    <span className={`text-[10px] ${signedToneClass(m.delta)}`}>
-                      {m.delta > 0 ? "+" : ""}
-                      {m.delta}
-                      {m.delta_unit || ""}
-                    </span>
-                  ) : null}
-                </div>
-                <div className="flex min-w-0 items-center">
-                  {asOfInfo.isLagged ? (
-                    <span className="inline-flex max-w-full items-center gap-1 rounded border border-warning/35 bg-warning/12 px-1 py-0.2 font-mono text-[9.5px] font-medium leading-tight text-warning">
-                      <Clock className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
-                      <span className="truncate">
-                        {asOfInfo.isMonthly ? "月度滞后" : "滞后"} · {asOfInfo.shortLabel}
-                      </span>
-                    </span>
-                  ) : asOfInfo.shortLabel ? (
-                    <span className="truncate font-mono text-[9.5px] leading-tight text-muted">
-                      截至 {asOfInfo.shortLabel}
-                    </span>
-                  ) : (
-                    <span className="font-mono text-[9.5px] leading-tight text-muted">—</span>
-                  )}
-                </div>
-              </div>
-            );
-          })}
-          {!macro && macroLoading ? (
-            <div className="col-span-full flex items-center gap-2 py-2 text-xs text-muted">
-              <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" aria-hidden="true" />
-              <span>正在拉取 FRED 美债/通胀、中国 PMI 与 25 个跨资产/国内期货定价锚…</span>
-            </div>
           ) : null}
         </div>
 
-        {/* Compact Tape-to-Macro Extreme Movers Radar Strip */}
-        {macro?.tape_movers &&
-        (macro.tape_movers.top_losers.length > 0 || macro.tape_movers.top_gainers.length > 0) ? (
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-hairline-soft bg-sunken/40 px-2.5 py-1.5 text-[11px]">
-            <span className="font-semibold text-ink-2">
-              盘面极端雷达 · {macro.tape_movers.regime_breadth.breadth_label}
-            </span>
-            {macro.tape_movers.top_losers.slice(0, 5).map((mv) => (
-              <button
-                key={`lose-${mv.symbol}`}
-                type="button"
-                onClick={() => onJumpWarRoom(mv.symbol)}
-                className="inline-flex cursor-pointer items-center gap-1 rounded border border-bear/30 bg-bear/8 px-1.5 py-0.5 font-mono text-[10.5px] text-bear hover:border-bear/60"
-                title={`20D ${fmtPct(mv.ret_20d_pct, 1)} / 60D ${fmtPct(mv.ret_60d_pct, 1)} · 点击进入战情室`}
-              >
-                <span className="font-sans">{mv.name}</span>
-                {mv.driver_window ? <span className="text-[9.5px] opacity-75">{mv.driver_window}</span> : null}
-                <span>{fmtPct(mv.driver_ret_pct ?? mv.ret_20d_pct ?? mv.ret_60d_pct, 1)}</span>
-              </button>
-            ))}
-            {macro.tape_movers.top_gainers.slice(0, 2).map((mv) => (
-              <button
-                key={`gain-${mv.symbol}`}
-                type="button"
-                onClick={() => onJumpWarRoom(mv.symbol)}
-                className="inline-flex cursor-pointer items-center gap-1 rounded border border-bull/30 bg-bull/8 px-1.5 py-0.5 font-mono text-[10.5px] text-bull hover:border-bull/60"
-                title={`20D ${fmtPct(mv.ret_20d_pct, 1)} / 60D ${fmtPct(mv.ret_60d_pct, 1)} · 点击进入战情室`}
-              >
-                <span className="font-sans">{mv.name}</span>
-                {mv.driver_window ? <span className="text-[9.5px] opacity-75">{mv.driver_window}</span> : null}
-                <span>{fmtPct(mv.driver_ret_pct ?? mv.ret_20d_pct ?? mv.ret_60d_pct, 1)}</span>
-              </button>
-            ))}
-          </div>
-        ) : null}
+        <div className="flex flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            className="btn btn-sm"
+            disabled={macroLoading}
+            onClick={() => void loadMacro(true)}
+            title="刷新免费宏观硬数据（FRED / 跨资产定价锚 / CFTC / Polymarket）"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${macroLoading ? "animate-spin" : ""}`} aria-hidden="true" />
+            <span>刷新宏观底座</span>
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            disabled={isRunActive}
+            onClick={() => {
+              setLaunchErr(null);
+              setLaunchOpen(true);
+            }}
+          >
+            <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>{isRunActive ? "AI 推演运行中…" : "AI 盲推演新方向"}</span>
+          </button>
+        </div>
+      </div>
 
-        {/* Compact Prediction Market Event Odds Strip (Polymarket Keyless Gamma API) */}
-        {polymarketHeadlines.length > 0 ? (
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-hairline-soft bg-sunken/40 px-2.5 py-1.5 text-[11px]">
-            <span className="font-semibold text-ink-2">预测市场赔率 · Polymarket</span>
-            {macro?.polymarket_odds?.status === "stale" ||
-            (macro?.polymarket_odds?.stale_categories?.length ?? 0) > 0 ? (
-              <span
-                className="inline-flex items-center gap-1 rounded border border-warning/35 bg-warning/10 px-1.5 py-0.2 text-[9.5px] font-medium text-warning"
-                title={
-                  macro?.polymarket_odds?.last_good_at_utc
-                    ? `部分或全部盘口沿用 ${shortTime(macro.polymarket_odds.last_good_at_utc)} 缓存`
-                    : "当前包含缓存降级盘口"
-                }
-              >
-                <Clock className="h-2.5 w-2.5" aria-hidden="true" />
-                <span>{macro?.polymarket_odds?.status === "stale" ? "缓存沿用" : "部分缓存"}</span>
-              </span>
-            ) : null}
-            {polymarketHeadlines.map((ev) => {
-              const d7 = formatPpDelta(ev.leading_chg_7d_pp);
-              const d1 = formatPpDelta(ev.leading_chg_1d_pp);
-              const deltaText = d7 ?? d1;
-              const deltaTag = d7 ? "7D" : d1 ? "1D" : "";
-              const deltaNum = d7 ? ev.leading_chg_7d_pp : ev.leading_chg_1d_pp;
-              const band = consensusBandMeta(ev.consensus_band ?? ev.priced_in_band);
-              const probText = formatProbPct(ev.leading_prob_pct);
-              const optPrefix = ev.market_type === "date_ladder" ? "截至 " : "";
-              const pillBody = (
-                <>
-                  <span className="max-w-[165px] truncate font-sans text-ink">{ev.title}</span>
-                  <span className="font-sans text-[10px] text-muted">
-                    · {optPrefix}
-                    {ev.leading_option}
-                  </span>
-                  <span className="font-semibold text-accent">{probText}</span>
-                  {deltaText ? (
-                    <span className={`text-[10px] ${ppDeltaToneClass(deltaNum ?? null)}`}>
-                      ({deltaTag} {deltaText})
-                    </span>
-                  ) : null}
-                </>
-              );
-              const deadlineNote = ev.leading_end_date ? ` · 对应期限 ${ev.leading_end_date}` : "";
-              const staleNote = ev.stale_fallback ? " · [缓存降级]" : "";
-              const tip = `${ev.category_label} · ${ev.title} | 盘口：${optPrefix}${ev.leading_option} ${probText} (${band.label})${deadlineNote} | 24h成交 ${formatCompactUsd(ev.volume_24h_usd)} / 累计 ${formatCompactUsd(ev.volume_total_usd)}${staleNote}`;
-              return isSafePolymarketUrl(ev.url) ? (
-                <a
-                  key={`pm-head-${ev.id}`}
-                  href={ev.url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1 rounded border border-hairline bg-elevated/70 px-1.5 py-0.5 font-mono text-[10.5px] no-underline hover:border-accent/55"
-                  title={tip}
-                >
-                  {pillBody}
-                </a>
+      {/* Macro Fetch Error Banner */}
+      {macroErr ? (
+        <div className="rounded-md border border-bear/35 bg-bear/8 px-3 py-1.5 text-[11.5px] text-bear">
+          宏观底座加载异常：{macroErr}
+        </div>
+      ) : null}
+
+      {/* Active SSE Progress Strip */}
+      {activeRun ? (
+        <div className="rounded-lg border border-accent/35 bg-accent/[0.04] px-3 py-2.5 text-[11.5px]">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              {isRunActive ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" aria-hidden="true" />
+              ) : activeRun.status === "completed" ? (
+                <CheckCircle2 className="h-3.5 w-3.5 text-bull" aria-hidden="true" />
               ) : (
-                <span
-                  key={`pm-head-${ev.id}`}
-                  className="inline-flex items-center gap-1 rounded border border-hairline bg-elevated/70 px-1.5 py-0.5 font-mono text-[10.5px]"
-                  title={tip}
+                <XCircle className="h-3.5 w-3.5 text-bear" aria-hidden="true" />
+              )}
+              <span className="font-semibold text-ink">
+                {isRunActive
+                  ? "正在执行 L1 去锚定盲推演…"
+                  : activeRun.status === "completed"
+                    ? "L1 推演已完成"
+                    : activeRun.error || "推演已结束"}
+              </span>
+              <span className="inline-flex items-center gap-1 font-mono text-[10.5px] text-muted">
+                <Clock className="h-3 w-3" aria-hidden="true" />
+                {formatElapsed((activeRun.finishedAtMs ?? nowMs) - activeRun.startedAtMs)} · {activeRun.engine}/{activeRun.effort}
+              </span>
+            </div>
+            <div className="flex items-center gap-2">
+              {isRunActive ? (
+                <button
+                  type="button"
+                  className="btn btn-sm !min-h-[24px] !px-2 text-bear"
+                  disabled={cancelling}
+                  onClick={() => void handleCancelCompass()}
                 >
-                  {pillBody}
-                </span>
+                  <Square className="h-3 w-3" aria-hidden="true" />
+                  <span>终止</span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn btn-ghost btn-sm !min-h-[24px] !px-2"
+                  onClick={() => setActiveRun(null)}
+                >
+                  收起
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+            {COMPASS_STAGES.map((stg, idx) => {
+              const cur = stageIndex(activeRun.stage, activeRun.done, activeRun.status);
+              const done = idx < cur;
+              const active = idx === cur && isRunActive;
+              return (
+                <div
+                  key={stg.key}
+                  className={`rounded border px-2 py-1 text-[10.5px] ${
+                    done
+                      ? "border-bull/35 bg-bull/10 text-bull"
+                      : active
+                        ? "border-accent/45 bg-accent/12 font-medium text-accent"
+                        : "border-hairline-soft bg-surface/60 text-muted"
+                  }`}
+                >
+                  {idx + 1}. {stg.label}
+                </div>
               );
             })}
           </div>
-        ) : null}
-
-        {/* On-demand Native Disclosure: Polymarket Macro / Tariffs / Geopolitics Odds */}
-        {polymarketGroups.length > 0 ? (
-          <details className="border-t border-hairline-soft pt-2">
-            <summary className="cursor-pointer select-none text-[11px] font-medium text-muted hover:text-ink">
-              展开 Polymarket 宏观利率 / 关税 / 地缘事件赔率（{macro?.polymarket_odds?.total_events ?? 0} 个盘口 ·{" "}
-              {macro?.polymarket_odds?.status === "stale"
-                ? "缓存降级"
-                : macro?.polymarket_odds?.status === "partial"
-                  ? "部分分类缓存"
-                  : "实时"}{" "}
-              · 仅事件概率参考，不等同于资产已计价）
-            </summary>
-            <div className="mt-2.5 grid grid-cols-1 gap-3 lg:grid-cols-3">
-              {polymarketGroups.map((grp) => (
-                <div key={grp.key} className="rounded-md border border-hairline-soft bg-sunken/50 p-2.5">
-                  <div className="mb-2 flex items-center justify-between text-[11px] font-semibold text-ink-2">
-                    <span>{grp.label}</span>
-                    <span className="font-mono text-[10px] font-normal text-muted">{grp.rows.length} 项</span>
-                  </div>
-                  <div className="flex flex-col divide-y divide-hairline-soft">
-                    {grp.rows.map((ev) => {
-                      const band = consensusBandMeta(ev.consensus_band ?? ev.priced_in_band);
-                      return (
-                        <div key={ev.id} className="flex flex-col gap-1.5 py-2 first:pt-0 last:pb-0">
-                          <div className="flex items-start justify-between gap-2">
-                            <div className="min-w-0 flex-1">
-                              {isSafePolymarketUrl(ev.url) ? (
-                                <a
-                                  href={ev.url}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="inline-flex items-center gap-1 text-[11.5px] font-medium leading-snug text-ink no-underline hover:text-accent"
-                                >
-                                  <span className="line-clamp-2">{ev.title}</span>
-                                  <ExternalLink className="h-2.5 w-2.5 shrink-0 opacity-65" aria-hidden="true" />
-                                </a>
-                              ) : (
-                                <span className="line-clamp-2 text-[11.5px] font-medium leading-snug text-ink">
-                                  {ev.title}
-                                </span>
-                              )}
-                            </div>
-                            <div className="flex shrink-0 items-center gap-1">
-                              {ev.stale_fallback ? (
-                                <span className="rounded border border-warning/35 bg-warning/10 px-1 py-0.2 text-[9px] font-medium text-warning">
-                                  缓存
-                                </span>
-                              ) : null}
-                              <span
-                                className={`rounded border px-1 py-0.2 text-[9.5px] font-medium ${band.cls}`}
-                              >
-                                {band.label}
-                              </span>
-                            </div>
-                          </div>
-                          <div className="flex flex-col gap-1">
-                            {ev.top_outcomes.map((o) => {
-                              const d1 = formatPpDelta(o.chg_1d_pp);
-                              const d7 = formatPpDelta(o.chg_7d_pp);
-                              const pct = clampProbPct(o.prob_pct);
-                              const barPct = pct ?? 0;
-                              const showSubDate =
-                                Boolean(o.end_date) &&
-                                (ev.market_type === "date_ladder" || o.end_date !== ev.end_date);
-                              return (
-                                <div key={`${ev.id}-${o.label}-${o.end_date ?? ""}`} className="flex flex-col gap-0.5">
-                                  <div
-                                    className="flex items-center justify-between gap-1.5 text-[10.5px] font-mono tabular-nums"
-                                    title={o.question || o.label}
-                                  >
-                                    <span className="flex min-w-0 items-center gap-1 truncate font-sans text-ink-2">
-                                      <span className="truncate">{o.label}</span>
-                                      {showSubDate ? (
-                                        <span className="shrink-0 font-mono text-[9.5px] text-muted">
-                                          ({o.end_date})
-                                        </span>
-                                      ) : null}
-                                    </span>
-                                    <span className="flex shrink-0 items-center gap-1.5">
-                                      {d1 ? (
-                                        <span className={`text-[9.5px] ${ppDeltaToneClass(o.chg_1d_pp ?? null)}`} title="24小时盘口概率变化（中性色，不代表资产多空）">
-                                          1D {d1}
-                                        </span>
-                                      ) : null}
-                                      {d7 ? (
-                                        <span className={`text-[9.5px] ${ppDeltaToneClass(o.chg_7d_pp ?? null)}`} title="7日盘口概率变化（中性色，不代表资产多空）">
-                                          7D {d7}
-                                        </span>
-                                      ) : null}
-                                      <span className="w-10 text-right font-semibold text-ink">
-                                        {formatProbPct(o.prob_pct)}
-                                      </span>
-                                    </span>
-                                  </div>
-                                  <div className="h-1 w-full overflow-hidden rounded-full bg-hairline-soft">
-                                    <div
-                                      className="h-full rounded-full bg-accent/70"
-                                      style={{ width: `${barPct}%` }}
-                                    />
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </div>
-                          <div className="flex flex-wrap items-center justify-between gap-1 font-mono text-[9.5px] text-muted">
-                            <span>
-                              24h {formatCompactUsd(ev.volume_24h_usd)} · 累计 {formatCompactUsd(ev.volume_total_usd)}
-                              {ev.liquidity_usd && ev.liquidity_usd > 0
-                                ? ` · 深度 ${formatCompactUsd(ev.liquidity_usd)}`
-                                : ""}
-                            </span>
-                            {ev.end_date ? (
-                              <span className={ev.end_date_passed ? "text-warning" : undefined}>
-                                {ev.end_date_passed
-                                  ? ev.accepting_orders === true
-                                    ? `原定 ${ev.end_date} (仍可交易)`
-                                    : `原定 ${ev.end_date} (已过原定日期)`
-                                  : ev.market_type === "date_ladder"
-                                    ? `最远期限 ${ev.end_date}`
-                                    : `截止 ${ev.end_date}`}
-                              </span>
-                            ) : null}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              ))}
+          {activeRun.logs.length > 0 ? (
+            <div className="mt-1.5 truncate font-mono text-[10.5px] text-muted">
+              最新：{activeRun.logs[activeRun.logs.length - 1].message}
             </div>
-          </details>
-        ) : null}
+          ) : null}
+        </div>
+      ) : null}
 
-        {/* On-demand Native Disclosure: 25 Cross-Asset & CN Futures Pricing Anchors (20D / 60D Relative Strength) */}
-        {anchorGroups.length > 0 ? (
-          <details className="border-t border-hairline-soft pt-2">
-            <summary className="cursor-pointer select-none text-[11px] font-medium text-muted hover:text-ink">
-              展开跨资产与国内期货 20D / 60D 相对强弱定价锚（{macro?.anchors?.ok_count ?? 0}/{macro?.anchors?.total ?? 0} 实时可用）
-            </summary>
-            <div className="mt-2.5 grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-4">
-              {anchorGroups.map((grp) => (
-                <div key={grp.label} className="rounded-md border border-hairline-soft bg-sunken/50 p-2.5">
-                  <div className="mb-1.5 text-[11px] font-semibold text-ink-2">{grp.label}</div>
-                  <div className="flex flex-col divide-y divide-hairline-soft">
-                    {grp.rows.map((r) => (
-                      <div
-                        key={r.symbol}
-                        className="grid grid-cols-12 items-center gap-1 py-1 text-[11px] font-mono tabular-nums"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => onJumpWarRoom(r.symbol)}
-                          className="col-span-5 cursor-pointer truncate border-0 bg-transparent p-0 text-left font-sans text-[11px] text-ink hover:text-accent"
-                          title={`打开 ${r.name} (${r.symbol}) 缠论战情室`}
-                        >
-                          {r.name} <span className="font-mono text-[10px] text-muted">{r.symbol}</span>
-                        </button>
-                        <span className="col-span-3 text-right text-ink-2">
-                          {r.last !== null ? r.last.toLocaleString("en-US", { maximumFractionDigits: 2 }) : "—"}
-                        </span>
-                        <span className={`col-span-2 text-right ${signedToneClass(r.ret_20d_pct)}`} title="20日涨跌幅">
-                          {fmtPct(r.ret_20d_pct, 1)}
-                        </span>
-                        <span className={`col-span-2 text-right ${signedToneClass(r.ret_60d_pct)}`} title="60日涨跌幅">
-                          {fmtPct(r.ret_60d_pct, 1)}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </details>
-        ) : null}
+      {/* 2. Dual-Pane Visual Macro Cockpit */}
+      <MacroCockpit macro={macro} loading={macroLoading} onJumpWarRoom={onJumpWarRoom} />
 
-        {/* On-demand Native Disclosure: CFTC 52-Week Derivatives Crowding (Disagg + TFF) */}
-        {cftcItems.length > 0 ? (
-          <details className="border-t border-hairline-soft pt-2">
-            <summary className="cursor-pointer select-none text-[11px] font-medium text-muted hover:text-ink">
-              展开 CFTC 52 周衍生品持仓拥挤度（{macro?.cftc_crowding?.benchmarks_ok ?? cftcItems.length}/{macro?.cftc_crowding?.benchmarks_total ?? cftcItems.length} 实时基准
-              {macro?.cftc_crowding?.latest_report_date ? ` · 截至 ${macro.cftc_crowding.latest_report_date}` : ""}
-              {macro?.cftc_crowding?.stale_fallback ? " · 陈旧缓存" : ""}）
-            </summary>
-            <div className="mt-2.5 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
-              {cftcItems.map((it) => {
-                const state = it.crowding_state || "neutral";
-                const badge = it.is_stale
-                  ? { label: "观测陈旧", cls: "border-hairline bg-surface text-muted" }
-                  : state === "crowded_long"
-                    ? { label: "多头拥挤 ≥90%", cls: "border-warning/45 bg-warning/10 text-warning" }
-                    : state === "crowded_short"
-                      ? { label: "空头拥挤 ≤10%", cls: "border-bear/45 bg-bear/10 text-bear" }
-                      : state === "short_covering_extreme"
-                        ? { label: "空头回补极值", cls: "border-accent/40 bg-accent/10 text-accent" }
-                        : state === "long_washout_extreme"
-                          ? { label: "多头出清极值", cls: "border-accent/40 bg-accent/10 text-accent" }
-                          : { label: "中性区间", cls: "border-hairline-soft bg-surface text-muted" };
-                return (
-                  <div
-                    key={it.symbol}
-                    className="flex items-center justify-between gap-2 rounded-md border border-hairline-soft bg-sunken/50 px-2.5 py-1.5 text-[11px]"
-                  >
-                    <div className="min-w-0">
-                      <button
-                        type="button"
-                        onClick={() => onJumpWarRoom(it.symbol)}
-                        className="cursor-pointer truncate border-0 bg-transparent p-0 text-left font-medium text-ink hover:text-accent"
-                        title={`打开 ${it.label} (${it.symbol}) 缠论战情室`}
-                      >
-                        {it.label} <span className="font-mono text-[10px] text-muted">{it.symbol}</span>
-                      </button>
-                      <div className="font-mono text-[10px] text-muted tabular-nums">
-                        净持仓/OI {it.net_pct_oi != null ? `${it.net_pct_oi >= 0 ? "+" : ""}${it.net_pct_oi.toFixed(1)}%` : "—"} · 52W分位{" "}
-                        {it.percentile_52w != null ? `${it.percentile_52w.toFixed(0)}%` : "—"}
-                      </div>
-                    </div>
-                    <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium ${badge.cls}`}>
-                      {badge.label}
+      {/* 3. Deterministic 4-Pillar Regime Strip + Regime Summary + Clickable Avoid Sectors */}
+      {(signalLights.length > 0 || result) ? (
+        <div className="flex flex-col gap-2 rounded-lg border border-hairline-soft bg-sunken/60 px-3 py-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            {/* 4-Pillar Deterministic Signal Lights */}
+            <div className="flex flex-wrap items-center gap-1.5">
+              {signalLights.map((light) => {
+                const tone = signalLightTone(light.level);
+                const Icon = tone.Icon;
+                const clickable = Boolean(result);
+                if (!clickable) {
+                  return (
+                    <span
+                      key={light.id}
+                      className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] ${tone.badgeBg}`}
+                      title={`${light.label}: ${light.tag} (${light.metric})`}
+                    >
+                      <Icon className="h-3 w-3 shrink-0" aria-hidden="true" />
+                      <span className="font-medium text-ink">{light.label}</span>
+                      <span className="font-semibold">{light.tag}</span>
+                      <span className="hidden font-mono text-[10px] opacity-80 sm:inline">{light.metric}</span>
                     </span>
-                  </div>
+                  );
+                }
+                return (
+                  <button
+                    key={light.id}
+                    type="button"
+                    onClick={() => setDrawer({ kind: "macro_pillars" })}
+                    className={`inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] transition-opacity hover:opacity-90 ${tone.badgeBg}`}
+                    title={`${light.label}: ${light.tag} (${light.metric}) · 点击查看宏观四维研判`}
+                  >
+                    <Icon className="h-3 w-3 shrink-0" aria-hidden="true" />
+                    <span className="font-medium text-ink">{light.label}</span>
+                    <span className="font-semibold">{light.tag}</span>
+                    <span className="hidden font-mono text-[10px] opacity-80 sm:inline">{light.metric}</span>
+                  </button>
                 );
               })}
             </div>
-          </details>
-        ) : null}
-      </div>
 
-      {/* 2. Layer 1 AI 7-Dimension Top-Down Strategic Compass */}
-      <div className="card flex flex-col gap-3.5 p-4">
-        {/* Header Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="inline-flex items-center gap-1 rounded border border-accent/35 bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-accent">
-                Layer 1
-              </span>
-              <h2 className="m-0 text-[15px] font-semibold text-ink">
-                7 维自上而下板块罗盘 · 最优多空方向与板块
-              </h2>
-            </div>
-            <p className="m-0 mt-0.5 text-xs text-muted">
-              去标的池锚定盲推演：先选出未来 1Q~1Y 最具逻辑的多空板块与产业链切入点 → 带入下方 Layer 2 由你自主挑池/选龙头跑日线缠论
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            {history.length > 0 ? (
-              <div className="inline-flex items-center gap-1.5">
-                <History className="h-3.5 w-3.5 text-muted" aria-hidden="true" />
-                <select
-                  className="input h-8 py-0 text-xs"
-                  aria-label="切换历史战略推演期次"
-                  value={selectedRunId}
-                  onChange={(e) => void handleSelectHistory(e.target.value)}
-                  disabled={loadingRun}
-                >
-                  {history.map((h) => (
-                    <option key={h.run_id} value={h.run_id}>
-                      {shortTime(h.finished_at_utc)} · {h.regime_title.slice(0, 18)} (
-                      {h.directions_count > 0 ? `${h.directions_count}向` : "留白"})
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ) : null}
-
-            {payload || isRunActive ? (
+            {result ? (
               <button
                 type="button"
-                className="btn btn-primary"
-                disabled={isRunActive}
-                onClick={() => {
-                  setLaunchErr(null);
-                  setLaunchOpen(true);
-                }}
+                onClick={() => setDrawer({ kind: "macro_pillars" })}
+                className="inline-flex items-center gap-1 text-[11px] font-medium text-accent hover:underline"
               >
-                {isRunActive ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
-                ) : (
-                  <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-                )}
-                <span>{isRunActive ? "战略推演运行中…" : "重新运行战略推演"}</span>
+                <Layers className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>查看四维全文与风险提示</span>
               </button>
             ) : null}
           </div>
-        </div>
 
-        {/* Live SSE Task Progress Banner */}
-        {activeRun ? (
-          <div
-            className={`flex flex-col gap-2.5 rounded-lg border p-3 ${
-              activeRun.status === "completed"
-                ? "border-bull/40 bg-bull/8"
-                : activeRun.status === "failed" || activeRun.status === "cancelled"
-                  ? "border-critical/40 bg-critical/8"
-                  : "border-accent/40 bg-accent/8"
-            }`}
-            aria-live="polite"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-2 text-xs">
-                {isRunActive ? (
-                  <Loader2 className="h-4 w-4 animate-spin text-accent" aria-hidden="true" />
-                ) : activeRun.status === "completed" ? (
-                  <CheckCircle2 className="h-4 w-4 text-bull" aria-hidden="true" />
-                ) : (
-                  <XCircle className="h-4 w-4 text-critical" aria-hidden="true" />
-                )}
-                <span className="font-semibold text-ink">
-                  {isRunActive
-                    ? "Layer 1 7 维自上而下战略推演进行中"
-                    : activeRun.status === "completed"
-                      ? "Layer 1 战略推演已完成并落盘"
-                      : activeRun.status === "cancelled"
-                        ? "已终止本次战略推演"
-                        : "战略推演执行失败"}
-                </span>
-                <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 font-mono text-[10px] text-muted">
-                  {activeRun.engine.toUpperCase()} · {formatElapsed((activeRun.finishedAtMs ?? nowMs) - activeRun.startedAtMs)}
-                </span>
-              </div>
-              <div className="flex items-center gap-1.5">
-                {isRunActive ? (
-                  <button
-                    type="button"
-                    className="btn btn-sm border-critical/40 text-critical"
-                    disabled={cancelling}
-                    onClick={() => void handleCancelCompass()}
-                  >
-                    <Square className="h-3 w-3" aria-hidden="true" />
-                    <span>{cancelling ? "终止中…" : "终止"}</span>
-                  </button>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn btn-sm"
-                    onClick={() => setActiveRun(null)}
-                  >
-                    关闭提示
-                  </button>
-                )}
-              </div>
-            </div>
+          {result?.regime_summary ? (
+            <p className="line-clamp-1 text-[12px] text-ink-2" title={result.regime_summary}>
+              <span className="mr-1.5 font-semibold text-ink">本轮定调：</span>
+              {result.regime_summary}
+            </p>
+          ) : null}
 
-            {/* 4-Stage Stepper */}
-            <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
-              {COMPASS_STAGES.map((st, idx) => {
-                const curIdx = stageIndex(activeRun.stage, activeRun.done, activeRun.status);
-                const done = idx < curIdx || activeRun.status === "completed";
-                const current = idx === curIdx && isRunActive;
+          {/* Compact Avoid Sectors Chip Bar */}
+          {result?.avoid_sectors && result.avoid_sectors.length > 0 ? (
+            <div className="flex flex-wrap items-center gap-1.5 border-t border-hairline-soft pt-2">
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-semibold text-bear">
+                <XCircle className="h-3 w-3" aria-hidden="true" />
+                逆风规避：
+              </span>
+              {result.avoid_sectors.map((item, idx) => {
+                const shortable = isHeadwindShortable(item);
                 return (
-                  <div
-                    key={st.key}
-                    className={`flex items-center gap-1.5 rounded border px-2 py-1 text-[11px] ${
-                      done
-                        ? "border-bull/30 bg-bull/10 text-bull"
-                        : current
-                          ? "border-accent/45 bg-surface text-ink font-medium"
-                          : "border-hairline-soft bg-sunken/60 text-muted"
-                    }`}
+                  <button
+                    key={`${item.sector}-${idx}`}
+                    type="button"
+                    onClick={() => setDrawer({ kind: "avoid", item, index: idx })}
+                    className="inline-flex items-center gap-1 rounded-md border border-bear/30 bg-bear/6 px-2 py-0.5 text-[11px] text-ink transition-colors hover:border-bear/60 hover:bg-bear/12"
+                    title={`${item.reason} · 点击查看规避详情${shortable ? "或衍生做空" : ""}`}
                   >
-                    <span className="font-mono text-[10px]">{idx + 1}.</span>
-                    <span className="truncate">{st.label}</span>
-                  </div>
+                    <span>{item.sector}</span>
+                    {shortable ? (
+                      <span className="rounded bg-bear/16 px-1 py-px text-[9.5px] font-semibold text-bear">
+                        可空
+                      </span>
+                    ) : null}
+                  </button>
                 );
               })}
             </div>
+          ) : null}
+        </div>
+      ) : null}
 
-            {activeRun.error ? (
-              <div className="text-xs text-critical">{activeRun.error}</div>
-            ) : null}
+      {/* Track C Feedback Toast Banner */}
+      {oppLogFeedback ? (
+        <div
+          className={`flex items-center justify-between gap-2 rounded-md border px-3 py-1.5 text-[11.5px] ${
+            oppLogFeedback.tone === "ok"
+              ? "border-bull/35 bg-bull/10 text-bull"
+              : "border-bear/35 bg-bear/10 text-bear"
+          }`}
+        >
+          <span>{oppLogFeedback.text}</span>
+          <button
+            type="button"
+            className="text-[10.5px] underline opacity-80 hover:opacity-100"
+            onClick={() => setOppLogFeedback(null)}
+          >
+            关闭
+          </button>
+        </div>
+      ) : null}
 
-            {activeRun.logs.length > 0 ? (
-              <div className="max-h-28 overflow-y-auto rounded border border-hairline-soft bg-sunken/80 px-2.5 py-1.5 font-mono text-[11px] text-ink-2">
-                {activeRun.logs.slice(-6).map((l, i) => (
-                  <div key={`${l.ts}-${i}`} className="truncate py-0.5">
-                    <span className="mr-2 text-muted">{shortTime(l.ts)}</span>
-                    <span>{l.message}</span>
-                  </div>
-                ))}
+      {/* 4. Article 4 Strategic Abstention Hero Card (when abstained === true) */}
+      {result?.abstained ? (
+        <div className="rounded-xl border-2 border-warning/50 bg-warning/[0.06] p-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="space-y-1.5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-1 rounded-full border border-warning/50 bg-warning/16 px-2.5 py-0.5 text-[11px] font-semibold text-warning">
+                  <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                  宪法第 4 条 · 本轮战略留白（全市场观望）
+                </span>
+                {isAbstentionLogged ? (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-bull/14 px-2 py-0.5 text-[10.5px] font-semibold text-bull">
+                    <BookmarkCheck className="h-3 w-3" aria-hidden="true" />
+                    已入 Track C 影子账本
+                  </span>
+                ) : null}
               </div>
-            ) : null}
-          </div>
-        ) : null}
-
-        {/* Empty State (First-time Guidance) */}
-        {!payload ? (
-          <div className="flex flex-col items-center justify-center gap-3 rounded-lg border border-dashed border-hairline bg-sunken/40 px-6 py-10 text-center">
-            <Compass className="h-8 w-8 text-accent/80" aria-hidden="true" />
-            <div className="max-w-xl">
-              <div className="text-sm font-semibold text-ink">
-                尚未生成本期 Layer 1 自上而下战略定调
-              </div>
-              <p className="m-0 mt-1 text-xs leading-relaxed text-muted">
-                不提前喂入本地标的池与持仓，彻底避免锚定偏差。点击下方按钮，AI 将纯基于上方中美宏观双核与实时全网检索，按 7 维驱动框架筛出未来 1Q~1Y 最具逻辑的多空板块与产业链切入点；选定板块后，具体真龙头交由你在下方 Layer 2 自主筛选与日线过筛。
+              <h3 className="text-[15px] font-semibold text-ink">
+                没有极度清晰的不对称赔率，坚决不硬凑机会卡片
+              </h3>
+              <p className="max-w-3xl text-[12.5px] leading-relaxed text-ink-2">
+                {result.abstain_reason || result.regime_summary || "当前风险收益比不足，保持现金与耐心等待。"}
               </p>
             </div>
-            {!isRunActive ? (
-              <button
-                type="button"
-                className="btn btn-primary"
-                onClick={() => {
-                  setLaunchErr(null);
-                  setLaunchOpen(true);
-                }}
-              >
-                <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>运行 Layer 1 战略推演</span>
-              </button>
-            ) : null}
+            <button
+              type="button"
+              className="btn btn-primary btn-sm shrink-0"
+              disabled={loggingOppKey === `${currentRun?.run_id}:abstain`}
+              onClick={() => void handleLogCompassOpportunity("l1_abstention")}
+            >
+              {isAbstentionLogged ? (
+                <>
+                  <BookmarkCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>已记录战略留白</span>
+                </>
+              ) : (
+                <>
+                  <BookmarkPlus className="h-3.5 w-3.5" aria-hidden="true" />
+                  <span>记入 Track C 留白纪律账本</span>
+                </>
+              )}
+            </button>
           </div>
-        ) : (
-          <>
-            {/* Regime Summary + Avoid Sectors Banner */}
-            <div className="grid grid-cols-1 gap-3 rounded-lg border border-hairline bg-elevated/60 p-3.5 lg:grid-cols-12">
-              <div className="flex flex-col gap-2 lg:col-span-8">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-[13px] font-semibold text-ink">{payload.regime_title}</span>
-                  <span className="font-mono text-[10px] text-muted">
-                    {shortTime(currentRun?.finished_at_utc)} · {(currentRun?.engine || "claude").toUpperCase()}
-                  </span>
-                  {currentRun?.focus_prompt ? (
-                    <span className="rounded border border-accent/30 bg-accent/10 px-1.5 py-0.5 text-[10px] text-accent">
-                      侧重：{currentRun.focus_prompt.slice(0, 26)}
-                      {currentRun.focus_prompt.length > 26 ? "…" : ""}
-                    </span>
-                  ) : null}
-                </div>
-                <p className="m-0 text-xs leading-relaxed text-ink-2">{payload.regime_summary}</p>
+        </div>
+      ) : null}
 
-                {/* Collapsible 4-Pillar Macro Breakdown */}
-                {payload.macro_signals &&
-                Object.values(payload.macro_signals).some((v) => Boolean(v && v.trim())) ? (
-                  <details className="mt-0.5">
-                    <summary className="cursor-pointer select-none text-[11px] font-medium text-accent hover:underline">
-                      展开四维宏观与产业脉动细项
-                    </summary>
-                    <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
-                      {payload.macro_signals.us_macro ? (
-                        <div className="rounded border border-hairline-soft bg-surface px-2.5 py-1.5 text-[11px]">
-                          <span className="font-semibold text-ink">美国宏观与流动性：</span>
-                          <span className="text-ink-2">{payload.macro_signals.us_macro}</span>
-                        </div>
-                      ) : null}
-                      {payload.macro_signals.china_macro ? (
-                        <div className="rounded border border-hairline-soft bg-surface px-2.5 py-1.5 text-[11px]">
-                          <span className="font-semibold text-ink">中国财政与信用：</span>
-                          <span className="text-ink-2">{payload.macro_signals.china_macro}</span>
-                        </div>
-                      ) : null}
-                      {payload.macro_signals.geopolitics_supply ? (
-                        <div className="rounded border border-hairline-soft bg-surface px-2.5 py-1.5 text-[11px]">
-                          <span className="font-semibold text-ink">地缘与资源国政策：</span>
-                          <span className="text-ink-2">{payload.macro_signals.geopolitics_supply}</span>
-                        </div>
-                      ) : null}
-                      {payload.macro_signals.tech_industry ? (
-                        <div className="rounded border border-hairline-soft bg-surface px-2.5 py-1.5 text-[11px]">
-                          <span className="font-semibold text-ink">技术与产业迭代：</span>
-                          <span className="text-ink-2">{payload.macro_signals.tech_industry}</span>
-                        </div>
-                      ) : null}
-                    </div>
-                  </details>
-                ) : null}
-              </div>
-
-              {/* Adverse / Avoid Sectors & Derived Short/Rotation Strategies */}
-              <div className="flex flex-col gap-1.5 border-t border-hairline-soft pt-2.5 lg:col-span-4 lg:border-l lg:border-t-0 lg:pl-3.5 lg:pt-0">
-                <div className="flex items-center justify-between gap-2 text-[11px] font-semibold text-warning">
-                  <span className="inline-flex items-center gap-1.5">
-                    <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
-                    <span>当下逆风 · 回避与衍生策略</span>
-                  </span>
-                </div>
-                {(payload.avoid_sectors ?? []).length > 0 ? (
-                  <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
-                    {(payload.avoid_sectors ?? []).map((av, i) => {
-                      const canDeriveShort = isLegacyHeadwindShortable(av);
-                      return (
-                        <li
-                          key={`${av.sector}-${i}`}
-                          className="flex flex-col gap-1 rounded border border-hairline-soft bg-surface/80 px-2.5 py-1.5 text-[11px]"
-                        >
-                          <div>
-                            <span className="font-semibold text-ink">{av.sector}</span>
-                            {av.reason ? <span className="text-muted"> — {av.reason}</span> : null}
-                          </div>
-                          {av.derived_strategy ? (
-                            <div className="text-[10.5px] leading-snug text-ink-2">
-                              <span className="font-semibold text-accent">延伸策略：</span>
-                              <span>{av.derived_strategy}</span>
-                            </div>
-                          ) : null}
-                          {canDeriveShort ? (
-                            <div className="flex flex-wrap items-center justify-between gap-1.5 pt-0.5">
-                              {av.short_proxy_hint ? (
-                                <span className="text-[10px] text-bear/90">
-                                  空头代理：{av.short_proxy_hint}
-                                </span>
-                              ) : (
-                                <span className="text-[10px] text-muted">
-                                  可用美股/ETF、商品/外汇/加密空头或代理表达（A 股禁空）
-                                </span>
-                              )}
-                              <button
-                                type="button"
-                                className="btn btn-sm border-bear/35 px-2 py-0.5 text-[10.5px] text-bear"
-                                disabled={scanBusy}
-                                onClick={() =>
-                                  setPickerTarget({
-                                    card: buildShortCardFromHeadwind(av, i),
-                                    runId: currentRun?.run_id,
-                                  })
-                                }
-                                title="按此逆风逻辑挑选合规空头/代理标的并跑日线缠论过筛（A 股禁空）"
-                              >
-                                <TrendingDown className="h-2.5 w-2.5" aria-hidden="true" />
-                                <span>衍生做空选标</span>
-                              </button>
-                            </div>
-                          ) : null}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                ) : (
-                  <div className="text-[11px] text-muted">本期未列出显著逆风板块</div>
-                )}
-              </div>
-            </div>
-
-            {/* Factor Concentration Warning & Constitutional Audit Strip */}
-            {(payload.factor_concentration?.concentrated ||
-              (payload.constitutional_audit &&
-                (payload.constitutional_audit.rejected_count > 0 ||
-                  payload.constitutional_audit.conviction_caps_applied > 0 ||
-                  payload.constitutional_audit.flagged_cards_count > 0))) ? (
-              <div className="flex flex-col gap-2">
-                {payload.factor_concentration?.concentrated ? (
-                  <div
-                    role="alert"
-                    className="flex flex-col gap-1.5 rounded-lg border border-warning/45 bg-warning/10 px-3 py-2.5 text-xs"
-                  >
-                    <div className="flex flex-wrap items-center gap-1.5 font-semibold text-warning">
-                      <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                      <span>
-                        跨卡片宏大因子集中度预警（共 {payload.factor_concentration.dominant_factors?.length ?? 0} 项因子同向叠加）
-                      </span>
-                    </div>
-                    <ul className="m-0 flex list-none flex-col gap-1 pl-0 text-[11px] text-ink-2">
-                      {payload.factor_concentration.warnings.map((w, idx) => (
-                        <li key={`fc-w-${idx}`} className="leading-snug">
-                          • {w}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-
-                {payload.constitutional_audit &&
-                (payload.constitutional_audit.rejected_count > 0 ||
-                  payload.constitutional_audit.conviction_caps_applied > 0 ||
-                  payload.constitutional_audit.flagged_cards_count > 0) ? (
-                  <div className="flex flex-wrap items-center gap-2 rounded-md border border-hairline bg-sunken/60 px-3 py-1.5 text-[11px] text-ink-2">
-                    <span className="inline-flex items-center gap-1 font-semibold text-accent">
-                      <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
-                      <span>程序化宪法护栏审计</span>
-                    </span>
-                    {payload.constitutional_audit.rejected_count > 0 ? (
-                      <span className="rounded border border-bear/35 bg-bear/10 px-1.5 py-0.5 text-[10.5px] font-medium text-bear">
-                        硬拦截 {payload.constitutional_audit.rejected_count} 张
-                      </span>
-                    ) : null}
-                    {payload.constitutional_audit.conviction_caps_applied > 0 ? (
-                      <span className="rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 text-[10.5px] font-medium text-warning">
-                        降档确信度 {payload.constitutional_audit.conviction_caps_applied} 张
-                      </span>
-                    ) : null}
-                    {payload.constitutional_audit.flagged_cards_count > 0 ? (
-                      <span className="rounded border border-hairline bg-surface px-1.5 py-0.5 text-[10.5px] text-muted">
-                        风险警示标记 {payload.constitutional_audit.flagged_cards_count} 张
-                      </span>
-                    ) : null}
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-
-            {oppLogFeedback ? (
-              <div
-                role={oppLogFeedback.tone === "err" ? "alert" : "status"}
-                className={`flex items-center justify-between gap-2 rounded-md border px-3 py-1.5 text-xs ${
-                  oppLogFeedback.tone === "err"
-                    ? "border-bear/45 bg-bear/10 text-bear"
-                    : "border-bull/40 bg-bull/10 text-bull"
-                }`}
+      {/* 5. Direction Filter + Factor Concentration Cross-Highlight Bar */}
+      {directions.length > 0 ? (
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {(
+              [
+                { id: "all", label: `全部 (${dirCounts.all})` },
+                { id: "long", label: `做多 (${dirCounts.long})` },
+                { id: "short", label: `做空 (${dirCounts.short})` },
+                { id: "pair", label: `配对 (${dirCounts.pair})` },
+              ] as const
+            ).map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                className="chip !min-h-[24px] !px-2.5 !text-[11px]"
+                aria-pressed={dirFilter === f.id}
+                onClick={() => setDirFilter(f.id)}
               >
-                <span>{oppLogFeedback.text}</span>
-                <button
-                  type="button"
-                  className="cursor-pointer border-0 bg-transparent text-[11px] text-muted hover:text-ink"
-                  onClick={() => setOppLogFeedback(null)}
-                >
-                  关闭
-                </button>
-              </div>
-            ) : null}
+                {f.label}
+              </button>
+            ))}
+          </div>
 
-            {/* Direction Filter Tabs */}
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="按多空方向筛选">
-                {(
-                  [
-                    { key: "all", label: `全部高共振 (${directionCounts.all})` },
-                    { key: "long", label: `做多方向 (${directionCounts.long})` },
-                    { key: "short", label: `做空方向 (${directionCounts.short})` },
-                    { key: "pair", label: `多空配对 (${directionCounts.pair})` },
-                  ] as const
-                ).map((tab) => (
-                  <button
-                    key={tab.key}
-                    type="button"
-                    className="chip"
-                    aria-pressed={dirFilter === tab.key}
-                    onClick={() => setDirFilter(tab.key)}
-                  >
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-              <span className="text-[11px] text-muted">
-                点击卡片「自选标的过筛」即可为该 L1 逻辑挑选专属小池标的，与下方手动大类池扫描完全隔离
+          {/* Factor Concentration Toggle Badges (Cross-Highlight Correlated Cards) */}
+          {concentratedFactors.length > 0 ? (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <span className="inline-flex items-center gap-1 text-[10.5px] font-semibold text-warning">
+                <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                同源宏因子集中:
               </span>
-            </div>
-
-            {/* High-Resonance Direction Cards Grid (or Constitutional Abstention / Empty Filter State) */}
-            {directions.length === 0 ? (
-              <div
-                role="status"
-                className="flex flex-col gap-2.5 rounded-lg border border-dashed border-accent/40 bg-sunken/50 px-4 py-5 text-xs"
-              >
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="font-semibold text-ink">
-                    本期触发《Layer 1 思考宪法》第 4 条 · 战略留白与持币观望
-                  </div>
-                  {currentRun?.run_id && payload.abstained ? (
-                    (() => {
-                      const abKey = `${currentRun.run_id}:abstain`;
-                      const isLogged = Boolean(loggedOppMap[abKey]);
-                      const isBusy = loggingOppKey === abKey;
-                      return (
-                        <button
-                          type="button"
-                          className="btn btn-sm border-accent/40 text-accent"
-                          disabled={Boolean(loggingOppKey) || isLogged}
-                          onClick={() => void handleLogCompassOpportunity("l1_abstention")}
-                          title="将本期战略留白决策记入 Track C 影子账本，供 1~4 周后回测验证留白是否正确"
-                        >
-                          {isBusy ? (
-                            <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
-                          ) : isLogged ? (
-                            <BookmarkCheck className="h-3 w-3 text-bull" aria-hidden="true" />
-                          ) : (
-                            <BookmarkPlus className="h-3 w-3" aria-hidden="true" />
-                          )}
-                          <span>{isLogged ? "已记入留白影子账本" : "记入 L1 战略留白账本"}</span>
-                        </button>
-                      );
-                    })()
-                  ) : null}
-                </div>
-                <p className="m-0 leading-relaxed text-ink-2">
-                  {payload.abstain_reason ||
-                    "当前战场未出现符合宪法硬护栏与两维共振门槛的高赔率方向，按宁缺毋滥原则保持空仓观望，请重点参考上方逆风回避与衍生策略。"}
-                </p>
-              </div>
-            ) : filteredDirections.length === 0 ? (
-              <div
-                role="status"
-                className="rounded-lg border border-dashed border-hairline bg-sunken/40 px-4 py-5 text-center text-xs text-muted"
-              >
-                当前筛选分类下暂无方向卡片，可切换上方方向标签查看其余高确信主线。
-              </div>
-            ) : (
-            <div className="grid grid-cols-1 gap-3 lg:grid-cols-2">
-              {filteredDirections.map((card) => {
-                const dm = directionMeta(card.direction);
-                const DirIcon = dm.Icon;
-
+              {concentratedFactors.map((cf) => {
+                const active = highlightFactor === cf.name;
                 return (
-                  <article
-                    key={card.id}
-                    className={`flex flex-col justify-between gap-3 rounded-lg border border-hairline border-l-2 bg-surface p-3.5 transition-colors hover:border-accent/40 ${dm.borderClass}`}
+                  <button
+                    key={cf.name}
+                    type="button"
+                    onClick={() => setHighlightFactor(active ? null : cf.name)}
+                    className={`rounded-full border px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
+                      active
+                        ? "border-warning bg-warning/20 text-warning"
+                        : "border-warning/35 bg-warning/8 text-warning hover:bg-warning/16"
+                    }`}
+                    title="点击高亮共享此单一宏因子的关联方向卡片（警惕伪分散）"
                   >
-                    <div className="flex flex-col gap-2.5">
-                      {/* Card Top Badges */}
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <span className="font-mono text-xs font-semibold text-muted">#{card.rank}</span>
-                          <span
-                            className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-semibold ${dm.badgeClass}`}
-                          >
-                            <DirIcon className="h-3 w-3" aria-hidden="true" />
-                            <span>{dm.label}</span>
-                          </span>
-                          <span className="rounded border border-hairline bg-elevated px-1.5 py-0.5 text-[10px] font-medium text-ink-2">
-                            {assetScopeLabel(card.asset_scope)}
-                          </span>
-                          <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 font-mono text-[10px] text-muted">
-                            {card.horizon}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          {card.is_new_theme ? (
-                            <span className="rounded border border-accent/35 bg-accent/10 px-1.5 py-0.5 text-[10px] font-medium text-accent">
-                              新挖掘主题
-                            </span>
-                          ) : null}
-                          <span
-                            className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                              card.conviction === "high"
-                                ? "bg-accent/15 text-accent"
-                                : "bg-sunken text-muted"
-                            }`}
-                          >
-                            {card.conviction === "high" ? "高确信度" : "中等确信度"}
-                          </span>
-                        </div>
-                      </div>
-
-                      {/* Title */}
-                      <h3 className="m-0 text-[14px] font-semibold leading-snug text-ink">{card.title}</h3>
-
-                      {/* 2-Dimension Resonance Pills */}
-                      <div className="flex flex-col gap-1 rounded-md border border-hairline-soft bg-sunken/60 p-2 text-[11px]">
-                        <div className="flex items-start gap-1.5">
-                          <span className="shrink-0 rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-semibold text-accent">
-                            主 · {card.primary_driver.dimension}
-                          </span>
-                          <span className="text-ink-2">{card.primary_driver.summary}</span>
-                        </div>
-                        <div className="flex items-start gap-1.5">
-                          <span className="shrink-0 rounded bg-subtle px-1.5 py-0.5 text-[10px] font-semibold text-ink-2">
-                            次 · {card.secondary_driver.dimension}
-                          </span>
-                          <span className="text-muted">{card.secondary_driver.summary}</span>
-                        </div>
-                      </div>
-
-                      {/* Core Thesis */}
-                      <p className="m-0 text-xs leading-relaxed text-ink">{card.thesis}</p>
-
-                      {/* Forward Expectation Gap (Priced-In vs Unpriced 1Q~1Y Delta) */}
-                      {card.priced_in_already || card.unpriced_gap ? (
-                        <div className="flex flex-col gap-1 rounded-md border border-hairline-soft bg-sunken/45 px-2.5 py-2 text-[11px] leading-snug">
-                          {card.priced_in_already ? (
-                            <div className="text-muted">
-                              <span className="font-semibold text-ink-2">已计价：</span>
-                              <span>{card.priced_in_already}</span>
-                            </div>
-                          ) : null}
-                          {card.unpriced_gap ? (
-                            <div className="text-ink-2">
-                              <span className="font-semibold text-accent">未计价预期差：</span>
-                              <span>{card.unpriced_gap}</span>
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : null}
-
-                      {/* Pair Legs Breakdown (for pair sector cards) */}
-                      {card.direction === "pair" && (card.long_leg_sector || card.short_leg_sector) ? (
-                        <div className="grid grid-cols-1 gap-1.5 text-[11px] sm:grid-cols-2">
-                          {card.long_leg_sector ? (
-                            <div className="rounded border border-bull/30 bg-bull/8 px-2.5 py-1.5">
-                              <span className="font-semibold text-bull">做多板块腿：</span>
-                              <span className="text-ink-2">{card.long_leg_sector}</span>
-                            </div>
-                          ) : null}
-                          {card.short_leg_sector ? (
-                            <div className="rounded border border-bear/30 bg-bear/8 px-2.5 py-1.5">
-                              <span className="font-semibold text-bear">做空板块腿：</span>
-                              <span className="text-ink-2">{card.short_leg_sector}</span>
-                            </div>
-                          ) : null}
-                        </div>
-                      ) : null}
-
-                      {/* Value Chain Focus & Leader-Picking Criteria */}
-                      {card.value_chain_focus ? (
-                        <div className="rounded-md border border-accent/25 bg-accent/6 px-2.5 py-2 text-[11px]">
-                          <span className="font-semibold text-accent">产业链切入与选龙头抓手：</span>
-                          <span className="text-ink">{card.value_chain_focus}</span>
-                        </div>
-                      ) : null}
-
-                      {/* Post-hoc Portfolio Overlap Notice (strictly informational, never fed to AI) */}
-                      {(card.portfolio_overlap ?? []).length > 0 ? (
-                        <div className="flex flex-wrap items-center gap-1.5 rounded border border-warning/30 bg-warning/8 px-2.5 py-1 text-[11px] text-warning">
-                          <AlertTriangle className="h-3 w-3 shrink-0" aria-hidden="true" />
-                          <span>当前已有相关持仓：{(card.portfolio_overlap ?? []).join("、")}（注意单板块龙头独占）</span>
-                        </div>
-                      ) : null}
-
-                      {/* Catalyst & Invalidation */}
-                      <div className="grid grid-cols-1 gap-1.5 text-[11px] sm:grid-cols-2">
-                        {card.key_catalyst ? (
-                          <div className="rounded border border-hairline-soft bg-elevated/50 px-2 py-1.5">
-                            <span className="font-semibold text-ink-2">近期催化：</span>
-                            <span className="text-muted">{card.key_catalyst}</span>
-                          </div>
-                        ) : null}
-                        {card.invalidation ? (
-                          <div className="rounded border border-critical/25 bg-critical/5 px-2 py-1.5">
-                            <span className="font-semibold text-critical">证伪红线：</span>
-                            <span className="text-ink-2">{card.invalidation}</span>
-                          </div>
-                        ) : null}
-                      </div>
-
-                      {/* Optional Reference Anchors (pricing reference only) */}
-                      {(card.reference_anchors ?? []).length > 0 ? (
-                        <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                          <span className="text-muted">板块基准参考锚：</span>
-                          {(card.reference_anchors ?? []).map((sym) => (
-                            <button
-                              key={`${card.id}-anc-${sym}`}
-                              type="button"
-                              className="chip py-0.5 text-[11px]"
-                              onClick={() => onJumpWarRoom(sym)}
-                              title={`查看 ${sym} 日线与 30min 缠论基准走势`}
-                            >
-                              <SymbolLabel symbol={sym} size="sm" />
-                            </button>
-                          ))}
-                        </div>
-                      ) : null}
-
-                      {/* Legacy Leaders Section (only shown if historical run populated leaders) */}
-                      {card.leaders.length > 0 ? (
-                        <div className="flex flex-col gap-1.5">
-                          <div className="text-[11px] font-semibold text-ink-2">
-                            历史记录参考标的（{card.leaders.length}）
-                          </div>
-                          <div className="flex flex-col gap-1.5">
-                            {card.leaders.map((leader) => (
-                              <div
-                                key={`${card.id}-${leader.symbol}`}
-                                className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-hairline-soft bg-sunken/70 px-2.5 py-1.5"
-                              >
-                                <div className="min-w-0 flex-1">
-                                  <div className="flex flex-wrap items-center gap-1.5">
-                                    <span
-                                      className={`rounded px-1 py-0.2 font-mono text-[10px] font-semibold ${
-                                        leader.leg === "short"
-                                          ? "bg-bear/15 text-bear"
-                                          : "bg-bull/15 text-bull"
-                                      }`}
-                                    >
-                                      {leader.leg === "short" ? "空" : "多"}
-                                    </span>
-                                    <SymbolLabel symbol={leader.symbol} name={leader.name} size="sm" />
-                                    <span className="text-[10px] text-muted">
-                                      {leader.role === "co_leader" ? "双寡头" : "唯一龙头"}
-                                    </span>
-                                  </div>
-                                  {leader.reason ? (
-                                    <div className="mt-0.5 text-[11px] text-muted">{leader.reason}</div>
-                                  ) : null}
-                                </div>
-                                <div className="flex shrink-0 items-center gap-1">
-                                  <button
-                                    type="button"
-                                    className="btn btn-sm px-2"
-                                    onClick={() => onJumpWarRoom(leader.symbol)}
-                                    title="打开 30min + 日线缠论战情室"
-                                  >
-                                    <Crosshair className="h-3 w-3 text-accent" aria-hidden="true" />
-                                    <span>战情</span>
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="btn btn-sm px-2"
-                                    onClick={() => onJumpArchive(leader.symbol)}
-                                    title="进入研报档案（Layer 3 深度研究）"
-                                  >
-                                    <BookOpen className="h-3 w-3" aria-hidden="true" />
-                                    <span>档案</span>
-                                  </button>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-                      ) : null}
-
-                      {/* Programmatic Constitutional Guardrail Flags */}
-                      {card.constitutional_flags && card.constitutional_flags.length > 0 ? (
-                        <div className="flex flex-col gap-1 rounded-md border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-[10.5px]">
-                          {card.constitutional_flags.map((fl, fi) => (
-                            <div key={`${card.id}-cf-${fi}`} className="flex items-start gap-1.5 leading-snug text-ink-2">
-                              <ShieldAlert className="mt-0.5 h-3 w-3 shrink-0 text-warning" aria-hidden="true" />
-                              <span>
-                                <span className="font-semibold text-warning">{fl.article}</span>
-                                {fl.action === "cap_conviction_to_medium" ? (
-                                  <span className="ml-1 rounded bg-warning/20 px-1 font-mono text-[9.5px] text-warning">
-                                    已封顶中等确信
-                                  </span>
-                                ) : null}
-                                <span className="ml-1">{fl.message}</span>
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-                      ) : null}
-
-                      {/* Evidence Disclosure (Native <details>, no heading inside <summary>) */}
-                      {card.evidence.length > 0 ? (
-                        <details className="text-[11px]">
-                          <summary className="cursor-pointer select-none font-medium text-muted hover:text-ink">
-                            查看 L1~L4 联网证据溯源（{card.evidence.length} 条）
-                          </summary>
-                          <ul className="m-0 mt-1.5 flex list-none flex-col gap-1.5 pl-0">
-                            {card.evidence.map((ev, i) => {
-                              const href = safeExternalUrl(ev.url);
-                              return (
-                                <li
-                                  key={`${card.id}-ev-${i}`}
-                                  className="rounded border border-hairline-soft bg-sunken/50 px-2 py-1.5 text-ink-2"
-                                >
-                                  <div className="flex items-start gap-1.5">
-                                    <span className="shrink-0 rounded border border-hairline bg-surface px-1 font-mono text-[10px] font-semibold text-accent">
-                                      {ev.level}
-                                    </span>
-                                    <span className="flex-1">{ev.fact}</span>
-                                  </div>
-                                  <div className="mt-1 flex flex-wrap items-center gap-2 pl-6 font-mono text-[10px] text-muted">
-                                    {ev.date ? <span>{ev.date}</span> : null}
-                                    {ev.source ? <span className="font-sans">{ev.source}</span> : null}
-                                    {ev.verification_status === "ai_cited_unverified" ? (
-                                      <span className="rounded bg-elevated px-1 font-sans text-[9.5px] text-muted">
-                                        AI 引用·待核验
-                                      </span>
-                                    ) : null}
-                                    {href ? (
-                                      <a
-                                        href={href}
-                                        target="_blank"
-                                        rel="noopener noreferrer"
-                                        className="inline-flex items-center gap-0.5 text-accent hover:underline"
-                                      >
-                                        <span>原文</span>
-                                        <ExternalLink className="h-2.5 w-2.5" aria-hidden="true" />
-                                      </a>
-                                    ) : null}
-                                  </div>
-                                </li>
-                              );
-                            })}
-                          </ul>
-                        </details>
-                      ) : null}
-                    </div>
-
-                    {/* Card Action Footer: Dedicated L1 Mini-Pool Leader Picker + Track C Shadow Ledger */}
-                    <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline-soft pt-2.5">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <button
-                          type="button"
-                          className="btn btn-sm btn-primary"
-                          disabled={scanBusy}
-                          onClick={() =>
-                            setPickerTarget({
-                              card,
-                              runId: currentRun?.run_id,
-                            })
-                          }
-                          title="在专属小池中自主挑选符合本 L1 逻辑的 1~3 只标的并做日线缠论联立过筛"
-                        >
-                          <span>自选标的过筛</span>
-                          <ArrowRight className="h-3 w-3" aria-hidden="true" />
-                        </button>
-                        {currentRun?.run_id ? (
-                          (() => {
-                            const opKey = `${currentRun.run_id}:${card.id}`;
-                            const isLogged = Boolean(loggedOppMap[opKey]);
-                            const isBusy = loggingOppKey === opKey;
-                            return (
-                              <button
-                                type="button"
-                                className="btn btn-sm"
-                                disabled={Boolean(loggingOppKey) || isLogged}
-                                onClick={() => void handleLogCompassOpportunity("l1_direction_call", card.id)}
-                                title="将本张 L1 方向卡片记入 Track C 影子机会账本，追踪 1~4 周后续 R 倍数兑现"
-                              >
-                                {isBusy ? (
-                                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
-                                ) : isLogged ? (
-                                  <BookmarkCheck className="h-3 w-3 text-bull" aria-hidden="true" />
-                                ) : (
-                                  <BookmarkPlus className="h-3 w-3" aria-hidden="true" />
-                                )}
-                                <span>{isLogged ? "已入影子账本" : "记入影子账本"}</span>
-                              </button>
-                            );
-                          })()
-                        ) : null}
-                      </div>
-                      <span className="text-[10.5px] text-muted">
-                        专属小池独立校验 · Track C 归因可追踪
-                      </span>
-                    </div>
-                  </article>
+                    {cf.name} ({cf.count}卡)
+                  </button>
                 );
               })}
             </div>
-            )}
+          ) : null}
+        </div>
+      ) : null}
 
-            {/* Global Risk Warnings */}
-            {(payload.risk_warnings ?? []).length > 0 ? (
-              <div className="flex flex-wrap items-start gap-2 rounded-md border border-warning/30 bg-warning/8 px-3 py-2 text-[11px] text-ink-2">
-                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-warning" aria-hidden="true" />
-                <div className="flex flex-col gap-0.5">
-                  <span className="font-semibold text-warning">跨资产宏观风险与因子重叠提示</span>
-                  {(payload.risk_warnings ?? []).map((w, i) => (
-                    <span key={i}>• {w}</span>
-                  ))}
+      {/* 6. Uniform-Height L1 Decision Cards Grid */}
+      {visibleDirections.length > 0 ? (
+        <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+          {visibleDirections.map((card) => {
+            const isShort = card.direction === "short";
+            const isPair = card.direction === "pair";
+            const DirIcon = isShort ? TrendingDown : isPair ? Scale : TrendingUp;
+            const dirCls = isShort
+              ? "border-bear/40 bg-bear/12 text-bear"
+              : isPair
+                ? "border-warning/40 bg-warning/12 text-warning"
+                : "border-bull/40 bg-bull/12 text-bull";
+            const dirLabel = isShort ? "做空" : isPair ? "配对" : "做多";
+
+            const flags = card.constitutional_flags ?? [];
+            const cappedFlag = flags.find((f) => f.action === "cap_conviction_to_medium");
+            const firstFlagMsg = cappedFlag?.message || flags[0]?.message || null;
+
+            const sharedFactors = concentratedCardFactors.get(card.id) ?? [];
+            const isFactorDimmed = Boolean(highlightFactor && !sharedFactors.includes(highlightFactor));
+            const isFactorHighlighted = Boolean(highlightFactor && sharedFactors.includes(highlightFactor));
+            const isActiveL2 = activeL2CardId === card.id;
+            const logged = isCardLogged(card.id);
+            const loggingThis = loggingOppKey === `${currentRun?.run_id}:${card.id}`;
+
+            const headlinePositive =
+              card.card_headline_gap || card.unpriced_gap || card.thesis || "点击查看核心预期差";
+            const headlineNegative =
+              card.invalidation_short || card.invalidation || card.priced_in_already || "查看证伪红线";
+
+            const anchorTemp = computeAnchorTemperature(card, anchorBySym);
+            const l2Summary = l2ScanSummaries?.[card.id];
+
+            return (
+              <article
+                key={card.id}
+                className={`relative flex min-h-[218px] flex-col justify-between overflow-hidden rounded-lg border bg-surface p-3 transition-all ${
+                  isActiveL2
+                    ? "border-accent ring-1 ring-accent/40"
+                    : isFactorHighlighted
+                      ? "border-warning ring-1 ring-warning/45"
+                      : "border-hairline hover:border-ink-2/40"
+                } ${isFactorDimmed ? "opacity-45" : ""}`}
+              >
+                {/* Shared Macro Factor Top Color Strip (Mandatory Redline #2) */}
+                {sharedFactors.length > 0 ? (
+                  <div
+                    aria-hidden="true"
+                    className="absolute inset-x-0 top-0 h-[3px]"
+                    style={{ background: "var(--warning)" }}
+                  />
+                ) : null}
+
+                {/* Top Content Block */}
+                <div className="flex flex-col gap-2">
+                  {/* Row 1: Badges + Conviction (with explicit cap strikethrough) + Persistent Track C */}
+                  <div className="flex flex-wrap items-center justify-between gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1">
+                      <span
+                        className={`inline-flex items-center gap-0.5 rounded border px-1.5 py-px text-[10px] font-semibold ${dirCls}`}
+                      >
+                        <DirIcon className="h-3 w-3" aria-hidden="true" />
+                        {dirLabel}
+                      </span>
+                      {cappedFlag ? (
+                        <span
+                          className="inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/12 px-1.5 py-px text-[10px] font-semibold text-warning"
+                          title={cappedFlag.message}
+                        >
+                          <span className="line-through opacity-65">高</span>
+                          <span>降档·中</span>
+                        </span>
+                      ) : (
+                        <span className="rounded bg-subtle px-1.5 py-px text-[10px] font-medium text-ink-2">
+                          {card.conviction === "high" ? "高确信" : card.conviction === "medium" ? "中确信" : "观察"}
+                        </span>
+                      )}
+                      <span className="rounded bg-subtle px-1.5 py-px text-[10px] text-muted">
+                        {assetScopeLabel(card.asset_scope)}
+                      </span>
+                      {sharedFactors.length > 0 ? (
+                        <span className="rounded bg-warning/14 px-1.5 py-px text-[9.5px] font-medium text-warning">
+                          共因子: {sharedFactors[0]}
+                        </span>
+                      ) : null}
+                    </div>
+                    {logged ? (
+                      <span
+                        className="inline-flex items-center gap-0.5 rounded bg-bull/14 px-1.5 py-px text-[9.5px] font-semibold text-bull"
+                        title="已记入 Track C 影子机会账本"
+                      >
+                        <BookmarkCheck className="h-3 w-3" aria-hidden="true" />
+                        已入影子
+                      </span>
+                    ) : null}
+                  </div>
+
+                  {/* Row 2: Title & Dual-Driver Tag */}
+                  <div>
+                    <h3
+                      className="line-clamp-1 text-[13.5px] font-semibold text-ink"
+                      title={card.title}
+                    >
+                      {card.title}
+                    </h3>
+                    <div className="mt-0.5 flex items-center gap-1.5 text-[10.5px] text-muted">
+                      <span className="truncate">
+                        {card.primary_driver?.dimension} + {card.secondary_driver?.dimension}
+                      </span>
+                      <span className="shrink-0 font-mono">· {card.horizon || "1Q~1Y"}</span>
+                    </div>
+                  </div>
+
+                  {/* Row 3: Mandatory Constitutional Flag 1-Line Surface Banner (Redline #1) */}
+                  {firstFlagMsg ? (
+                    <div
+                      className="flex items-center gap-1.5 rounded border border-warning/40 bg-warning/10 px-2 py-1 text-[10.5px] font-medium text-warning"
+                      title={firstFlagMsg}
+                    >
+                      <ShieldAlert className="h-3 w-3 shrink-0" aria-hidden="true" />
+                      <span className="truncate">{firstFlagMsg}</span>
+                    </div>
+                  ) : null}
+
+                  {/* Row 4: Strict 1 Positive + 1 Negative 2-Line Summary (Redline #3) */}
+                  <div className="space-y-1 text-[11.5px]">
+                    <p className="line-clamp-1 text-ink" title={headlinePositive}>
+                      <span className="mr-1 font-semibold text-bull">差:</span>
+                      {headlinePositive}
+                    </p>
+                    <p className="line-clamp-1 text-bear" title={headlineNegative}>
+                      <span className="mr-1 font-semibold">线:</span>
+                      {headlineNegative}
+                    </p>
+                  </div>
+
+                  {/* Row 5: Anchor Temperature (Anti-Anchoring) + Bidirectional L2 Scan Badge */}
+                  <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+                    {anchorTemp ? (
+                      <span
+                        title={anchorTemp.detail}
+                        className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-medium ${
+                          anchorTemp.kind === "aligned"
+                            ? "bg-bull/10 text-bull"
+                            : anchorTemp.kind === "divergent"
+                              ? "bg-warning/14 text-warning"
+                              : "bg-subtle text-muted"
+                        }`}
+                      >
+                        <Crosshair className="h-2.5 w-2.5" aria-hidden="true" />
+                        {anchorTemp.label}
+                      </span>
+                    ) : null}
+                    {l2Summary ? (
+                      <span
+                        className="inline-flex items-center gap-1 rounded border border-accent/35 bg-accent/10 px-1.5 py-0.5 font-mono text-[10px] font-medium text-accent"
+                        title={`该 L1 轨道最近一次 L2 扫描共 ${l2Summary.total} 只标的`}
+                      >
+                        L2 已筛: {l2Summary.aligned}同向 · {l2Summary.watch}观察
+                      </span>
+                    ) : null}
+                    {card.portfolio_overlap && card.portfolio_overlap.length > 0 ? (
+                      <span
+                        className="rounded bg-accent/12 px-1.5 py-0.5 text-accent"
+                        title={`与当前持仓/板块重合：${card.portfolio_overlap.join("、")}`}
+                      >
+                        含现有持仓 ({card.portfolio_overlap.length})
+                      </span>
+                    ) : null}
+                  </div>
                 </div>
-              </div>
-            ) : null}
-          </>
-        )}
-      </div>
 
-      {/* Launch Layer 1 Synthesis Modal */}
+                {/* Row 6: Compact Action Footer */}
+                <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-hairline-soft pt-2">
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      className={`btn btn-sm !min-h-[26px] !px-2 !text-[11px] ${
+                        drawer?.kind === "card" && drawer.card.id === card.id
+                          ? "border-accent/45 bg-accent/12 font-medium text-accent"
+                          : "btn-ghost"
+                      }`}
+                      aria-expanded={drawer?.kind === "card" && drawer.card.id === card.id}
+                      onClick={() =>
+                        setDrawer((prev) =>
+                          prev?.kind === "card" && prev.card.id === card.id
+                            ? null
+                            : { kind: "card", card },
+                        )
+                      }
+                    >
+                      <BookOpen className="h-3 w-3" aria-hidden="true" />
+                      <span>{drawer?.kind === "card" && drawer.card.id === card.id ? "收起详情" : "详情"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn-ghost btn-sm !min-h-[26px] !px-2 !text-[11px]"
+                      disabled={loggingThis}
+                      onClick={() => void handleLogCompassOpportunity("l1_direction_call", card.id)}
+                      title={logged ? "已记入 Track C 影子账本（幂等可复用）" : "将本 L1 战略方向记入 Track C 影子账本"}
+                    >
+                      {logged ? (
+                        <BookmarkCheck className="h-3.5 w-3.5 text-bull" aria-hidden="true" />
+                      ) : (
+                        <BookmarkPlus className="h-3.5 w-3.5" aria-hidden="true" />
+                      )}
+                      <span className="hidden sm:inline">{logged ? "已记" : "影子"}</span>
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    className={`btn btn-sm !min-h-[26px] !px-2.5 !text-[11px] ${
+                      isActiveL2 ? "border-accent bg-accent/14 font-semibold text-accent" : "btn-primary"
+                    }`}
+                    onClick={() => onSelectCardForL2(card, currentRun?.run_id)}
+                  >
+                    <span>{isActiveL2 ? "● 当前 L2 轨道" : "选龙头过筛"}</span>
+                    {!isActiveL2 ? <ArrowRight className="h-3 w-3" aria-hidden="true" /> : null}
+                  </button>
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      ) : !result?.abstained && !loadingRun ? (
+        <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-hairline bg-sunken/40 py-7 text-center text-[12px] text-muted">
+          <p>
+            {result
+              ? "当前筛选条件下无方向卡片，可切换筛选标签或重新推演。"
+              : "尚未运行第一层 AI 宏观盲推演。点击右上角「AI 盲推演新方向」开启自上而下 7 维推演。"}
+          </p>
+        </div>
+      ) : null}
+
+      {/* Non-Modal Progressive Disclosure Right Slide-Over Drawer */}
+      <Layer1DetailDrawer
+        drawer={drawer}
+        result={result}
+        runId={currentRun?.run_id}
+        onClose={() => setDrawer(null)}
+        onActivateL2Card={(card) => onSelectCardForL2(card, currentRun?.run_id)}
+        onLaunchAvoidShort={(item, idx) => {
+          const shortCard = buildShortCardFromHeadwind(item, idx);
+          onSelectCardForL2(shortCard, currentRun?.run_id);
+        }}
+        isCardLogged={isCardLogged}
+        isLoggingCard={(cid) => loggingOppKey === `${currentRun?.run_id}:${cid}`}
+        onLogCard={(cid) => void handleLogCompassOpportunity("l1_direction_call", cid)}
+      />
+
+      {/* AI Launch Dialog */}
       <ModalDialog
         open={launchOpen}
         onClose={() => setLaunchOpen(false)}
-        title="运行 Layer 1 · 7 维自上而下板块盲推演"
-        subtitle="不喂本地标的池与持仓，纯从宏观与全网催化推演 1Q~1Y 最优多空板块"
+        title="发起 L1 宏观战略盲推演"
+        subtitle="基于免费宏观双核与实时联网检索，严格遵守 5 条宪法护栏与去锚定原则"
         lightDismiss
       >
-        <form onSubmit={handleStartCompass} className="flex flex-col gap-3.5 p-5">
-          <p className="m-0 text-xs leading-relaxed text-muted">
-            后端仅向 AI 提供客观中美宏观双核与大类基准硬数据（不传入现有标的池和持仓，彻底杜绝锚定偏差），由 AI 实时全网检索并按 7 维框架选出 1Q~1Y 最优多空板块与产业链切入点；推演完成后由程序自动匹配本地池，具体真龙头留给你在下方 Layer 2 自主筛选。
-          </p>
-
-          {/* Engine Selector */}
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-ink">AI 推演引擎</span>
-            <div className="grid grid-cols-2 gap-2">
-              {(enginesInfo?.engines ?? [
-                { id: "claude" as DeepResearchEngine, label: "Claude Code", description: "主力联网推演", available: true },
-                { id: "codex" as DeepResearchEngine, label: "Codex", description: "备选跨模型引擎", available: true },
-              ]).map((eng) => {
-                const active = selectedEngine === eng.id;
-                return (
-                  <button
-                    key={eng.id}
-                    type="button"
-                    disabled={!eng.available}
-                    onClick={() => setSelectedEngine(eng.id)}
-                    className={`flex flex-col items-start gap-0.5 rounded-md border p-2.5 text-left transition-colors ${
-                      active
-                        ? "border-accent bg-accent/10 text-ink"
-                        : "border-hairline bg-sunken/60 text-ink-2 hover:border-accent/40"
-                    } ${!eng.available ? "cursor-not-allowed opacity-45" : "cursor-pointer"}`}
-                  >
-                    <span className="text-xs font-semibold">{eng.label}</span>
-                    <span className="text-[11px] text-muted">
-                      {eng.available ? eng.description : "本机未检测到 CLI"}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
+        <form onSubmit={handleStartCompass} className="flex flex-col gap-3.5 text-[12px]">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <label className="flex flex-col gap-1">
+              <span className="font-medium text-ink">AI 推演引擎</span>
+              <select
+                value={selectedEngine}
+                onChange={(e) => setSelectedEngine(e.target.value as DeepResearchEngine)}
+                className="input h-9 px-2.5 text-[12px]"
+              >
+                {(enginesInfo?.engines ?? []).length > 0 ? (
+                  enginesInfo!.engines.map((eng) => (
+                    <option key={eng.id} value={eng.id} disabled={!eng.available}>
+                      {eng.label} {!eng.available ? "(未就绪)" : ""}
+                    </option>
+                  ))
+                ) : (
+                  <>
+                    <option value="claude">Claude</option>
+                    <option value="codex">Codex</option>
+                  </>
+                )}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="font-medium text-ink">思考强度 (Effort)</span>
+              <select
+                value={effort}
+                onChange={(e) => setEffort(e.target.value as "low" | "medium" | "high")}
+                className="input h-9 px-2.5 text-[12px]"
+              >
+                <option value="low">Low（快速扫描）</option>
+                <option value="medium">Medium（标准推荐）</option>
+                <option value="high">High（深度盲推）</option>
+              </select>
+            </label>
           </div>
 
-          {/* Reasoning Effort */}
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs font-medium text-ink">推理深度</span>
-            <div className="flex items-center gap-1.5">
-              {(
-                [
-                  { id: "low", label: "快速 (Low)" },
-                  { id: "medium", label: "均衡推荐 (Medium)" },
-                  { id: "high", label: "深度推演 (High)" },
-                ] as const
-              ).map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  className="chip"
-                  aria-pressed={effort === opt.id}
-                  onClick={() => setEffort(opt.id)}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Multi-select Target Battlefields */}
-          <div className="flex flex-col gap-2">
-            <div className="flex items-center justify-between gap-2">
-              <span className="text-xs font-medium text-ink">
-                重点深挖战场（可多选；不选则全市场均衡）
-              </span>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="font-medium text-ink">定向聚焦领域（留空则跨全市场自动发掘）</span>
               {selectedFocusScopes.length > 0 ? (
                 <button
                   type="button"
-                  className="cursor-pointer border-0 bg-transparent p-0 text-[11px] text-accent hover:underline"
+                  className="text-[11px] text-accent hover:underline"
                   onClick={() => setSelectedFocusScopes([])}
                 >
-                  清空（恢复全市场）
+                  清空已选 ({selectedFocusScopes.length})
                 </button>
-              ) : (
-                <span className="text-[11px] text-muted">当前：全市场均衡</span>
-              )}
+              ) : null}
             </div>
-
-            <div className="flex flex-col gap-2 rounded-md border border-hairline-soft bg-sunken/50 p-2.5">
+            <div className="space-y-2 rounded-md border border-hairline-soft bg-sunken/50 p-2.5">
               {FOCUS_SCOPE_GROUPS.map((grp) => (
-                <div key={grp.group} className="flex flex-col gap-1">
-                  <span className="text-[10.5px] font-medium text-muted">{grp.group}</span>
+                <div key={grp.group} className="space-y-1">
+                  <div className="text-[10.5px] font-medium text-muted">{grp.group}</div>
                   <div className="flex flex-wrap gap-1.5">
-                    {grp.items.map((item) => {
-                      const active = selectedFocusScopes.includes(item.id);
+                    {grp.items.map((it) => {
+                      const active = selectedFocusScopes.includes(it.id);
                       return (
                         <button
-                          key={item.id}
+                          key={it.id}
                           type="button"
-                          className="chip text-[11px]"
+                          onClick={() => toggleFocusScope(it.id)}
+                          title={it.hint}
+                          className={`chip !min-h-[24px] !px-2 !text-[11px]`}
                           aria-pressed={active}
-                          title={item.hint}
-                          onClick={() => toggleFocusScope(item.id)}
                         >
-                          {item.label}
+                          {it.label}
                         </button>
                       );
                     })}
@@ -2247,64 +1468,39 @@ export function Layer1CompassPanel({
             </div>
           </div>
 
-          {/* Optional Free-Text Supplement */}
-          <div className="flex flex-col gap-1">
-            <label htmlFor="compass-focus-prompt" className="text-xs font-medium text-ink">
-              补充推演要求（可选）
-            </label>
+          <label className="flex flex-col gap-1">
+            <span className="font-medium text-ink">补充研究指令（可选）</span>
             <textarea
-              id="compass-focus-prompt"
               rows={2}
-              className="input resize-none text-xs"
-              placeholder="如：重点对比铜/铝/镍内部强弱，以及商品货币澳元/加元是否具备右侧做空条件"
               value={focusPrompt}
               onChange={(e) => setFocusPrompt(e.target.value)}
+              placeholder="例如：重点评估美债利率上行背景下商品空头与电力设备出海的预期差…"
+              className="input px-2.5 py-2 text-[12px]"
             />
-          </div>
+          </label>
 
-          <label className="inline-flex cursor-pointer items-center gap-2 text-xs text-ink-2">
+          <label className="inline-flex cursor-pointer items-center gap-2 text-ink-2">
             <input
               type="checkbox"
               checked={refreshMacroOnRun}
               onChange={(e) => setRefreshMacroOnRun(e.target.checked)}
-              className="accent-accent"
             />
-            <span>推演前强制刷新最新宏观与跨资产定价锚硬数据</span>
+            <span>推演前同步拉取最新 FRED / 定价锚 / CFTC / Polymarket 数据</span>
           </label>
 
-          {launchErr ? (
-            <div className="rounded-md border border-critical/40 bg-critical/10 px-3 py-2 text-xs text-critical">
-              {launchErr}
-            </div>
-          ) : null}
+          {launchErr ? <p className="text-bear">{launchErr}</p> : null}
 
           <div className="flex items-center justify-end gap-2 border-t border-hairline-soft pt-3">
-            <button type="button" className="btn" onClick={() => setLaunchOpen(false)}>
+            <button type="button" className="btn btn-sm" onClick={() => setLaunchOpen(false)}>
               取消
             </button>
-            <button
-              type="submit"
-              className="btn btn-primary"
-              disabled={launching || (enginesInfo !== null && !enginesInfo.any_available)}
-            >
+            <button type="submit" className="btn btn-primary btn-sm" disabled={launching}>
               <Sparkles className="h-3.5 w-3.5" aria-hidden="true" />
-              <span>{launching ? "正在启动…" : "开始 7 维推演"}</span>
+              <span>{launching ? "启动中…" : "开始 L1 推演"}</span>
             </button>
           </div>
         </form>
       </ModalDialog>
-
-      {/* Dedicated L1 Mini-Pool Leader Picker Modal */}
-      <Layer1LeaderPickerModal
-        open={pickerTarget !== null}
-        card={pickerTarget?.card ?? null}
-        runId={pickerTarget?.runId}
-        universes={universes}
-        scanBusy={scanBusy}
-        onClose={() => setPickerTarget(null)}
-        onLaunchScan={onLaunchCompassScan}
-        onUniverseSaved={onUniverseSaved}
-      />
     </section>
   );
 }

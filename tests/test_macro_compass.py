@@ -2505,6 +2505,168 @@ def test_programmatic_constitutional_guardrails_and_factor_concentration():
     assert [x["symbol"] for x in diag_partial["article2_credit_and_crowding"]["crowded_long_90pct"]] == ["CL=F"]
 
 
+def test_regime_signal_lights_and_short_card_fields():
+    from datetime import datetime, timezone
+
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    macro_ov = {
+        "sources_status": {"us_fred": "ok", "live_macro": "ok", "cftc_crowding": "ok", "china_macro": "ok"},
+        "stale_sources": {},
+        "live_macro": {
+            "VIX": {"last": 32.4, "as_of": today_iso},
+            "US10Y_Yield": {"last": 4.55, "as_of": today_iso},
+        },
+        "us_fred": {
+            "series": {
+                "DFII10": {"status": "ok", "latest_value": 2.18, "change": 0.08, "latest_date": today_iso},
+                "T10YIE": {"status": "ok", "latest_value": 2.82, "change": 0.05, "latest_date": today_iso},
+                "DGS10": {"status": "ok", "latest_value": 4.55, "change": 0.12, "latest_date": today_iso},
+                "BAMLH0A0HYM2": {"status": "ok", "latest_value": 5.35, "change": 0.25, "latest_date": today_iso},
+            }
+        },
+        "china_macro": {"pmi_manufacturing": {"latest": 50.8, "latest_date": today_iso}},
+        "tape_movers": {"regime_breadth": {"advancing_20d_count": 6, "declining_20d_count": 19}},
+        "cftc_crowding": {
+            "status": "ok",
+            "latest_report_date": today_iso,
+            "items": [
+                {
+                    "symbol": "GC=F",
+                    "label": "黄金",
+                    "cohort": "managed_money",
+                    "latest_date": today_iso,
+                    "is_stale": False,
+                    "net_pct_oi": 24.5,
+                    "percentile_52w": 95.0,
+                    "crowding_state": "crowded_long",
+                }
+            ],
+        },
+    }
+    lights = macro_compass.compute_regime_signal_lights(macro_ov)
+    by_id = {x["id"]: x for x in lights}
+    assert by_id["us_rates_credit"]["level"] == "red"
+    assert by_id["volatility_breadth"]["level"] == "red"
+    assert by_id["derivatives_crowding"]["level"] == "amber"
+    assert by_id["china_cycle"]["level"] == "green"
+
+    payload = {
+        "regime_title": "高波动分化",
+        "regime_summary": "测试简短摘要字段透传。",
+        "avoid_sectors": [],
+        "directions": [
+            {
+                "id": "copper_shortage",
+                "rank": 1,
+                "title": "铜矿供给缺口",
+                "direction": "long",
+                "horizon": "1Q~1Y",
+                "conviction": "high",
+                "asset_scope": "commodities",
+                "primary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "全球铜矿增量不足"},
+                "secondary_driver": {"dimension": "地缘与资源国政策", "summary": "主产国矿权扰动"},
+                "thesis": "未来一年矿端缺口扩大。",
+                "card_headline_gap": "市场低估明年智利铜矿品位下滑幅度",
+                "invalidation": "智利与秘鲁主要铜矿恢复满产且精铜持续累库",
+                "invalidation_short": "铜矿复产+精铜连续4周累库",
+                "evidence": [
+                    {"fact": "ICSG 报告显示矿端缺口扩大", "level": "L2", "date": today_iso, "source": "ICSG"},
+                    {"fact": "TC/RC 持续低位", "level": "L1", "date": today_iso, "source": "SMM"},
+                ],
+            }
+        ],
+    }
+    norm = macro_compass.normalize_compass_output(payload, valid_universes=set())
+    card = norm["directions"][0]
+    assert card["card_headline_gap"] == "市场低估明年智利铜矿品位下滑幅度"
+    assert card["invalidation_short"] == "铜矿复产+精铜连续4周累库"
+
+
+def test_compass_logged_opportunities_hydration_on_history_and_latest(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from datetime import datetime, timezone
+    import portfolio_manager as pm
+
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    pdir = tmp_path / "portfolio"
+    pdir.mkdir()
+    monkeypatch.setattr(pm, "DEFAULT_PORTFOLIO_DIR", str(pdir))
+
+    run_id = "cmp_hydrate_test_1"
+    run_doc = {
+        "run_id": run_id,
+        "task_id": run_id,
+        "created_at_utc": f"{today_iso}T01:00:00+00:00",
+        "finished_at_utc": f"{today_iso}T01:02:00+00:00",
+        "status": "completed",
+        "engine": "codex",
+        "effort": "medium",
+        "focus_prompt": "",
+        "regime_title": "测试水合",
+        "directions_count": 1,
+        "result": {
+            "regime_title": "测试水合",
+            "regime_summary": "测试持久化 Track C 记账状态回显",
+            "abstained": False,
+            "directions": [
+                {
+                    "id": "power_grid_long",
+                    "rank": 1,
+                    "title": "北美电网设备",
+                    "direction": "long",
+                    "horizon": "1Q~1Y",
+                    "conviction": "high",
+                    "asset_scope": "us_equities",
+                    "reference_anchors": ["XLU"],
+                    "primary_driver": {"dimension": "技术与产业迭代", "summary": "AI用电"},
+                    "secondary_driver": {"dimension": "宏观双核", "summary": "基建周期"},
+                    "thesis": "变压器交期拉长。",
+                    "key_catalyst": "季报",
+                    "invalidation": "订单下滑",
+                    "recommended_universes": [],
+                    "is_new_theme": False,
+                    "suggested_pool_name": "",
+                    "suggested_pool_description": "",
+                    "leaders": [],
+                    "evidence": [],
+                }
+            ],
+        },
+    }
+    monkeypatch.setattr(macro_compass, "get_compass_run", lambda rid: run_doc if rid == run_id else None)
+    monkeypatch.setattr(macro_compass, "get_latest_compass_run", lambda: run_doc)
+    monkeypatch.setattr(macro_compass, "list_compass_runs", lambda limit=15: [run_doc])
+
+    client = TestClient(app_mod.create_app())
+    client.post(
+        "/api/portfolio/init",
+        json={"equity": 100_000.0, "base_currency": "USD", "default_risk_per_trade_pct": 1.0},
+    )
+
+    # Before logging: empty
+    r0 = client.get(f"/api/compass/history/{run_id}")
+    assert r0.status_code == 200
+    assert r0.json()["logged_opportunities"] == {"abstention_id": None, "cards": {}}
+
+    # Log card opportunity
+    r_log = client.post(
+        f"/api/compass/history/{run_id}/log-opportunity",
+        json={"kind": "l1_direction_call", "card_id": "power_grid_long", "symbol": "XLU", "anchor_price": 80.0},
+    )
+    assert r_log.status_code == 200
+    opp_id = r_log.json()["opportunity"]["opportunity_id"]
+
+    # After logging: both history/{run_id} and latest hydrate logged_opportunities
+    r1 = client.get(f"/api/compass/history/{run_id}")
+    assert r1.status_code == 200
+    assert r1.json()["logged_opportunities"]["cards"]["power_grid_long"] == opp_id
+
+    r_latest = client.get("/api/compass/latest")
+    assert r_latest.status_code == 200
+    assert r_latest.json()["latest"]["logged_opportunities"]["cards"]["power_grid_long"] == opp_id
+
+
+
 
 
 

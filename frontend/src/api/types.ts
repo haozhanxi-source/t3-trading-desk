@@ -1443,12 +1443,21 @@ export interface CftcCrowdingOverview {
   error?: string;
 }
 
+export interface RegimeSignalLight {
+  id: "us_rates_credit" | "volatility_breadth" | "derivatives_crowding" | "china_cycle" | string;
+  label: string;
+  level: "green" | "amber" | "red" | "neutral" | string;
+  tag: string;
+  metric: string;
+}
+
 export interface CompassMacroOverview {
   fetched_at_utc: string;
   cache_hit?: boolean;
   sources_status: Record<string, string>;
   stale_sources?: Record<string, { last_good_at_utc?: string | null; error?: string }>;
   regime_tags: MacroRegimeTag[];
+  regime_signal_lights?: RegimeSignalLight[];
   headline_metrics: MacroHeadlineMetric[];
   anchors?: {
     status: string;
@@ -1530,6 +1539,7 @@ export interface CompassDirectionCard {
   primary_driver: CompassDriverItem;
   secondary_driver: CompassDriverItem;
   thesis: string;
+  card_headline_gap?: string;
   priced_in_already?: string;
   unpriced_gap?: string;
   value_chain_focus?: string;
@@ -1539,6 +1549,7 @@ export interface CompassDirectionCard {
   reference_anchors?: string[];
   key_catalyst: string;
   invalidation: string;
+  invalidation_short?: string;
   recommended_universes: string[];
   is_new_theme: boolean;
   suggested_pool_name: string;
@@ -1610,8 +1621,14 @@ export interface CompassRunSummary {
   directions_count: number;
 }
 
+export interface CompassLoggedOpportunities {
+  abstention_id?: string | null;
+  cards: Record<string, string>;
+}
+
 export interface CompassRunRecord extends CompassRunSummary {
   result: CompassResultPayload;
+  logged_opportunities?: CompassLoggedOpportunities;
 }
 
 export interface CompassLatestResponse {

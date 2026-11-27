@@ -75,37 +75,41 @@ EQUITY_ASSET_CLASSES = frozenset({"us_stock_or_etf", "a_share"})
 LONG_ONLY_EQUITY_ASSET_CLASSES = frozenset({"a_share"})
 
 CROSS_ASSET_ANCHORS: tuple[dict[str, str], ...] = (
-    # US Equities & Sector Pricing Anchors
-    {"symbol": "SPY", "name": "标普500", "group": "us_equities", "group_label": "美股行业锚"},
-    {"symbol": "QQQ", "name": "纳指100", "group": "us_equities", "group_label": "美股行业锚"},
-    {"symbol": "SMH", "name": "半导体", "group": "us_equities", "group_label": "美股行业锚"},
-    {"symbol": "XLU", "name": "电力公用", "group": "us_equities", "group_label": "美股行业锚"},
-    {"symbol": "XLE", "name": "能源", "group": "us_equities", "group_label": "美股行业锚"},
-    {"symbol": "XLI", "name": "工业基建", "group": "us_equities", "group_label": "美股行业锚"},
-    {"symbol": "XLB", "name": "基础材料", "group": "us_equities", "group_label": "美股行业锚"},
-    {"symbol": "COPX", "name": "全球铜矿", "group": "us_equities", "group_label": "美股行业锚"},
-    # Overseas Commodities
-    {"symbol": "GC=F", "name": "黄金", "group": "commodities", "group_label": "海外大宗锚"},
-    {"symbol": "HG=F", "name": "COMEX铜", "group": "commodities", "group_label": "海外大宗锚"},
-    {"symbol": "CL=F", "name": "WTI原油", "group": "commodities", "group_label": "海外大宗锚"},
-    {"symbol": "ALI=F", "name": "COMEX铝", "group": "commodities", "group_label": "海外大宗锚"},
-    # A-shares, FX & Crypto
-    {"symbol": "510300.SS", "name": "沪深300", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
-    {"symbol": "510880.SS", "name": "A股红利", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
-    {"symbol": "EURUSD=X", "name": "欧元/美元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
-    {"symbol": "USDJPY=X", "name": "美元/日元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
-    {"symbol": "AUDUSD=X", "name": "澳元/美元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
-    {"symbol": "USDCNY=X", "name": "美元/人民币", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
-    {"symbol": "BTC-USD", "name": "比特币", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密"},
+    # US Equities: Broad Macro Benchmarks (macro_core) + Sector Leaders (sector_leader)
+    {"symbol": "SPY", "name": "标普500", "group": "us_equities", "group_label": "美股行业锚", "tier": "macro_core"},
+    {"symbol": "QQQ", "name": "纳指100", "group": "us_equities", "group_label": "美股行业锚", "tier": "macro_core"},
+    {"symbol": "SMH", "name": "半导体", "group": "us_equities", "group_label": "美股行业锚", "tier": "sector_leader"},
+    {"symbol": "XLU", "name": "电力公用", "group": "us_equities", "group_label": "美股行业锚", "tier": "sector_leader"},
+    {"symbol": "XLE", "name": "能源", "group": "us_equities", "group_label": "美股行业锚", "tier": "sector_leader"},
+    {"symbol": "XLI", "name": "工业基建", "group": "us_equities", "group_label": "美股行业锚", "tier": "sector_leader"},
+    {"symbol": "XLB", "name": "基础材料", "group": "us_equities", "group_label": "美股行业锚", "tier": "sector_leader"},
+    {"symbol": "XLF", "name": "金融", "group": "us_equities", "group_label": "美股行业锚", "tier": "sector_leader"},
+    {"symbol": "XLV", "name": "医疗健康", "group": "us_equities", "group_label": "美股行业锚", "tier": "sector_leader"},
+    # Overseas Commodities: 1 Macro Benchmark per Asset Class (no duplicate metals / illiquid feeds)
+    {"symbol": "DBC", "name": "综合商品", "group": "commodities", "group_label": "海外大宗锚", "tier": "macro_core"},
+    {"symbol": "GC=F", "name": "黄金", "group": "commodities", "group_label": "海外大宗锚", "tier": "macro_core"},
+    {"symbol": "CL=F", "name": "WTI原油", "group": "commodities", "group_label": "海外大宗锚", "tier": "macro_core"},
+    {"symbol": "HG=F", "name": "COMEX铜", "group": "commodities", "group_label": "海外大宗锚", "tier": "macro_core"},
+    {"symbol": "DBA", "name": "农产品", "group": "commodities", "group_label": "海外大宗锚", "tier": "macro_core"},
+    # A-shares, FX & Crypto Macro Benchmarks
+    {"symbol": "510300.SS", "name": "沪深300", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密", "tier": "macro_core"},
+    {"symbol": "510880.SS", "name": "A股红利", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密", "tier": "macro_core"},
+    {"symbol": "EURUSD=X", "name": "欧元/美元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密", "tier": "macro_core"},
+    {"symbol": "USDJPY=X", "name": "美元/日元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密", "tier": "macro_core"},
+    {"symbol": "AUDUSD=X", "name": "澳元/美元", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密", "tier": "macro_core"},
+    {"symbol": "USDCNY=X", "name": "美元/人民币", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密", "tier": "macro_core"},
+    {"symbol": "BTC-USD", "name": "比特币", "group": "cn_fx_crypto", "group_label": "A股·汇市·加密", "tier": "macro_core"},
 )
 
+# Domestic Futures Sector Leaders: strictly 1 bellwether leader per major sector (excluded from macro_core breadth)
 CN_FUTURES_ANCHORS: tuple[dict[str, str], ...] = (
-    {"symbol": "CU0", "name": "沪铜", "group": "cn_futures", "group_label": "国内核心期货锚"},
-    {"symbol": "SN0", "name": "沪锡", "group": "cn_futures", "group_label": "国内核心期货锚"},
-    {"symbol": "AL0", "name": "沪铝", "group": "cn_futures", "group_label": "国内核心期货锚"},
-    {"symbol": "NI0", "name": "沪镍", "group": "cn_futures", "group_label": "国内核心期货锚"},
-    {"symbol": "I0", "name": "铁矿石", "group": "cn_futures", "group_label": "国内核心期货锚"},
-    {"symbol": "LC0", "name": "碳酸锂", "group": "cn_futures", "group_label": "国内核心期货锚"},
+    {"symbol": "CU0", "name": "沪铜(有色)", "group": "cn_futures", "group_label": "国内期货板块锚", "tier": "sector_leader"},
+    {"symbol": "I0", "name": "铁矿石(黑色)", "group": "cn_futures", "group_label": "国内期货板块锚", "tier": "sector_leader"},
+    {"symbol": "SC0", "name": "上海原油(能化)", "group": "cn_futures", "group_label": "国内期货板块锚", "tier": "sector_leader"},
+    {"symbol": "AU0", "name": "沪金(贵金属)", "group": "cn_futures", "group_label": "国内期货板块锚", "tier": "sector_leader"},
+    {"symbol": "M0", "name": "豆粕(农产)", "group": "cn_futures", "group_label": "国内期货板块锚", "tier": "sector_leader"},
+    {"symbol": "LC0", "name": "碳酸锂(新能源)", "group": "cn_futures", "group_label": "国内期货板块锚", "tier": "sector_leader"},
+    {"symbol": "EC0", "name": "集运欧线(航运)", "group": "cn_futures", "group_label": "国内期货板块锚", "tier": "sector_leader"},
 )
 
 FOCUS_SCOPES_CATALOG: tuple[dict[str, str], ...] = (
@@ -600,6 +604,7 @@ def compute_tape_movers(items: list[dict[str, Any]]) -> dict[str, Any]:
             "symbol": it.get("symbol"),
             "name": it.get("name"),
             "group": it.get("group"),
+            "tier": it.get("tier"),
             "last": it.get("last"),
             "ret_5d_pct": it.get("ret_5d_pct"),
             "ret_20d_pct": it.get("ret_20d_pct"),
@@ -624,19 +629,25 @@ def compute_tape_movers(items: list[dict[str, Any]]) -> dict[str, Any]:
     losers_scored.sort(key=lambda pair: pair[0])
     gainers_scored.sort(key=lambda pair: pair[0], reverse=True)
 
-    with_20d = [it for it in fresh_items if it.get("ret_20d_pct") is not None]
+    # Compute macro market breadth strictly from macro_core benchmarks when tier tags are present,
+    # preventing sector ETFs or domestic single-commodity leaders from double-counting macro breadth.
+    macro_core_fresh = [it for it in fresh_items if it.get("tier") == "macro_core"]
+    breadth_pool = macro_core_fresh if macro_core_fresh else fresh_items
+    breadth_scope = "macro_core" if macro_core_fresh else "all"
+
+    with_20d = [it for it in breadth_pool if it.get("ret_20d_pct") is not None]
     total_20d = len(with_20d)
     declining_20d = sum(1 for it in with_20d if float(it["ret_20d_pct"]) < 0)
     advancing_20d = sum(1 for it in with_20d if float(it["ret_20d_pct"]) > 0)
     severe_drawdown = sum(
         1
-        for it in fresh_items
+        for it in breadth_pool
         if (it.get("ret_20d_pct") is not None and float(it["ret_20d_pct"]) <= -10.0)
         or (it.get("ret_60d_pct") is not None and float(it["ret_60d_pct"]) <= -15.0)
     )
     strong_rally = sum(
         1
-        for it in fresh_items
+        for it in breadth_pool
         if (it.get("ret_20d_pct") is not None and float(it["ret_20d_pct"]) >= 10.0)
         or (it.get("ret_60d_pct") is not None and float(it["ret_60d_pct"]) >= 15.0)
     )
@@ -658,6 +669,7 @@ def compute_tape_movers(items: list[dict[str, Any]]) -> dict[str, Any]:
             "severe_drawdown_count": severe_drawdown,
             "strong_rally_count": strong_rally,
             "breadth_label": breadth_label,
+            "scope": breadth_scope,
         },
     }
 
@@ -2495,7 +2507,7 @@ def build_compass_prompt(
         "- **二级溯源与取证规程（严禁走捷径）**：① **反常劈叉仅作侦探警报**：对“逆古典宏观走强”的品种，必须先核查全市场顺周期权益与信贷地基——信贷与顺周期企稳才是真新主线；若顺周期权益与信贷已崩盘、仅剩下游高烧商品独强，必须警惕晚周期需求坍塌补跌诱多（Catch-down），严禁免检追涨；② **物理供给严禁靠 K 线臆测**：绝不凭过去涨跌幅猜“稀缺”或“过剩”，商品多空必须联网查实未来 `1Q~1Y` 真实物理新增产能投产表与成本曲线；③ **定价主权归属**：中国内需定价品种（A股/黑色建材/内盘化工）锚定国内信用与产业政策，不机械外推美联储。\n\n"
         "【Layer 1 职责边界与铁律（严格遵守）】\n"
         "1. **极端盘面异动强制归因（Tape-to-Macro Radar · 警报器而非选品清单！）**：\n"
-        "   - 简报中的月度宏观数据（如 `CN_PMI`、`FEDFUNDS`、`PCOPPUSDM`）天然滞后 1~2 个月，仅作背景参考；**实时市场定价（`tape_movers` 极端领涨/领跌榜、`cross_asset_anchors` 含国内核心期货锚的近 5D/20D/60D 异动、`VIX`/`US10Y`/`DXY`）与你通过 WebSearch 检索到的近 1~2 周最新变化享有绝对最高优先级**。\n"
+        "   - 简报中的月度宏观数据（如 `CN_PMI`、`FEDFUNDS`、`PCOPPUSDM`）天然滞后 1~2 个月，仅作背景参考；**实时市场定价（`tape_movers` 极端领涨/领跌榜、`cross_asset_anchors` 含宏观大类 `macro_core` 与美股行业/国内期货板块龙头 `sector_leader` 的近 5D/20D/60D 异动、`VIX`/`US10Y`/`DXY`）与你通过 WebSearch 检索到的近 1~2 周最新变化享有绝对最高优先级**。\n"
         "   - **强制动作**：先逐一审视 `brief.json` 里的 `tape_movers.top_losers` 和 `top_gainers`！凡是 20D/60D 出现 **≥15% 单边走势**的品种/板块（无论海外资产还是国内期货锚），背后往往是**资金方向的高度一致（未背驰主趋势段）**，必须主动联网查清多维度真实驱动，彻底打破脑海里残留的卖方旧共识钢印（例如“某金属长期短缺”或“某赛道长期高增”）。\n"
         "   - **警惕两种极端**：① 严禁凭“跌多了就该涨”的均值回归思维机械否定正在延续的主趋势；② 同样严禁**后视镜线性外推**——把过去 60 天跌幅榜前几名原样照搬成未来 1 年的结论！查清驱动后，必须前瞻追问：**“市场已经计价了什么（`priced_in_already`）？未来 1Q~1Y 还有哪些尚未被充分定价的增量预期差或二阶传导（`unpriced_gap`）？”**\n"
         "   - **预测市场事件概率参考（`polymarket_odds` · 不等同于资产已计价！）**：`brief.json` 附带 Polymarket 真实资金盘口对宏观利率、关税贸易与地缘事件的发生概率及 1D/7D 赔率变动（`pp`）。其中 `market_type == \"date_ladder\"` 表示多期限阶梯（每个子盘口对应独立截止日期 `end_date`，严禁将近期截止日的高概率混同为远期截止日）。请将高概率/显著 7D 重定价作为**事件发生概率的盘口共识与边际预期变化线索**，**严禁把盘口高概率（如 ≥80%）直接等同于相关资产价格已经充分计价**——判断 `priced_in_already` 与 `unpriced_gap` 时，必须用相关资产价格走势、利率/期货期限结构、估值分位或事件窗口市场反应独立核验，且留意标注了 `stale_fallback` 或较低 24h 成交量的盘口。\n"
@@ -2721,12 +2733,18 @@ _BENCHMARK_NAME_ALIAS_TO_SYMBOL: dict[str, str] = {
     "comex铜": "HG=F",
     "wti原油": "CL=F",
     "美国天然气": "NG=F",
+    "综合商品": "DBC",
+    "农产品": "DBA",
     "沪铜": "CU0",
     "沪锡": "SN0",
     "沪铝": "AL0",
     "沪镍": "NI0",
     "铁矿石": "I0",
+    "上海原油": "SC0",
+    "沪金": "AU0",
+    "豆粕": "M0",
     "碳酸锂": "LC0",
+    "集运欧线": "EC0",
     "欧元/美元": "EURUSD=X",
     "美元/日元": "USDJPY=X",
     "澳元/美元": "AUDUSD=X",

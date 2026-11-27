@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import math
 import os
 from collections.abc import AsyncIterator, Callable
@@ -45,6 +46,8 @@ from .tasks import (
     run_sentinel_sync,
     sentinel_cache_key,
 )
+
+logger = logging.getLogger(__name__)
 
 CORS_ORIGINS = [
     "http://127.0.0.1:5173",
@@ -1545,9 +1548,50 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         bundle = await asyncio.to_thread(macro_compass.collect_macro_overview, refresh=refresh)
         return ok(bundle, headers=_cache_headers(bool(bundle.get("cache_hit"))))
 
+    def _hydrate_compass_logged_opportunities(run_id: str) -> dict[str, Any]:
+        """Read-only hydration of persisted Track C shadow-opportunity logs for a compass run."""
+        abstention_id: str | None = None
+        cards_map: dict[str, str] = {}
+        try:
+            abstain_rows = _portfolio_op(
+                pm.list_idempotent_results_by_prefix,
+                key_prefix=f"l1-abstain:{run_id}:",
+                expected_operation="log_opportunity",
+            )
+            for _k, payload in abstain_rows:
+                opp_id = str(payload.get("opportunity_id") or "").strip()
+                if opp_id:
+                    abstention_id = opp_id
+                    break
+            call_rows = _portfolio_op(
+                pm.list_idempotent_results_by_prefix,
+                key_prefix=f"l1-call:{run_id}:",
+                expected_operation="log_opportunity",
+            )
+            prefix = f"l1-call:{run_id}:"
+            for k, payload in call_rows:
+                opp_id = str(payload.get("opportunity_id") or "").strip()
+                if not opp_id or not k.startswith(prefix):
+                    continue
+                rest = k[len(prefix) :]
+                card_id = rest.split(":", 1)[0].strip()
+                if card_id and card_id not in cards_map:
+                    cards_map[card_id] = opp_id
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError) as exc:
+            logger.debug("Hydrate compass logged opportunities skipped for %s: %s", run_id, exc)
+        return {
+            "abstention_id": abstention_id,
+            "cards": cards_map,
+        }
+
     @app.get("/api/compass/latest")
     def compass_latest():
         latest = macro_compass.get_latest_compass_run()
+        if isinstance(latest, dict) and latest.get("run_id"):
+            latest = {
+                **latest,
+                "logged_opportunities": _hydrate_compass_logged_opportunities(str(latest["run_id"])),
+            }
         history = macro_compass.list_compass_runs(limit=15)
         active = tasks.get_active_macro_compass()
         return ok(
@@ -1567,7 +1611,12 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         detail = macro_compass.get_compass_run(run_id)
         if detail is None:
             raise HTTPException(status_code=404, detail=f"Compass run not found: {run_id}")
-        return ok(detail)
+        return ok(
+            {
+                **detail,
+                "logged_opportunities": _hydrate_compass_logged_opportunities(run_id),
+            }
+        )
 
     @app.post("/api/compass/history/{run_id}/log-opportunity")
     async def compass_log_opportunity(run_id: str, req: CompassLogOpportunityReq):

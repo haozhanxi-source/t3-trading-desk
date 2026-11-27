@@ -629,6 +629,52 @@ def lookup_idempotent_result(
             conn.close()
 
 
+def list_idempotent_results_by_prefix(
+    *,
+    key_prefix: str,
+    expected_operation: str | None = None,
+    portfolio_dir: str | None = None,
+    db_path: str | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Read-only prefix lookup of committed idempotency records without mutating DB state."""
+    prefix = str(key_prefix or "").strip()
+    if not prefix:
+        return []
+    pdir, db_file = _resolve_storage(portfolio_dir=portfolio_dir, db_path=db_path)
+    target_db = Path(db_file) if db_file is not None else (Path(pdir) / "portfolio.db")
+    if not target_db.exists():
+        return []
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    with _portfolio_lock(pdir):
+        conn = _connect_db(pdir, db_file=db_file)
+        try:
+            if expected_operation:
+                rows = conn.execute(
+                    "SELECT key, result_json FROM idempotency_keys "
+                    "WHERE operation = ? AND key LIKE ? ESCAPE '\\' ORDER BY created_at_utc DESC",
+                    (expected_operation, escaped),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT key, result_json FROM idempotency_keys "
+                    "WHERE key LIKE ? ESCAPE '\\' ORDER BY created_at_utc DESC",
+                    (escaped,),
+                ).fetchall()
+            out: list[tuple[str, dict[str, Any]]] = []
+            for k, raw_json in rows:
+                try:
+                    parsed = json.loads(raw_json)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+                if isinstance(parsed, dict):
+                    out.append((str(k), parsed))
+            return out
+        except sqlite3.OperationalError:
+            return []
+        finally:
+            conn.close()
+
+
 def _export_json_mirrors_unlocked(pdir: str, db_file: str | None = None) -> None:
     """Export read-only JSON mirrors (account.json, positions.json, journal.jsonl, opportunities.jsonl) from one DB snapshot."""
     account_path, positions_path, journal_path = _paths(pdir)

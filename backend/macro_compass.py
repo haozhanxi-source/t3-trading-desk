@@ -1347,6 +1347,7 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
             "cftc_crowding": cftc_crowding,
         }
     )
+    bundle["regime_signal_lights"] = compute_regime_signal_lights(bundle)
     CACHE.set(("compass_macro_overview",), bundle, ttl)
     CACHE.set(("compass_polymarket_odds",), (polymarket_odds, st_pm, stale_pm), pm_ttl)
     if reused_cftc_tuple is None:
@@ -1390,6 +1391,7 @@ def _overlay_optional_sources_on_overview(
     out["cache_hit"] = True
     out["sources_status"] = new_sources_status
     out["stale_sources"] = new_stale
+    out["regime_signal_lights"] = compute_regime_signal_lights(out)
     return sanitize(out)
 
 
@@ -2078,6 +2080,130 @@ def compute_constitutional_diagnostics(
     }
 
 
+def compute_regime_signal_lights(
+    macro_overview: dict[str, Any],
+    constitutional_diagnostics: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Deterministically compute 4 macro signal lights from hard diagnostics (zero LLM hallucination)."""
+    anchor_items = (macro_overview.get("anchors") or {}).get("items") or []
+    diag = (
+        constitutional_diagnostics
+        if isinstance(constitutional_diagnostics, dict)
+        else compute_constitutional_diagnostics(macro_overview=macro_overview, anchor_items=anchor_items)
+    )
+    art1 = diag.get("article1_denominator_truth") if isinstance(diag.get("article1_denominator_truth"), dict) else {}
+    art2_cc = diag.get("article2_credit_and_crowding") if isinstance(diag.get("article2_credit_and_crowding"), dict) else {}
+    art3 = diag.get("article3_panic_pendulum_gate") if isinstance(diag.get("article3_panic_pendulum_gate"), dict) else {}
+
+    # 1) US Rates & Credit
+    hy_level = str(art2_cc.get("credit_stress_level") or "missing")
+    hy_val = _to_float(art2_cc.get("hy_oas_pct"))
+    real_y = _to_float(art1.get("real_yield_10y_pct"))
+    art1_state = str(art1.get("state") or "")
+    art1_status = str(art1.get("data_status") or "missing")
+    if hy_level == "stress_crisis" or art1_state == "unanchored_inflation_nominal_pressure":
+        us_level = "red"
+        us_tag = "信用高压/通胀失锚" if hy_level == "stress_crisis" else "通胀预期失锚"
+    elif hy_level == "stress_widening" or (real_y is not None and real_y >= 2.0):
+        us_level = "amber"
+        us_tag = "利差走阔/高实际利率" if hy_level == "stress_widening" else "实际利率紧缩"
+    elif art1_status == "ok" and hy_level in ("calm", "normal"):
+        us_level = "green"
+        us_tag = "分母受控 · 信用平稳"
+    else:
+        us_level = "neutral"
+        us_tag = "部分陈旧/待核验"
+    us_parts: list[str] = []
+    if real_y is not None:
+        us_parts.append(f"实际利率 {real_y:.2f}%")
+    if hy_val is not None:
+        us_parts.append(f"HY OAS {hy_val:.2f}%")
+    us_metric = " · ".join(us_parts) if us_parts else "数据待核验"
+
+    # 2) Volatility & Breadth
+    vix_val = _to_float(art3.get("vix_last"))
+    vix_status = str(art3.get("vix_data_status") or "missing")
+    breadth = (macro_overview.get("tape_movers") or {}).get("regime_breadth") or {}
+    adv_20 = breadth.get("advancing_20d_count")
+    dec_20 = breadth.get("declining_20d_count")
+    total_20 = (int(adv_20) + int(dec_20)) if isinstance(adv_20, (int, float)) and isinstance(dec_20, (int, float)) else 0
+    adv_ratio = (float(adv_20) / total_20) if total_20 > 0 else None
+    if bool(art3.get("systemic_panic_active")) or (vix_val is not None and vix_status == "ok" and vix_val >= 30.0):
+        vol_level = "red"
+        vol_tag = "VIX 恐慌极值"
+    elif (vix_val is not None and vix_status == "ok" and vix_val >= 20.0) or (adv_ratio is not None and adv_ratio < 0.35):
+        vol_level = "amber"
+        vol_tag = "波动抬升/宽度偏弱"
+    elif vix_val is not None and vix_status == "ok" and vix_val < 20.0:
+        vol_level = "green"
+        vol_tag = "波动温和"
+    else:
+        vol_level = "neutral"
+        vol_tag = "波动观测待核验"
+    vol_parts: list[str] = []
+    if vix_val is not None:
+        vol_parts.append(f"VIX {vix_val:.1f}")
+    if total_20 > 0:
+        vol_parts.append(f"20D {int(adv_20)}涨/{int(dec_20)}跌")
+    vol_metric = " · ".join(vol_parts) if vol_parts else "数据待核验"
+
+    # 3) Derivatives Crowding (CFTC 52W)
+    cftc_status = str(art2_cc.get("cftc_status") or "missing")
+    crowded_l = art2_cc.get("crowded_long_90pct") or []
+    crowded_s = art2_cc.get("crowded_short_10pct") or []
+    ext_cnt = len(crowded_l) + len(crowded_s)
+    if cftc_status not in ("ok", "partial"):
+        cftc_level = "neutral"
+        cftc_tag = "持仓观测陈旧/缺失"
+        cftc_metric = "CFTC 待更新"
+    elif ext_cnt >= 2:
+        cftc_level = "red"
+        cftc_tag = f"{ext_cnt} 品种极端拥挤"
+        names = [str(x.get("label") or x.get("symbol")) for x in [*crowded_l, *crowded_s][:3]]
+        cftc_metric = " / ".join(names)
+    elif ext_cnt == 1:
+        cftc_level = "amber"
+        first = crowded_l[0] if crowded_l else crowded_s[0]
+        side = "极多" if crowded_l else "极空"
+        cftc_tag = f"1 品种{side}拥挤"
+        cftc_metric = f"{first.get('label') or first.get('symbol')} ({first.get('percentile_52w')}%)"
+    else:
+        cftc_level = "green"
+        cftc_tag = "拥挤度中性"
+        cftc_metric = "0 极端品种"
+
+    # 4) China Cycle (Manufacturing PMI)
+    cn_raw = macro_overview.get("china_macro") if isinstance(macro_overview.get("china_macro"), dict) else {}
+    pmi_obj = cn_raw.get("pmi_manufacturing") if isinstance(cn_raw.get("pmi_manufacturing"), dict) else {}
+    pmi_val = _to_float(pmi_obj.get("latest") if pmi_obj.get("latest") is not None else pmi_obj.get("latest_value"))
+    cn_stale = ("china_macro" in (macro_overview.get("stale_sources") or {})) or (
+        (macro_overview.get("sources_status") or {}).get("china_macro") == "stale"
+    )
+    if pmi_val is None or cn_stale:
+        cn_level = "neutral"
+        cn_tag = "PMI 待核验" if pmi_val is None else "PMI 陈旧回退"
+        cn_metric = f"PMI {pmi_val:.1f}" if pmi_val is not None else "暂无"
+    elif pmi_val >= 50.5:
+        cn_level = "green"
+        cn_tag = "景气扩张"
+        cn_metric = f"PMI {pmi_val:.1f}"
+    elif pmi_val >= 49.5:
+        cn_level = "amber"
+        cn_tag = "荣枯线震荡"
+        cn_metric = f"PMI {pmi_val:.1f}"
+    else:
+        cn_level = "red"
+        cn_tag = "景气收缩"
+        cn_metric = f"PMI {pmi_val:.1f}"
+
+    return [
+        {"id": "us_rates_credit", "label": "美债与信用", "level": us_level, "tag": us_tag, "metric": us_metric},
+        {"id": "volatility_breadth", "label": "波动与宽度", "level": vol_level, "tag": vol_tag, "metric": vol_metric},
+        {"id": "derivatives_crowding", "label": "衍生品拥挤", "level": cftc_level, "tag": cftc_tag, "metric": cftc_metric},
+        {"id": "china_cycle", "label": "中国周期", "level": cn_level, "tag": cn_tag, "metric": cn_metric},
+    ]
+
+
 def build_compass_brief(
     *,
     macro_overview: dict[str, Any],
@@ -2274,6 +2400,7 @@ def build_compass_prompt(
         '      "primary_driver": {"dimension": "7维规范名之一", "summary": "主驱动逻辑核心要点（1句，必填）"},\n'
         '      "secondary_driver": {"dimension": "另1个不同的7维规范名", "summary": "次驱动共振要点（1句，必填）"},\n'
         '      "thesis": "2~3句讲透未来1Q~1Y该板块的核心预期差、供需/盈利传导链与为什么现在是最优方向（若对应盘面大幅异动须讲清资金一致性驱动）",\n'
+        '      "card_headline_gap": "1句极简核心预期差摘要（<=28字，用于主屏卡片单行展示）",\n'
         '      "priced_in_already": "1句客观交代当下市场已经计价了哪些共识/涨跌幅（防止后视镜线性外推）",\n'
         '      "unpriced_gap": "1句明确指出未来1Q~1Y尚未被充分定价的增量预期差、二阶传导或催化",\n'
         '      "value_chain_focus": "1~2句明确产业链最该切入的环节及 Layer 2 选真龙头的硬标准（如上游资源壁垒/成本曲线左端/估值泡沫最脆弱或订单兑现纯度；若该方向20D/60D已暴跌超25%，必须明确提醒 Layer 2 等待反抽二卖/三卖或30min结构卖点，严禁远离中枢盲目追空）",\n'
@@ -2283,6 +2410,7 @@ def build_compass_prompt(
         '      "reference_anchors": ["可选0~2个板块基准定价锚代码，用于辅助定位，可空数组"],\n'
         '      "key_catalyst": "未来1~3个月具体催化事件与时间节点",\n'
         '      "invalidation": "明确可证伪红线（什么数据/政策/事件出现即放弃该板块）",\n'
+        '      "invalidation_short": "1句极简硬证伪红线（<=22字，用于主屏卡片常显红线）",\n'
         '      "evidence": [\n'
         "        {\n"
         '          "fact": "具体可核验的近期硬事实或数据（带数字/时间）",\n'
@@ -3223,6 +3351,7 @@ def normalize_compass_output(
                 "primary_driver": primary_driver,
                 "secondary_driver": secondary_driver,
                 "thesis": thesis,
+                "card_headline_gap": str(raw_d.get("card_headline_gap") or "").strip()[:60],
                 "priced_in_already": str(raw_d.get("priced_in_already") or "").strip(),
                 "unpriced_gap": str(raw_d.get("unpriced_gap") or "").strip(),
                 "value_chain_focus": value_chain_focus,
@@ -3232,6 +3361,7 @@ def normalize_compass_output(
                 "reference_anchors": reference_anchors,
                 "key_catalyst": str(raw_d.get("key_catalyst") or "").strip(),
                 "invalidation": invalidation_str,
+                "invalidation_short": str(raw_d.get("invalidation_short") or "").strip()[:48],
                 "recommended_universes": rec_univs,
                 "is_new_theme": is_new_theme,
                 "suggested_pool_name": suggested_pool_name,

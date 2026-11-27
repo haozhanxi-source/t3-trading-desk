@@ -1,11 +1,97 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { AlertTriangle } from "lucide-react";
+import { AlertTriangle, ShieldCheck } from "lucide-react";
 import { api, errorMessage } from "../../api/client";
-import type { Direction, OpenPositionBody, Position, Tranche } from "../../api/types";
-import { fmtInputPrice, fmtPlanNum, fmtPrice, inferAssetCurrency, optNum, parseSymbolList } from "../../lib/format";
+import type { Direction, OpenPositionBody, Position, StopRegime, Tranche } from "../../api/types";
+import { fmtInputPrice, fmtMoney, fmtPlanNum, fmtPrice, inferAssetCurrency, optNum, parseSymbolList } from "../../lib/format";
 import { formatSymbolWithCode } from "../../lib/symbols";
 import { CrossCurrencyFxBanner } from "../ui/CrossCurrencyFxBanner";
 import { ModalDialog } from "../ui/ModalDialog";
+
+/* ------------------------------------------------------------------
+ * Shared Attribution Taxonomy (aligned with portfolio_manager.py ATTRIBUTION_TAGS)
+ * ------------------------------------------------------------------ */
+export interface AttributionTagOption {
+  tag: string;
+  label: string;
+  category: "positive" | "pilot_friction" | "mistake";
+}
+
+export const ATTRIBUTION_TAG_GROUPS: {
+  groupLabel: string;
+  category: "positive" | "pilot_friction" | "mistake";
+  items: AttributionTagOption[];
+}[] = [
+  {
+    groupLabel: "正向执行 (Positive)",
+    category: "positive",
+    items: [
+      { tag: "full_main_wave_ride", label: "主升浪吃满", category: "positive" },
+      { tag: "clean_pyramid_win", label: "保本推仓兑现", category: "positive" },
+      { tag: "disciplined_trailing_exit", label: "移动防线锁盈", category: "positive" },
+      { tag: "thesis_target_reached", label: "预期兑现止盈", category: "positive" },
+      { tag: "leader_rotation_upgrade", label: "龙头切换升级", category: "positive" },
+    ],
+  },
+  {
+    groupLabel: "合规试错摩擦 (Pilot Friction)",
+    category: "pilot_friction",
+    items: [{ tag: "normal_pilot_cost", label: "标准30m试仓摩擦", category: "pilot_friction" }],
+  },
+  {
+    groupLabel: "错误漏损 (Preventable Mistake)",
+    category: "mistake",
+    items: [
+      { tag: "l1_regime_headwind", label: "L1宏观逆风误判", category: "mistake" },
+      { tag: "l3_thesis_falsified", label: "L3逻辑/指标证伪", category: "mistake" },
+      { tag: "l4_chased_extended", label: "L4追高远离中枢", category: "mistake" },
+      { tag: "shaken_out_30m_noise", label: "30m噪音过早洗飞", category: "mistake" },
+      { tag: "premature_profit_taking", label: "小赚即跑卖飞主升", category: "mistake" },
+      { tag: "discipline_rule_breach", label: "违背纪律硬扛/乱动", category: "mistake" },
+    ],
+  },
+];
+
+export const ATTRIBUTION_TAG_LABELS: Record<string, { label: string; category: "positive" | "pilot_friction" | "mistake" }> =
+  Object.fromEntries(
+    ATTRIBUTION_TAG_GROUPS.flatMap((g) =>
+      g.items.map((item) => [item.tag, { label: item.label, category: item.category }]),
+    ),
+  );
+
+export function formatAttributionTagZh(tag: string | null | undefined): string {
+  if (!tag) return "";
+  return ATTRIBUTION_TAG_LABELS[tag]?.label ?? tag;
+}
+
+export function AttributionTagSelect({
+  value,
+  onChange,
+  label = "复盘归因标签 (attribution_tag)",
+  placeholder = "未归因（可选）",
+}: {
+  value: string;
+  onChange: (val: string) => void;
+  label?: string;
+  placeholder?: string;
+}) {
+  return (
+    <label className="field">
+      <span>{label}</span>
+      <select className="input" value={value} onChange={(e) => onChange(e.target.value)}>
+        <option value="">{placeholder}</option>
+        {ATTRIBUTION_TAG_GROUPS.map((g) => (
+          <optgroup key={g.category} label={g.groupLabel}>
+            {g.items.map((item) => (
+              <option key={item.tag} value={item.tag}>
+                {item.label} ({item.tag})
+              </option>
+            ))}
+          </optgroup>
+        ))}
+      </select>
+    </label>
+  );
+}
 
 /* ------------------------------------------------------------------
  * 1. Initialize Portfolio Ledger Dialog
@@ -184,6 +270,7 @@ export interface OpenPositionSeed {
   first_tranche_qty?: number | null;
   first_tranche_weight?: number | null;
   full_plan_qty?: number | null;
+  campaign_1r_amount?: number | null;
   tranches?: Tranche[];
   fx_to_account?: number | null;
   macro_factors?: string[];
@@ -249,6 +336,7 @@ export function OpenPositionDialog({
   const [targetPrice, setTargetPrice] = useState("");
   const [quantity, setQuantity] = useState("");
   const [qtyPreset, setQtyPreset] = useState<"t1" | "full" | "custom">("full");
+  const [campaign1rInput, setCampaign1rInput] = useState("");
   const [fxToAccount, setFxToAccount] = useState("");
   const [macroFactors, setMacroFactors] = useState("");
   const [redLines, setRedLines] = useState("");
@@ -304,6 +392,11 @@ export function OpenPositionDialog({
       setQtyPreset("custom");
     }
     setFxToAccount(seed?.fx_to_account != null && seed.fx_to_account > 0 ? fmtPlanNum(seed.fx_to_account, 6) : "");
+    setCampaign1rInput(
+      seed?.campaign_1r_amount != null && seed.campaign_1r_amount > 0
+        ? fmtPlanNum(seed.campaign_1r_amount, 2)
+        : "",
+    );
     setMacroFactors((seed?.macro_factors ?? []).join(", "));
     setRedLines((seed?.exit_red_lines ?? []).join("\n"));
     setNotes(seed?.notes ?? "");
@@ -380,8 +473,10 @@ export function OpenPositionDialog({
       };
       const sd = optNum(stopDaily);
       const tp = optNum(targetPrice);
+      const c1r = optNum(campaign1rInput);
       if (sd !== undefined) body.structural_stop_daily = sd;
       if (tp !== undefined) body.target_price = tp;
+      if (c1r !== undefined && c1r > 0) body.campaign_1r_amount = c1r;
       if (fxVal !== undefined) body.fx_to_account = fxVal;
       if (leaderRole === "co_leader" && coLeaderReason.trim()) {
         body.co_leader_reason = coLeaderReason.trim();
@@ -526,13 +621,38 @@ export function OpenPositionDialog({
                   aria-pressed={qtyPreset === "full"}
                   onClick={() => handleSelectQtyPreset("full")}
                 >
-                  核定全仓 (100% · {fmtPlanNum(resolvedFullQty, 4)})
+                  {seed?.campaign_1r_amount ? "满额 1R 首仓" : "核定全仓"} (100% · {fmtPlanNum(resolvedFullQty, 4)})
                 </button>
               </div>
             </div>
             <span className="text-[11px] text-muted">
-              默认按分批计划预填 T1 首仓，浮盈确认后可在哨兵总控继续顺势加仓
+              {seed?.campaign_1r_amount
+                ? `标准战役 1R 基准：${fmtMoney(seed.campaign_1r_amount, acctCcy)}（支持满额 1R 首仓或 T1 分批首仓）`
+                : "默认按分批计划预填 T1 首仓，浮盈确认后可在哨兵总控继续顺势加仓"}
             </span>
+          </div>
+        ) : null}
+
+        {campaign1rInput.trim() !== "" || seed?.campaign_1r_amount ? (
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-accent/35 bg-accent/8 px-3 py-2 text-xs">
+            <div className="flex flex-col gap-0.5">
+              <span className="font-medium text-ink">
+                战役标准 1R 基准金额 (campaign_1r_amount · {acctCcy})
+              </span>
+              <span className="text-[11px] text-muted">
+                用于后续追踪 Campaign R 倍数、+1.0R 保本锁死、+1.5R 零本金推仓与 +2.0R 主升移交
+              </span>
+            </div>
+            <input
+              className="input h-7 w-32 font-mono"
+              type="number"
+              inputMode="decimal"
+              step="any"
+              min="0.01"
+              aria-label="战役标准 1R 基准金额"
+              value={campaign1rInput}
+              onChange={(e) => setCampaign1rInput(e.target.value)}
+            />
           </div>
         ) : null}
 
@@ -694,6 +814,10 @@ export function OpenPositionDialog({
   );
 }
 
+function exactNumInput(v: number | null | undefined): string {
+  return v != null && Number.isFinite(v) ? String(v) : "";
+}
+
 /* ------------------------------------------------------------------
  * 3. Trail Stop Dialog (only tightens, never loosens)
  * ------------------------------------------------------------------ */
@@ -728,9 +852,9 @@ export function TrailStopDialog({
     if (!open) return;
     setNewStop(
       suggestedStop30m != null
-        ? fmtInputPrice(suggestedStop30m)
+        ? exactNumInput(suggestedStop30m)
         : currentStop30m != null
-          ? fmtInputPrice(currentStop30m)
+          ? exactNumInput(currentStop30m)
           : "",
     );
     setNewDailyStop("");
@@ -855,6 +979,8 @@ export function TrimPositionDialog({
   const [trimPrice, setTrimPrice] = useState("");
   const [trimQty, setTrimQty] = useState("");
   const [reason, setReason] = useState("指标松动/分批止盈减仓");
+  const [attributionTag, setAttributionTag] = useState("");
+  const [lessonNote, setLessonNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -864,6 +990,8 @@ export function TrimPositionDialog({
     setTrimPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(entryRef, 6));
     setTrimQty(String(Math.max(1, Math.floor(position.quantity / 2))));
     setReason("指标松动/分批止盈减仓");
+    setAttributionTag("");
+    setLessonNote("");
     setErr(null);
   }, [open, position, lastPrice]);
 
@@ -883,6 +1011,8 @@ export function TrimPositionDialog({
         trim_price: p,
         trim_quantity: q,
         reason: reason.trim() || "partial_take_profit",
+        ...(attributionTag ? { attribution_tag: attributionTag } : {}),
+        ...(lessonNote.trim() ? { lesson_note: lessonNote.trim() } : {}),
       });
       onSuccess();
       onClose();
@@ -932,6 +1062,19 @@ export function TrimPositionDialog({
           <input className="input" value={reason} onChange={(e) => setReason(e.target.value)} />
         </label>
 
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <AttributionTagSelect value={attributionTag} onChange={setAttributionTag} />
+          <label className="field">
+            <span>复盘教训 (lesson_note)</span>
+            <input
+              className="input"
+              placeholder="如：是否过早止盈或合规减仓锁盈？"
+              value={lessonNote}
+              onChange={(e) => setLessonNote(e.target.value)}
+            />
+          </label>
+        </div>
+
         {err ? (
           <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
             {err}
@@ -971,6 +1114,8 @@ export function RotatePositionDialog({
 }) {
   const [exitPrice, setExitPrice] = useState("");
   const [exitReason, setExitReason] = useState("原龙头动能弱化，原子切换至同板块新引领龙头");
+  const [attributionTag, setAttributionTag] = useState("leader_rotation_upgrade");
+  const [lessonNote, setLessonNote] = useState("");
   const [newSymbol, setNewSymbol] = useState("");
   const [newDirection, setNewDirection] = useState<Direction>("long");
   const [sectorTheme, setSectorTheme] = useState("");
@@ -988,6 +1133,8 @@ export function RotatePositionDialog({
     const entryRef = position.avg_entry_price ?? position.entry_price;
     setExitPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(entryRef, 6));
     setExitReason("原龙头动能弱化，原子切换至同板块新引领龙头");
+    setAttributionTag("leader_rotation_upgrade");
+    setLessonNote("");
     setNewSymbol("");
     setNewDirection(position.direction || "long");
     setSectorTheme(position.sector_theme || "");
@@ -1034,6 +1181,8 @@ export function RotatePositionDialog({
         exit_price: epOut,
         exit_reason: exitReason.trim() || "leader_rotation",
         exit_category: "leader_rotation",
+        ...(attributionTag ? { attribution_tag: attributionTag } : {}),
+        ...(lessonNote.trim() ? { lesson_note: lessonNote.trim() } : {}),
         new_position: {
           symbol: newSymbol.trim().toUpperCase(),
           direction: newDirection,
@@ -1086,6 +1235,22 @@ export function RotatePositionDialog({
                 required
                 value={exitReason}
                 onChange={(e) => setExitReason(e.target.value)}
+              />
+            </label>
+          </div>
+          <div className="mt-2.5 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <AttributionTagSelect
+              value={attributionTag}
+              onChange={setAttributionTag}
+              label="原龙头归因标签"
+            />
+            <label className="field">
+              <span>切换复盘教训 (lesson_note)</span>
+              <input
+                className="input bg-surface"
+                placeholder="记录新旧龙头强弱切换依据…"
+                value={lessonNote}
+                onChange={(e) => setLessonNote(e.target.value)}
               />
             </label>
           </div>
@@ -1229,6 +1394,8 @@ export function ClosePositionDialog({
   const [exitPrice, setExitPrice] = useState("");
   const [exitReason, setExitReason] = useState("");
   const [exitCategory, setExitCategory] = useState("red_line_exit");
+  const [attributionTag, setAttributionTag] = useState("");
+  const [lessonNote, setLessonNote] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -1238,6 +1405,8 @@ export function ClosePositionDialog({
     setExitPrice(lastPrice != null ? fmtInputPrice(lastPrice) : fmtPlanNum(entryRef, 6));
     setExitReason(defaultReason || "触发撤离红线或逻辑松动果断平仓");
     setExitCategory("red_line_exit");
+    setAttributionTag("");
+    setLessonNote("");
     setErr(null);
   }, [open, position, lastPrice, defaultReason]);
 
@@ -1256,6 +1425,8 @@ export function ClosePositionDialog({
         exit_price: p,
         exit_reason: exitReason.trim(),
         exit_category: exitCategory,
+        ...(attributionTag ? { attribution_tag: attributionTag } : {}),
+        ...(lessonNote.trim() ? { lesson_note: lessonNote.trim() } : {}),
       });
       onSuccess();
       onClose();
@@ -1325,6 +1496,19 @@ export function ClosePositionDialog({
             onChange={(e) => setExitReason(e.target.value)}
           />
         </label>
+
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <AttributionTagSelect value={attributionTag} onChange={setAttributionTag} />
+          <label className="field">
+            <span>复盘教训 (lesson_note)</span>
+            <input
+              className="input"
+              placeholder="沉淀可复用经验或避免重复犯错…"
+              value={lessonNote}
+              onChange={(e) => setLessonNote(e.target.value)}
+            />
+          </label>
+        </div>
 
         {err ? (
           <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
@@ -1472,6 +1656,281 @@ export function VoidPositionDialog({
           ) : null}
         </div>
       </div>
+    </ModalDialog>
+  );
+}
+
+/* ------------------------------------------------------------------
+ * 8. Stop Regime Handover Dialog (/api/portfolio/positions/{id}/stop-regime)
+ * ------------------------------------------------------------------ */
+export function StopRegimeDialog({
+  open,
+  onClose,
+  onSuccess,
+  position,
+  currentPrice,
+  suggestedRegime,
+  suggestedDailyStop,
+  defaultReason,
+}: {
+  open: boolean;
+  onClose: () => void;
+  onSuccess: () => void;
+  position: Position | null;
+  currentPrice?: number | null;
+  suggestedRegime?: StopRegime;
+  suggestedDailyStop?: number | null;
+  defaultReason?: string;
+}) {
+  const [regime, setRegime] = useState<StopRegime>("daily_structure");
+  const [newDailyStop, setNewDailyStop] = useState("");
+  const [newStop30m, setNewStop30m] = useState("");
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const isLong = (position?.direction ?? "long") === "long";
+  const avgEntry = position ? (position.avg_entry_price ?? position.entry_price ?? null) : null;
+  const currentRegime: StopRegime =
+    position?.active_stop_regime === "daily_structure" ? "daily_structure" : "tactical_30m";
+
+  const contractMult = (() => {
+    if (!position) return 1;
+    if (typeof position.multiplier === "number" && Number.isFinite(position.multiplier) && position.multiplier > 0) {
+      return position.multiplier;
+    }
+    const rawSpec =
+      position.contract_spec && typeof position.contract_spec === "object"
+        ? (position.contract_spec as Record<string, unknown>)
+        : null;
+    if (
+      rawSpec &&
+      typeof rawSpec.multiplier === "number" &&
+      Number.isFinite(rawSpec.multiplier) &&
+      rawSpec.multiplier > 0
+    ) {
+      return rawSpec.multiplier;
+    }
+    return 1;
+  })();
+  const fxRate =
+    position?.fx_to_account != null && Number.isFinite(position.fx_to_account) && position.fx_to_account > 0
+      ? position.fx_to_account
+      : 1;
+  const partialRealized = Number(position?.partial_realized_pnl ?? 0);
+  const campaignBreakevenPrice = (() => {
+    if (avgEntry == null) return null;
+    if (!Number.isFinite(partialRealized) || partialRealized >= -1e-9 || !position || position.quantity <= 0) {
+      return avgEntry;
+    }
+    const denom = position.quantity * contractMult * fxRate;
+    if (denom <= 0) return avgEntry;
+    const offset = Math.abs(partialRealized) / denom;
+    const raw = isLong ? avgEntry + offset : avgEntry - offset;
+    const scale = 1e6;
+    return isLong ? Math.ceil((raw - 1e-12) * scale) / scale : Math.floor((raw + 1e-12) * scale) / scale;
+  })();
+
+  const computedBreakevenDailyFloor = (() => {
+    const structDaily = position?.structural_stop_daily ?? null;
+    if (campaignBreakevenPrice == null) return structDaily;
+    if (structDaily == null) return campaignBreakevenPrice;
+    return isLong ? Math.max(structDaily, campaignBreakevenPrice) : Math.min(structDaily, campaignBreakevenPrice);
+  })();
+
+  useEffect(() => {
+    if (!open || !position) return;
+    const targetRegime: StopRegime =
+      suggestedRegime ?? (currentRegime === "daily_structure" ? "tactical_30m" : "daily_structure");
+    setRegime(targetRegime);
+
+    const prefDaily = suggestedDailyStop ?? computedBreakevenDailyFloor;
+    setNewDailyStop(exactNumInput(prefDaily));
+    setNewStop30m(exactNumInput(position.tactical_stop_30m));
+    setReason(
+      defaultReason ||
+        (targetRegime === "daily_structure"
+          ? currentRegime === "daily_structure"
+            ? "日线主升结构上移，同步收紧日线主升防线锁盈"
+            : "浮盈脱离成本区，移交日线主升防线以过滤 30m 回踩噪音"
+          : "切回 30m 战术防线紧密锁盈"),
+    );
+    setErr(null);
+  }, [open, position, suggestedRegime, suggestedDailyStop, defaultReason, currentRegime, computedBreakevenDailyFloor]);
+
+  const parsedDailyStop = optNum(newDailyStop);
+  const dailyBreakevenViolated = Boolean(
+    regime === "daily_structure" &&
+      campaignBreakevenPrice != null &&
+      parsedDailyStop !== undefined &&
+      (isLong ? parsedDailyStop < campaignBreakevenPrice - 1e-9 : parsedDailyStop > campaignBreakevenPrice + 1e-9),
+  );
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!position) return;
+    if (regime === "daily_structure") {
+      if (parsedDailyStop === undefined || parsedDailyStop <= 0) {
+        setErr("切换或更新日线主升防线必须提供有效的日线止损位 (new_daily_stop)");
+        return;
+      }
+      if (dailyBreakevenViolated && campaignBreakevenPrice != null) {
+        setErr(
+          `保本底线不变量拦截：日线主升防线 (${fmtPrice(parsedDailyStop)}) 必须位于战役级保本线 (${fmtPrice(campaignBreakevenPrice)}) 的${isLong ? "上方/保本侧" : "下方/保本侧"}，禁止移交后恢复本金敞口。`,
+        );
+        return;
+      }
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await api.setStopRegime(position.position_id, {
+        regime,
+        ...(regime === "daily_structure" && parsedDailyStop !== undefined
+          ? { new_daily_stop: parsedDailyStop }
+          : {}),
+        ...(regime === "tactical_30m" && optNum(newStop30m) !== undefined
+          ? { new_stop_30m: optNum(newStop30m) }
+          : {}),
+        ...(currentPrice != null && Number.isFinite(currentPrice) ? { current_price: currentPrice } : {}),
+        reason: reason.trim() || `switch_regime_${regime}`,
+      });
+      onSuccess();
+      onClose();
+    } catch (ex) {
+      setErr(errorMessage(ex));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const isDailyTrailUpdate =
+    currentRegime === "daily_structure" && regime === "daily_structure" && suggestedDailyStop != null;
+
+  return (
+    <ModalDialog
+      open={open}
+      onClose={onClose}
+      title={
+        isDailyTrailUpdate
+          ? `收紧日线主升防线 · ${formatSymbolWithCode(position?.symbol)}`
+          : `防线模式切换 · ${formatSymbolWithCode(position?.symbol)}`
+      }
+      subtitle={
+        isDailyTrailUpdate
+          ? "主升期日线结构防线只紧不松；通过日线中枢阶梯锁盈并持续过滤 30m 回踩噪音"
+          : "在「30m 战术防线」与「日线主升防线」之间移交主控止损权"
+      }
+    >
+      <form onSubmit={submit} className="flex flex-col gap-3.5 p-5">
+        <div className="metric-strip grid-cols-2 sm:grid-cols-4">
+          <div className="metric-cell">
+            <span className="metric-label">当前防线模式</span>
+            <span className="metric-val text-xs">
+              {currentRegime === "daily_structure" ? "日线主升防线" : "30m 战术防线"}
+            </span>
+          </div>
+          <div className="metric-cell">
+            <span className="metric-label">综合成本均价</span>
+            <span className="metric-val">{fmtPrice(avgEntry)}</span>
+          </div>
+          <div className="metric-cell">
+            <span className="metric-label">当前 30m 止损</span>
+            <span className="metric-val text-bear">{fmtPrice(position?.tactical_stop_30m)}</span>
+          </div>
+          <div className="metric-cell">
+            <span className="metric-label">当前日线结构位</span>
+            <span className="metric-val text-ink-2">{fmtPrice(position?.structural_stop_daily)}</span>
+          </div>
+        </div>
+
+        <label className="field">
+          <span>目标防线模式 (regime)</span>
+          <select
+            className="input"
+            value={regime}
+            onChange={(e) => setRegime(e.target.value as StopRegime)}
+          >
+            <option value="daily_structure">日线主升防线 (daily_structure) — 过滤 30m 回踩噪音</option>
+            <option value="tactical_30m">30m 战术防线 (tactical_30m) — 紧密贴身保护</option>
+          </select>
+        </label>
+
+        {regime === "daily_structure" ? (
+          <>
+            <div className="flex items-start gap-2 rounded-md border border-bull/40 bg-bull/10 px-3 py-2 text-xs text-ink">
+              <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-bull" aria-hidden="true" />
+              <div>
+                <strong>保本底线不变量：</strong>日线主升防线必须锁在战役级保本线{" "}
+                <strong className="font-mono">{fmtPrice(campaignBreakevenPrice)}</strong> 的{isLong ? "上方（≥ 保本线）" : "下方（≤ 保本线）"}，确保骑乘大波段全程零本金敞口。
+              </div>
+            </div>
+            <label className="field">
+              <span>新日线主升防线 (new_daily_stop) *</span>
+              <input
+                className="input font-mono"
+                type="number"
+                inputMode="decimal"
+                step="any"
+                required
+                autoFocus
+                value={newDailyStop}
+                onChange={(e) => setNewDailyStop(e.target.value)}
+              />
+            </label>
+          </>
+        ) : (
+          <label className="field">
+            <span>切回后的 30m 战术止损位（可选，只紧不松）</span>
+            <input
+              className="input font-mono"
+              type="number"
+              inputMode="decimal"
+              step="any"
+              placeholder="不改留空"
+              value={newStop30m}
+              onChange={(e) => setNewStop30m(e.target.value)}
+            />
+          </label>
+        )}
+
+        <label className="field">
+          <span>切换依据 (reason)</span>
+          <input className="input" value={reason} onChange={(e) => setReason(e.target.value)} />
+        </label>
+
+        {dailyBreakevenViolated ? (
+          <div role="alert" className="rounded-md border border-warning/50 bg-warning/10 px-3 py-2 text-xs text-ink">
+            当前填写的日线防线尚未达到战役级保本线 ({fmtPrice(campaignBreakevenPrice)})，后端将拒绝提交。建议填为{" "}
+            <strong className="font-mono">{fmtPrice(computedBreakevenDailyFloor)}</strong> 或更高保护位。
+          </div>
+        ) : null}
+
+        {err ? (
+          <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
+            {err}
+          </div>
+        ) : null}
+
+        <div className="flex justify-end gap-2 border-t border-hairline pt-3">
+          <button type="button" className="btn" onClick={onClose} disabled={busy}>
+            取消
+          </button>
+          <button
+            type="submit"
+            className="btn btn-primary"
+            disabled={busy || dailyBreakevenViolated}
+          >
+            {busy
+              ? "正在提交…"
+              : regime === "daily_structure"
+                ? currentRegime === "daily_structure"
+                  ? "确认收紧日线主升防线"
+                  : "确认移交日线主升防线"
+                : "确认切回 30m 战术防线"}
+          </button>
+        </div>
+      </form>
     </ModalDialog>
   );
 }

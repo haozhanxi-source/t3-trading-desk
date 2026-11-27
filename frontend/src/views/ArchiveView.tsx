@@ -2,15 +2,19 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState, type FormEven
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  AlertTriangle,
   Bot,
   CalendarPlus,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Crosshair,
   Database,
   Edit3,
   ExternalLink,
   FilePlus2,
   FileText,
+  Gauge,
   ListChecks,
   Loader2,
   Plus,
@@ -29,9 +33,12 @@ import type {
   ArchiveState,
   ArchiveStatus,
   ArchiveTrigger,
+  CrowdingAssessment,
   DeepResearchEngine,
   DeepResearchMode,
   EvidenceItem,
+  ExpectationGap,
+  LeadingKpiItem,
   Position,
   ResearchDataResponse,
   ResearchEnginesResponse,
@@ -2735,6 +2742,21 @@ export function ArchiveView({
           </div>
         ) : null}
 
+        {detail ? (
+          <ExpectationGapCard
+            detail={detail}
+            onSaved={async () => {
+              const targetSym = detail.symbol;
+              const targetMkt = detail.market;
+              const token = selectionTokenRef.current;
+              loadedKeyRef.current = "";
+              await loadDetail(targetSym, targetMkt, undefined, token);
+              await loadList();
+              onArchiveMutated?.();
+            }}
+          />
+        ) : null}
+
         <div className="grid grid-cols-1 items-start gap-4 xl:grid-cols-9">
           <div className={`flex min-w-0 flex-col gap-3.5 ${showCompanion ? "xl:col-span-6" : "xl:col-span-9"}`}>
         {/* TAB 1: Warm-Paper Thesis Markdown Reader / Safe Body Editor + Append Log */}
@@ -3526,6 +3548,543 @@ export function ArchiveView({
         }}
       />
     </div>
+  );
+}
+
+const CROWDING_BADGE_MAP: Record<
+  CrowdingAssessment,
+  { label: string; tone: "good" | "neutral" | "critical" | "warning" }
+> = {
+  underpriced: { label: "未充分定价 (Underpriced)", tone: "good" },
+  fair: { label: "合理定价 (Fair)", tone: "neutral" },
+  crowded: { label: "共识拥挤警示 (Crowded)", tone: "critical" },
+  unknown: { label: "拥挤度待评估", tone: "warning" },
+};
+
+const VALUATION_BALANCE_KEY_ZH: Record<string, string> = {
+  subtype: "定价子类型",
+  valuation_anchor: "估值锚",
+  forward_pe: "前瞻 PE",
+  pe_ttm: "滚动 PE(TTM)",
+  pb: "市净率 PB",
+  pe_pctile_5y: "5年 PE 分位",
+  ev_ebitda: "EV/EBITDA",
+  fcf_yield_pct: "FCF 收益率",
+  supply_demand_balance: "供需平衡",
+  cost_floor: "现金成本支撑",
+  inventory_regime: "库存周期",
+  curve_structure: "期限结构",
+  rate_diff_10y_bp: "10Y 利差(bp)",
+  rate_diff_2y_bp: "2Y 利差(bp)",
+  fair_value_band: "公允区间",
+  bull_case: "牛情景",
+  base_case: "基准情景",
+  bear_case: "熊情景",
+};
+
+function normalizeCrowdingValue(raw: unknown): CrowdingAssessment {
+  const s = String(raw || "").trim().toLowerCase();
+  if (s === "underpriced" || s === "fair" || s === "crowded" || s === "unknown") return s;
+  return "unknown";
+}
+
+function formatPendingVerificationItem(item: unknown): string {
+  if (typeof item === "string") return item.trim();
+  if (item && typeof item === "object") {
+    const obj = item as Record<string, unknown>;
+    const main = String(obj.item || obj.title || obj.question || obj.description || obj.metric || "").trim();
+    const note = String(obj.note || obj.reason || obj.status || "").trim();
+    if (main && note && note !== main) return `${main}（${note}）`;
+    if (main) return main;
+    return JSON.stringify(item);
+  }
+  return String(item ?? "");
+}
+
+function extractCompactValuationEntries(
+  raw: Record<string, unknown> | null | undefined,
+): { key: string; label: string; value: string }[] {
+  if (!raw || typeof raw !== "object") return [];
+  const out: { key: string; label: string; value: string }[] = [];
+  for (const [k, v] of Object.entries(raw)) {
+    if (v === null || v === undefined) continue;
+    if (typeof v === "string") {
+      const trimmed = v.trim();
+      if (!trimmed || trimmed === "待补充" || trimmed === "N/A") continue;
+      out.push({ key: k, label: VALUATION_BALANCE_KEY_ZH[k] || k, value: trimmed });
+    } else if (typeof v === "number" && Number.isFinite(v)) {
+      out.push({ key: k, label: VALUATION_BALANCE_KEY_ZH[k] || k, value: String(v) });
+    } else if (typeof v === "boolean") {
+      out.push({ key: k, label: VALUATION_BALANCE_KEY_ZH[k] || k, value: v ? "是" : "否" });
+    }
+    if (out.length >= 6) break;
+  }
+  return out;
+}
+
+function emptyLeadingKpi(): LeadingKpiItem {
+  return {
+    name: "",
+    current_baseline: "",
+    expected_trajectory: "",
+    falsification_threshold: "",
+    cadence: "月度",
+  };
+}
+
+function ExpectationGapCard({
+  detail,
+  onSaved,
+}: {
+  detail: ArchiveDetail;
+  onSaved: () => Promise<void>;
+}) {
+  const archiveId = `${detail.market}::${detail.symbol}`;
+  const eg = detail.state.expectation_gap ?? null;
+  const crowding = normalizeCrowdingValue(eg?.crowding_assessment);
+  const crowdingMeta = CROWDING_BADGE_MAP[crowding];
+  const leadingKpis = Array.isArray(eg?.leading_kpis) ? eg.leading_kpis : [];
+  const pendingItems = useMemo(
+    () =>
+      (Array.isArray(detail.state.pending_verifications) ? detail.state.pending_verifications : [])
+        .map(formatPendingVerificationItem)
+        .filter(Boolean),
+    [detail.state.pending_verifications],
+  );
+  const valEntries = useMemo(
+    () => extractCompactValuationEntries(detail.state.valuation_or_balance),
+    [detail.state.valuation_or_balance],
+  );
+
+  const hasContent = Boolean(
+    (eg?.priced_in_consensus || "").trim() ||
+      (eg?.our_variant_view || "").trim() ||
+      leadingKpis.length > 0 ||
+      pendingItems.length > 0 ||
+      valEntries.length > 0 ||
+      crowding !== "unknown",
+  );
+
+  const [collapsed, setCollapsed] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [baseRev, setBaseRev] = useState(detail.state.revision);
+  const [draftConsensus, setDraftConsensus] = useState("");
+  const [draftVariant, setDraftVariant] = useState("");
+  const [draftCrowding, setDraftCrowding] = useState<CrowdingAssessment>("unknown");
+  const [draftKpis, setDraftKpis] = useState<LeadingKpiItem[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    setEditing(false);
+    setSaveErr(null);
+    setCollapsed(false);
+  }, [archiveId]);
+
+  const startEdit = () => {
+    setDraftConsensus(eg?.priced_in_consensus ?? "");
+    setDraftVariant(eg?.our_variant_view ?? "");
+    setDraftCrowding(crowding);
+    setDraftKpis(
+      leadingKpis.length > 0
+        ? leadingKpis.map((k) => ({
+            name: k.name ?? "",
+            current_baseline: k.current_baseline ?? "",
+            expected_trajectory: k.expected_trajectory ?? "",
+            falsification_threshold: k.falsification_threshold ?? "",
+            cadence: k.cadence ?? "",
+          }))
+        : [],
+    );
+    setBaseRev(detail.state.revision);
+    setSaveErr(null);
+    setCollapsed(false);
+    setEditing(true);
+  };
+
+  const handleSave = async (e: FormEvent) => {
+    e.preventDefault();
+    setSaving(true);
+    setSaveErr(null);
+    try {
+      const cleanedKpis: LeadingKpiItem[] = draftKpis
+        .map((k) => ({
+          name: k.name.trim(),
+          current_baseline: k.current_baseline.trim(),
+          expected_trajectory: k.expected_trajectory.trim(),
+          falsification_threshold: k.falsification_threshold.trim(),
+          cadence: k.cadence.trim() || "月度",
+        }))
+        .filter((k) => k.name.length > 0);
+
+      const nextGap: ExpectationGap = {
+        priced_in_consensus: draftConsensus.trim(),
+        our_variant_view: draftVariant.trim(),
+        crowding_assessment: draftCrowding,
+        leading_kpis: cleanedKpis,
+      };
+      await api.archiveState(detail.symbol, { expectation_gap: nextGap }, baseRev, detail.market);
+      setEditing(false);
+      await onSaved();
+    } catch (ex) {
+      if (ex instanceof ApiError && ex.status === 409) {
+        setSaveErr("版本冲突（409）：档案已在后台更新，请先取消或刷新档案后重试保存。");
+      } else {
+        setSaveErr(errorMessage(ex));
+      }
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section
+      className={`card flex flex-col gap-3 p-4 ${
+        crowding === "crowded" ? "border-critical/45" : ""
+      }`}
+      aria-label="二阶预期差与领先硬指标"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <Gauge className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
+          <span className="section-title">二阶预期差 & 领先硬指标</span>
+          <StatusBadge tone={crowdingMeta.tone} label={crowdingMeta.label} />
+          {leadingKpis.length > 0 ? (
+            <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 font-mono text-[10.5px] text-muted">
+              {leadingKpis.length} 项领先指标
+            </span>
+          ) : null}
+          {pendingItems.length > 0 ? (
+            <StatusBadge
+              tone={pendingItems.length >= 2 ? "critical" : "warning"}
+              label={`待核验缺口 ${pendingItems.length} 项`}
+            />
+          ) : null}
+        </div>
+        <div className="flex items-center gap-1.5">
+          {!editing ? (
+            <button type="button" className="btn btn-sm" onClick={startEdit}>
+              <Edit3 className="h-3 w-3 text-muted" aria-hidden="true" />
+              <span>{hasContent ? "编辑预期差" : "补充预期差"}</span>
+            </button>
+          ) : null}
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm px-1.5 text-muted"
+            aria-expanded={!collapsed}
+            title={collapsed ? "展开二阶预期差卡片" : "收起二阶预期差卡片"}
+            onClick={() => setCollapsed((v) => !v)}
+          >
+            {collapsed ? (
+              <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+            ) : (
+              <ChevronUp className="h-3.5 w-3.5" aria-hidden="true" />
+            )}
+          </button>
+        </div>
+      </div>
+
+      {!collapsed ? (
+        editing ? (
+          <form onSubmit={handleSave} className="flex flex-col gap-3 border-t border-hairline-soft pt-3">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <label className="field">
+                <span>拥挤度与定价评估 (crowding_assessment)</span>
+                <select
+                  className="input"
+                  value={draftCrowding}
+                  onChange={(e) => setDraftCrowding(e.target.value as CrowdingAssessment)}
+                >
+                  <option value="underpriced">未充分定价 (underpriced)</option>
+                  <option value="fair">合理定价 (fair)</option>
+                  <option value="crowded">共识拥挤警示 (crowded)</option>
+                  <option value="unknown">待评估 (unknown)</option>
+                </select>
+              </label>
+              <div className="flex items-end sm:col-span-2">
+                <span className="text-[11px] text-muted">
+                  若标为「共识拥挤警示」，四象限闸门将自动发出拥挤预警并要求 30min 结构完全确认。
+                </span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+              <label className="field">
+                <span>现价已计入共识 (priced_in_consensus)</span>
+                <textarea
+                  className="input"
+                  rows={2}
+                  placeholder="当前价格已经隐含了市场哪部分一致预期？"
+                  value={draftConsensus}
+                  onChange={(e) => setDraftConsensus(e.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>我们的二阶预期差 (our_variant_view)</span>
+                <textarea
+                  className="input"
+                  rows={2}
+                  placeholder="我们看到但市场尚未充分定价的增量变化是什么？"
+                  value={draftVariant}
+                  onChange={(e) => setDraftVariant(e.target.value)}
+                />
+              </label>
+            </div>
+
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-ink">
+                  领先硬指标跟踪表 ({draftKpis.length})
+                </span>
+                <button
+                  type="button"
+                  className="chip py-0.5 text-[11px]"
+                  onClick={() => setDraftKpis((prev) => [...prev, emptyLeadingKpi()])}
+                >
+                  <Plus className="h-3 w-3" aria-hidden="true" />
+                  <span>新增领先指标</span>
+                </button>
+              </div>
+
+              {draftKpis.length === 0 ? (
+                <div className="rounded border border-hairline-soft bg-sunken/50 px-3 py-2 text-[11px] text-muted">
+                  暂无领先硬指标，点击右上角「新增领先指标」绑定高频可验证 KPI 与证伪阈值。
+                </div>
+              ) : (
+                <div className="flex flex-col gap-2">
+                  {draftKpis.map((kpi, idx) => (
+                    <div
+                      key={idx}
+                      className="grid grid-cols-1 items-end gap-2 rounded-md border border-hairline-soft bg-sunken/50 p-2.5 sm:grid-cols-12"
+                    >
+                      <label className="field sm:col-span-3">
+                        <span>指标名 *</span>
+                        <input
+                          className="input"
+                          required
+                          placeholder="如 LME 注销仓单比"
+                          value={kpi.name}
+                          onChange={(e) =>
+                            setDraftKpis((prev) =>
+                              prev.map((row, i) => (i === idx ? { ...row, name: e.target.value } : row)),
+                            )
+                          }
+                        />
+                      </label>
+                      <label className="field sm:col-span-2">
+                        <span>当前基线</span>
+                        <input
+                          className="input font-mono"
+                          placeholder="如 18%"
+                          value={kpi.current_baseline}
+                          onChange={(e) =>
+                            setDraftKpis((prev) =>
+                              prev.map((row, i) =>
+                                i === idx ? { ...row, current_baseline: e.target.value } : row,
+                              ),
+                            )
+                          }
+                        />
+                      </label>
+                      <label className="field sm:col-span-3">
+                        <span>预期轨迹</span>
+                        <input
+                          className="input"
+                          placeholder="如 1Q 内升至 35%+"
+                          value={kpi.expected_trajectory}
+                          onChange={(e) =>
+                            setDraftKpis((prev) =>
+                              prev.map((row, i) =>
+                                i === idx ? { ...row, expected_trajectory: e.target.value } : row,
+                              ),
+                            )
+                          }
+                        />
+                      </label>
+                      <label className="field sm:col-span-2">
+                        <span>证伪阈值</span>
+                        <input
+                          className="input"
+                          placeholder="如 跌破 10%"
+                          value={kpi.falsification_threshold}
+                          onChange={(e) =>
+                            setDraftKpis((prev) =>
+                              prev.map((row, i) =>
+                                i === idx ? { ...row, falsification_threshold: e.target.value } : row,
+                              ),
+                            )
+                          }
+                        />
+                      </label>
+                      <label className="field sm:col-span-1">
+                        <span>频率</span>
+                        <input
+                          className="input"
+                          placeholder="周度"
+                          value={kpi.cadence}
+                          onChange={(e) =>
+                            setDraftKpis((prev) =>
+                              prev.map((row, i) =>
+                                i === idx ? { ...row, cadence: e.target.value } : row,
+                              ),
+                            )
+                          }
+                        />
+                      </label>
+                      <div className="flex justify-end sm:col-span-1">
+                        <button
+                          type="button"
+                          className="btn btn-ghost btn-sm px-1.5 text-muted hover:text-critical"
+                          title="删除该领先指标"
+                          onClick={() =>
+                            setDraftKpis((prev) => prev.filter((_, i) => i !== idx))
+                          }
+                        >
+                          <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {saveErr ? (
+              <div role="alert" className="rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink">
+                {saveErr}
+              </div>
+            ) : null}
+
+            <div className="flex justify-end gap-2 border-t border-hairline-soft pt-2.5">
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={saving}
+                onClick={() => {
+                  setEditing(false);
+                  setSaveErr(null);
+                }}
+              >
+                取消
+              </button>
+              <button type="submit" className="btn btn-sm btn-primary" disabled={saving}>
+                <Save className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>{saving ? "保存中…" : "保存二阶预期差"}</span>
+              </button>
+            </div>
+          </form>
+        ) : (
+          <div className="flex flex-col gap-3">
+            {crowding === "crowded" ? (
+              <div className="flex items-start gap-2 rounded border border-critical/45 bg-critical/10 px-3 py-2 text-xs text-ink">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-critical" aria-hidden="true" />
+                <span>
+                  <strong>共识拥挤警示：</strong>当前市场一致预期高度拥挤，严禁追高远离中枢建仓，入场须严格等待 30min 缠论结构确认且核验超预期催化。
+                </span>
+              </div>
+            ) : null}
+
+            {/* Side-by-Side Consensus vs Variant View */}
+            <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+              <div className="rounded-md border border-hairline-soft bg-sunken/60 p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+                  现价已计入共识 (Priced-in Consensus)
+                </div>
+                <p className="m-0 mt-1 text-xs leading-relaxed text-ink-2">
+                  {(eg?.priced_in_consensus || "").trim() || "待补充：请明确当前股价/期货价已充分折现哪部分市场共识。"}
+                </p>
+              </div>
+              <div className="rounded-md border border-accent/30 bg-accent/6 p-3">
+                <div className="text-[11px] font-semibold uppercase tracking-wide text-accent">
+                  我们的二阶预期差 (Our Variant View)
+                </div>
+                <p className="m-0 mt-1 text-xs leading-relaxed text-ink">
+                  {(eg?.our_variant_view || "").trim() || "待补充：请阐明未来 1Q~1Y 市场尚未充分定价的核心边际变化。"}
+                </p>
+              </div>
+            </div>
+
+            {/* Leading KPIs Compact Table */}
+            {leadingKpis.length > 0 ? (
+              <div tabIndex={0} role="region" aria-label="领先硬指标跟踪表" className="table-wrapper">
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th scope="col">领先指标</th>
+                      <th scope="col">当前基线</th>
+                      <th scope="col">预期轨迹</th>
+                      <th scope="col">证伪阈值</th>
+                      <th scope="col">跟踪频次</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {leadingKpis.map((kpi, idx) => (
+                      <tr key={`${kpi.name}-${idx}`}>
+                        <th scope="row" className="font-medium text-ink">
+                          {kpi.name || "—"}
+                        </th>
+                        <td data-label="当前基线" className="tnum font-mono text-ink-2">
+                          {kpi.current_baseline || "—"}
+                        </td>
+                        <td data-label="预期轨迹" className="text-bull">
+                          {kpi.expected_trajectory || "—"}
+                        </td>
+                        <td data-label="证伪阈值" className="text-bear">
+                          {kpi.falsification_threshold || "—"}
+                        </td>
+                        <td data-label="跟踪频次" className="text-muted">
+                          {kpi.cadence || "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : null}
+
+            {/* Valuation / Balance Key Values */}
+            {valEntries.length > 0 ? (
+              <div
+                className={`metric-strip ${
+                  valEntries.length <= 2
+                    ? "grid-cols-2"
+                    : valEntries.length === 3
+                      ? "grid-cols-3"
+                      : "grid-cols-2 sm:grid-cols-3 lg:grid-cols-6"
+                }`}
+              >
+                {valEntries.map((entry) => (
+                  <div key={entry.key} className="metric-cell">
+                    <span className="metric-label">{entry.label}</span>
+                    <span className="metric-val truncate text-xs" title={entry.value}>
+                      {entry.value}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : null}
+
+            {/* Pending Verifications Alert List */}
+            {pendingItems.length > 0 ? (
+              <div className="rounded-md border border-warning/45 bg-warning/10 px-3 py-2 text-xs text-ink">
+                <div className="flex items-center gap-1.5 font-semibold text-warning">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    未完成核验项（{pendingItems.length} 项
+                    {pendingItems.length >= 2 ? " · ≥2 项将限制四象限直接放行" : ""}）
+                  </span>
+                </div>
+                <ul className="m-0 mt-1 list-disc space-y-0.5 pl-4 text-[11.5px] text-ink-2">
+                  {pendingItems.map((txt, idx) => (
+                    <li key={idx}>{txt}</li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+          </div>
+        )
+      ) : null}
+    </section>
   );
 }
 

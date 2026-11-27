@@ -25,12 +25,15 @@ import os
 import re
 import sys
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, ROUND_FLOOR
+from decimal import ROUND_FLOOR, Decimal
+from fractions import Fraction
 from typing import Any
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(__file__))
-from market_snapshot import normalize_symbol  # noqa: E402
+from market_snapshot import normalize_symbol
+
+UTC = timezone.utc  # noqa: UP017
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +612,7 @@ def _enrich_spec(spec: dict[str, Any]) -> dict[str, Any]:
 def _resolve_fx_currencies(norm_sym: str) -> tuple[str | None, str]:
     """Resolve (base_currency, quote_currency) from normalized FX ticker like EURUSD=X or USDJPY=X."""
     cleaned = (norm_sym or "").strip().upper()
-    if cleaned.endswith("=X"):
-        cleaned = cleaned[:-2]
+    cleaned = cleaned.removesuffix("=X")
     cleaned = cleaned.replace("/", "").replace("-", "")
     if re.fullmatch(r"[A-Z]{6}", cleaned):
         return cleaned[:3], cleaned[3:]
@@ -622,7 +624,7 @@ def _resolve_fx_currencies(norm_sym: str) -> tuple[str | None, str]:
 
 def _require_finite_float(val: Any, name: str, *, positive: bool = False, non_negative: bool = False) -> float:
     if isinstance(val, bool) or not isinstance(val, (int, float)):
-        raise ValueError(f"{name} must be a finite number, got {val!r}")
+        raise ValueError(f"{name} must be a finite number, got {val!r}")  # noqa: TRY004
     fval = float(val)
     if not math.isfinite(fval):
         raise ValueError(f"{name} must be finite, got {val!r}")
@@ -945,7 +947,7 @@ def get_contract_spec(symbol: str, asset_class: str | None = None) -> dict[str, 
         spec = OVERSEAS_FUTURE_SPECS.get(key)
         if spec is not None:
             return _enrich_spec({"symbol": key, "known_spec": True, **spec})
-        root = key[:-2] if key.endswith("=F") else key
+        root = key.removesuffix("=F")
         return _enrich_spec({
             "symbol": key,
             "root": root,
@@ -1081,50 +1083,96 @@ def _normalize_curve_structure(raw_structure: Any, roll_yield_pct: float | None)
     return "unknown"
 
 
-def _extract_crypto_annualized_funding(crypto_funding: dict[str, Any] | None) -> tuple[float | None, list[str]]:
+def _opt_exact_fraction(value: Any) -> Fraction | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Fraction):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            return Fraction(s)
+        except (ValueError, ZeroDivisionError):
+            return None
+    try:
+        return _to_exact_fraction(value, "exact_fraction")
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_crypto_annualized_funding(crypto_funding: dict[str, Any] | None) -> tuple[Fraction | None, list[str]]:
     if not isinstance(crypto_funding, dict) or not crypto_funding:
         return None, []
+    direct_raw = _opt_finite_float(crypto_funding.get("funding_annualized_pct_raw"))
+    if direct_raw is not None:
+        return Fraction(str(direct_raw)), ["direct"]
+    direct_8h_raw = _opt_finite_float(crypto_funding.get("funding_rate_8h_pct_raw"))
+    if direct_8h_raw is not None:
+        return Fraction(str(direct_8h_raw)) * Fraction(1095), ["direct_8h"]
+    direct_rate_raw = _opt_finite_float(crypto_funding.get("funding_rate_raw"))
+    if direct_rate_raw is not None:
+        return Fraction(str(direct_rate_raw)) * Fraction(109500), ["direct_rate"]
     direct = _opt_finite_float(crypto_funding.get("funding_annualized_pct"))
     if direct is not None:
-        return direct, ["direct"]
+        return Fraction(str(direct)), ["direct"]
     direct_8h = _opt_finite_float(crypto_funding.get("funding_rate_8h_pct"))
     if direct_8h is not None:
-        return round(direct_8h * 3.0 * 365.0, 4), ["direct_8h"]
+        return Fraction(str(direct_8h)) * Fraction(1095), ["direct_8h"]
 
-    vals: list[float] = []
+    vals: list[Fraction] = []
     exchanges: list[str] = []
     for ex_name, payload in crypto_funding.items():
         if not isinstance(payload, dict) or payload.get("error"):
             continue
-        ann = _opt_finite_float(payload.get("funding_annualized_pct"))
+        ann: Fraction | None = None
+        ann_f = _opt_finite_float(payload.get("funding_annualized_pct_raw"))
+        if ann_f is not None:
+            ann = Fraction(str(ann_f))
+        if ann is None:
+            r8_raw = _opt_finite_float(payload.get("funding_rate_8h_pct_raw"))
+            if r8_raw is not None:
+                ann = Fraction(str(r8_raw)) * Fraction(1095)
+        if ann is None:
+            rate_raw = _opt_finite_float(payload.get("funding_rate_raw"))
+            if rate_raw is not None:
+                ann = Fraction(str(rate_raw)) * Fraction(109500)
+        if ann is None:
+            ann_disp = _opt_finite_float(payload.get("funding_annualized_pct"))
+            if ann_disp is not None:
+                ann = Fraction(str(ann_disp))
         if ann is None:
             r8 = _opt_finite_float(payload.get("funding_rate_8h_pct"))
             if r8 is not None:
-                ann = r8 * 3.0 * 365.0
+                ann = Fraction(str(r8)) * Fraction(1095)
         if ann is not None:
             vals.append(ann)
             exchanges.append(str(ex_name))
     if not vals:
         return None, []
-    return round(sum(vals) / len(vals), 4), exchanges
+    return sum(vals, Fraction(0)) / len(vals), exchanges
 
 
 def _extract_fx_rate_diff_pct(rate_diff: dict[str, Any] | None) -> tuple[float | None, str | None]:
     if not isinstance(rate_diff, dict) or not rate_diff:
         return None, None
-    # Prefer shorter-tenor / policy differential when available, then 10Y benchmark
+    # Prefer unrounded raw differentials first, then shorter-tenor / policy differential, then 10Y benchmark
     pct_keys = (
-        "policy_rate_diff_pct",
-        "base_minus_quote_2y_pct",
-        "us_minus_cn_2y_pct",
-        "base_minus_quote_10y_pct",
-        "us_minus_cn_10y_pct",
-        "rate_diff_pct",
+        ("policy_rate_diff_pct_raw", "policy_rate_diff_pct"),
+        ("base_minus_quote_2y_pct_raw", "base_minus_quote_2y_pct"),
+        ("us_minus_cn_2y_pct_raw", "us_minus_cn_2y_pct"),
+        ("base_minus_quote_10y_pct_raw", "base_minus_quote_10y_pct"),
+        ("us_minus_cn_10y_pct_raw", "us_minus_cn_10y_pct"),
+        ("rate_diff_pct_raw", "rate_diff_pct"),
     )
-    for k in pct_keys:
-        val = _opt_finite_float(rate_diff.get(k))
+    for raw_k, disp_k in pct_keys:
+        val_raw = _opt_finite_float(rate_diff.get(raw_k))
+        if val_raw is not None:
+            return val_raw, disp_k
+        val = _opt_finite_float(rate_diff.get(disp_k))
         if val is not None:
-            return val, k
+            return val, disp_k
     bp_keys = (
         "base_minus_quote_2y_bp",
         "us_minus_cn_2y_bp",
@@ -1135,8 +1183,38 @@ def _extract_fx_rate_diff_pct(rate_diff: dict[str, Any] | None) -> tuple[float |
     for k in bp_keys:
         val = _opt_finite_float(rate_diff.get(k))
         if val is not None:
-            return round(val / 100.0, 4), k
+            return val / 100.0, k
     return None, None
+
+
+def _to_exact_fraction(value: Any, name: str, *, positive: bool = False, non_negative: bool = False) -> Fraction:
+    """Convert numeric input (Fraction/Decimal/int/float) into an exact Fraction with range checks."""
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be numeric, got bool {value!r}")
+    if isinstance(value, Fraction):
+        frac = value
+    elif isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"{name} must be finite, got {value!r}")
+        frac = Fraction(value)
+    elif isinstance(value, int):
+        frac = Fraction(value)
+    else:
+        fval = _require_finite_float(value, name, positive=positive, non_negative=non_negative)
+        frac = Fraction(str(fval))
+    if positive and frac <= 0:
+        raise ValueError(f"{name} must be > 0, got {value!r}")
+    if non_negative and frac < 0:
+        raise ValueError(f"{name} must be >= 0, got {value!r}")
+    return frac
+
+
+def _fraction_to_raw_float_preserving_bound(frac: Fraction) -> float:
+    """Convert exact Fraction to float without rounding an exact sub-threshold value UP onto a decimal boundary."""
+    val = float(frac)
+    if math.isfinite(val) and frac < Fraction(str(val)):
+        return math.nextafter(val, -math.inf)
+    return val
 
 
 def evaluate_expression_and_carry(
@@ -1146,8 +1224,9 @@ def evaluate_expression_and_carry(
     rate_diff: dict[str, Any] | None = None,
     crypto_funding: dict[str, Any] | None = None,
     holding_horizon_days: int = 90,
-    expected_move_pct: float | None = None,
-    stop_distance_pct: float | None = None,
+    expected_move_pct: float | Decimal | Fraction | None = None,
+    stop_distance_pct: float | Decimal | Fraction | None = None,
+    nominal_rr_ratio: float | Decimal | Fraction | None = None,
 ) -> dict[str, Any]:
     """Evaluate carry / roll-yield impact and optimal contract/instrument expression.
 
@@ -1163,29 +1242,48 @@ def evaluate_expression_and_carry(
     if norm_ac not in VALID_ASSET_CLASSES:
         raise ValueError(f"Unsupported asset_class {asset_class!r}")
     horizon_days = _require_finite_float(holding_horizon_days, "holding_horizon_days", positive=True)
-    exp_move = (
-        _require_finite_float(expected_move_pct, "expected_move_pct", positive=True)
+    horizon_days_frac = _to_exact_fraction(holding_horizon_days, "holding_horizon_days", positive=True)
+    exp_move_frac = (
+        _to_exact_fraction(expected_move_pct, "expected_move_pct", positive=True)
         if expected_move_pct is not None
         else None
     )
-    stop_dist = (
-        _require_finite_float(stop_distance_pct, "stop_distance_pct", positive=True)
+    exp_move = float(exp_move_frac) if exp_move_frac is not None else None
+    stop_dist_frac = (
+        _to_exact_fraction(stop_distance_pct, "stop_distance_pct", positive=True)
         if stop_distance_pct is not None
         else None
     )
+    nominal_rr_frac = (
+        _to_exact_fraction(nominal_rr_ratio, "nominal_rr_ratio", non_negative=True)
+        if nominal_rr_ratio is not None
+        else None
+    )
 
-    def _finish_carry(ann_carry: float | None) -> tuple[float | None, float | None, float | None, float | None]:
+    def _finish_carry(
+        ann_carry: float | Fraction | None,
+    ) -> tuple[float | None, float | None, float | None, float | None, float | None]:
         if ann_carry is None:
-            return None, None, None, None
-        ann_rounded = round(float(ann_carry), 4)
-        hor = round(ann_rounded * (horizon_days / 365.0), 4)
-        ratio = round(hor / exp_move, 4) if (exp_move is not None and exp_move > 0) else None
-        carry_adj_rr = (
-            round((exp_move + hor) / stop_dist, 4)
-            if (exp_move is not None and stop_dist is not None and stop_dist > 0)
-            else None
-        )
-        return ann_rounded, hor, ratio, carry_adj_rr
+            return None, None, None, None, None
+        ann_frac = ann_carry if isinstance(ann_carry, Fraction) else Fraction(str(float(ann_carry)))
+        ann_raw = float(ann_frac)
+        ann_rounded = round(ann_raw, 4)
+        hor_frac = ann_frac * horizon_days_frac / Fraction(365)
+        hor_raw = float(hor_frac)
+        hor = round(hor_raw, 4)
+        ratio = round(hor_raw / exp_move, 4) if (exp_move is not None and exp_move > 0) else None
+        if exp_move_frac is not None and stop_dist_frac is not None and stop_dist_frac > 0:
+            if nominal_rr_frac is not None:
+                carry_adj_frac = (
+                    nominal_rr_frac if ann_frac == 0 else (nominal_rr_frac + hor_frac / stop_dist_frac)
+                )
+            else:
+                carry_adj_frac = (exp_move_frac + hor_frac) / stop_dist_frac
+            carry_adj_rr_raw = _fraction_to_raw_float_preserving_bound(carry_adj_frac)
+        else:
+            carry_adj_rr_raw = None
+        carry_adj_rr = round(carry_adj_rr_raw, 4) if carry_adj_rr_raw is not None else None
+        return ann_rounded, hor, ratio, carry_adj_rr, carry_adj_rr_raw
 
     # --- Commodities (CN futures & overseas futures) ---
     if norm_ac in {"commodity", "cn_future"}:
@@ -1219,8 +1317,11 @@ def evaluate_expression_and_carry(
                 "curve_horizon_carry_pct": None,
                 "carry_to_target_ratio": None,
                 "carry_adjusted_rr_ratio": None,
+                "carry_adjusted_rr_ratio_raw": None,
                 "curve_carry_adjusted_rr_ratio": None,
+                "curve_carry_adjusted_rr_ratio_raw": None,
                 "near_carry_stress_rr_ratio": None,
+                "near_carry_stress_rr_ratio_raw": None,
                 "expression_recommendation": "data_stale_refresh_required",
                 "contract_guidance": (
                     "期限结构数据异常或已过期（stale/error），拒绝基于陈旧曲线计算展期收益或推荐具体近远月合约，"
@@ -1234,29 +1335,61 @@ def evaluate_expression_and_carry(
                 "far_contract": None,
             }
 
-        roll_near = _opt_finite_float(ts.get("annualized_roll_yield_near_pct"))
-        roll_curve = _opt_finite_float(ts.get("annualized_roll_yield_curve_pct"))
-        if roll_near is None and roll_curve is None:
-            roll_curve = _opt_finite_float(ts.get("roll_yield_pct"))
+        # Guard against stale/unaligned quote dates: if display roll field was explicitly nulled
+        # (e.g. _null_misaligned_curve_spreads) or curve dates are unaligned, do not fall back to _raw.
+        curve_dates_unaligned = (
+            ts.get("quote_dates_aligned") is False
+            or str(ts.get("structure") or "").strip().lower() == "unaligned_dates"
+        )
+        near_explicitly_nulled = (
+            "annualized_roll_yield_near_pct" in ts and ts.get("annualized_roll_yield_near_pct") is None
+        )
+        curve_explicitly_nulled = (
+            "annualized_roll_yield_curve_pct" in ts and ts.get("annualized_roll_yield_curve_pct") is None
+        )
+        if near_explicitly_nulled:
+            roll_near_frac: Fraction | None = None
+        else:
+            roll_near_frac = _opt_exact_fraction(ts.get("annualized_roll_yield_near_pct_exact"))
+            if roll_near_frac is None:
+                roll_near_f = _opt_finite_float(ts.get("annualized_roll_yield_near_pct_raw"))
+                if roll_near_f is None:
+                    roll_near_f = _opt_finite_float(ts.get("annualized_roll_yield_near_pct"))
+                roll_near_frac = Fraction(str(roll_near_f)) if roll_near_f is not None else None
+        if curve_explicitly_nulled or curve_dates_unaligned:
+            roll_curve_frac: Fraction | None = None
+        else:
+            roll_curve_frac = _opt_exact_fraction(ts.get("annualized_roll_yield_curve_pct_exact"))
+            if roll_curve_frac is None:
+                roll_curve_f = _opt_finite_float(ts.get("annualized_roll_yield_curve_pct_raw"))
+                if roll_curve_f is None:
+                    roll_curve_f = _opt_finite_float(ts.get("annualized_roll_yield_curve_pct"))
+                roll_curve_frac = Fraction(str(roll_curve_f)) if roll_curve_f is not None else None
+        if roll_near_frac is None and roll_curve_frac is None and not (
+            near_explicitly_nulled or curve_explicitly_nulled or curve_dates_unaligned
+        ):
+            roll_fb = _opt_finite_float(ts.get("roll_yield_pct"))
+            roll_curve_frac = Fraction(str(roll_fb)) if roll_fb is not None else None
         raw_struct = ts.get("structure")
 
-        primary_roll = roll_curve if roll_curve is not None else roll_near
+        primary_roll_frac = roll_curve_frac if roll_curve_frac is not None else roll_near_frac
+        primary_roll = float(primary_roll_frac) if primary_roll_frac is not None else None
         norm_struct = _normalize_curve_structure(raw_struct, primary_roll)
 
         # Positive roll yield = Backwardation (tailwind for long, headwind/drag for short)
-        sign = 1.0 if norm_dir == "long" else -1.0
-        near_carry = round(sign * roll_near, 4) if roll_near is not None else None
-        curve_carry = round(sign * roll_curve, 4) if roll_curve is not None else None
-        _, near_horizon_carry, _, near_carry_stress_rr = _finish_carry(near_carry)
-        _, curve_horizon_carry, _, curve_carry_adj_rr = _finish_carry(curve_carry)
+        sign_frac = Fraction(1) if norm_dir == "long" else Fraction(-1)
+        near_carry_raw = sign_frac * roll_near_frac if roll_near_frac is not None else None
+        curve_carry_raw = sign_frac * roll_curve_frac if roll_curve_frac is not None else None
+        near_carry, near_horizon_carry, _, near_carry_stress_rr, near_carry_stress_rr_raw = _finish_carry(near_carry_raw)
+        curve_carry, curve_horizon_carry, _, curve_carry_adj_rr, curve_carry_adj_rr_raw = _finish_carry(curve_carry_raw)
 
         # Survival Rule #1 ("大B结构绝不否决做空"): for 1Q~1Y medium-frequency trades,
         # evaluate carry-adjusted R:R using full-curve/far-month carry (falling back to near_carry
         # only when curve_carry is unavailable), while exposing near_carry_stress_rr_ratio as an
         # explicit front-month squeeze stress test so a 1-month near squeeze (e.g. CU0 -39.8% front
         # vs -5.4% curve) guides the trader into far-month contracts instead of vetoing the short!
-        primary_carry_raw = curve_carry if curve_carry is not None else near_carry
-        ann_carry, horizon_carry, carry_to_target, carry_adj_rr = _finish_carry(primary_carry_raw)
+        primary_carry_raw = curve_carry_raw if curve_carry_raw is not None else near_carry_raw
+        ann_carry, horizon_carry, carry_to_target, carry_adj_rr, carry_adj_rr_raw = _finish_carry(primary_carry_raw)
 
         # Explicitly tag "强现实 vs 弱预期" / "弱现实 vs 强预期" divergence regimes
         if norm_dir == "short" and norm_struct == "Backwardation":
@@ -1384,8 +1517,11 @@ def evaluate_expression_and_carry(
             "curve_horizon_carry_pct": curve_horizon_carry,
             "carry_to_target_ratio": carry_to_target,
             "carry_adjusted_rr_ratio": carry_adj_rr,
+            "carry_adjusted_rr_ratio_raw": carry_adj_rr_raw,
             "curve_carry_adjusted_rr_ratio": curve_carry_adj_rr,
+            "curve_carry_adjusted_rr_ratio_raw": curve_carry_adj_rr_raw,
             "near_carry_stress_rr_ratio": near_carry_stress_rr,
+            "near_carry_stress_rr_ratio_raw": near_carry_stress_rr_raw,
             "expression_recommendation": expr_rec,
             "contract_guidance": guidance,
             "monitoring_points": monitoring_points,
@@ -1417,13 +1553,14 @@ def evaluate_expression_and_carry(
                 "horizon_carry_pct": None,
                 "carry_to_target_ratio": None,
                 "carry_adjusted_rr_ratio": None,
+                "carry_adjusted_rr_ratio_raw": None,
                 "expression_recommendation": "data_stale_refresh_required",
                 "contract_guidance": "外汇利差数据异常或已过期（stale/error），请刷新实时国债与政策利差后再做 Carry 与直盘/交叉盘决策。",
                 "warnings": [rd_warn],
             }
         raw_diff_pct, diff_key = _extract_fx_rate_diff_pct(rate_diff)
         sign = 1.0 if norm_dir == "long" else -1.0
-        ann_carry, horizon_carry, carry_to_target, carry_adj_rr = _finish_carry(
+        ann_carry, horizon_carry, carry_to_target, carry_adj_rr, carry_adj_rr_raw = _finish_carry(
             sign * raw_diff_pct if raw_diff_pct is not None else None
         )
         warnings = []
@@ -1457,12 +1594,13 @@ def evaluate_expression_and_carry(
             "direction": norm_dir,
             "vetoed": False,
             "rate_diff_source_key": diff_key,
-            "base_minus_quote_rate_pct": raw_diff_pct,
+            "base_minus_quote_rate_pct": round(raw_diff_pct, 4) if raw_diff_pct is not None else None,
             "annualized_carry_pct": ann_carry,
             "holding_horizon_days": horizon_days,
             "horizon_carry_pct": horizon_carry,
             "carry_to_target_ratio": carry_to_target,
             "carry_adjusted_rr_ratio": carry_adj_rr,
+            "carry_adjusted_rr_ratio_raw": carry_adj_rr_raw,
             "expression_recommendation": expr_rec,
             "contract_guidance": guidance,
             "warnings": warnings,
@@ -1470,11 +1608,12 @@ def evaluate_expression_and_carry(
 
     # --- Crypto ---
     if norm_ac == "crypto":
-        ann_funding, exchanges_used = _extract_crypto_annualized_funding(crypto_funding)
+        ann_funding_frac, exchanges_used = _extract_crypto_annualized_funding(crypto_funding)
+        ann_funding = float(ann_funding_frac) if ann_funding_frac is not None else None
         # Positive funding => longs pay shorts
-        sign = -1.0 if norm_dir == "long" else 1.0
-        ann_carry, horizon_carry, carry_to_target, carry_adj_rr = _finish_carry(
-            sign * ann_funding if ann_funding is not None else None
+        sign_frac = Fraction(-1) if norm_dir == "long" else Fraction(1)
+        ann_carry, horizon_carry, carry_to_target, carry_adj_rr, carry_adj_rr_raw = _finish_carry(
+            sign_frac * ann_funding_frac if ann_funding_frac is not None else None
         )
         warnings = []
         if ann_carry is None:
@@ -1506,20 +1645,21 @@ def evaluate_expression_and_carry(
             "asset_class": norm_ac,
             "direction": norm_dir,
             "vetoed": False,
-            "funding_annualized_pct": ann_funding,
+            "funding_annualized_pct": round(ann_funding, 4) if ann_funding is not None else None,
             "exchanges_used": exchanges_used,
             "annualized_carry_pct": ann_carry,
             "holding_horizon_days": horizon_days,
             "horizon_carry_pct": horizon_carry,
             "carry_to_target_ratio": carry_to_target,
             "carry_adjusted_rr_ratio": carry_adj_rr,
+            "carry_adjusted_rr_ratio_raw": carry_adj_rr_raw,
             "expression_recommendation": expr_rec,
             "contract_guidance": guidance,
             "warnings": warnings,
         }
 
     # --- Equities & Macro ---
-    _, _, _, eq_carry_adj_rr = _finish_carry(0.0)
+    _, _, _, eq_carry_adj_rr, eq_carry_adj_rr_raw = _finish_carry(0.0)
     return {
         "asset_class": norm_ac,
         "direction": norm_dir,
@@ -1529,6 +1669,7 @@ def evaluate_expression_and_carry(
         "horizon_carry_pct": 0.0,
         "carry_to_target_ratio": 0.0 if exp_move is not None else None,
         "carry_adjusted_rr_ratio": eq_carry_adj_rr,
+        "carry_adjusted_rr_ratio_raw": eq_carry_adj_rr_raw,
         "expression_recommendation": (
             "cash_equity_staggered_long"
             if norm_dir == "long"
@@ -1559,6 +1700,64 @@ def evaluate_expression_and_carry(
 # 3. Four-Quadrant Final Execution Gate (Fail-Closed)
 # ---------------------------------------------------------------------------
 
+CROWDED_EXPECTATION_GAP_WARNING = (
+    "L3 提示当前一阶共识高度拥挤(crowded)，严禁在无 30min 精确确认结构时追高/追空"
+)
+
+
+def _summarize_expectation_gap(
+    expectation_gap: dict[str, Any] | None = None,
+    archive_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract normalized Layer-3 expectation_gap summary from explicit dict or archive state.json."""
+    raw_eg: dict[str, Any] | None = None
+    if isinstance(expectation_gap, dict):
+        raw_eg = expectation_gap
+    elif isinstance(archive_state, dict) and isinstance(archive_state.get("expectation_gap"), dict):
+        raw_eg = archive_state["expectation_gap"]
+
+    if not isinstance(raw_eg, dict):
+        return {
+            "crowding_assessment": "unknown",
+            "priced_in_consensus": "",
+            "our_variant_view": "",
+            "leading_kpis_count": 0,
+        }
+
+    crowding = str(raw_eg.get("crowding_assessment") or raw_eg.get("crowding") or "unknown").strip().lower()
+    if not crowding:
+        crowding = "unknown"
+    priced_in = str(raw_eg.get("priced_in_consensus") or "").strip()
+    variant = str(raw_eg.get("our_variant_view") or raw_eg.get("variant_view") or "").strip()
+
+    kpis_count = 0
+    if isinstance(raw_eg.get("leading_kpis_count"), int) and not isinstance(raw_eg.get("leading_kpis_count"), bool):
+        kpis_count = max(0, raw_eg["leading_kpis_count"])
+    else:
+        for list_key in ("leading_kpis", "leading_verifiable_kpis", "verifiable_leading_kpis", "kpis"):
+            val = raw_eg.get(list_key)
+            if isinstance(val, list):
+                count = 0
+                for item in val:
+                    if isinstance(item, dict):
+                        if any(str(v).strip() for v in item.values() if v is not None):
+                            count += 1
+                    elif isinstance(item, str):
+                        if item.strip():
+                            count += 1
+                    elif item is not None:
+                        count += 1
+                kpis_count = count
+                break
+
+    return {
+        "crowding_assessment": crowding,
+        "priced_in_consensus": priced_in,
+        "our_variant_view": variant,
+        "leading_kpis_count": kpis_count,
+    }
+
+
 def evaluate_four_quadrant_gate(
     direction: str,
     asset_class: str,
@@ -1580,6 +1779,8 @@ def evaluate_four_quadrant_gate(
     research_direction: str | None = None,
     pair_leg_asset_class: str | None = None,
     pair_leg_short_thesis_verified: bool | None = None,
+    archive_state: dict[str, Any] | None = None,
+    expectation_gap: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Enforce fail-closed Layer-4 decision gate across thesis, direction, alignment, sizing, capital, carry, and R:R."""
     norm_dir = str(direction or "").strip().lower()
@@ -1676,6 +1877,17 @@ def evaluate_four_quadrant_gate(
         (isinstance(alignment_dict, dict) and alignment_dict.get("intraday_stroke_end_weakening") is True)
         or (intra_sig_meta is not None and intra_sig_meta.get("stroke_end_weakening") is True)
     )
+    intra_explicitly_unconfirmed = bool(
+        intra_sig_meta is not None and intra_sig_meta.get("confirmed") is False
+    )
+
+    eg_summary = _summarize_expectation_gap(
+        expectation_gap=expectation_gap,
+        archive_state=archive_state,
+    )
+    crowding_assessment = eg_summary["crowding_assessment"]
+    is_crowded = crowding_assessment == "crowded"
+    gate_warnings: list[str] = [CROWDED_EXPECTATION_GAP_WARNING] if is_crowded else []
 
     # Fail-closed dual-timeframe verification: ALL THREE fields must be explicitly present & aligned
     # and 30min MUST NOT have an active Lesson-11 same-direction stroke-end weakening warning.
@@ -1692,6 +1904,7 @@ def evaluate_four_quadrant_gate(
         and daily_bias_matches
         and intraday_action_matches
         and not intraday_stroke_end_weakening
+        and not (is_crowded and intra_explicitly_unconfirmed)
     )
     sizing_ok = (qty_val is not None and qty_val > 0) and bool(within_capital_limits)
 
@@ -1703,7 +1916,6 @@ def evaluate_four_quadrant_gate(
     pair_leg_is_us_short = (is_pair_trade and norm_dir == "long" and norm_pair_leg_ac == "us_stock_or_etf")
     primary_us_short_ok = (not primary_is_us_short) or (us_short_thesis_verified is True)
     pair_leg_us_short_ok = (not pair_leg_is_us_short) or (pair_leg_short_thesis_verified is True)
-    us_short_basis_ok = primary_us_short_ok and pair_leg_us_short_ok
 
     checks = {
         "thesis_falsified": bool(thesis_falsified),
@@ -1713,6 +1925,7 @@ def evaluate_four_quadrant_gate(
         "pair_leg_short_thesis_verified": pair_leg_short_thesis_verified if pair_leg_is_us_short else None,
         "research_direction": norm_research_dir,
         "direction_aligned": direction_aligned,
+        "crowding_assessment": crowding_assessment,
         "upstream_errors": up_errors,
         "curve_stale_or_error": bool(curve_stale_or_error),
         "upstream_ok": len(up_errors) == 0,
@@ -1727,14 +1940,25 @@ def evaluate_four_quadrant_gate(
         "intraday_action": intraday_action or None,
         "intraday_stroke_end_weakening": intraday_stroke_end_weakening,
         "alignment_verified": alignment_verified,
-        "rr_ratio": rr_val,
-        "carry_adjusted_rr_ratio": carry_adj_rr_val,
+        "rr_ratio": round(rr_val, 4) if rr_val is not None else None,
+        "rr_ratio_raw": rr_val,
+        "carry_adjusted_rr_ratio": round(carry_adj_rr_val, 4) if carry_adj_rr_val is not None else None,
+        "carry_adjusted_rr_ratio_raw": carry_adj_rr_val,
         "min_rr": min_rr_val,
         "rr_ok": (rr_val >= min_rr_val) if rr_val is not None else False,
         "carry_adjusted_rr_ok": (carry_adj_rr_val >= min_rr_val) if carry_adj_rr_val is not None else None,
     }
 
     def _gate_result(decision: str, actionable: bool, reasons_list: list[str]) -> dict[str, Any]:
+        eff_reasons = list(reasons_list)
+        if (
+            is_crowded
+            and not actionable
+            and not alignment_verified
+            and decision.startswith("watchlist")
+            and CROWDED_EXPECTATION_GAP_WARNING not in eff_reasons
+        ):
+            eff_reasons.append(CROWDED_EXPECTATION_GAP_WARNING)
         return {
             "decision": decision,
             "actionable": actionable,
@@ -1742,8 +1966,10 @@ def evaluate_four_quadrant_gate(
             "asset_class": norm_ac,
             "research_direction": norm_research_dir,
             "direction_aligned": direction_aligned,
-            "reason": "；".join(reasons_list),
-            "reasons": reasons_list,
+            "reason": "；".join(eff_reasons),
+            "reasons": eff_reasons,
+            "warnings": list(gate_warnings),
+            "expectation_gap_summary": eg_summary,
             "checks": checks,
         }
 
@@ -1848,6 +2074,13 @@ def evaluate_four_quadrant_gate(
             ["30min 缠论已触发第11课反向K线破位/笔结束走弱警戒，与哨兵风控口径一致暂不放行建仓，等待 30min 结构重塑"],
         )
 
+    if is_crowded and intra_explicitly_unconfirmed:
+        return _gate_result(
+            "watchlist_wait_30m",
+            False,
+            [CROWDED_EXPECTATION_GAP_WARNING],
+        )
+
     if alignment_status != "aligned_trigger":
         return _gate_result(
             "watchlist_unverified",
@@ -1867,6 +2100,18 @@ def evaluate_four_quadrant_gate(
             ],
         )
 
+    def _fmt_rr_below(val: float, threshold: float, default_dp: int = 2) -> str:
+        formatted = f"{val:.{default_dp}f}"
+        if val < threshold and float(formatted) >= threshold:
+            for dp in (4, 6, 8, 12):
+                if dp <= default_dp:
+                    continue
+                cand = f"{val:.{dp}f}".rstrip("0").rstrip(".")
+                if float(cand) < threshold:
+                    return cand
+            return repr(val)
+        return formatted
+
     if rr_val is None:
         return _gate_result(
             "watchlist_missing_rr",
@@ -1875,19 +2120,21 @@ def evaluate_four_quadrant_gate(
         )
 
     if rr_val < min_rr_val:
+        rr_txt = _fmt_rr_below(rr_val, min_rr_val, default_dp=2)
         return _gate_result(
             "watchlist_poor_rr",
             False,
-            [f"30min 紧凑止损下盈亏比 {rr_val:.2f} 低于最低门槛 {min_rr_val:.2f}，等待更优入场位"],
+            [f"30min 紧凑止损下盈亏比 {rr_txt} 低于最低门槛 {min_rr_val:.2f}，等待更优入场位"],
         )
 
     if carry_adj_rr_val is not None and carry_adj_rr_val < min_rr_val:
+        carry_txt = _fmt_rr_below(carry_adj_rr_val, min_rr_val, default_dp=4)
         return _gate_result(
             "watchlist_poor_carry_adjusted_rr",
             False,
             [
                 (
-                    f"计入展期/Carry 成本后的调整盈亏比 {carry_adj_rr_val:.4f} 低于最低门槛 {min_rr_val:.2f} "
+                    f"计入展期/Carry 成本后的调整盈亏比 {carry_txt} 低于最低门槛 {min_rr_val:.2f} "
                     f"（名义盈亏比 {rr_val:.2f}），建议切换远月合约、熊/牛市价差或等待更佳 30min 入场位"
                 )
             ],
@@ -1916,7 +2163,7 @@ def _hamilton_split(total_units: int, weights: tuple[float, ...]) -> list[int]:
     if total_units <= 0:
         return [0 for _ in weights]
     dec_weights = [Decimal(str(w)) for w in weights]
-    w_sum = sum(dec_weights, Decimal("0"))
+    w_sum = sum(dec_weights, Decimal(0))
     raw = [(Decimal(total_units) * w) / w_sum for w in dec_weights]
     base = [int(x.to_integral_value(rounding=ROUND_FLOOR)) for x in raw]
     remainder = total_units - sum(base)
@@ -1970,11 +2217,11 @@ def _decimal_to_plain_str(val: Decimal) -> str:
     return s or "0"
 
 
-def _lots_to_quantity_decimal(steps: int, lot_step: float | int) -> Decimal:
+def _lots_to_quantity_decimal(steps: int, lot_step: float) -> Decimal:
     return Decimal(steps) * Decimal(str(lot_step))
 
 
-def _lots_to_quantity(steps: int, lot_step: float | int, fractional: bool) -> int | float:
+def _lots_to_quantity(steps: int, lot_step: float, fractional: bool) -> int | float:
     dec_qty = _lots_to_quantity_decimal(steps, lot_step)
     if not fractional:
         return int(dec_qty)
@@ -2089,12 +2336,15 @@ def calculate_position_plan(
         eff_max_leverage = None
 
     # Cash-equity margin/leverage guard: forbid implicit margin_rate < 1.0 or max_leverage > 1.0
-    if spec["asset_class"] in {"us_stock_or_etf", "a_share"}:
-        if (eff_margin < 1.0 or (eff_max_leverage is not None and eff_max_leverage > 1.0)) and not allow_equity_margin:
-            raise ValueError(
-                "equity_margin_forbidden: 现金股票严禁隐式使用 margin_rate < 1.0 或 max_leverage > 1.0，"
-                "若确需融资请显式传 allow_equity_margin=True / --allow-equity-margin"
-            )
+    if (
+        spec["asset_class"] in {"us_stock_or_etf", "a_share"}
+        and (eff_margin < 1.0 or (eff_max_leverage is not None and eff_max_leverage > 1.0))
+        and not allow_equity_margin
+    ):
+        raise ValueError(
+            "equity_margin_forbidden: 现金股票严禁隐式使用 margin_rate < 1.0 或 max_leverage > 1.0，"
+            "若确需融资请显式传 allow_equity_margin=True / --allow-equity-margin"
+        )
 
     min_order_qty = spec["min_order_qty"]
     lot_step = spec["lot_step"]
@@ -2104,61 +2354,90 @@ def calculate_position_plan(
     margin_budget_amount = equity * (eff_max_margin_pct / 100.0)
     leverage_budget_amount = (equity * eff_max_leverage) if eff_max_leverage is not None else None
 
-    stop_distance_30m = abs(entry - stop_30m)
-    stop_distance_30m_pct = (stop_distance_30m / entry) * 100.0
-    risk_per_unit_account = stop_distance_30m * eff_mult * fx_rate
-    notional_per_unit_account = entry * eff_mult * fx_rate
-    margin_per_unit_account = notional_per_unit_account * eff_margin
-    single_lot_risk_amount = risk_per_unit_account * float(min_order_qty)
-
-    # Joint sizing caps: risk budget, margin/cash cap, and leverage cap
-    max_qty_by_risk = risk_budget_amount / risk_per_unit_account
-    max_qty_by_margin = margin_budget_amount / margin_per_unit_account
-    max_qty_by_leverage = (
-        (leverage_budget_amount / notional_per_unit_account)
-        if leverage_budget_amount is not None
-        else None
+    # Enforce 6-decimal ledger persistence precision up front so sizing, R:R, and gate agree bit-for-bit with serialized output.
+    entry_r = round(entry, 6)
+    stop_30m_r = round(stop_30m, 6)
+    stop_precision_collapsed = not (
+        entry_r > 0
+        and stop_30m_r > 0
+        and ((norm_dir == "long" and entry_r > stop_30m_r) or (norm_dir == "short" and entry_r < stop_30m_r))
     )
-
-    cap_candidates = [max_qty_by_risk, max_qty_by_margin]
-    if max_qty_by_leverage is not None:
-        cap_candidates.append(max_qty_by_leverage)
-    effective_raw_qty = min(cap_candidates)
 
     # Quantize down to exact valid order quantity: 0 or (min_order_qty + k * lot_step)
     dec_min = Decimal(str(min_order_qty))
     dec_step = Decimal(str(lot_step))
     min_steps = int((dec_min / dec_step).to_integral_value())
 
-    if effective_raw_qty + 1e-12 < float(min_order_qty):
+    notional_per_unit_account = entry_r * eff_mult * fx_rate
+    margin_per_unit_account = notional_per_unit_account * eff_margin
+
+    entry_dec = Decimal(str(entry_r))
+    stop_30m_dec = Decimal(str(stop_30m_r))
+    stop_dist_30m_dec = Decimal(0) if stop_precision_collapsed else abs(entry_dec - stop_30m_dec)
+
+    if stop_precision_collapsed:
+        stop_distance_30m = 0.0
+        stop_distance_30m_pct = 0.0
+        risk_per_unit_account = 0.0
+        single_lot_risk_amount = 0.0
+        max_qty_by_risk = 0.0
+        max_qty_by_margin = (margin_budget_amount / margin_per_unit_account) if margin_per_unit_account > 0 else 0.0
+        max_qty_by_leverage = (
+            ((leverage_budget_amount / notional_per_unit_account) if notional_per_unit_account > 0 else 0.0)
+            if leverage_budget_amount is not None
+            else None
+        )
         total_steps = 0
     else:
-        k_steps = int(math.floor(((effective_raw_qty - float(min_order_qty)) / float(lot_step)) + 1e-12))
-        total_steps = (min_steps + k_steps) if k_steps >= 0 else 0
+        stop_distance_30m = float(stop_dist_30m_dec)
+        stop_distance_30m_pct = float((stop_dist_30m_dec / entry_dec) * Decimal(100))
+        risk_per_unit_account = stop_distance_30m * eff_mult * fx_rate
+        single_lot_risk_amount = risk_per_unit_account * float(min_order_qty)
 
-    def _steps_exceed_any_cap(steps_val: int) -> bool:
-        if steps_val <= 0:
-            return False
-        q = float(_lots_to_quantity(steps_val, lot_step, fractional))
-        if q * risk_per_unit_account > risk_budget_amount * (1.0 + 1e-9):
-            return True
-        if q * margin_per_unit_account > margin_budget_amount * (1.0 + 1e-9):
-            return True
-        if leverage_budget_amount is not None and q * notional_per_unit_account > leverage_budget_amount * (1.0 + 1e-9):
-            return True
-        return False
+        # Joint sizing caps: risk budget, margin/cash cap, and leverage cap
+        max_qty_by_risk = risk_budget_amount / risk_per_unit_account
+        max_qty_by_margin = margin_budget_amount / margin_per_unit_account
+        max_qty_by_leverage = (
+            (leverage_budget_amount / notional_per_unit_account)
+            if leverage_budget_amount is not None
+            else None
+        )
 
-    while total_steps > 0 and _steps_exceed_any_cap(total_steps):
-        total_steps -= 1
-        if total_steps < min_steps:
+        cap_candidates = [max_qty_by_risk, max_qty_by_margin]
+        if max_qty_by_leverage is not None:
+            cap_candidates.append(max_qty_by_leverage)
+        effective_raw_qty = min(cap_candidates)
+
+        if effective_raw_qty + 1e-12 < float(min_order_qty):
             total_steps = 0
+        else:
+            k_steps = math.floor(((effective_raw_qty - float(min_order_qty)) / float(lot_step)) + 1e-12)
+            total_steps = (min_steps + k_steps) if k_steps >= 0 else 0
+
+        def _steps_exceed_any_cap(steps_val: int) -> bool:
+            if steps_val <= 0:
+                return False
+            q = float(_lots_to_quantity(steps_val, lot_step, fractional))
+            if q * risk_per_unit_account > risk_budget_amount * (1.0 + 1e-9):
+                return True
+            if q * margin_per_unit_account > margin_budget_amount * (1.0 + 1e-9):
+                return True
+            return bool(
+                leverage_budget_amount is not None
+                and q * notional_per_unit_account > leverage_budget_amount * (1.0 + 1e-9)
+            )
+
+        while total_steps > 0 and _steps_exceed_any_cap(total_steps):
+            total_steps -= 1
+            if total_steps < min_steps:
+                total_steps = 0
 
     total_qty_dec = _lots_to_quantity_decimal(total_steps, lot_step)
     total_quantity = _lots_to_quantity(total_steps, lot_step, fractional)
     total_quantity_str = _decimal_to_plain_str(total_qty_dec)
-    actual_risk_amount = float(total_qty_dec) * risk_per_unit_account
+    actual_risk_amount = 0.0 if stop_precision_collapsed else (float(total_qty_dec) * risk_per_unit_account)
     actual_risk_pct = (actual_risk_amount / equity) * 100.0
-    notional_value_quote = float(total_qty_dec) * entry * eff_mult
+    notional_value_quote = 0.0 if stop_precision_collapsed else (float(total_qty_dec) * entry_r * eff_mult)
     notional_value_account = notional_value_quote * fx_rate
     estimated_margin_account = notional_value_account * eff_margin
     margin_pct_of_equity = (estimated_margin_account / equity) * 100.0
@@ -2169,8 +2448,14 @@ def calculate_position_plan(
     )
 
     warnings: list[str] = []
-    oversized_single_lot = total_steps == 0
-    if oversized_single_lot:
+    oversized_single_lot = (total_steps == 0) and (not stop_precision_collapsed)
+    if stop_precision_collapsed:
+        sizing_binding_constraint = "stop_precision_collapsed"
+        warnings.append(
+            f"入场价 ({entry_r}) 与 30min 战术止损价 ({stop_30m_r}) 在 6 位记账精度下重合或无严格保护空间，"
+            "可执行数量归零并禁止开仓。"
+        )
+    elif oversized_single_lot:
         sizing_binding_constraint = "oversized_single_lot"
         if max_qty_by_risk + 1e-12 < float(min_order_qty):
             warnings.append(
@@ -2201,21 +2486,74 @@ def calculate_position_plan(
             f"预计保证金/资金占用达账户权益 {margin_pct_of_equity:.1f}%，注意流动性与组合保证金压力。"
         )
 
+    stop_daily_out: float | None = None
+    if stop_daily is not None:
+        sd_r = round(stop_daily, 6)
+        if sd_r > 0 and ((norm_dir == "long" and sd_r < entry_r) or (norm_dir == "short" and sd_r > entry_r)):
+            stop_daily_out = sd_r
+        else:
+            warnings.append(
+                f"日线结构止损 ({sd_r}) 与入场价 ({entry_r}) 在 6 位记账精度下无严格保护空间，已省略该日线止损输出。"
+            )
+
     rr_ratio: float | None = None
+    rr_ratio_raw: float | None = None
     expected_move_pct: float | None = None
     carry_adjusted_rr_ratio: float | None = None
+    carry_adjusted_rr_ratio_raw: float | None = None
+    target_out: float | None = None
     if target is not None:
-        reward_distance = abs(target - entry)
-        rr_ratio = round(reward_distance / stop_distance_30m, 4)
-        expected_move_pct = round((reward_distance / entry) * 100.0, 4)
-        if carry_hor is not None and stop_distance_30m_pct > 0:
-            carry_adjusted_rr_ratio = round((expected_move_pct + carry_hor) / stop_distance_30m_pct, 4)
+        target_r = round(target, 6)
+        target_precision_ok = (
+            target_r > 0
+            and entry_r > 0
+            and (
+                (norm_dir == "long" and target_r > entry_r)
+                or (norm_dir == "short" and target_r < entry_r)
+            )
+        )
+        if target_precision_ok:
+            target_out = target_r
+            entry_frac = Fraction(str(entry_r))
+            stop_dist_frac = Fraction(0) if stop_precision_collapsed else abs(entry_frac - Fraction(str(stop_30m_r)))
+            reward_dist_frac = abs(Fraction(str(target_r)) - entry_frac)
+            rr_ratio_frac = (
+                (reward_dist_frac / stop_dist_frac)
+                if (not stop_precision_collapsed and stop_dist_frac > 0)
+                else Fraction(0)
+            )
+            rr_ratio_raw = _fraction_to_raw_float_preserving_bound(rr_ratio_frac)
+            rr_ratio = round(rr_ratio_raw, 4)
+            expected_move_pct_frac = (reward_dist_frac / entry_frac) * Fraction(100)
+            expected_move_pct = round(float(expected_move_pct_frac), 4)
+            if carry_hor is not None:
+                if not stop_precision_collapsed and stop_dist_frac > 0:
+                    carry_hor_frac = Fraction(str(carry_hor))
+                    carry_adj_frac = (
+                        rr_ratio_frac
+                        if carry_hor_frac == 0
+                        else rr_ratio_frac + (carry_hor_frac * entry_frac) / (stop_dist_frac * Fraction(100))
+                    )
+                    carry_adjusted_rr_ratio_raw = _fraction_to_raw_float_preserving_bound(carry_adj_frac)
+                else:
+                    carry_adjusted_rr_ratio_raw = 0.0
+                carry_adjusted_rr_ratio = round(carry_adjusted_rr_ratio_raw, 4)
+        else:
+            warnings.append(
+                f"目标价 ({target_r}) 在 6 位记账精度下 <= 0 或未位于入场价 ({entry_r}) 盈利侧，已省略无效目标价并将盈亏比归零。"
+            )
+            rr_ratio = 0.0
+            rr_ratio_raw = 0.0
+            expected_move_pct = 0.0
+            if carry_hor is not None:
+                carry_adjusted_rr_ratio = 0.0
+                carry_adjusted_rr_ratio_raw = 0.0
 
     daily_structural_risk_amount: float | None = None
     daily_vs_30m_risk_ratio: float | None = None
     noise_risk_saved_amount: float | None = None
-    if stop_daily is not None:
-        stop_distance_daily = abs(entry - stop_daily)
+    if stop_daily_out is not None and not stop_precision_collapsed and stop_distance_30m > 0:
+        stop_distance_daily = abs(entry_r - stop_daily_out)
         daily_structural_risk_amount = round(float(total_quantity) * stop_distance_daily * eff_mult * fx_rate, 2)
         daily_vs_30m_risk_ratio = round(stop_distance_daily / stop_distance_30m, 4)
         noise_risk_saved_amount = round(max(0.0, daily_structural_risk_amount - actual_risk_amount), 2)
@@ -2223,7 +2561,7 @@ def calculate_position_plan(
             warnings.append("日线结构止损距窄于 30min 战术止损距，请核对两级缠论止损锚点是否正确。")
 
     stop_vs_atr30m: float | None = None
-    if atr_30m is not None:
+    if atr_30m is not None and not stop_precision_collapsed:
         stop_vs_atr30m = round(stop_distance_30m / atr_30m, 4)
         if stop_vs_atr30m < 0.5:
             warnings.append(f"30min 止损距仅 {stop_vs_atr30m:.2f}x ATR(30m)，过窄易被盘中噪点扫损。")
@@ -2231,12 +2569,12 @@ def calculate_position_plan(
             warnings.append(f"30min 止损距达 {stop_vs_atr30m:.2f}x ATR(30m)，偏宽，可等待回踩更优 30min 分型。")
 
     stop_vs_atr_daily: float | None = None
-    if atr_d is not None:
+    if atr_d is not None and not stop_precision_collapsed:
         stop_vs_atr_daily = round(stop_distance_30m / atr_d, 4)
 
     tranche_steps = _split_steps_across_tranches(total_steps, min_steps, weights)
     tranches: list[dict[str, Any]] = []
-    tranche_qty_dec_sum = Decimal("0")
+    tranche_qty_dec_sum = Decimal(0)
     for idx, (w, t_steps) in enumerate(zip(weights, tranche_steps, strict=True), start=1):
         t_qty_dec = _lots_to_quantity_decimal(t_steps, lot_step)
         tranche_qty_dec_sum += t_qty_dec
@@ -2254,7 +2592,7 @@ def calculate_position_plan(
                 "quantity": t_qty,
                 "quantity_str": _decimal_to_plain_str(t_qty_dec),
                 "risk_amount": round(float(t_qty_dec) * risk_per_unit_account, 2),
-                "notional_account": round(float(t_qty_dec) * entry * eff_mult * fx_rate, 2),
+                "notional_account": round(float(t_qty_dec) * entry_r * eff_mult * fx_rate, 2),
                 "rule": rule,
             }
         )
@@ -2262,8 +2600,259 @@ def calculate_position_plan(
     tranche_qty_sum_exact = (
         tranche_steps_sum == total_steps
         and tranche_qty_dec_sum == total_qty_dec
-        and sum((Decimal(str(t["quantity"])) for t in tranches), Decimal("0")) == Decimal(str(total_quantity))
+        and sum((Decimal(str(t["quantity"])) for t in tranches), Decimal(0)) == Decimal(str(total_quantity))
     )
+
+    # 3-Stage Offensive Campaign Blueprint (1R Pilot -> +1.0R BE / +1.5R Zero-Principal-Risk Pyramid -> +2.0R Main-Wave Handover)
+    offensive_campaign: dict[str, Any] | None = None
+    if entry > 0 and abs(entry - stop_30m) > 0:
+        unit_1r_dist = stop_distance_30m
+        sign = 1.0 if norm_dir == "long" else -1.0
+        if not stop_precision_collapsed and unit_1r_dist > 0:
+            raw_be_price = entry_r + sign * 1.0 * unit_1r_dist
+            raw_pyr_price = entry_r + sign * 1.5 * unit_1r_dist
+            raw_mw_price = entry_r + sign * 2.0 * unit_1r_dist
+
+            breakeven_trigger_price = round(raw_be_price, 6) if raw_be_price > 0 else None
+            pyramid_trigger_price = round(raw_pyr_price, 6) if raw_pyr_price > 0 else None
+            main_wave_trigger_price = round(raw_mw_price, 6) if raw_mw_price > 0 else None
+        else:
+            breakeven_trigger_price = None
+            pyramid_trigger_price = None
+            main_wave_trigger_price = None
+
+        split_pilot_qty: int | float = tranches[0]["quantity"] if tranches else (0.0 if fractional else 0)
+
+        add_steps = 0
+        prior_cushion = 0.0
+        giveback_cap = 0.0
+        added_leg_giveback_amount = 0.0
+
+        if not stop_precision_collapsed and total_steps > 0 and pyramid_trigger_price is not None and pyramid_trigger_price > 0:
+            pilot_qty = float(total_qty_dec)
+            add_price = float(pyramid_trigger_price)
+            prior_cushion = abs(add_price - entry_r) * pilot_qty * eff_mult * fx_rate
+            giveback_cap = round(prior_cushion * 0.65, 2)
+
+            if abs(add_price - entry_r) > 0:
+                if prior_cushion > giveback_cap + 1e-12:
+                    max_add_by_giveback = (pilot_qty * giveback_cap) / (prior_cushion - giveback_cap)
+                else:
+                    max_add_by_giveback = float("inf")
+
+                add_unit_notional = add_price * eff_mult * fx_rate
+                add_unit_margin = add_unit_notional * eff_margin
+                max_add_margin_mark = (margin_budget_amount / add_unit_margin) - pilot_qty
+                max_add_margin_cost = (
+                    margin_budget_amount - pilot_qty * entry_r * eff_mult * fx_rate * eff_margin
+                ) / add_unit_margin
+                max_add_by_margin = max(0.0, min(max_add_margin_mark, max_add_margin_cost))
+
+                add_cap_candidates = [max_add_by_giveback, max_add_by_margin]
+                if leverage_budget_amount is not None:
+                    max_add_lev_mark = (leverage_budget_amount / add_unit_notional) - pilot_qty
+                    max_add_lev_cost = (
+                        leverage_budget_amount - pilot_qty * entry_r * eff_mult * fx_rate
+                    ) / add_unit_notional
+                    add_cap_candidates.append(max(0.0, min(max_add_lev_mark, max_add_lev_cost)))
+
+                raw_max_add = min(add_cap_candidates)
+                if raw_max_add + 1e-12 < float(min_order_qty):
+                    add_steps = 0
+                else:
+                    k_add = math.floor(((raw_max_add - float(min_order_qty)) / float(lot_step)) + 1e-12)
+                    add_steps = (min_steps + k_add) if k_add >= 0 else 0
+
+                def _add_steps_exceed_any_cap(steps_val: int) -> bool:
+                    if steps_val <= 0:
+                        return False
+                    q_cand = float(_lots_to_quantity_decimal(steps_val, lot_step))
+                    new_avg_cand = (entry_r * pilot_qty + add_price * q_cand) / (pilot_qty + q_cand)
+                    giveback_cand = abs(add_price - new_avg_cand) * q_cand * eff_mult * fx_rate
+                    if giveback_cand > giveback_cap + 1e-6:
+                        return True
+                    notional_mark = (pilot_qty + q_cand) * add_price * eff_mult * fx_rate
+                    notional_cost = (pilot_qty * entry_r + q_cand * add_price) * eff_mult * fx_rate
+                    binding_notional = max(notional_mark, notional_cost)
+                    if binding_notional * eff_margin > margin_budget_amount * (1.0 + 1e-9):
+                        return True
+                    return bool(
+                        leverage_budget_amount is not None and binding_notional > leverage_budget_amount * (1.0 + 1e-9)
+                    )
+
+                while add_steps > 0 and _add_steps_exceed_any_cap(add_steps):
+                    add_steps -= 1
+                    if add_steps < min_steps:
+                        add_steps = 0
+
+        max_zero_risk_add_qty = _lots_to_quantity(add_steps, lot_step, fractional)
+        post_add_total_qty = _lots_to_quantity(total_steps + add_steps, lot_step, fractional)
+        stage3_qty_f = float(_lots_to_quantity_decimal(total_steps + add_steps, lot_step))
+        if add_steps > 0 and pyramid_trigger_price is not None:
+            pilot_qty_f = float(total_qty_dec)
+            q_add_f = float(_lots_to_quantity_decimal(add_steps, lot_step))
+            exact_blended_cost = (entry_r * pilot_qty_f + float(pyramid_trigger_price) * q_add_f) / (pilot_qty_f + q_add_f)
+            if norm_dir == "long":
+                post_add_breakeven_stop = math.ceil((exact_blended_cost - 1e-12) * 1_000_000.0) / 1_000_000.0
+            else:
+                post_add_breakeven_stop = math.floor((exact_blended_cost + 1e-12) * 1_000_000.0) / 1_000_000.0
+            added_leg_giveback_amount = round(
+                abs(float(pyramid_trigger_price) - post_add_breakeven_stop) * q_add_f * eff_mult * fx_rate,
+                2,
+            )
+        else:
+            exact_blended_cost = entry_r
+            post_add_breakeven_stop = entry_r
+            added_leg_giveback_amount = 0.0
+
+        stage3_breakeven_floor = post_add_breakeven_stop if add_steps > 0 else entry_r
+        main_wave_actionable = False
+        initial_main_wave_stop: float | None = None
+        if not stop_precision_collapsed and main_wave_trigger_price is not None and main_wave_trigger_price > 0 and stage3_qty_f > 0:
+            if stop_daily_out is not None and stop_daily_out > 0:
+                cand_mw_stop = (
+                    round(max(stop_daily_out, stage3_breakeven_floor), 6)
+                    if norm_dir == "long"
+                    else round(min(stop_daily_out, stage3_breakeven_floor), 6)
+                )
+            else:
+                cand_mw_stop = round(stage3_breakeven_floor, 6)
+
+            def _has_mw_room(stop_val: float) -> bool:
+                return (
+                    (norm_dir == "long" and stop_val < float(main_wave_trigger_price) - 1e-9)
+                    or (norm_dir == "short" and stop_val > float(main_wave_trigger_price) + 1e-9)
+                )
+
+            if not _has_mw_room(cand_mw_stop):
+                cand_mw_stop = round(stage3_breakeven_floor, 6)
+            if _has_mw_room(cand_mw_stop) and cand_mw_stop > 0:
+                initial_main_wave_stop = cand_mw_stop
+                main_wave_actionable = True
+
+        stage2_risk_dist = (
+            max(0.0, exact_blended_cost - post_add_breakeven_stop)
+            if norm_dir == "long"
+            else max(0.0, post_add_breakeven_stop - exact_blended_cost)
+        )
+        stage2_principal_risk_amount = round(stage2_risk_dist * stage3_qty_f * eff_mult * fx_rate, 2)
+        if stage2_principal_risk_amount == 0:
+            stage2_principal_risk_amount = 0.0
+
+        if main_wave_actionable and initial_main_wave_stop is not None:
+            stage3_risk_dist = (
+                max(0.0, exact_blended_cost - initial_main_wave_stop)
+                if norm_dir == "long"
+                else max(0.0, initial_main_wave_stop - exact_blended_cost)
+            )
+            stage3_principal_risk_amount = round(stage3_risk_dist * stage3_qty_f * eff_mult * fx_rate, 2)
+            if stage3_principal_risk_amount == 0:
+                stage3_principal_risk_amount = 0.0
+            stage3_trigger_price: float | None = main_wave_trigger_price
+            stage3_recommended_qty: int | float = post_add_total_qty
+            stage3_rule_summary = (
+                f"浮盈达 +2.0R ({main_wave_trigger_price}) 脱离成本区且日线结构与 L3 领先指标稳固时，"
+                f"切换 active_stop_regime='daily_structure'，以保本侧日线防线 {initial_main_wave_stop} 骑乘主升浪、过滤 30min 回踩噪音"
+            )
+        else:
+            stage3_principal_risk_amount = 0.0
+            stage3_trigger_price = None
+            stage3_recommended_qty = 0
+            stage3_rule_summary = (
+                "当前止损距/价格结构下 +2.0R 主升移交触发位不可达或与保本防线之间无严格保护空间，暂不生成可执行主升移交阶段"
+            )
+
+        pilot_entry_r = entry_r
+        pilot_stop_r = stop_30m_r
+        pilot_has_room = not stop_precision_collapsed
+        pilot_actionable = bool(total_steps > 0 and pilot_has_room)
+
+        if not pilot_actionable:
+            main_wave_actionable = False
+            initial_main_wave_stop = None
+            max_zero_risk_add_qty = 0
+            post_add_total_qty = 0
+            stage2_principal_risk_amount = 0.0
+            stage3_principal_risk_amount = 0.0
+            stage3_trigger_price = None
+            stage3_recommended_qty = 0
+            stage3_rule_summary = (
+                "当前入场价与 30min 战术止损价在 6 位记账精度下无严格保护空间，不可执行主升移交阶段"
+            )
+
+        stage1_recommended_qty: int | float = total_quantity if pilot_actionable else 0
+        stage1_risk_amount = round(actual_risk_amount, 2) if pilot_actionable else 0.0
+        stage1_rule_summary = (
+            (
+                f"30min 缠论买卖点确认入场（满额 1R 首仓 {total_quantity}，保守分批首笔 {split_pilot_qty}），"
+                f"刚性战术止损 {pilot_stop_r}，严禁浮亏摊平"
+            )
+            if pilot_actionable
+            else f"当前入场价 ({pilot_entry_r}) 与 30min 止损价 ({pilot_stop_r}) 在 6 位记账精度下无有效保护空间或可下单数为 0，不可开仓"
+        )
+        stage2_actionable = bool(pilot_actionable and add_steps > 0 and pyramid_trigger_price is not None)
+
+        stages = [
+            {
+                "stage": "pilot",
+                "actionable": pilot_actionable,
+                "title": "第1阶段 · 30min 精确首仓试探 (1R Pilot)",
+                "trigger_r": 0.0,
+                "trigger_price": pilot_entry_r,
+                "recommended_qty": stage1_recommended_qty,
+                "stop_price": pilot_stop_r,
+                "principal_risk_amount": stage1_risk_amount,
+                "rule_summary": stage1_rule_summary,
+            },
+            {
+                "stage": "breakeven_pyramid",
+                "actionable": stage2_actionable,
+                "title": "第2阶段 · 保本锁死与零本金风险推仓 (+1.0R 保本 / +1.5R 推仓)",
+                "trigger_r": 1.5,
+                "trigger_price": pyramid_trigger_price if stage2_actionable else None,
+                "recommended_qty": max_zero_risk_add_qty if stage2_actionable else 0,
+                "stop_price": post_add_breakeven_stop if stage2_actionable else None,
+                "principal_risk_amount": stage2_principal_risk_amount,
+                "rule_summary": (
+                    f"浮盈达 +1.0R ({breakeven_trigger_price}) 先移止损至成本 {pilot_entry_r} 锁死零本金风险；"
+                    f"浮盈达 +1.5R ({pyramid_trigger_price}) 且 30min 结构确认时，最多零本金风险顺势加仓 "
+                    f"{max_zero_risk_add_qty} 并同步提止损至综合均价 {post_add_breakeven_stop}"
+                    if stage2_actionable
+                    else "当前仓位/止损精度条件下无可执行零本金风险推仓阶段"
+                ),
+            },
+            {
+                "stage": "main_wave_handover",
+                "actionable": main_wave_actionable,
+                "title": "第3阶段 · 日线中枢主升防线移交 (+2.0R 防洗盘持有)",
+                "trigger_r": 2.0,
+                "trigger_price": stage3_trigger_price,
+                "recommended_qty": stage3_recommended_qty,
+                "stop_price": initial_main_wave_stop,
+                "principal_risk_amount": stage3_principal_risk_amount,
+                "rule_summary": stage3_rule_summary,
+            },
+        ]
+
+        offensive_campaign = {
+            "campaign_1r_amount": round(risk_budget_amount, 2),
+            "unit_1r_price_distance": round(unit_1r_dist, 6),
+            "full_pilot_qty": total_quantity,
+            "full_pilot_risk_amount": round(actual_risk_amount, 2),
+            "split_pilot_qty": split_pilot_qty,
+            "breakeven_trigger_price": breakeven_trigger_price,
+            "pyramid_trigger_price": pyramid_trigger_price,
+            "main_wave_trigger_price": main_wave_trigger_price,
+            "prior_profit_cushion_at_pyramid": round(prior_cushion, 2),
+            "added_giveback_cap_amount": round(giveback_cap, 2),
+            "added_leg_giveback_amount": added_leg_giveback_amount,
+            "new_open_risk": stage2_principal_risk_amount,
+            "max_zero_risk_add_qty": max_zero_risk_add_qty,
+            "post_add_total_qty": post_add_total_qty,
+            "post_add_breakeven_stop": post_add_breakeven_stop,
+            "initial_main_wave_stop": initial_main_wave_stop,
+            "stages": stages,
+        }
 
     return {
         "symbol": spec["symbol"],
@@ -2276,10 +2865,10 @@ def calculate_position_plan(
             "effective_multiplier": eff_mult,
             "effective_margin_rate": eff_margin,
         },
-        "entry_price": round(entry, 6),
-        "tactical_stop_30m": round(stop_30m, 6),
-        "structural_stop_daily": round(stop_daily, 6) if stop_daily is not None else None,
-        "target_price": round(target, 6) if target is not None else None,
+        "entry_price": entry_r,
+        "tactical_stop_30m": stop_30m_r,
+        "structural_stop_daily": stop_daily_out,
+        "target_price": target_out,
         "stop_distance_30m": round(stop_distance_30m, 6),
         "stop_distance_30m_pct": round(stop_distance_30m_pct, 4),
         "account_equity": round(equity, 2),
@@ -2312,7 +2901,9 @@ def calculate_position_plan(
         "estimated_margin_account": round(estimated_margin_account, 2),
         "margin_pct_of_equity": round(margin_pct_of_equity, 4),
         "rr_ratio": rr_ratio,
+        "rr_ratio_raw": rr_ratio_raw,
         "carry_adjusted_rr_ratio": carry_adjusted_rr_ratio,
+        "carry_adjusted_rr_ratio_raw": carry_adjusted_rr_ratio_raw,
         "expected_move_pct": expected_move_pct,
         "daily_structural_risk_amount": daily_structural_risk_amount,
         "daily_vs_30m_risk_ratio": daily_vs_30m_risk_ratio,
@@ -2320,6 +2911,7 @@ def calculate_position_plan(
         "stop_vs_atr30m": stop_vs_atr30m,
         "stop_vs_atr_daily": stop_vs_atr_daily,
         "tranches": tranches,
+        "offensive_campaign": offensive_campaign,
         "warnings": warnings,
     }
 
@@ -2363,10 +2955,10 @@ def _parse_bar_timestamp(val: Any) -> tuple[datetime | None, date | None, bool]:
         return None, None, False
     if isinstance(val, datetime):
         if val.tzinfo is not None:
-            return val.astimezone(timezone.utc), val.date(), True
-        return val.replace(tzinfo=timezone.utc), val.date(), True
+            return val.astimezone(UTC), val.date(), True
+        return val.replace(tzinfo=UTC), val.date(), True
     if isinstance(val, date):
-        return datetime(val.year, val.month, val.day, tzinfo=timezone.utc), val, False
+        return datetime(val.year, val.month, val.day, tzinfo=UTC), val, False
 
     s = str(val).strip()
     if not s or s.lower() in {"none", "null", "nan", "nat", "n/a", "na"}:
@@ -2376,7 +2968,7 @@ def _parse_bar_timestamp(val: Any) -> tuple[datetime | None, date | None, bool]:
     if m_date:
         try:
             d = date(int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)))
-            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc), d, False
+            return datetime(d.year, d.month, d.day, tzinfo=UTC), d, False
         except ValueError:
             return None, None, False
 
@@ -2384,7 +2976,7 @@ def _parse_bar_timestamp(val: Any) -> tuple[datetime | None, date | None, bool]:
     if m_date8:
         try:
             d = date(int(m_date8.group(1)), int(m_date8.group(2)), int(m_date8.group(3)))
-            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc), d, False
+            return datetime(d.year, d.month, d.day, tzinfo=UTC), d, False
         except ValueError:
             return None, None, False
 
@@ -2404,8 +2996,8 @@ def _parse_bar_timestamp(val: Any) -> tuple[datetime | None, date | None, bool]:
     try:
         dt = datetime.fromisoformat(s_norm)
         if dt.tzinfo is not None:
-            return dt.astimezone(timezone.utc), dt.date(), True
-        return dt.replace(tzinfo=timezone.utc), dt.date(), True
+            return dt.astimezone(UTC), dt.date(), True
+        return dt.replace(tzinfo=UTC), dt.date(), True
     except ValueError:
         return None, None, False
 
@@ -2448,12 +3040,9 @@ def _is_market_in_regular_session(eff_now_utc: datetime, asset_class: str | None
         sh = eff_now_utc.astimezone(ZoneInfo("Asia/Shanghai"))
         wd = sh.weekday()  # Mon=0 .. Sun=6
         hm = (sh.hour, sh.minute)
-        if wd <= 4:
-            if ((9, 0) <= hm < (11, 30)) or ((13, 30) <= hm < (15, 0)) or (hm >= (21, 0)):
-                return True
-        if 1 <= wd <= 5 and hm < (2, 30):
+        if wd <= 4 and (((9, 0) <= hm < (11, 30)) or ((13, 30) <= hm < (15, 0)) or (hm >= (21, 0))):
             return True
-        return False
+        return bool(1 <= wd <= 5 and hm < (2, 30))
     if norm_ac in {"commodity", "fx"}:
         ny = eff_now_utc.astimezone(ZoneInfo("America/New_York"))
         wd = ny.weekday()
@@ -2482,11 +3071,11 @@ def _check_live_upstream_health(
     rate_diff_bad = False
 
     if now_utc is None:
-        eff_now = datetime.now(timezone.utc)
+        eff_now = datetime.now(UTC)
     elif now_utc.tzinfo is not None:
-        eff_now = now_utc.astimezone(timezone.utc)
+        eff_now = now_utc.astimezone(UTC)
     else:
-        eff_now = now_utc.replace(tzinfo=timezone.utc)
+        eff_now = now_utc.replace(tzinfo=UTC)
 
     norm_ac = str(asset_class or "").strip().lower()
     max_stale_days = 1.0 if norm_ac == "crypto" else 4.0
@@ -2649,11 +3238,11 @@ def _parse_tranches_arg(raw: str) -> tuple[float, ...]:
     return tuple(float(p) for p in parts)
 
 
-def _load_archive_direction_bias(
+def _load_archive_state(
     symbol: str,
     research_root: str | None = None,
-) -> str | None:
-    """Load direction_bias from the symbol's Layer-3 research archive state.json if present."""
+) -> dict[str, Any] | None:
+    """Load Layer-3 research archive state.json dict if present."""
     try:
         from research_archive import load_archive
 
@@ -2661,6 +3250,15 @@ def _load_archive_direction_bias(
     except (FileNotFoundError, ValueError, OSError):
         return None
     state = loaded.get("state") if isinstance(loaded, dict) else None
+    return state if isinstance(state, dict) else None
+
+
+def _load_archive_direction_bias(
+    symbol: str,
+    research_root: str | None = None,
+) -> str | None:
+    """Load direction_bias from the symbol's Layer-3 research archive state.json if present."""
+    state = _load_archive_state(symbol, research_root=research_root)
     if not isinstance(state, dict):
         return None
     raw_dir = state.get("direction_bias")
@@ -2941,13 +3539,35 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
             term_structure["structure"] = args.curve_structure
         if args.roll_yield is not None:
             term_structure["annualized_roll_yield_curve_pct"] = args.roll_yield
+            term_structure["annualized_roll_yield_curve_pct_raw"] = args.roll_yield
+            term_structure.pop("annualized_roll_yield_curve_pct_exact", None)
+            term_structure["quote_dates_aligned"] = True
+            if str(term_structure.get("structure") or "").strip().lower() == "unaligned_dates":
+                term_structure.pop("structure", None)
         if args.near_roll_yield is not None:
             term_structure["annualized_roll_yield_near_pct"] = args.near_roll_yield
+            term_structure["annualized_roll_yield_near_pct_raw"] = args.near_roll_yield
+            term_structure.pop("annualized_roll_yield_near_pct_exact", None)
 
     if args.rate_diff_pct is not None:
         rate_diff = dict(rate_diff or {})
         rate_diff.pop("status", None)
+        for override_k in (
+            "policy_rate_diff_pct_raw",
+            "policy_rate_diff_pct",
+            "base_minus_quote_2y_pct_raw",
+            "base_minus_quote_2y_pct",
+            "us_minus_cn_2y_pct_raw",
+            "us_minus_cn_2y_pct",
+            "base_minus_quote_10y_pct_raw",
+            "us_minus_cn_10y_pct_raw",
+            "us_minus_cn_10y_pct",
+            "rate_diff_pct_raw",
+            "rate_diff_pct",
+        ):
+            rate_diff.pop(override_k, None)
         rate_diff["base_minus_quote_10y_pct"] = args.rate_diff_pct
+        rate_diff["base_minus_quote_10y_pct_raw"] = args.rate_diff_pct
 
     if args.funding_ann_pct is not None:
         crypto_funding = {"funding_annualized_pct": args.funding_ann_pct}
@@ -2981,6 +3601,44 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
         max_leverage=args.max_leverage,
         allow_equity_margin=args.allow_equity_margin,
     )
+    plan_entry = plan.get("entry_price")
+    plan_stop_30m = plan.get("tactical_stop_30m")
+    plan_target = plan.get("target_price")
+    entry_frac = (
+        Fraction(str(plan_entry))
+        if (plan_entry is not None and float(plan_entry) > 0)
+        else None
+    )
+    stop_dist_frac = (
+        abs(entry_frac - Fraction(str(plan_stop_30m)))
+        if (entry_frac is not None and plan_stop_30m is not None and float(plan_stop_30m) > 0)
+        else None
+    )
+    reward_dist_frac = (
+        abs(Fraction(str(plan_target)) - entry_frac)
+        if (entry_frac is not None and plan_target is not None and float(plan_target) > 0)
+        else None
+    )
+    eff_stop_dist_pct_frac = (
+        (stop_dist_frac / entry_frac) * Fraction(100)
+        if (entry_frac is not None and stop_dist_frac is not None and stop_dist_frac > 0)
+        else None
+    )
+    eff_exp_move_pct_frac = (
+        (reward_dist_frac / entry_frac) * Fraction(100)
+        if (entry_frac is not None and reward_dist_frac is not None and reward_dist_frac > 0)
+        else None
+    )
+    eff_nominal_rr_frac = (
+        (reward_dist_frac / stop_dist_frac)
+        if (
+            reward_dist_frac is not None
+            and reward_dist_frac > 0
+            and stop_dist_frac is not None
+            and stop_dist_frac > 0
+        )
+        else None
+    )
     expression = evaluate_expression_and_carry(
         direction=args.direction,
         asset_class=plan["asset_class"],
@@ -2988,19 +3646,36 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
         rate_diff=rate_diff,
         crypto_funding=crypto_funding,
         holding_horizon_days=args.horizon_days,
-        expected_move_pct=plan.get("expected_move_pct"),
-        stop_distance_pct=plan.get("stop_distance_30m_pct"),
+        expected_move_pct=eff_exp_move_pct_frac,
+        stop_distance_pct=eff_stop_dist_pct_frac,
+        nominal_rr_ratio=eff_nominal_rr_frac,
     )
     if expression.get("carry_adjusted_rr_ratio") is not None:
         plan["carry_adjusted_rr_ratio"] = expression["carry_adjusted_rr_ratio"]
+    if expression.get("carry_adjusted_rr_ratio_raw") is not None:
+        plan["carry_adjusted_rr_ratio_raw"] = expression["carry_adjusted_rr_ratio_raw"]
     explicit_research_dir = getattr(args, "research_direction", None)
     research_root = getattr(args, "research_root", None)
+    archive_state = getattr(args, "archive_state", None)
+    if not isinstance(archive_state, dict):
+        archive_state = _load_archive_state(args.symbol, research_root=research_root)
+    explicit_eg = getattr(args, "expectation_gap", None)
+    eg_summary = _summarize_expectation_gap(
+        expectation_gap=explicit_eg if isinstance(explicit_eg, dict) else None,
+        archive_state=archive_state,
+    )
+
     if explicit_research_dir is not None and str(explicit_research_dir).strip() != "":
         resolved_research_direction: str | None = str(explicit_research_dir).strip().lower()
-    else:
-        resolved_research_direction = _load_archive_direction_bias(
-            args.symbol, research_root=research_root
+    elif isinstance(archive_state, dict) and isinstance(archive_state.get("direction_bias"), str):
+        cleaned_bias = archive_state["direction_bias"].strip().lower()
+        resolved_research_direction = (
+            (cleaned_bias if cleaned_bias in VALID_RESEARCH_DIRECTIONS else "neutral")
+            if cleaned_bias
+            else None
         )
+    else:
+        resolved_research_direction = None
 
     explicit_us_short_verified = getattr(args, "us_short_thesis_verified", None)
     if (
@@ -3017,7 +3692,7 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
         pending_verifications_count=args.pending_verifications,
         thesis_falsified=args.thesis_falsified,
         daily_alignment=daily_alignment,
-        rr_ratio=plan.get("rr_ratio"),
+        rr_ratio=plan.get("rr_ratio_raw") if plan.get("rr_ratio_raw") is not None else plan.get("rr_ratio"),
         min_rr=args.min_rr,
         hedge_only=args.hedge_only,
         is_pair_trade=args.pair_trade,
@@ -3025,23 +3700,31 @@ def build_trade_plan(args: argparse.Namespace) -> dict[str, Any]:
         within_capital_limits=plan.get("within_capital_limits", True),
         upstream_errors=upstream_errors,
         pair_leg_verified=args.pair_leg_verified,
-        carry_adjusted_rr_ratio=expression.get("carry_adjusted_rr_ratio"),
+        carry_adjusted_rr_ratio=(
+            expression.get("carry_adjusted_rr_ratio_raw")
+            if expression.get("carry_adjusted_rr_ratio_raw") is not None
+            else expression.get("carry_adjusted_rr_ratio")
+        ),
         curve_stale_or_error=bool(expression.get("curve_data_warning")),
         us_short_thesis_verified=explicit_us_short_verified,
         research_direction=resolved_research_direction,
         pair_leg_asset_class=getattr(args, "pair_leg_asset_class", None),
         pair_leg_short_thesis_verified=getattr(args, "pair_leg_short_thesis_verified", None),
+        archive_state=archive_state,
+        expectation_gap=explicit_eg if isinstance(explicit_eg, dict) else None,
     )
 
     stop_source = "live_30m_chanlun" if args.live else "manual_scenario"
     stop_timeframe = "30m" if args.live else "manual"
     plan["stop_source"] = stop_source
     plan["stop_timeframe"] = stop_timeframe
+    plan["expectation_gap_summary"] = eg_summary
 
     output: dict[str, Any] = {
         "four_quadrant_gate": gate,
         "expression_and_carry": expression,
         "position_plan": plan,
+        "expectation_gap_summary": eg_summary,
         "stop_source": stop_source,
         "stop_timeframe": stop_timeframe,
     }

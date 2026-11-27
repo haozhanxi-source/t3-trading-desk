@@ -24,6 +24,7 @@ import sys
 import threading
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
+from fractions import Fraction
 from typing import Any
 
 import numpy as np
@@ -1104,6 +1105,7 @@ def summarize_term_structure(raw_data: pd.DataFrame | list[dict[str, Any]]) -> d
                 "name": row.get("name"),
                 "month_code": month_code,
                 "_sort_month": sort_month,
+                "_raw_price": float(price),
                 "price": round(price, 4),
                 "price_basis": price_basis,
                 "settlement": _to_float(row.get("settlement")),
@@ -1118,8 +1120,10 @@ def summarize_term_structure(raw_data: pd.DataFrame | list[dict[str, Any]]) -> d
 
     contracts.sort(key=lambda c: c["_sort_month"])
     sort_months = [int(c["_sort_month"]) for c in contracts]
+    raw_prices = [float(c["_raw_price"]) for c in contracts]
     for c in contracts:
         c.pop("_sort_month", None)
+        c.pop("_raw_price", None)
 
     front = contracts[0]
     back = contracts[-1]
@@ -1132,18 +1136,34 @@ def summarize_term_structure(raw_data: pd.DataFrame | list[dict[str, Any]]) -> d
     )
 
     ann_roll_near: float | None = None
+    ann_roll_near_raw: float | None = None
+    ann_roll_near_exact: str | None = None
     ann_roll_curve: float | None = None
+    ann_roll_curve_raw: float | None = None
+    ann_roll_curve_exact: str | None = None
     if len(contracts) >= 2:
-        second = contracts[1]
+        front_raw = raw_prices[0]
+        second_raw = raw_prices[1]
+        back_raw = raw_prices[-1]
         y1, m1 = divmod(sort_months[0], 100)
         y2, m2 = divmod(sort_months[1], 100)
         yb, mb = divmod(sort_months[-1], 100)
         months_near = (y2 - y1) * 12 + (m2 - m1)
         months_far = (yb - y1) * 12 + (mb - m1)
-        if months_near > 0 and second["price"] > 0:
-            ann_roll_near = round(((front["price"] / second["price"]) - 1.0) * (12.0 / months_near) * 100.0, 3)
-        if months_far > 0 and back["price"] > 0:
-            ann_roll_curve = round(((front["price"] / back["price"]) - 1.0) * (12.0 / months_far) * 100.0, 3)
+        if months_near > 0 and second_raw > 0:
+            near_frac = (
+                (Fraction(str(front_raw)) - Fraction(str(second_raw))) / Fraction(str(second_raw))
+            ) * Fraction(1200, months_near)
+            ann_roll_near_raw = float(near_frac)
+            ann_roll_near_exact = f"{near_frac.numerator}/{near_frac.denominator}"
+            ann_roll_near = round(ann_roll_near_raw, 3)
+        if months_far > 0 and back_raw > 0:
+            curve_frac = (
+                (Fraction(str(front_raw)) - Fraction(str(back_raw))) / Fraction(str(back_raw))
+            ) * Fraction(1200, months_far)
+            ann_roll_curve_raw = float(curve_frac)
+            ann_roll_curve_exact = f"{curve_frac.numerator}/{curve_frac.denominator}"
+            ann_roll_curve = round(ann_roll_curve_raw, 3)
 
     if len(contracts) < 2:
         structure = "insufficient_contracts"
@@ -1166,7 +1186,11 @@ def summarize_term_structure(raw_data: pd.DataFrame | list[dict[str, Any]]) -> d
         "far_minus_near_spread": spread_far_minus_near,
         "far_vs_near_pct": spread_pct,
         "annualized_roll_yield_near_pct": ann_roll_near,
+        "annualized_roll_yield_near_pct_raw": ann_roll_near_raw,
+        "annualized_roll_yield_near_pct_exact": ann_roll_near_exact,
         "annualized_roll_yield_curve_pct": ann_roll_curve,
+        "annualized_roll_yield_curve_pct_raw": ann_roll_curve_raw,
+        "annualized_roll_yield_curve_pct_exact": ann_roll_curve_exact,
         "contracts": contracts,
     }
 

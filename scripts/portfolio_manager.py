@@ -44,10 +44,11 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(__file__))
-from trade_planner import (  # noqa: E402
+from trade_planner import (
     _BARE_OVERSEAS_FUTURE_RE,
     VALID_DIRECTIONS,
     _require_finite_float,
@@ -58,6 +59,7 @@ from trade_planner import (  # noqa: E402
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 DEFAULT_PORTFOLIO_DIR = os.path.join(ROOT_DIR, "portfolio")
+DEFAULT_DB_PATH = Path(DEFAULT_PORTFOLIO_DIR) / "portfolio.db"
 DEFAULT_RESEARCH_DIR = os.path.join(ROOT_DIR, "research")
 
 DEFAULT_DRAWDOWN_STEPS: list[dict[str, float]] = [
@@ -66,7 +68,80 @@ DEFAULT_DRAWDOWN_STEPS: list[dict[str, float]] = [
 ]
 
 VALID_LEADER_ROLES = {"sole_leader", "co_leader"}
-VALID_JOURNAL_ACTIONS = {"open", "add_on_profit", "trail_stop", "rotate_leader", "trim", "close", "void"}
+VALID_JOURNAL_ACTIONS = {
+    "open",
+    "add_on_profit",
+    "trail_stop",
+    "set_stop_regime",
+    "rotate_leader",
+    "trim",
+    "close",
+    "void",
+}
+VALID_LIFECYCLE_STAGES = ("pilot", "breakeven_locked", "pyramided", "main_wave")
+VALID_STOP_REGIMES = ("tactical_30m", "daily_structure")
+
+ATTRIBUTION_TAGS: dict[str, dict[str, str]] = {
+    "full_main_wave_ride": {"label": "主升浪吃满", "category": "positive"},
+    "clean_pyramid_win": {"label": "保本推仓兑现", "category": "positive"},
+    "disciplined_trailing_exit": {"label": "移动防线锁盈", "category": "positive"},
+    "thesis_target_reached": {"label": "预期兑现止盈", "category": "positive"},
+    "leader_rotation_upgrade": {"label": "龙头切换升级", "category": "positive"},
+    "normal_pilot_cost": {"label": "标准30m试仓摩擦", "category": "pilot_friction"},
+    "l1_regime_headwind": {"label": "L1宏观逆风误判", "category": "mistake"},
+    "l3_thesis_falsified": {"label": "L3逻辑/指标证伪", "category": "mistake"},
+    "l4_chased_extended": {"label": "L4追高远离中枢", "category": "mistake"},
+    "shaken_out_30m_noise": {"label": "30m噪音过早洗飞", "category": "mistake"},
+    "premature_profit_taking": {"label": "小赚即跑卖飞主升", "category": "mistake"},
+    "discipline_rule_breach": {"label": "违背纪律硬扛/乱动", "category": "mistake"},
+}
+
+VALID_OPPORTUNITY_KINDS = ("missed_entry", "shaken_out", "premature_exit")
+VALID_OPPORTUNITY_STATUSES = ("tracking", "reviewed")
+
+_UNSET: Any = object()
+
+
+class PortfolioError(ValueError):
+    """Domain validation or risk-control rejection raised by portfolio_manager."""
+
+
+def compute_conservative_notional_and_margin(
+    quantity: float,
+    avg_entry: float,
+    mark_price: float,
+    multiplier: float,
+    fx_rate: float,
+    margin_rate: float,
+) -> dict[str, float]:
+    """Compute conservative notional and margin using max(cost_notional, mark_notional)."""
+    qty_f = float(quantity)
+    mult_f = float(multiplier)
+    fx_f = float(fx_rate)
+    mrate_f = float(margin_rate)
+    cost_notional = round(qty_f * float(avg_entry) * mult_f * fx_f, 2)
+    mark_notional = round(qty_f * float(mark_price) * mult_f * fx_f, 2)
+    conservative_notional = round(max(cost_notional, mark_notional), 2)
+    conservative_margin = round(conservative_notional * mrate_f, 2)
+    return {
+        "cost_notional": cost_notional,
+        "mark_notional": mark_notional,
+        "conservative_notional": conservative_notional,
+        "conservative_margin": conservative_margin,
+    }
+
+
+def _require_portfolio_float(
+    val: Any,
+    name: str,
+    *,
+    positive: bool = False,
+    non_negative: bool = False,
+) -> float:
+    try:
+        return _require_finite_float(val, name, positive=positive, non_negative=non_negative)
+    except ValueError as exc:
+        raise PortfolioError(str(exc)) from exc
 
 _INPROC_LOCKS_GUARD = threading.Lock()
 _INPROC_LOCKS: dict[str, threading.RLock] = {}
@@ -96,15 +171,44 @@ def _portfolio_lock(portfolio_dir: str):
 
 
 def utc_now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")  # noqa: UP017
 
 
-def _resolve_portfolio_dir(portfolio_dir: str | None) -> str:
-    return os.path.abspath(portfolio_dir or DEFAULT_PORTFOLIO_DIR)
+_INITIAL_DEFAULT_DB_PATH = DEFAULT_DB_PATH
+
+
+def _resolve_portfolio_dir(portfolio_dir: str | os.PathLike[str] | None) -> str:
+    if portfolio_dir is not None:
+        return os.path.abspath(os.fspath(portfolio_dir))
+    return os.path.abspath(os.fspath(DEFAULT_PORTFOLIO_DIR))
+
+
+def _resolve_storage(
+    portfolio_dir: str | os.PathLike[str] | None = None,
+    db_path: str | os.PathLike[str] | None = None,
+) -> tuple[str, str]:
+    """Resolve (portfolio_dir, db_file) supporting both portfolio_dir and db_path callers."""
+    if portfolio_dir is not None:
+        pdir = _resolve_portfolio_dir(portfolio_dir)
+        return pdir, _db_path(pdir)
+    if db_path is not None:
+        raw = os.path.abspath(os.fspath(db_path))
+        if raw.endswith((".db", ".sqlite", ".sqlite3")) or os.path.isfile(raw):
+            return os.path.dirname(raw), raw
+        return raw, _db_path(raw)
+    if DEFAULT_DB_PATH != _INITIAL_DEFAULT_DB_PATH:
+        raw_def = os.path.abspath(os.fspath(DEFAULT_DB_PATH))
+        return os.path.dirname(raw_def), raw_def
+    pdir = _resolve_portfolio_dir(None)
+    return pdir, _db_path(pdir)
 
 
 def _db_path(portfolio_dir: str) -> str:
     return os.path.join(portfolio_dir, "portfolio.db")
+
+
+def _opportunities_path(portfolio_dir: str) -> str:
+    return os.path.join(portfolio_dir, "opportunities.jsonl")
 
 
 def _paths(portfolio_dir: str) -> tuple[str, str, str]:
@@ -186,6 +290,19 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS opportunities (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            opportunity_id TEXT UNIQUE NOT NULL,
+            status TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            updated_at_utc TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS idempotency_keys (
             key TEXT PRIMARY KEY,
             operation TEXT NOT NULL,
@@ -200,9 +317,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE idempotency_keys ADD COLUMN request_hash TEXT NOT NULL DEFAULT ''")
 
 
-def _connect_db(pdir: str) -> sqlite3.Connection:
-    os.makedirs(pdir, exist_ok=True)
-    conn = sqlite3.connect(_db_path(pdir), isolation_level=None, timeout=30.0)
+def _connect_db(pdir: str, db_file: str | None = None) -> sqlite3.Connection:
+    target_db = db_file or _db_path(pdir)
+    os.makedirs(os.path.dirname(target_db) or pdir, exist_ok=True)
+    conn = sqlite3.connect(target_db, isolation_level=None, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute("PRAGMA foreign_keys=ON")
@@ -242,6 +360,35 @@ def _db_read_positions_doc(conn: sqlite3.Connection, pdir: str) -> dict[str, Any
 def _db_read_journal(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute("SELECT payload_json FROM journal ORDER BY id ASC").fetchall()
     return [json.loads(r[0]) for r in rows]
+
+
+def _db_read_opportunities_asc(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute("SELECT payload_json FROM opportunities ORDER BY seq ASC").fetchall()
+    return [json.loads(r[0]) for r in rows]
+
+
+def _db_upsert_opportunity(conn: sqlite3.Connection, opp: dict[str, Any]) -> None:
+    payload = json.dumps(opp, ensure_ascii=False, allow_nan=False)
+    conn.execute(
+        """
+        INSERT INTO opportunities (opportunity_id, status, kind, symbol, payload_json, updated_at_utc)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(opportunity_id) DO UPDATE SET
+            status = excluded.status,
+            kind = excluded.kind,
+            symbol = excluded.symbol,
+            payload_json = excluded.payload_json,
+            updated_at_utc = excluded.updated_at_utc
+        """,
+        (
+            str(opp["opportunity_id"]),
+            str(opp["status"]),
+            str(opp["kind"]),
+            str(opp["symbol"]),
+            payload,
+            str(opp.get("updated_at_utc") or ""),
+        ),
+    )
 
 
 def _db_upsert_account(conn: sqlite3.Connection, account: dict[str, Any]) -> None:
@@ -348,6 +495,13 @@ def _maybe_migrate_legacy_json_in_tx(conn: sqlite3.Connection, pdir: str) -> Non
                     legacy_rows.append(json.loads(s))
         if legacy_rows:
             _db_insert_journal_records(conn, legacy_rows)
+    opp_path = _opportunities_path(pdir)
+    if os.path.exists(opp_path):
+        with open(opp_path, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if s:
+                    _db_upsert_opportunity(conn, json.loads(s))
 
 
 def _normalize_idempotency_key(idempotency_key: str | None) -> str | None:
@@ -434,34 +588,49 @@ def _db_store_idempotency(
     )
 
 
-def _export_json_mirrors_unlocked(pdir: str) -> None:
-    """Export read-only JSON mirrors (account.json, positions.json, journal.jsonl) from one consistent DB snapshot."""
+def _export_json_mirrors_unlocked(pdir: str, db_file: str | None = None) -> None:
+    """Export read-only JSON mirrors (account.json, positions.json, journal.jsonl, opportunities.jsonl) from one DB snapshot."""
     account_path, positions_path, journal_path = _paths(pdir)
-    conn = _connect_db(pdir)
+    opp_path = _opportunities_path(pdir)
+    conn = _connect_db(pdir, db_file=db_file)
+    has_state = False
+    account: dict[str, Any] | None = None
+    positions_doc: dict[str, Any] | None = None
+    journal_rows: list[dict[str, Any]] = []
+    opp_rows: list[dict[str, Any]] = []
     try:
         conn.execute("BEGIN DEFERRED")
         try:
-            account = _db_read_account(conn, pdir)
-            positions_doc = _db_read_positions_doc(conn, pdir)
-            journal_rows = _db_read_journal(conn)
+            has_state = _db_has_state(conn)
+            if has_state:
+                account = _db_read_account(conn, pdir)
+                positions_doc = _db_read_positions_doc(conn, pdir)
+                journal_rows = _db_read_journal(conn)
+            opp_rows = _db_read_opportunities_asc(conn)
         finally:
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
     finally:
         conn.close()
 
-    _atomic_write_json(account_path, account)
-    _atomic_write_json(positions_path, positions_doc)
-    journal_text = "".join(
-        json.dumps(r, ensure_ascii=False, allow_nan=False) + "\n" for r in journal_rows
-    )
-    _atomic_write_text(journal_path, journal_text)
+    if has_state and account is not None and positions_doc is not None:
+        _atomic_write_json(account_path, account)
+        _atomic_write_json(positions_path, positions_doc)
+        journal_text = "".join(
+            json.dumps(r, ensure_ascii=False, allow_nan=False) + "\n" for r in journal_rows
+        )
+        _atomic_write_text(journal_path, journal_text)
+    if opp_rows or os.path.exists(opp_path):
+        opp_text = "".join(
+            json.dumps(r, ensure_ascii=False, allow_nan=False) + "\n" for r in opp_rows
+        )
+        _atomic_write_text(opp_path, opp_text)
 
 
-def _safe_export_mirrors_unlocked(pdir: str) -> tuple[bool, str | None]:
+def _safe_export_mirrors_unlocked(pdir: str, db_file: str | None = None) -> tuple[bool, str | None]:
     """Best-effort post-commit mirror export; NEVER re-raises after SQLite COMMIT succeeds."""
     try:
-        _export_json_mirrors_unlocked(pdir)
+        _export_json_mirrors_unlocked(pdir, db_file=db_file)
         return True, None
     except Exception as exc:  # noqa: BLE001
         err_msg = f"{type(exc).__name__}: {exc}"
@@ -675,13 +844,14 @@ def _reconcile_archive_status_unlocked(
 
 
 def sync_mirrors(portfolio_dir: str | None = None) -> dict[str, Any]:
-    """Explicitly resync account.json, positions.json, and journal.jsonl from canonical portfolio.db."""
+    """Explicitly resync account.json, positions.json, journal.jsonl, and opportunities.jsonl from canonical portfolio.db."""
     pdir = _resolve_portfolio_dir(portfolio_dir)
     with _portfolio_lock(pdir):
         _export_json_mirrors_unlocked(pdir)
         account = _read_account_unlocked(pdir)
         doc = _read_positions_doc_unlocked(pdir)
         journal_rows = _read_journal_unlocked(pdir)
+        opp_rows = _read_opportunities_unlocked(pdir)
     return {
         "status": "synced",
         "portfolio_dir": pdir,
@@ -690,14 +860,15 @@ def sync_mirrors(portfolio_dir: str | None = None) -> dict[str, Any]:
         "revision": int(doc.get("revision") or 0),
         "positions_count": len(doc.get("positions") or []),
         "journal_count": len(journal_rows),
+        "opportunities_count": len(opp_rows),
         "equity": float(account["equity"]),
     }
 
 
 @contextlib.contextmanager
-def _sqlite_write_tx(pdir: str):
+def _sqlite_write_tx(pdir: str, db_file: str | None = None):
     """Open a single SQLite BEGIN IMMEDIATE transaction with automatic ROLLBACK on any failure."""
-    conn = _connect_db(pdir)
+    conn = _connect_db(pdir, db_file=db_file)
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -736,11 +907,11 @@ def _normalize_red_lines(exit_red_lines: list[str] | tuple[str, ...] | None) -> 
 
 def _validate_drawdown_steps(steps: list[dict[str, Any]]) -> list[dict[str, float]]:
     if not isinstance(steps, list):
-        raise ValueError("drawdown_steps must be a list of {drawdown_pct, risk_scale} dicts")
+        raise ValueError("drawdown_steps must be a list of {drawdown_pct, risk_scale} dicts")  # noqa: TRY004
     cleaned: list[dict[str, float]] = []
     for item in steps:
         if not isinstance(item, dict):
-            raise ValueError(f"Invalid drawdown step: {item!r}")
+            raise ValueError(f"Invalid drawdown step: {item!r}")  # noqa: TRY004
         dd = _require_finite_float(item.get("drawdown_pct"), "drawdown_pct", positive=True)
         rs = _require_finite_float(item.get("risk_scale"), "risk_scale", positive=True)
         if dd >= 100.0:
@@ -825,13 +996,176 @@ def _compute_realized_pnl(
 
 def _generate_position_id(symbol: str, existing_ids: set[str]) -> str:
     safe = re.sub(r"[^A-Za-z0-9]+", "_", symbol.upper()).strip("_") or "SYM"
-    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")  # noqa: UP017
     for _ in range(32):
         suffix = uuid.uuid4().hex[:6].upper()
         cand = f"pos_{day}_{safe}_{suffix}"
         if cand not in existing_ids:
             return cand
     raise RuntimeError("Failed to generate unique position_id")
+
+
+def _generate_opportunity_id(symbol: str, existing_ids: set[str]) -> str:
+    safe = re.sub(r"[^A-Za-z0-9]+", "_", symbol.upper()).strip("_") or "SYM"
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")  # noqa: UP017
+    for _ in range(32):
+        suffix = uuid.uuid4().hex[:6].upper()
+        cand = f"opp_{day}_{safe}_{suffix}"
+        if cand not in existing_ids:
+            return cand
+    raise RuntimeError("Failed to generate unique opportunity_id")
+
+
+def _position_campaign_1r(pos: dict[str, Any]) -> float:
+    raw = pos.get("campaign_1r_amount")
+    if raw is not None:
+        try:
+            val = float(raw)
+            if math.isfinite(val) and val > 0:
+                quantized = round(val, 2)
+                if quantized > 0.0:
+                    return quantized
+        except (TypeError, ValueError):
+            pass
+    return round(float(pos.get("initial_risk_amount") or 0.0), 2)
+
+
+def _compute_campaign_breakeven_stop(
+    direction: str,
+    avg_entry: float,
+    quantity: float,
+    multiplier: float,
+    fx_rate: float,
+    partial_realized_pnl: float,
+) -> float:
+    """Compute exact stop price that covers avg_entry AND any negative partial_realized_pnl."""
+    if partial_realized_pnl >= -1e-9:
+        return round(avg_entry, _PRICE_PERSIST_DECIMALS)
+    denom = float(quantity) * float(multiplier) * float(fx_rate)
+    if denom <= 0:
+        return round(avg_entry, _PRICE_PERSIST_DECIMALS)
+    offset = abs(partial_realized_pnl) / denom
+    scale = 10**_PRICE_PERSIST_DECIMALS
+    if direction == "long":
+        raw = avg_entry + offset
+        return math.ceil((raw - 1e-12) * scale) / scale
+    raw = avg_entry - offset
+    return math.floor((raw + 1e-12) * scale) / scale
+
+
+def _compute_position_campaign_risk(pos: dict[str, Any]) -> tuple[float, float, float]:
+    """Return (remaining_open_risk_amount, campaign_open_risk_amount, campaign_net_pnl_at_stop)."""
+    if pos.get("status") != "open":
+        return 0.0, 0.0, 0.0
+    direction = str(pos.get("direction") or "long")
+    avg_entry_raw = pos.get("avg_entry_price")
+    if avg_entry_raw is None:
+        avg_entry_raw = pos.get("entry_price")
+    qty_raw = pos.get("quantity")
+    eff_stop_raw = (
+        pos.get("structural_stop_daily")
+        if (_position_stop_regime(pos) == "daily_structure" and pos.get("structural_stop_daily") is not None)
+        else pos.get("tactical_stop_30m")
+    )
+    if avg_entry_raw is None or qty_raw is None or eff_stop_raw is None:
+        fallback = round(float(pos.get("current_open_risk_amount") or 0.0), 2) + 0.0
+        return fallback, fallback, 0.0
+    avg_entry = float(avg_entry_raw)
+    eff_stop = float(eff_stop_raw)
+    qty = float(qty_raw)
+    mult = float(pos.get("multiplier") if pos.get("multiplier") is not None else 1.0)
+    fx_rate = float(pos.get("fx_to_account") if pos.get("fx_to_account") is not None else 1.0)
+    partial_realized = float(pos.get("partial_realized_pnl") or 0.0)
+
+    is_rem_be = (
+        (eff_stop >= avg_entry - 1e-9) if direction == "long" else (eff_stop <= avg_entry + 1e-9)
+    )
+    remaining_open_risk = (
+        0.0
+        if is_rem_be
+        else _compute_open_risk_amount(direction, avg_entry, eff_stop, qty, mult, fx_rate)
+    )
+    rem_pnl_at_stop = (
+        ((eff_stop - avg_entry) if direction == "long" else (avg_entry - eff_stop))
+        * qty
+        * mult
+        * fx_rate
+    )
+    campaign_net_pnl_raw = partial_realized + rem_pnl_at_stop
+    campaign_net_pnl_at_stop = round(campaign_net_pnl_raw, 2) + 0.0
+    campaign_open_risk = round(max(0.0, -campaign_net_pnl_raw), 2) + 0.0
+    return remaining_open_risk, campaign_open_risk, campaign_net_pnl_at_stop
+
+
+def _sync_position_campaign_risk_fields(pos: dict[str, Any]) -> tuple[float, float, float]:
+    rem_risk, camp_risk, camp_net_pnl = _compute_position_campaign_risk(pos)
+    pos["remaining_open_risk_amount"] = rem_risk
+    pos["campaign_open_risk_amount"] = camp_risk
+    pos["campaign_net_pnl_at_stop"] = camp_net_pnl
+    return rem_risk, camp_risk, camp_net_pnl
+
+
+def _position_stop_regime(pos: dict[str, Any]) -> str:
+    reg = pos.get("active_stop_regime")
+    if reg in VALID_STOP_REGIMES:
+        return str(reg)
+    return "tactical_30m"
+
+
+def _position_lifecycle_stage(pos: dict[str, Any]) -> str:
+    st = pos.get("lifecycle_stage")
+    if st in VALID_LIFECYCLE_STAGES:
+        return str(st)
+    if _position_stop_regime(pos) == "daily_structure":
+        return "main_wave"
+    if len(pos.get("tranches") or []) > 1:
+        return "pyramided"
+    return "pilot"
+
+
+def _effective_position_stop(pos: dict[str, Any]) -> float:
+    """Return active effective stop price: structural_stop_daily under daily_structure, else tactical_stop_30m."""
+    if _position_stop_regime(pos) == "daily_structure" and pos.get("structural_stop_daily") is not None:
+        return float(pos["structural_stop_daily"])
+    return float(pos["tactical_stop_30m"])
+
+
+def _apply_position_defaults(pos: dict[str, Any]) -> dict[str, Any]:
+    """Normalize legacy position records in memory without mutating persisted state."""
+    out = dict(pos)
+    out["campaign_1r_amount"] = _position_campaign_1r(out)
+    out["active_stop_regime"] = _position_stop_regime(out)
+    out["lifecycle_stage"] = _position_lifecycle_stage(out)
+    if not out.get("tactical_stop_active_since_utc"):
+        out["tactical_stop_active_since_utc"] = out.get("stop_updated_at_utc") or out.get("opened_at_utc")
+    _sync_position_campaign_risk_fields(out)
+    if out.get("status") == "closed" and "campaign_r_multiple" not in out:
+        camp_1r = out["campaign_1r_amount"]
+        rpnl = out.get("realized_pnl")
+        out["campaign_r_multiple"] = (
+            round(float(rpnl) / camp_1r, 4) if (rpnl is not None and camp_1r > 0) else out.get("r_multiple")
+        )
+    return out
+
+
+def _validate_attribution_tag(attribution_tag: str | None) -> str | None:
+    if attribution_tag is None:
+        return None
+    cleaned = str(attribution_tag).strip()
+    if not cleaned:
+        return None
+    if cleaned not in ATTRIBUTION_TAGS:
+        raise PortfolioError(
+            f"invalid_attribution_tag: Unknown attribution_tag {cleaned!r}; "
+            f"must be one of {sorted(ATTRIBUTION_TAGS)}"
+        )
+    return cleaned
+
+
+def _normalize_lesson_note(lesson_note: str | None) -> str:
+    if lesson_note is None:
+        return ""
+    return str(lesson_note).strip()
 
 
 def _validate_account_bounds(
@@ -929,6 +1263,26 @@ def _read_journal_unlocked(pdir: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _read_opportunities_unlocked(pdir: str, db_file: str | None = None) -> list[dict[str, Any]]:
+    eff_db = db_file or _db_path(pdir)
+    if os.path.exists(eff_db):
+        conn = _connect_db(pdir, db_file=eff_db)
+        try:
+            return _db_read_opportunities_asc(conn)
+        finally:
+            conn.close()
+    opp_path = _opportunities_path(pdir)
+    if not os.path.exists(opp_path):
+        return []
+    rows: list[dict[str, Any]] = []
+    with open(opp_path, "r", encoding="utf-8") as f:
+        for line in f:
+            s = line.strip()
+            if s:
+                rows.append(json.loads(s))
+    return rows
+
+
 def _account_caps(account: dict[str, Any]) -> tuple[float, float, float, float, float]:
     equity = _require_finite_float(account["equity"], "equity")
     dd_pct = _compute_drawdown_pct(account)
@@ -993,6 +1347,7 @@ def init_portfolio(
             }
             if overwrite:
                 conn.execute("DELETE FROM idempotency_keys")
+                conn.execute("DELETE FROM opportunities")
                 conn.execute("DELETE FROM journal")
                 conn.execute("DELETE FROM positions")
                 conn.execute("DELETE FROM account")
@@ -1081,7 +1436,7 @@ def load_positions(portfolio_dir: str | None = None, status: str | None = None) 
         raise ValueError(f"status filter must be 'open', 'closed', or None, got {status!r}")
     with _portfolio_lock(pdir):
         doc = _read_positions_doc_unlocked(pdir)
-        positions = list(doc.get("positions") or [])
+        positions = [_apply_position_defaults(p) for p in (doc.get("positions") or [])]
     if status is not None:
         positions = [p for p in positions if p.get("status") == status]
     return positions
@@ -1411,6 +1766,7 @@ def _build_new_position(
     existing_ids: set[str],
     now: str,
     allow_equity_margin: bool = False,
+    campaign_1r_amount: float | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     norm_dir = str(direction or "").strip().lower()
     if norm_dir not in VALID_DIRECTIONS:
@@ -1418,27 +1774,55 @@ def _build_new_position(
 
     entry = _require_finite_float(entry_price, "entry_price", positive=True)
     stop_30m = _require_finite_float(tactical_stop_30m, "tactical_stop_30m", positive=True)
+    entry_p = round(entry, _PRICE_PERSIST_DECIMALS)
+    stop_30m_p = round(stop_30m, _PRICE_PERSIST_DECIMALS)
 
-    if norm_dir == "long" and not (entry > stop_30m):
-        raise ValueError(f"Long open requires entry_price ({entry}) > tactical_stop_30m ({stop_30m})")
-    if norm_dir == "short" and not (entry < stop_30m):
-        raise ValueError(f"Short open requires entry_price ({entry}) < tactical_stop_30m ({stop_30m})")
+    if entry_p <= 0 or stop_30m_p <= 0:
+        raise ValueError(
+            f"entry_price ({entry_p}) and tactical_stop_30m ({stop_30m_p}) must remain > 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+        )
+    if norm_dir == "long" and not (entry > stop_30m and entry_p > stop_30m_p):
+        raise ValueError(
+            f"Long open requires entry_price ({entry_p}) > tactical_stop_30m ({stop_30m_p}) at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+        )
+    if norm_dir == "short" and not (entry < stop_30m and entry_p < stop_30m_p):
+        raise ValueError(
+            f"Short open requires entry_price ({entry_p}) < tactical_stop_30m ({stop_30m_p}) at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+        )
 
     stop_daily: float | None = None
     if structural_stop_daily is not None:
         stop_daily = _require_finite_float(structural_stop_daily, "structural_stop_daily", positive=True)
-        if norm_dir == "long" and not (stop_daily < entry):
-            raise ValueError(f"Long structural_stop_daily ({stop_daily}) must be < entry_price ({entry})")
-        if norm_dir == "short" and not (stop_daily > entry):
-            raise ValueError(f"Short structural_stop_daily ({stop_daily}) must be > entry_price ({entry})")
+        stop_daily_p = round(stop_daily, _PRICE_PERSIST_DECIMALS)
+        if stop_daily_p <= 0:
+            raise ValueError(
+                f"structural_stop_daily ({stop_daily_p}) must remain > 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+            )
+        if norm_dir == "long" and not (stop_daily < entry and stop_daily_p < entry_p):
+            raise ValueError(
+                f"Long structural_stop_daily ({stop_daily_p}) must be < entry_price ({entry_p}) at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+            )
+        if norm_dir == "short" and not (stop_daily > entry and stop_daily_p > entry_p):
+            raise ValueError(
+                f"Short structural_stop_daily ({stop_daily_p}) must be > entry_price ({entry_p}) at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+            )
 
     target: float | None = None
     if target_price is not None:
         target = _require_finite_float(target_price, "target_price", positive=True)
-        if norm_dir == "long" and not (target > entry):
-            raise ValueError(f"Long target_price ({target}) must be > entry_price ({entry})")
-        if norm_dir == "short" and not (target < entry):
-            raise ValueError(f"Short target_price ({target}) must be < entry_price ({entry})")
+        target_p = round(target, _PRICE_PERSIST_DECIMALS)
+        if target_p <= 0:
+            raise ValueError(
+                f"target_price ({target_p}) must remain > 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+            )
+        if norm_dir == "long" and not (target > entry and target_p > entry_p):
+            raise ValueError(
+                f"Long target_price ({target_p}) must be > entry_price ({entry_p}) at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+            )
+        if norm_dir == "short" and not (target < entry and target_p < entry_p):
+            raise ValueError(
+                f"Short target_price ({target_p}) must be < entry_price ({entry_p}) at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+            )
 
     spec = get_contract_spec(symbol, asset_class=asset_class)
     if multiplier is not None:
@@ -1490,6 +1874,15 @@ def _build_new_position(
         warnings.append("missing_exit_red_lines: 建议为每笔持仓绑定明确的日线/30m与基本面撤离红线触发器")
 
     init_risk = _compute_open_risk_amount(norm_dir, entry, stop_30m, clean_qty, eff_mult, fx_rate)
+    if campaign_1r_amount is not None:
+        raw_camp_1r = _require_portfolio_float(campaign_1r_amount, "campaign_1r_amount", positive=True)
+        camp_1r = round(raw_camp_1r, 2)
+        if camp_1r <= 0.0:
+            raise PortfolioError(
+                f"campaign_1r_amount must be >= 0.01 after 2-decimal rounding, got {campaign_1r_amount!r}"
+            )
+    else:
+        camp_1r = init_risk
     est_margin = round(float(clean_qty) * entry * eff_mult * fx_rate * eff_margin, 2)
 
     pos_id = _generate_position_id(spec["symbol"], existing_ids)
@@ -1517,11 +1910,19 @@ def _build_new_position(
         "tactical_stop_30m": round(stop_30m, 6),
         "initial_stop_30m": round(stop_30m, 6),
         "stop_updated_at_utc": now,
+        "tactical_stop_active_since_utc": now,
         "structural_stop_daily": round(stop_daily, 6) if stop_daily is not None else None,
         "structural_stop_updated_at_utc": now if stop_daily is not None else None,
+        "regime_updated_at_utc": now,
         "target_price": round(target, 6) if target is not None else None,
         "initial_risk_amount": init_risk,
+        "campaign_1r_amount": camp_1r,
+        "lifecycle_stage": "pilot",
+        "active_stop_regime": "tactical_30m",
         "current_open_risk_amount": init_risk,
+        "remaining_open_risk_amount": init_risk,
+        "campaign_open_risk_amount": init_risk,
+        "campaign_net_pnl_at_stop": round(-init_risk, 2) + 0.0,
         "locked_profit_amount": 0.0,
         "slot_risk_share": 1.0,
         "exit_red_lines": red_lines,
@@ -1544,6 +1945,9 @@ def _build_new_position(
         "exit_category": None,
         "realized_pnl": None,
         "r_multiple": None,
+        "campaign_r_multiple": None,
+        "attribution_tag": None,
+        "lesson_note": None,
     }
     return pos, warnings
 
@@ -1573,39 +1977,36 @@ def open_position(
     allow_equity_margin: bool = False,
     idempotency_key: str | None = None,
     research_dir: str | None = None,
+    campaign_1r_amount: float | None = None,
 ) -> dict[str, Any]:
     """Open a new position atomically after enforcing exclusivity, granularity, FX, capital, and risk caps."""
     idem_key = _normalize_idempotency_key(idempotency_key)
-    req_hash = (
-        _compute_request_hash(
-            "open_position",
-            {
-                "symbol": symbol,
-                "direction": direction,
-                "sector_theme": sector_theme,
-                "entry_price": entry_price,
-                "tactical_stop_30m": tactical_stop_30m,
-                "quantity": quantity,
-                "structural_stop_daily": structural_stop_daily,
-                "target_price": target_price,
-                "leader_role": leader_role,
-                "co_leader_reason": co_leader_reason,
-                "macro_factors": list(macro_factors) if macro_factors is not None else None,
-                "exit_red_lines": list(exit_red_lines) if exit_red_lines is not None else None,
-                "contract_symbol": contract_symbol,
-                "multiplier": multiplier,
-                "margin_rate": margin_rate,
-                "fx_to_account": fx_to_account,
-                "asset_class": asset_class,
-                "notes": notes,
-                "reason": reason,
-                "enforce_macro_cap": enforce_macro_cap,
-                "allow_equity_margin": allow_equity_margin,
-            },
-        )
-        if idem_key is not None
-        else ""
-    )
+    req_payload: dict[str, Any] = {
+        "symbol": symbol,
+        "direction": direction,
+        "sector_theme": sector_theme,
+        "entry_price": entry_price,
+        "tactical_stop_30m": tactical_stop_30m,
+        "quantity": quantity,
+        "structural_stop_daily": structural_stop_daily,
+        "target_price": target_price,
+        "leader_role": leader_role,
+        "co_leader_reason": co_leader_reason,
+        "macro_factors": list(macro_factors) if macro_factors is not None else None,
+        "exit_red_lines": list(exit_red_lines) if exit_red_lines is not None else None,
+        "contract_symbol": contract_symbol,
+        "multiplier": multiplier,
+        "margin_rate": margin_rate,
+        "fx_to_account": fx_to_account,
+        "asset_class": asset_class,
+        "notes": notes,
+        "reason": reason,
+        "enforce_macro_cap": enforce_macro_cap,
+        "allow_equity_margin": allow_equity_margin,
+    }
+    if campaign_1r_amount is not None:
+        req_payload["campaign_1r_amount"] = campaign_1r_amount
+    req_hash = _compute_request_hash("open_position", req_payload) if idem_key is not None else ""
     pdir = _resolve_portfolio_dir(portfolio_dir)
 
     with _portfolio_lock(pdir):
@@ -1647,6 +2048,7 @@ def open_position(
                     existing_ids=existing_ids,
                     now=now,
                     allow_equity_margin=allow_equity_margin,
+                    campaign_1r_amount=campaign_1r_amount,
                 )
 
                 admission = check_sector_slot_admission(
@@ -1758,24 +2160,26 @@ def rotate_leader(
     enforce_macro_cap: bool = True,
     idempotency_key: str | None = None,
     research_dir: str | None = None,
+    attribution_tag: str | None = None,
+    lesson_note: str = "",
 ) -> dict[str, Any]:
     """Atomically close outgoing leader, update realized ledger equity, and admit/open new leader in ONE SQLite tx."""
+    norm_attr_tag = _validate_attribution_tag(attribution_tag)
+    norm_lesson = _normalize_lesson_note(lesson_note)
     idem_key = _normalize_idempotency_key(idempotency_key)
-    req_hash = (
-        _compute_request_hash(
-            "rotate_leader",
-            {
-                "old_position_id": old_position_id,
-                "exit_price": exit_price,
-                "exit_reason": exit_reason,
-                "new_position_kwargs": new_position_kwargs,
-                "exit_category": exit_category,
-                "enforce_macro_cap": enforce_macro_cap,
-            },
-        )
-        if idem_key is not None
-        else ""
-    )
+    req_payload: dict[str, Any] = {
+        "old_position_id": old_position_id,
+        "exit_price": exit_price,
+        "exit_reason": exit_reason,
+        "new_position_kwargs": new_position_kwargs,
+        "exit_category": exit_category,
+        "enforce_macro_cap": enforce_macro_cap,
+    }
+    if norm_attr_tag is not None:
+        req_payload["attribution_tag"] = norm_attr_tag
+    if norm_lesson:
+        req_payload["lesson_note"] = norm_lesson
+    req_hash = _compute_request_hash("rotate_leader", req_payload) if idem_key is not None else ""
     pdir = _resolve_portfolio_dir(portfolio_dir)
 
     with _portfolio_lock(pdir):
@@ -1840,6 +2244,8 @@ def rotate_leader(
                 total_pnl = round(float(old_pos.get("partial_realized_pnl") or 0.0) + rem_pnl, 2)
                 init_risk_old = float(old_pos.get("initial_risk_amount") or 0.0)
                 r_mult = round(total_pnl / init_risk_old, 4) if init_risk_old > 0 else None
+                camp_1r_old = _position_campaign_1r(old_pos)
+                camp_r_mult = round(total_pnl / camp_1r_old, 4) if camp_1r_old > 0 else r_mult
 
                 post_equity = round(float(account["equity"]) + rem_pnl, 2)
                 post_insolvent = post_equity <= 0
@@ -1877,6 +2283,7 @@ def rotate_leader(
                     existing_ids=existing_ids,
                     now=now,
                     allow_equity_margin=bool(kwargs.get("allow_equity_margin", False)),
+                    campaign_1r_amount=kwargs.get("campaign_1r_amount"),
                 )
 
                 if new_pos["symbol"].upper() == str(old_pos["symbol"]).upper():
@@ -1920,14 +2327,21 @@ def rotate_leader(
                     )
 
                 # Step 5: Mutate old_pos, new_pos, post_account, meta, and journal inside ONE atomic SQLite tx
+                old_pos["campaign_1r_amount"] = camp_1r_old
+                old_pos["active_stop_regime"] = _position_stop_regime(old_pos)
+                old_pos["lifecycle_stage"] = _position_lifecycle_stage(old_pos)
                 old_pos["status"] = "closed"
                 old_pos["current_open_risk_amount"] = 0.0
+                _sync_position_campaign_risk_fields(old_pos)
                 old_pos["estimated_margin_account"] = 0.0
                 old_pos["exit_price"] = round(ex_price, 6)
                 old_pos["exit_reason"] = ex_reason
                 old_pos["exit_category"] = (exit_category or "leader_rotation").strip()
                 old_pos["realized_pnl"] = total_pnl
                 old_pos["r_multiple"] = r_mult
+                old_pos["campaign_r_multiple"] = camp_r_mult
+                old_pos["attribution_tag"] = norm_attr_tag
+                old_pos["lesson_note"] = norm_lesson
                 old_pos["closed_at_utc"] = now
                 old_pos["updated_at_utc"] = now
 
@@ -1953,6 +2367,10 @@ def rotate_leader(
                         "realized_pnl": total_pnl,
                         "equity_after": post_equity,
                         "r_multiple": r_mult,
+                        "campaign_r_multiple": camp_r_mult,
+                        "exit_category": old_pos["exit_category"],
+                        "attribution_tag": norm_attr_tag,
+                        "lesson_note": norm_lesson,
                         "risk_delta": round(-old_open_risk, 2),
                         "reason": ex_reason,
                     },
@@ -2090,28 +2508,34 @@ def add_position_tranche(
     idempotency_key: str | None = None,
     fx_to_account: float | None = None,
     note: str = "",
+    require_breakeven_lock: bool = False,
+    max_profit_cushion_ratio: float = 0.65,
+    new_daily_stop: float | None = None,
+    max_leverage: float | None = None,
 ) -> dict[str, Any]:
     """Add a pyramid tranche ONLY on confirmed floating profit, strictly on the profit side of avg_entry,
     effective tactical_stop_30m, AND effective structural_stop_daily (if set).
     """
     idem_key = _normalize_idempotency_key(idempotency_key)
-    req_hash = (
-        _compute_request_hash(
-            "add_position_tranche",
-            {
-                "position_id": position_id,
-                "add_price": add_price,
-                "add_quantity": add_quantity,
-                "new_stop_30m": new_stop_30m,
-                "reason": reason,
-                "enforce_macro_cap": enforce_macro_cap,
-                "fx_to_account": fx_to_account,
-                "note": note,
-            },
-        )
-        if idem_key is not None
-        else ""
-    )
+    req_payload: dict[str, Any] = {
+        "position_id": position_id,
+        "add_price": add_price,
+        "add_quantity": add_quantity,
+        "new_stop_30m": new_stop_30m,
+        "reason": reason,
+        "enforce_macro_cap": enforce_macro_cap,
+        "fx_to_account": fx_to_account,
+        "note": note,
+    }
+    if require_breakeven_lock:
+        req_payload["require_breakeven_lock"] = True
+    if max_profit_cushion_ratio != 0.65:
+        req_payload["max_profit_cushion_ratio"] = max_profit_cushion_ratio
+    if new_daily_stop is not None:
+        req_payload["new_daily_stop"] = new_daily_stop
+    if max_leverage is not None:
+        req_payload["max_leverage"] = max_leverage
+    req_hash = _compute_request_hash("add_position_tranche", req_payload) if idem_key is not None else ""
     pdir = _resolve_portfolio_dir(portfolio_dir)
 
     with _portfolio_lock(pdir):
@@ -2123,6 +2547,17 @@ def add_position_tranche(
             if cached is not None:
                 replayed_result = cached
             else:
+                cushion_ratio = _require_portfolio_float(
+                    max_profit_cushion_ratio, "max_profit_cushion_ratio", positive=True
+                )
+                if cushion_ratio > 1.0:
+                    raise PortfolioError(
+                        f"invalid_max_profit_cushion_ratio: max_profit_cushion_ratio must be in (0, 1.0], "
+                        f"got {max_profit_cushion_ratio}"
+                    )
+                eff_max_leverage: float | None = None
+                if max_leverage is not None:
+                    eff_max_leverage = _require_portfolio_float(max_leverage, "max_leverage", positive=True)
                 price = round(_require_finite_float(add_price, "add_price", positive=True), _PRICE_PERSIST_DECIMALS)
                 if price <= 0:
                     raise ValueError(
@@ -2150,10 +2585,16 @@ def add_position_tranche(
                 qty_add = float(clean_add_qty)
 
                 direction = pos["direction"]
+                active_regime = _position_stop_regime(pos)
                 old_avg = round(float(pos["avg_entry_price"]), _PRICE_PERSIST_DECIMALS)
                 old_qty_orig = pos["quantity"]
                 old_qty = float(old_qty_orig)
                 old_stop = round(float(pos["tactical_stop_30m"]), _PRICE_PERSIST_DECIMALS)
+                old_daily_raw = pos.get("structural_stop_daily")
+                old_daily = (
+                    round(float(old_daily_raw), _PRICE_PERSIST_DECIMALS) if old_daily_raw is not None else None
+                )
+                old_eff_stop = old_daily if (active_regime == "daily_structure" and old_daily is not None) else old_stop
                 old_risk = float(pos.get("current_open_risk_amount") or 0.0)
                 mult = float(pos["multiplier"])
                 if fx_to_account is not None:
@@ -2176,7 +2617,7 @@ def add_position_tranche(
                         f"必须严格低于当前均价 ({old_avg})，仅允许浮盈确认后顺势加仓"
                     )
 
-                eff_stop = old_stop
+                eff_stop_30m = old_stop
                 if new_stop_30m is not None:
                     cand_stop = round(
                         _require_finite_float(new_stop_30m, "new_stop_30m", positive=True),
@@ -2194,24 +2635,44 @@ def add_position_tranche(
                         raise ValueError(
                             f"stop_widening_forbidden: 移动止损只紧不松：加仓时空头止损 ({cand_stop}) 不得高于原止损 ({old_stop})"
                         )
-                    eff_stop = cand_stop
+                    eff_stop_30m = cand_stop
 
-                # HARD RULE 2a: Stop consistency — add_price must be strictly on profit side of effective tactical_stop_30m!
-                if direction == "long" and not (price > eff_stop):
-                    raise ValueError(
-                        f"stop_consistency_violation: 多头加仓价 ({price}) 必须严格高于有效 30min 止损 ({eff_stop})，"
-                        "禁止跨过已上移止损位加仓"
-                    )
-                if direction == "short" and not (price < eff_stop):
-                    raise ValueError(
-                        f"stop_consistency_violation: 空头加仓价 ({price}) 必须严格低于有效 30min 止损 ({eff_stop})，"
-                        "禁止跨过已下移止损位加仓"
-                    )
+                # HARD RULE 2a: Stop consistency — add_price must be strictly on profit side of tactical_stop_30m
+                if active_regime == "tactical_30m" or new_stop_30m is not None:
+                    if direction == "long" and not (price > eff_stop_30m):
+                        raise ValueError(
+                            f"stop_consistency_violation: 多头加仓价 ({price}) 必须严格高于有效 30min 止损 ({eff_stop_30m})，"
+                            "禁止跨过已上移止损位加仓"
+                        )
+                    if direction == "short" and not (price < eff_stop_30m):
+                        raise ValueError(
+                            f"stop_consistency_violation: 空头加仓价 ({price}) 必须严格低于有效 30min 止损 ({eff_stop_30m})，"
+                            "禁止跨过已下移止损位加仓"
+                        )
 
-                # HARD RULE 2b: Stop consistency — add_price must ALSO be strictly on profit side of structural_stop_daily!
-                eff_daily_raw = pos.get("structural_stop_daily")
-                if eff_daily_raw is not None:
-                    eff_daily_stop = float(eff_daily_raw)
+                # HARD RULE 2b: Validate new_daily_stop (if provided) and enforce protective side of add_price
+                eff_daily_stop = old_daily
+                if new_daily_stop is not None:
+                    cand_daily = round(
+                        _require_portfolio_float(new_daily_stop, "new_daily_stop", positive=True),
+                        _PRICE_PERSIST_DECIMALS,
+                    )
+                    if cand_daily <= 0:
+                        raise PortfolioError(
+                            f"new_daily_stop ({new_daily_stop}) rounds to <= 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+                        )
+                    if old_daily is not None:
+                        if direction == "long" and cand_daily < old_daily:
+                            raise PortfolioError(
+                                f"stop_widening_forbidden: 移动止损只紧不松：加仓时多头日线结构止损 ({cand_daily}) 不得低于原日线止损 ({old_daily})"
+                            )
+                        if direction == "short" and cand_daily > old_daily:
+                            raise PortfolioError(
+                                f"stop_widening_forbidden: 移动止损只紧不松：加仓时空头日线结构止损 ({cand_daily}) 不得高于原日线止损 ({old_daily})"
+                            )
+                    eff_daily_stop = cand_daily
+
+                if eff_daily_stop is not None:
                     if direction == "long" and not (price > eff_daily_stop):
                         raise ValueError(
                             f"stop_consistency_violation: add_price crosses structural_stop_daily — "
@@ -2223,19 +2684,104 @@ def add_position_tranche(
                             f"空头加仓价 ({price}) 必须严格低于有效日线结构止损 ({eff_daily_stop})"
                         )
 
+                if active_regime == "daily_structure":
+                    if eff_daily_stop is None:
+                        raise PortfolioError(
+                            "missing_daily_structural_stop: 当前持仓处于 daily_structure 止损模式但缺少有效日线结构止损"
+                        )
+                    eff_stop = eff_daily_stop
+                else:
+                    eff_stop = eff_stop_30m
+
                 dec_new_qty = Decimal(str(pos["quantity"])) + Decimal(str(clean_add_qty))
                 is_int_qty = not bool(spec.get("fractional", False))
                 new_qty: int | float = int(dec_new_qty) if is_int_qty else round(float(dec_new_qty), 8)
                 new_avg = round((old_avg * old_qty + price * qty_add) / float(new_qty), 6)
-                new_open_risk = _compute_open_risk_amount(direction, new_avg, eff_stop, new_qty, mult, fx_rate)
-                added_tranche_risk = _compute_open_risk_amount(direction, price, eff_stop, qty_add, mult, fx_rate)
+                is_remaining_be = (
+                    (eff_stop >= new_avg - 1e-9) if direction == "long" else (eff_stop <= new_avg + 1e-9)
+                )
+                remaining_open_risk = (
+                    0.0
+                    if is_remaining_be
+                    else _compute_open_risk_amount(direction, new_avg, eff_stop, new_qty, mult, fx_rate)
+                )
+                new_open_risk = remaining_open_risk
+                partial_realized = float(pos.get("partial_realized_pnl") or 0.0)
+                rem_pnl_at_stop = (
+                    ((eff_stop - new_avg) if direction == "long" else (new_avg - eff_stop))
+                    * float(new_qty)
+                    * mult
+                    * fx_rate
+                )
+                campaign_net_pnl_at_stop_raw = partial_realized + rem_pnl_at_stop
+                campaign_net_pnl_at_stop = round(campaign_net_pnl_at_stop_raw, 2) + 0.0
+                campaign_open_risk = round(max(0.0, -campaign_net_pnl_at_stop_raw), 2) + 0.0
+                req_campaign_be = _compute_campaign_breakeven_stop(
+                    direction, new_avg, float(new_qty), mult, fx_rate, partial_realized
+                )
+                is_campaign_breakeven_locked = (
+                    is_remaining_be
+                    and remaining_open_risk <= 1e-6
+                    and campaign_open_risk <= 1e-6
+                    and campaign_net_pnl_at_stop_raw >= -1e-6
+                )
+                added_tranche_risk_raw = max(
+                    0.0,
+                    ((price - eff_stop) if direction == "long" else (eff_stop - price))
+                    * qty_add
+                    * mult
+                    * fx_rate,
+                )
+                added_tranche_risk = round(added_tranche_risk_raw, 2) + 0.0
                 locked_profit = _compute_locked_profit_amount(direction, new_avg, eff_stop, new_qty, mult, fx_rate)
                 old_risk_pct = round((old_risk / equity_val) * 100.0, 4)
                 new_risk_pct = round((new_open_risk / equity_val) * 100.0, 4)
 
-                # Check BOTH combined position open risk AND added tranche's standalone stop risk against all risk caps
-                effective_risk_for_caps = max(new_open_risk, added_tranche_risk)
+                # Campaign-level Breakeven Lock Gate (and daily_structure breakeven floor)
+                if require_breakeven_lock and not is_campaign_breakeven_locked:
+                    cmp_op = ">=" if direction == "long" else "<="
+                    raise PortfolioError(
+                        f"breakeven_lock_required: 零本金风险推仓要求有效止损锁定战役级保本线 "
+                        f"({cmp_op} {req_campaign_be})，当前有效止损为 {eff_stop} "
+                        f"(剩余在途本金风险 {remaining_open_risk:,.2f}, 战役在途本金风险 {campaign_open_risk:,.2f}, "
+                        f"已实现减仓损益 {partial_realized:,.2f})"
+                    )
+                if active_regime == "daily_structure" and not is_campaign_breakeven_locked:
+                    raise PortfolioError(
+                        f"daily_stop_below_breakeven_floor: 主升 daily_structure 模式下加仓后日线结构止损 ({eff_stop}) "
+                        f"不得劣于战役级保本线 ({req_campaign_be}, 战役在途本金风险 {campaign_open_risk:,.2f})"
+                    )
+
                 _, risk_scale, single_sector_cap, max_total_cap, max_macro_cap = _account_caps(account)
+                prior_unrealized_profit = max(
+                    0.0,
+                    ((price - old_avg) if direction == "long" else (old_avg - price))
+                    * old_qty
+                    * mult
+                    * fx_rate,
+                )
+                net_profit_cushion_raw = max(0.0, prior_unrealized_profit + partial_realized)
+                net_profit_cushion = round(net_profit_cushion_raw, 2)
+                allowed_giveback_ceiling: float | None = None
+                if is_campaign_breakeven_locked:
+                    # Principal is 100% campaign-breakeven-locked (remaining & campaign open risk = 0.0);
+                    # decouple principal caps from profit cushion and enforce strict unrounded profit-cushion ceiling.
+                    effective_risk_for_caps = 0.0
+                    giveback_cap_mode = "strict_profit_cushion_ceiling"
+                    allowed_giveback_ceiling_raw = net_profit_cushion_raw * cushion_ratio
+                    allowed_giveback_ceiling = round(allowed_giveback_ceiling_raw, 4)
+                    if added_tranche_risk_raw > allowed_giveback_ceiling_raw + 1e-9:
+                        raise PortfolioError(
+                            f"profit_cushion_giveback_exceeded: 保本推仓新增笔止损回吐风险 {added_tranche_risk_raw:,.4f} "
+                            f"超过允许浮盈回吐硬上限 {allowed_giveback_ceiling_raw:,.4f} "
+                            f"(净浮盈缓冲={net_profit_cushion_raw:,.4f} × {cushion_ratio:.2f}, "
+                            f"含已实现减仓损益 {partial_realized:,.2f})"
+                        )
+                else:
+                    # Principal still at risk: enforce max(remaining open risk, campaign open risk, added tranche risk)
+                    giveback_cap_mode = "principal_risk_budget"
+                    effective_risk_for_caps = max(remaining_open_risk, campaign_open_risk, added_tranche_risk)
+
                 open_others = [
                     p for p in positions if p.get("status") == "open" and p.get("position_id") != position_id
                 ]
@@ -2252,7 +2798,8 @@ def add_position_tranche(
                     raise ValueError(
                         f"add_tranche_sector_risk_exceeded: 加仓后板块风险约束 "
                         f"{other_sector_risk + effective_risk_for_caps:,.2f} "
-                        f"(合并在途={new_open_risk:,.2f}, 新增笔风险={added_tranche_risk:,.2f}) "
+                        f"(合并在途={remaining_open_risk:,.2f}, 战役在途={campaign_open_risk:,.2f}, "
+                        f"新增笔风险={added_tranche_risk:,.2f}) "
                         f"超过单板块上限 {single_sector_cap:,.2f} (回撤缩放系数 {risk_scale:.2f})，"
                         "可先将止损上移至保本/浮盈区释放风险额度后再加仓，或减小加仓手数"
                     )
@@ -2284,15 +2831,34 @@ def add_position_tranche(
                                 "可先将止损上移至保本/浮盈区释放风险额度后再加仓"
                             )
 
-                # Portfolio margin / capital ceiling check
-                new_pos_margin = round(
-                    float(new_qty) * new_avg * mult * fx_rate * float(pos.get("margin_rate", 1.0)), 2
+                # Portfolio margin / capital & optional leverage ceiling check (conservative max(cost, mark-to-add))
+                eff_margin_rate = float(pos.get("margin_rate", 1.0))
+                margin_metrics = compute_conservative_notional_and_margin(
+                    quantity=float(new_qty),
+                    avg_entry=new_avg,
+                    mark_price=price,
+                    multiplier=mult,
+                    fx_rate=fx_rate,
+                    margin_rate=eff_margin_rate,
                 )
+                cost_pos_margin = round(float(new_qty) * new_avg * mult * fx_rate * eff_margin_rate, 2)
+                conservative_pos_margin = margin_metrics["conservative_margin"]
+                conservative_pos_notional = margin_metrics["conservative_notional"]
+                margin_basis = "max(cost,mark_to_add)_vs_booked_equity"
                 other_margin = round(sum(_position_estimated_margin_account(p) for p in open_others), 2)
-                if other_margin + new_pos_margin > equity_val + 1e-6:
+                if other_margin + conservative_pos_margin > equity_val + 1e-6:
                     raise ValueError(
-                        f"portfolio_capital_limit_exceeded: 加仓后组合预计保证金/资金占用 "
-                        f"{other_margin + new_pos_margin:,.2f} 超过账户权益 {equity_val:,.2f}"
+                        f"portfolio_capital_limit_exceeded: 加仓后组合保守预计保证金/资金占用 "
+                        f"{other_margin + conservative_pos_margin:,.2f} (basis={margin_basis}, "
+                        f"cost_notional={margin_metrics['cost_notional']:,.2f}, "
+                        f"mark_notional={margin_metrics['mark_notional']:,.2f}) "
+                        f"超过账户权益 {equity_val:,.2f}"
+                    )
+                if eff_max_leverage is not None and conservative_pos_notional > equity_val * eff_max_leverage + 1e-6:
+                    raise PortfolioError(
+                        f"leverage_limit_exceeded: 加仓后保守名义敞口 {conservative_pos_notional:,.2f} "
+                        f"(basis={margin_basis}) 超过最大杠杆上限 {eff_max_leverage:.2f}x × 账户权益 "
+                        f"{equity_val:,.2f} = {equity_val * eff_max_leverage:,.2f}"
                     )
 
                 now = utc_now_str()
@@ -2309,20 +2875,38 @@ def add_position_tranche(
                     }
                 )
                 eff_stop_rounded = eff_stop
+                new_stage = "main_wave" if active_regime == "daily_structure" else "pyramided"
                 pos["quantity"] = new_qty
                 pos["avg_entry_price"] = new_avg
-                pos["tactical_stop_30m"] = eff_stop_rounded
+                pos["tactical_stop_30m"] = eff_stop_30m
                 pos["fx_to_account"] = fx_rate
-                if new_stop_30m is not None and eff_stop_rounded != old_stop:
+                if new_stop_30m is not None and eff_stop_30m != old_stop:
                     pos["stop_updated_at_utc"] = now
-                pos["current_open_risk_amount"] = new_open_risk
+                    pos["tactical_stop_active_since_utc"] = now
+                elif not pos.get("tactical_stop_active_since_utc"):
+                    pos["tactical_stop_active_since_utc"] = pos.get("stop_updated_at_utc") or pos.get("opened_at_utc") or now
+                if new_daily_stop is not None:
+                    pos["structural_stop_daily"] = eff_daily_stop
+                    if (
+                        old_daily is None
+                        or eff_daily_stop != old_daily
+                        or not pos.get("structural_stop_updated_at_utc")
+                    ):
+                        pos["structural_stop_updated_at_utc"] = now
+                pos["campaign_1r_amount"] = _position_campaign_1r(pos)
+                pos["active_stop_regime"] = active_regime
+                pos["lifecycle_stage"] = new_stage
+                pos["current_open_risk_amount"] = remaining_open_risk
+                pos["remaining_open_risk_amount"] = remaining_open_risk
+                pos["campaign_open_risk_amount"] = campaign_open_risk
+                pos["campaign_net_pnl_at_stop"] = campaign_net_pnl_at_stop
                 pos["locked_profit_amount"] = locked_profit
-                pos["estimated_margin_account"] = new_pos_margin
+                pos["estimated_margin_account"] = cost_pos_margin
                 pos["tranches"] = tranches
                 pos["updated_at_utc"] = now
 
                 new_revision = int(doc.get("revision") or 0) + 1
-                risk_delta = round(new_open_risk - old_risk, 2)
+                risk_delta = round(remaining_open_risk - old_risk, 2)
                 journal_entry = {
                     "timestamp_utc": now,
                     "action": "add_on_profit",
@@ -2336,20 +2920,30 @@ def add_position_tranche(
                     "old_entry_price": round(old_avg, 6),
                     "new_avg_entry_price": new_avg,
                     "new_entry_price": new_avg,
-                    "old_stop_loss": round(old_stop, 6),
+                    "old_stop_loss": round(old_eff_stop, 6),
                     "new_stop_loss": eff_stop_rounded,
-                    "stop_30m": eff_stop_rounded,
+                    "stop_30m": eff_stop_30m,
+                    "structural_stop_daily": pos.get("structural_stop_daily"),
+                    "lifecycle_stage": new_stage,
                     "old_quantity": old_qty_orig,
                     "add_quantity": clean_add_qty,
                     "new_quantity": new_qty,
                     "total_quantity": new_qty,
                     "risk_delta": risk_delta,
                     "old_risk_amount": old_risk,
-                    "new_risk_amount": new_open_risk,
+                    "new_risk_amount": remaining_open_risk,
                     "old_risk_pct": old_risk_pct,
                     "new_risk_pct": new_risk_pct,
                     "added_tranche_risk_amount": added_tranche_risk,
-                    "current_open_risk_amount": new_open_risk,
+                    "current_open_risk_amount": remaining_open_risk,
+                    "remaining_open_risk_amount": remaining_open_risk,
+                    "campaign_open_risk_amount": campaign_open_risk,
+                    "campaign_net_pnl_at_stop": campaign_net_pnl_at_stop,
+                    "locked_profit_amount": locked_profit,
+                    "margin_basis": margin_basis,
+                    "conservative_margin_account": conservative_pos_margin,
+                    "conservative_notional_account": conservative_pos_notional,
+                    "giveback_cap_mode": giveback_cap_mode,
                     "note": clean_note,
                     "reason": clean_reason,
                 }
@@ -2364,14 +2958,27 @@ def add_position_tranche(
                     "old_entry_price": round(old_avg, 6),
                     "add_price": round(price, 6),
                     "new_entry_price": new_avg,
-                    "old_stop_loss": round(old_stop, 6),
+                    "old_stop_loss": round(old_eff_stop, 6),
                     "new_stop_loss": eff_stop_rounded,
                     "old_risk_amount": old_risk,
-                    "new_risk_amount": new_open_risk,
+                    "new_risk_amount": remaining_open_risk,
+                    "remaining_open_risk_amount": remaining_open_risk,
+                    "campaign_open_risk_amount": campaign_open_risk,
+                    "campaign_net_pnl_at_stop": campaign_net_pnl_at_stop,
+                    "required_breakeven_stop": req_campaign_be,
                     "old_risk_pct": old_risk_pct,
                     "new_risk_pct": new_risk_pct,
                     "risk_delta": risk_delta,
                     "added_tranche_risk_amount": added_tranche_risk,
+                    "breakeven_locked": is_campaign_breakeven_locked,
+                    "net_profit_cushion_amount": net_profit_cushion,
+                    "allowed_giveback_ceiling": allowed_giveback_ceiling,
+                    "giveback_cap_mode": giveback_cap_mode,
+                    "margin_basis": margin_basis,
+                    "conservative_notional_account": conservative_pos_notional,
+                    "conservative_margin_account": conservative_pos_margin,
+                    "lifecycle_stage": new_stage,
+                    "active_stop_regime": active_regime,
                     "tranche_count": len(tranches),
                     "note": clean_note,
                 }
@@ -2406,6 +3013,10 @@ def scale_in_position(
     portfolio_dir: str | None = None,
     enforce_macro_cap: bool = True,
     idempotency_key: str | None = None,
+    require_breakeven_lock: bool = False,
+    max_profit_cushion_ratio: float = 0.65,
+    new_daily_stop: float | None = None,
+    max_leverage: float | None = None,
 ) -> dict[str, Any]:
     """Scale into an existing open position strictly on confirmed floating profit (T2/T3 pyramid)."""
     eff_reason = (note or "").strip() or "profit_pyramid"
@@ -2420,6 +3031,10 @@ def scale_in_position(
         idempotency_key=idempotency_key,
         fx_to_account=fx_rate_to_base,
         note=note,
+        require_breakeven_lock=require_breakeven_lock,
+        max_profit_cushion_ratio=max_profit_cushion_ratio,
+        new_daily_stop=new_daily_stop,
+        max_leverage=max_leverage,
     )
 
 
@@ -2552,11 +3167,31 @@ def trail_stop(
                 pos["tactical_stop_30m"] = new_stop_rounded
                 if new_stop_rounded != old_stop_rounded or not pos.get("stop_updated_at_utc"):
                     pos["stop_updated_at_utc"] = now
+                if new_stop_rounded != old_stop_rounded or not pos.get("tactical_stop_active_since_utc"):
+                    pos["tactical_stop_active_since_utc"] = now
                 pos["structural_stop_daily"] = updated_daily
                 if updated_daily is not None and (
                     updated_daily != old_daily_rounded or not pos.get("structural_stop_updated_at_utc")
                 ):
                     pos["structural_stop_updated_at_utc"] = now
+                pos["campaign_1r_amount"] = _position_campaign_1r(pos)
+                pos["active_stop_regime"] = _position_stop_regime(pos)
+
+                eff_stop_for_risk = _effective_position_stop(pos)
+                rem_risk, camp_risk, _ = _sync_position_campaign_risk_fields(pos)
+                new_open_risk = rem_risk
+                locked_profit = _compute_locked_profit_amount(
+                    direction,
+                    float(pos["avg_entry_price"]),
+                    eff_stop_for_risk,
+                    float(pos["quantity"]),
+                    float(pos["multiplier"]),
+                    float(pos.get("fx_to_account", 1.0)),
+                )
+                cur_stage = _position_lifecycle_stage(pos)
+                if cur_stage == "pilot" and new_open_risk <= 1e-6 and camp_risk <= 1e-6:
+                    cur_stage = "breakeven_locked"
+                pos["lifecycle_stage"] = cur_stage
                 pos["current_open_risk_amount"] = new_open_risk
                 pos["locked_profit_amount"] = locked_profit
                 pos["updated_at_utc"] = now
@@ -2573,6 +3208,7 @@ def trail_stop(
                     "old_stop_30m": old_stop,
                     "new_stop_30m": new_stop_rounded,
                     "new_structural_stop_daily": updated_daily,
+                    "lifecycle_stage": cur_stage,
                     "risk_delta": risk_delta,
                     "current_open_risk_amount": new_open_risk,
                     "locked_profit_amount": locked_profit,
@@ -2609,6 +3245,381 @@ def trail_stop(
         }
 
 
+def set_stop_regime(
+    position_id: str,
+    regime: str,
+    new_daily_stop: float | None = None,
+    new_stop_30m: float | None = None,
+    current_price: float | None = None,
+    reason: str = "",
+    idempotency_key: str | None = None,
+    db_path: Path | str | None = None,
+    portfolio_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Hand over active stop governance between 30m tactical stop and daily structural main-wave stop."""
+    norm_regime = str(regime or "").strip().lower()
+    if norm_regime not in VALID_STOP_REGIMES:
+        raise PortfolioError(
+            f"invalid_stop_regime: regime must be one of {list(VALID_STOP_REGIMES)}, got {regime!r}"
+        )
+    idem_key = _normalize_idempotency_key(idempotency_key)
+    req_hash = (
+        _compute_request_hash(
+            "set_stop_regime",
+            {
+                "position_id": position_id,
+                "regime": norm_regime,
+                "new_daily_stop": new_daily_stop,
+                "new_stop_30m": new_stop_30m,
+                "current_price": current_price,
+                "reason": reason,
+            },
+        )
+        if idem_key is not None
+        else ""
+    )
+    pdir, db_file = _resolve_storage(portfolio_dir=portfolio_dir, db_path=db_path)
+
+    with _portfolio_lock(pdir):
+        replayed_result: dict[str, Any] | None = None
+        result_payload: dict[str, Any] | None = None
+        with _sqlite_write_tx(pdir, db_file=db_file) as conn:
+            _maybe_migrate_legacy_json_in_tx(conn, pdir)
+            cached = _db_lookup_idempotency(conn, idem_key, "set_stop_regime", req_hash)
+            if cached is not None:
+                replayed_result = cached
+            else:
+                cur_price = (
+                    round(_require_portfolio_float(current_price, "current_price", positive=True), _PRICE_PERSIST_DECIMALS)
+                    if current_price is not None
+                    else None
+                )
+                doc = _db_read_positions_doc(conn, pdir)
+                positions: list[dict[str, Any]] = list(doc.get("positions") or [])
+                idx = next((i for i, p in enumerate(positions) if p.get("position_id") == position_id), None)
+                if idx is None:
+                    raise PortfolioError(f"Position not found: {position_id}")
+                pos = dict(positions[idx])
+                if pos.get("status") != "open":
+                    raise PortfolioError(f"Position {position_id} is not open (status={pos.get('status')})")
+
+                direction = pos["direction"]
+                avg_entry = round(float(pos["avg_entry_price"]), _PRICE_PERSIST_DECIMALS)
+                old_regime = _position_stop_regime(pos)
+                old_30m = round(float(pos["tactical_stop_30m"]), _PRICE_PERSIST_DECIMALS)
+                old_daily_raw = pos.get("structural_stop_daily")
+                old_daily = (
+                    round(float(old_daily_raw), _PRICE_PERSIST_DECIMALS) if old_daily_raw is not None else None
+                )
+                old_risk = float(pos.get("current_open_risk_amount") or 0.0)
+
+                cand_daily: float | None = None
+                if new_daily_stop is not None:
+                    cand_daily = round(
+                        _require_portfolio_float(new_daily_stop, "new_daily_stop", positive=True),
+                        _PRICE_PERSIST_DECIMALS,
+                    )
+                    if cand_daily <= 0:
+                        raise PortfolioError(
+                            f"new_daily_stop ({new_daily_stop}) rounds to <= 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+                        )
+                    if old_daily is not None:
+                        if direction == "long" and cand_daily < old_daily - 1e-9:
+                            raise PortfolioError(
+                                f"stop_widening_forbidden: 多头日线结构止损不得下移 ({cand_daily} < {old_daily})"
+                            )
+                        if direction == "short" and cand_daily > old_daily + 1e-9:
+                            raise PortfolioError(
+                                f"stop_widening_forbidden: 空头日线结构止损不得上移 ({cand_daily} > {old_daily})"
+                            )
+
+                eff_daily_candidate = cand_daily if cand_daily is not None else old_daily
+
+                cand_30m: float | None = None
+                if new_stop_30m is not None:
+                    cand_30m = round(
+                        _require_finite_float(new_stop_30m, "new_stop_30m", positive=True),
+                        _PRICE_PERSIST_DECIMALS,
+                    )
+                    if cand_30m <= 0:
+                        raise PortfolioError(
+                            f"new_stop_30m ({new_stop_30m}) rounds to <= 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+                        )
+                    if old_regime == "tactical_30m":
+                        if direction == "long" and cand_30m < old_30m - 1e-9:
+                            raise PortfolioError(
+                                f"stop_widening_forbidden: 多头 30m 战术止损不得下移 ({cand_30m} < {old_30m})"
+                            )
+                        if direction == "short" and cand_30m > old_30m + 1e-9:
+                            raise PortfolioError(
+                                f"stop_widening_forbidden: 空头 30m 战术止损不得上移 ({cand_30m} > {old_30m})"
+                            )
+                    elif old_regime == "daily_structure" and norm_regime == "tactical_30m":
+                        if eff_daily_candidate is not None:
+                            if direction == "long" and cand_30m < eff_daily_candidate - 1e-9:
+                                raise PortfolioError(
+                                    f"stop_widening_forbidden: 从 daily_structure 切回 tactical_30m 时，"
+                                    f"多头 30m 止损 ({cand_30m}) 不得宽松于有效日线结构止损 ({eff_daily_candidate})"
+                                )
+                            if direction == "short" and cand_30m > eff_daily_candidate + 1e-9:
+                                raise PortfolioError(
+                                    f"stop_widening_forbidden: 从 daily_structure 切回 tactical_30m 时，"
+                                    f"空头 30m 止损 ({cand_30m}) 不得宽松于有效日线结构止损 ({eff_daily_candidate})"
+                                )
+                    else:
+                        if direction == "long" and cand_30m < old_30m - 1e-9:
+                            raise PortfolioError(
+                                f"stop_widening_forbidden: 多头 30m 战术止损不得下移 ({cand_30m} < {old_30m})"
+                            )
+                        if direction == "short" and cand_30m > old_30m + 1e-9:
+                            raise PortfolioError(
+                                f"stop_widening_forbidden: 空头 30m 战术止损不得上移 ({cand_30m} > {old_30m})"
+                            )
+
+                now = utc_now_str()
+                partial_realized = float(pos.get("partial_realized_pnl") or 0.0)
+                qty_val = float(pos["quantity"])
+                mult_val = float(pos["multiplier"])
+                fx_val = float(pos.get("fx_to_account", 1.0))
+
+                if norm_regime == "daily_structure":
+                    if eff_daily_candidate is None:
+                        raise PortfolioError(
+                            "missing_daily_structural_stop: 切换至 daily_structure 主升持有模式必须具备有效日线结构止损"
+                        )
+                    # Hard Campaign Breakeven Floor Rule: NEVER turn a winner (or whole campaign) back into a principal loser
+                    req_campaign_be = _compute_campaign_breakeven_stop(
+                        direction, avg_entry, qty_val, mult_val, fx_val, partial_realized
+                    )
+                    rem_pnl_at_daily = (
+                        ((eff_daily_candidate - avg_entry) if direction == "long" else (avg_entry - eff_daily_candidate))
+                        * qty_val
+                        * mult_val
+                        * fx_val
+                    )
+                    campaign_net_pnl_at_daily_raw = partial_realized + rem_pnl_at_daily
+                    if direction == "long" and eff_daily_candidate < avg_entry - 1e-9:
+                        raise PortfolioError(
+                            f"daily_stop_below_breakeven_floor: 严禁将主升持有头寸变回本金亏损单："
+                            f"多头日线结构止损 ({eff_daily_candidate}) 必须 >= 持仓均价 ({avg_entry}) "
+                            f"(required_breakeven_stop={req_campaign_be})"
+                        )
+                    if direction == "short" and eff_daily_candidate > avg_entry + 1e-9:
+                        raise PortfolioError(
+                            f"daily_stop_below_breakeven_floor: 严禁将主升持有头寸变回本金亏损单："
+                            f"空头日线结构止损 ({eff_daily_candidate}) 必须 <= 持仓均价 ({avg_entry}) "
+                            f"(required_breakeven_stop={req_campaign_be})"
+                        )
+                    if campaign_net_pnl_at_daily_raw < -1e-6:
+                        cmp_op = ">=" if direction == "long" else "<="
+                        raise PortfolioError(
+                            f"daily_stop_below_breakeven_floor: 严禁将整轮战役变回净亏损："
+                            f"日线结构止损 ({eff_daily_candidate}) 需覆盖前期已实现减仓亏损 ({partial_realized:,.2f})，"
+                            f"要求 {cmp_op} {req_campaign_be} (required_breakeven_stop={req_campaign_be}, "
+                            f"campaign_net_pnl_at_stop={round(campaign_net_pnl_at_daily_raw, 2):,.2f})"
+                        )
+                    if cur_price is not None:
+                        if direction == "long" and not (eff_daily_candidate < cur_price):
+                            raise PortfolioError(
+                                f"stop_breached_by_current_price: 多头日线结构止损 ({eff_daily_candidate}) "
+                                f"必须严格低于当前价 ({cur_price})"
+                            )
+                        if direction == "short" and not (eff_daily_candidate > cur_price):
+                            raise PortfolioError(
+                                f"stop_breached_by_current_price: 空头日线结构止损 ({eff_daily_candidate}) "
+                                f"必须严格高于当前价 ({cur_price})"
+                            )
+                        if cand_30m is not None:
+                            if direction == "long" and not (cand_30m < cur_price):
+                                raise PortfolioError(
+                                    f"stop_breached_by_current_price: 多头 30m 止损 ({cand_30m}) 必须严格低于当前价 ({cur_price})"
+                                )
+                            if direction == "short" and not (cand_30m > cur_price):
+                                raise PortfolioError(
+                                    f"stop_breached_by_current_price: 空头 30m 止损 ({cand_30m}) 必须严格高于当前价 ({cur_price})"
+                                )
+
+                    eff_30m_final = cand_30m if cand_30m is not None else old_30m
+                    pos["tactical_stop_30m"] = eff_30m_final
+                    if cand_30m is not None and (eff_30m_final != old_30m or not pos.get("stop_updated_at_utc")):
+                        pos["stop_updated_at_utc"] = now
+                        pos["tactical_stop_active_since_utc"] = now
+                    elif not pos.get("tactical_stop_active_since_utc"):
+                        pos["tactical_stop_active_since_utc"] = (
+                            pos.get("stop_updated_at_utc") or pos.get("opened_at_utc") or now
+                        )
+                    pos["structural_stop_daily"] = eff_daily_candidate
+                    if not pos.get("structural_stop_updated_at_utc") or (
+                        cand_daily is not None and (old_daily is None or eff_daily_candidate != old_daily)
+                    ):
+                        pos["structural_stop_updated_at_utc"] = now
+                    pos["active_stop_regime"] = "daily_structure"
+                    pos["lifecycle_stage"] = "main_wave"
+                    eff_active_stop = eff_daily_candidate
+                    rem_risk, camp_risk, camp_net_pnl = _sync_position_campaign_risk_fields(pos)
+                    new_open_risk = rem_risk
+                    locked_profit = _compute_locked_profit_amount(
+                        direction,
+                        avg_entry,
+                        eff_active_stop,
+                        qty_val,
+                        mult_val,
+                        fx_val,
+                    )
+                else:
+                    # norm_regime == "tactical_30m"
+                    eff_30m_final = cand_30m if cand_30m is not None else old_30m
+                    if eff_daily_candidate is not None:
+                        if cand_30m is not None:
+                            if direction == "long" and cand_30m < eff_daily_candidate - 1e-9:
+                                raise PortfolioError(
+                                    f"stop_widening_forbidden: 多头 30m 止损 ({cand_30m}) 不得宽松于日线结构止损 ({eff_daily_candidate})"
+                                )
+                            if direction == "short" and cand_30m > eff_daily_candidate + 1e-9:
+                                raise PortfolioError(
+                                    f"stop_widening_forbidden: 空头 30m 止损 ({cand_30m}) 不得宽松于日线结构止损 ({eff_daily_candidate})"
+                                )
+                        elif (
+                            direction == "long"
+                            and eff_30m_final < eff_daily_candidate
+                            or direction == "short"
+                            and eff_30m_final > eff_daily_candidate
+                        ):
+                            eff_30m_final = eff_daily_candidate
+
+                    if cur_price is not None:
+                        if direction == "long" and not (eff_30m_final < cur_price):
+                            raise PortfolioError(
+                                f"stop_breached_by_current_price: 多头 30m 战术止损 ({eff_30m_final}) "
+                                f"必须严格低于当前价 ({cur_price})"
+                            )
+                        if direction == "short" and not (eff_30m_final > cur_price):
+                            raise PortfolioError(
+                                f"stop_breached_by_current_price: 空头 30m 战术止损 ({eff_30m_final}) "
+                                f"必须严格高于当前价 ({cur_price})"
+                            )
+                        if cand_daily is not None and eff_daily_candidate is not None:
+                            if direction == "long" and not (eff_daily_candidate < cur_price):
+                                raise PortfolioError(
+                                    f"stop_breached_by_current_price: 多头日线结构止损 ({eff_daily_candidate}) "
+                                    f"必须严格低于当前价 ({cur_price})"
+                                )
+                            if direction == "short" and not (eff_daily_candidate > cur_price):
+                                raise PortfolioError(
+                                    f"stop_breached_by_current_price: 空头日线结构止损 ({eff_daily_candidate}) "
+                                    f"必须严格高于当前价 ({cur_price})"
+                                )
+
+                    pos["tactical_stop_30m"] = eff_30m_final
+                    if eff_30m_final != old_30m or not pos.get("stop_updated_at_utc"):
+                        pos["stop_updated_at_utc"] = now
+                    # Unconditionally refresh tactical_stop_active_since_utc whenever switching back to tactical_30m
+                    # so historical 30m wicks from the daily_structure period cannot retroactively trigger false RED_EXIT.
+                    if (
+                        old_regime != "tactical_30m"
+                        or eff_30m_final != old_30m
+                        or not pos.get("tactical_stop_active_since_utc")
+                    ):
+                        pos["tactical_stop_active_since_utc"] = now
+                    if cand_daily is not None:
+                        pos["structural_stop_daily"] = eff_daily_candidate
+                        if (
+                            old_daily is None
+                            or eff_daily_candidate != old_daily
+                            or not pos.get("structural_stop_updated_at_utc")
+                        ):
+                            pos["structural_stop_updated_at_utc"] = now
+                    pos["active_stop_regime"] = "tactical_30m"
+                    rem_risk, camp_risk, camp_net_pnl = _sync_position_campaign_risk_fields(pos)
+                    new_open_risk = rem_risk
+                    locked_profit = _compute_locked_profit_amount(
+                        direction,
+                        avg_entry,
+                        eff_30m_final,
+                        qty_val,
+                        mult_val,
+                        fx_val,
+                    )
+                    pos["lifecycle_stage"] = (
+                        "pyramided"
+                        if len(pos.get("tranches") or []) >= 2
+                        else ("breakeven_locked" if (new_open_risk <= 1e-6 and camp_risk <= 1e-6) else "pilot")
+                    )
+                    eff_active_stop = eff_30m_final
+
+                pos["campaign_1r_amount"] = _position_campaign_1r(pos)
+                pos["current_open_risk_amount"] = new_open_risk
+                pos["locked_profit_amount"] = locked_profit
+                pos["regime_updated_at_utc"] = now
+                pos["updated_at_utc"] = now
+
+                new_revision = int(doc.get("revision") or 0) + 1
+                risk_delta = round(new_open_risk - old_risk, 2)
+                clean_reason = (reason or "").strip() or f"set_stop_regime:{norm_regime}"
+                journal_entry = {
+                    "timestamp_utc": now,
+                    "action": "set_stop_regime",
+                    "position_id": position_id,
+                    "symbol": pos["symbol"],
+                    "sector_theme": pos["sector_theme"],
+                    "direction": direction,
+                    "old_stop_regime": old_regime,
+                    "new_stop_regime": pos["active_stop_regime"],
+                    "lifecycle_stage": pos["lifecycle_stage"],
+                    "old_stop_30m": old_30m,
+                    "new_stop_30m": pos["tactical_stop_30m"],
+                    "structural_stop_daily": pos.get("structural_stop_daily"),
+                    "effective_stop": eff_active_stop,
+                    "risk_delta": risk_delta,
+                    "current_open_risk_amount": new_open_risk,
+                    "remaining_open_risk_amount": rem_risk,
+                    "campaign_open_risk_amount": camp_risk,
+                    "campaign_net_pnl_at_stop": camp_net_pnl,
+                    "locked_profit_amount": locked_profit,
+                    "reason": clean_reason,
+                }
+                if cur_price is not None:
+                    journal_entry["price"] = cur_price
+
+                result_payload = {
+                    "status": "regime_updated",
+                    "revision": new_revision,
+                    "position": pos,
+                    "old_stop_regime": old_regime,
+                    "active_stop_regime": pos["active_stop_regime"],
+                    "lifecycle_stage": pos["lifecycle_stage"],
+                    "effective_stop": eff_active_stop,
+                    "risk_delta": risk_delta,
+                    "current_open_risk_amount": new_open_risk,
+                    "remaining_open_risk_amount": rem_risk,
+                    "campaign_open_risk_amount": camp_risk,
+                    "campaign_net_pnl_at_stop": camp_net_pnl,
+                    "locked_profit_amount": locked_profit,
+                }
+                _db_upsert_position(conn, pos)
+                _db_update_meta(conn, revision=new_revision, updated_at_utc=now)
+                _db_insert_journal_records(conn, [journal_entry])
+                _db_store_idempotency(conn, idem_key, "set_stop_regime", req_hash, result_payload, now)
+
+        mirror_ok, mirror_err = _safe_export_mirrors_unlocked(pdir, db_file=db_file)
+        summary = _summarize_portfolio_unlocked(pdir)
+        if replayed_result is not None:
+            return {
+                **replayed_result,
+                "summary": summary,
+                "idempotent_replay": True,
+                "mirror_sync_ok": mirror_ok,
+                "mirror_sync_error": mirror_err,
+            }
+        assert result_payload is not None
+        return {
+            **result_payload,
+            "summary": summary,
+            "mirror_sync_ok": mirror_ok,
+            "mirror_sync_error": mirror_err,
+        }
+
+
 def trim_position(
     position_id: str,
     trim_price: float,
@@ -2616,22 +3627,24 @@ def trim_position(
     reason: str = "partial_take_profit",
     portfolio_dir: str | None = None,
     idempotency_key: str | None = None,
+    attribution_tag: str | None = None,
+    lesson_note: str = "",
 ) -> dict[str, Any]:
     """Partially reduce an open position, enforcing min_order_qty & SSE Rule 6.7 and booking partial realized PnL."""
+    norm_attr_tag = _validate_attribution_tag(attribution_tag)
+    norm_lesson = _normalize_lesson_note(lesson_note)
     idem_key = _normalize_idempotency_key(idempotency_key)
-    req_hash = (
-        _compute_request_hash(
-            "trim_position",
-            {
-                "position_id": position_id,
-                "trim_price": trim_price,
-                "trim_quantity": trim_quantity,
-                "reason": reason,
-            },
-        )
-        if idem_key is not None
-        else ""
-    )
+    req_payload: dict[str, Any] = {
+        "position_id": position_id,
+        "trim_price": trim_price,
+        "trim_quantity": trim_quantity,
+        "reason": reason,
+    }
+    if norm_attr_tag is not None:
+        req_payload["attribution_tag"] = norm_attr_tag
+    if norm_lesson:
+        req_payload["lesson_note"] = norm_lesson
+    req_hash = _compute_request_hash("trim_position", req_payload) if idem_key is not None else ""
     pdir = _resolve_portfolio_dir(portfolio_dir)
 
     with _portfolio_lock(pdir):
@@ -2705,18 +3718,28 @@ def trim_position(
                         "账本已如实记账并自动禁止后续新开仓与加仓"
                     )
 
-                new_open_risk = _compute_open_risk_amount(
-                    pos["direction"],
-                    float(pos["avg_entry_price"]),
-                    float(pos["tactical_stop_30m"]),
-                    rem_qty,
-                    float(pos["multiplier"]),
-                    float(pos.get("fx_to_account", 1.0)),
+                eff_stop = _effective_position_stop(pos)
+                is_be = (
+                    (eff_stop >= float(pos["avg_entry_price"]) - 1e-9)
+                    if pos["direction"] == "long"
+                    else (eff_stop <= float(pos["avg_entry_price"]) + 1e-9)
+                )
+                new_open_risk = (
+                    0.0
+                    if is_be
+                    else _compute_open_risk_amount(
+                        pos["direction"],
+                        float(pos["avg_entry_price"]),
+                        eff_stop,
+                        rem_qty,
+                        float(pos["multiplier"]),
+                        float(pos.get("fx_to_account", 1.0)),
+                    )
                 )
                 locked_profit = _compute_locked_profit_amount(
                     pos["direction"],
                     float(pos["avg_entry_price"]),
-                    float(pos["tactical_stop_30m"]),
+                    eff_stop,
                     rem_qty,
                     float(pos["multiplier"]),
                     float(pos.get("fx_to_account", 1.0)),
@@ -2731,11 +3754,31 @@ def trim_position(
                 )
                 account["updated_at_utc"] = now
 
+                clean_reason = (reason or "partial_take_profit").strip()
+                trims = list(pos.get("trims") or [])
+                trims.append(
+                    {
+                        "trim_index": len(trims) + 1,
+                        "timestamp_utc": now,
+                        "price": round(price, 6),
+                        "quantity": clean_trim_qty,
+                        "remaining_quantity": rem_qty,
+                        "realized_pnl": part_pnl,
+                        "reason": clean_reason,
+                        "attribution_tag": norm_attr_tag,
+                        "lesson_note": norm_lesson,
+                    }
+                )
                 pos["quantity"] = rem_qty
                 pos["partial_realized_pnl"] = round(float(pos.get("partial_realized_pnl") or 0.0) + part_pnl, 2)
+                pos["campaign_1r_amount"] = _position_campaign_1r(pos)
+                pos["active_stop_regime"] = _position_stop_regime(pos)
+                pos["lifecycle_stage"] = _position_lifecycle_stage(pos)
                 pos["current_open_risk_amount"] = new_open_risk
+                _sync_position_campaign_risk_fields(pos)
                 pos["locked_profit_amount"] = locked_profit
                 pos["estimated_margin_account"] = _position_estimated_margin_account(pos)
+                pos["trims"] = trims
                 pos["updated_at_utc"] = now
 
                 new_revision = int(doc.get("revision") or 0) + 1
@@ -2753,8 +3796,10 @@ def trim_position(
                     "partial_realized_pnl": part_pnl,
                     "equity_after": new_equity,
                     "account_insolvent": is_insolvent,
+                    "attribution_tag": norm_attr_tag,
+                    "lesson_note": norm_lesson,
                     "risk_delta": risk_delta,
-                    "reason": (reason or "partial_take_profit").strip(),
+                    "reason": clean_reason,
                 }
 
                 result_payload = {
@@ -2764,6 +3809,8 @@ def trim_position(
                     "account_insolvent": is_insolvent,
                     "position": pos,
                     "partial_realized_pnl": part_pnl,
+                    "attribution_tag": norm_attr_tag,
+                    "lesson_note": norm_lesson,
                     "risk_delta": risk_delta,
                     "warnings": warnings,
                 }
@@ -2798,23 +3845,25 @@ def close_position(
     update_account_equity: bool = True,
     idempotency_key: str | None = None,
     research_dir: str | None = None,
+    attribution_tag: str | None = None,
+    lesson_note: str = "",
 ) -> dict[str, Any]:
     """Close an open position, record realized PnL & R-multiple, and update ledger equity atomically."""
+    norm_attr_tag = _validate_attribution_tag(attribution_tag)
+    norm_lesson = _normalize_lesson_note(lesson_note)
     idem_key = _normalize_idempotency_key(idempotency_key)
-    req_hash = (
-        _compute_request_hash(
-            "close_position",
-            {
-                "position_id": position_id,
-                "exit_price": exit_price,
-                "exit_reason": exit_reason,
-                "exit_category": exit_category,
-                "update_account_equity": update_account_equity,
-            },
-        )
-        if idem_key is not None
-        else ""
-    )
+    req_payload: dict[str, Any] = {
+        "position_id": position_id,
+        "exit_price": exit_price,
+        "exit_reason": exit_reason,
+        "exit_category": exit_category,
+        "update_account_equity": update_account_equity,
+    }
+    if norm_attr_tag is not None:
+        req_payload["attribution_tag"] = norm_attr_tag
+    if norm_lesson:
+        req_payload["lesson_note"] = norm_lesson
+    req_hash = _compute_request_hash("close_position", req_payload) if idem_key is not None else ""
     pdir = _resolve_portfolio_dir(portfolio_dir)
 
     with _portfolio_lock(pdir):
@@ -2862,16 +3911,25 @@ def close_position(
                 total_pnl = round(float(pos.get("partial_realized_pnl") or 0.0) + rem_pnl, 2)
                 init_risk = float(pos.get("initial_risk_amount") or 0.0)
                 r_mult = round(total_pnl / init_risk, 4) if init_risk > 0 else None
+                camp_1r = _position_campaign_1r(pos)
+                camp_r_mult = round(total_pnl / camp_1r, 4) if camp_1r > 0 else r_mult
 
                 now = utc_now_str()
+                pos["campaign_1r_amount"] = camp_1r
+                pos["active_stop_regime"] = _position_stop_regime(pos)
+                pos["lifecycle_stage"] = _position_lifecycle_stage(pos)
                 pos["status"] = "closed"
                 pos["current_open_risk_amount"] = 0.0
+                _sync_position_campaign_risk_fields(pos)
                 pos["estimated_margin_account"] = 0.0
                 pos["exit_price"] = round(ex_price, 6)
                 pos["exit_reason"] = ex_reason
                 pos["exit_category"] = (exit_category or "manual").strip()
                 pos["realized_pnl"] = total_pnl
                 pos["r_multiple"] = r_mult
+                pos["campaign_r_multiple"] = camp_r_mult
+                pos["attribution_tag"] = norm_attr_tag
+                pos["lesson_note"] = norm_lesson
                 pos["closed_at_utc"] = now
                 pos["updated_at_utc"] = now
 
@@ -2911,7 +3969,10 @@ def close_position(
                     "equity_after": account["equity"],
                     "account_insolvent": is_insolvent,
                     "r_multiple": r_mult,
+                    "campaign_r_multiple": camp_r_mult,
                     "exit_category": pos["exit_category"],
+                    "attribution_tag": norm_attr_tag,
+                    "lesson_note": norm_lesson,
                     "risk_delta": round(-old_risk, 2),
                     "reason": ex_reason,
                 }
@@ -2924,6 +3985,9 @@ def close_position(
                     "position": pos,
                     "realized_pnl": total_pnl,
                     "r_multiple": r_mult,
+                    "campaign_r_multiple": camp_r_mult,
+                    "attribution_tag": norm_attr_tag,
+                    "lesson_note": norm_lesson,
                     "warnings": warnings,
                 }
                 _db_upsert_position(conn, pos)
@@ -3127,20 +4191,23 @@ def void_position(
 # Portfolio Summary
 # ---------------------------------------------------------------------------
 
-def summarize_portfolio(portfolio_dir: str | None = None) -> dict[str, Any]:
-    """Return full account risk summary, margin utilization, sector slot occupancy, macro overlap, and open positions."""
-    pdir = _resolve_portfolio_dir(portfolio_dir)
-    with _portfolio_lock(pdir):
-        account = _read_account_unlocked(pdir)
-        doc = _read_positions_doc_unlocked(pdir)
+def _summarize_portfolio_unlocked(pdir: str) -> dict[str, Any]:
+    account = _read_account_unlocked(pdir)
+    doc = _read_positions_doc_unlocked(pdir)
 
-    positions: list[dict[str, Any]] = list(doc.get("positions") or [])
+    positions: list[dict[str, Any]] = [_apply_position_defaults(p) for p in (doc.get("positions") or [])]
     open_positions = [p for p in positions if p.get("status") == "open"]
     closed_positions = [p for p in positions if p.get("status") == "closed"]
 
     equity = float(account["equity"])
     dd_pct, risk_scale, single_sector_cap, max_total_cap, max_macro_cap = _account_caps(account)
     total_open_risk = round(sum(float(p.get("current_open_risk_amount") or 0.0) for p in open_positions), 2)
+    total_remaining_open_risk = round(
+        sum(float(p.get("remaining_open_risk_amount") or 0.0) for p in open_positions), 2
+    )
+    total_campaign_open_risk = round(
+        sum(float(p.get("campaign_open_risk_amount") or 0.0) for p in open_positions), 2
+    )
     total_open_risk_pct = round((total_open_risk / equity) * 100.0, 4) if equity > 0 else 0.0
     total_locked_profit = round(sum(float(p.get("locked_profit_amount") or 0.0) for p in open_positions), 2)
     total_est_margin = round(sum(_position_estimated_margin_account(p) for p in open_positions), 2)
@@ -3209,6 +4276,8 @@ def summarize_portfolio(portfolio_dir: str | None = None) -> dict[str, Any]:
         "open_positions_count": len(open_positions),
         "closed_positions_count": len(closed_positions),
         "total_open_risk_amount": total_open_risk,
+        "total_remaining_open_risk_amount": total_remaining_open_risk,
+        "total_campaign_open_risk_amount": total_campaign_open_risk,
         "total_open_risk_pct": total_open_risk_pct,
         "total_estimated_margin_account": total_est_margin,
         "margin_utilization_pct": margin_util_pct,
@@ -3219,6 +4288,576 @@ def summarize_portfolio(portfolio_dir: str | None = None) -> dict[str, Any]:
         "open_positions": open_positions,
         "revision": int(doc.get("revision") or 0),
         "updated_at_utc": doc.get("updated_at_utc"),
+    }
+
+
+def summarize_portfolio(portfolio_dir: str | None = None) -> dict[str, Any]:
+    """Return full account risk summary, margin utilization, sector slot occupancy, macro overlap, and open positions."""
+    pdir = _resolve_portfolio_dir(portfolio_dir)
+    with _portfolio_lock(pdir):
+        return _summarize_portfolio_unlocked(pdir)
+
+
+# ---------------------------------------------------------------------------
+# Shadow Opportunity Ledger & Post-Trade Skewness / Attribution Analytics
+# ---------------------------------------------------------------------------
+
+def _compute_opportunity_metrics(
+    direction: str,
+    anchor_price: float,
+    planned_stop_price: float,
+    subsequent_extreme_price: float | None,
+) -> tuple[float, float | None, float | None, float | None]:
+    unit_1r = round(abs(anchor_price - planned_stop_price), _PRICE_PERSIST_DECIMALS)
+    if unit_1r <= 0:
+        raise PortfolioError("invalid_planned_stop: planned_stop_price must differ from anchor_price")
+    if subsequent_extreme_price is None:
+        return unit_1r, None, None, None
+    ext = round(
+        _require_portfolio_float(subsequent_extreme_price, "subsequent_extreme_price", positive=True),
+        _PRICE_PERSIST_DECIMALS,
+    )
+    if ext <= 0:
+        raise PortfolioError(
+            f"subsequent_extreme_price ({subsequent_extreme_price}) rounds to <= 0 at {_PRICE_PERSIST_DECIMALS}-decimal precision"
+        )
+    fav_move = max(0.0, (ext - anchor_price) if direction == "long" else (anchor_price - ext))
+    missed_move_pct = round((fav_move / anchor_price) * 100.0, 4) + 0.0
+    missed_r_multiple = round(fav_move / unit_1r, 4) + 0.0
+    return unit_1r, ext, missed_move_pct, missed_r_multiple
+
+
+def log_opportunity(
+    symbol: str,
+    market: str,
+    sector_theme: str,
+    direction: str,
+    kind: str,
+    anchor_price: float,
+    planned_stop_price: float,
+    subsequent_extreme_price: float | None = None,
+    root_cause_tag: str | None = None,
+    lesson_note: str = "",
+    linked_position_id: str | None = None,
+    status: str = "tracking",
+    idempotency_key: str | None = None,
+    db_path: Path | str | None = None,
+    portfolio_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Record a missed entry, 30m noise shakeout, or premature exit in the shadow opportunity ledger."""
+    clean_sym = (symbol or "").strip().upper()
+    if not clean_sym:
+        raise PortfolioError("symbol must be a non-empty string")
+    clean_market = (market or "").strip().upper()
+    if not clean_market:
+        raise PortfolioError("market must be a non-empty string")
+    clean_sector = _normalize_tag(sector_theme)
+    if not clean_sector:
+        raise PortfolioError("sector_theme must be a non-empty string")
+    norm_dir = str(direction or "").strip().lower()
+    if norm_dir not in ("long", "short"):
+        raise PortfolioError(f"direction must be 'long' or 'short', got {direction!r}")
+    norm_kind = str(kind or "").strip().lower()
+    if norm_kind not in VALID_OPPORTUNITY_KINDS:
+        raise PortfolioError(f"kind must be one of {list(VALID_OPPORTUNITY_KINDS)}, got {kind!r}")
+    norm_status = str(status or "tracking").strip().lower()
+    if norm_status not in VALID_OPPORTUNITY_STATUSES:
+        raise PortfolioError(f"status must be one of {list(VALID_OPPORTUNITY_STATUSES)}, got {status!r}")
+
+    anc = round(_require_portfolio_float(anchor_price, "anchor_price", positive=True), _PRICE_PERSIST_DECIMALS)
+    pstop = round(
+        _require_portfolio_float(planned_stop_price, "planned_stop_price", positive=True),
+        _PRICE_PERSIST_DECIMALS,
+    )
+    if anc <= 0 or pstop <= 0:
+        raise PortfolioError("anchor_price and planned_stop_price must round to > 0")
+    if norm_dir == "long" and not (pstop < anc):
+        raise PortfolioError(
+            f"invalid_planned_stop: 多头计划止损 planned_stop_price ({pstop}) 必须严格低于 anchor_price ({anc})"
+        )
+    if norm_dir == "short" and not (pstop > anc):
+        raise PortfolioError(
+            f"invalid_planned_stop: 空头计划止损 planned_stop_price ({pstop}) 必须严格高于 anchor_price ({anc})"
+        )
+
+    unit_1r, ext, missed_pct, missed_r = _compute_opportunity_metrics(
+        norm_dir, anc, pstop, subsequent_extreme_price
+    )
+    clean_root_tag = (str(root_cause_tag).strip() or None) if root_cause_tag is not None else None
+    clean_lesson = _normalize_lesson_note(lesson_note)
+    clean_linked = (str(linked_position_id).strip() or None) if linked_position_id is not None else None
+
+    idem_key = _normalize_idempotency_key(idempotency_key)
+    req_hash = (
+        _compute_request_hash(
+            "log_opportunity",
+            {
+                "symbol": clean_sym,
+                "market": clean_market,
+                "sector_theme": clean_sector,
+                "direction": norm_dir,
+                "kind": norm_kind,
+                "anchor_price": anc,
+                "planned_stop_price": pstop,
+                "subsequent_extreme_price": ext,
+                "root_cause_tag": clean_root_tag,
+                "lesson_note": clean_lesson,
+                "linked_position_id": clean_linked,
+                "status": norm_status,
+            },
+        )
+        if idem_key is not None
+        else ""
+    )
+    pdir, db_file = _resolve_storage(portfolio_dir=portfolio_dir, db_path=db_path)
+
+    with _portfolio_lock(pdir):
+        replayed_result: dict[str, Any] | None = None
+        opp_record: dict[str, Any] | None = None
+        with _sqlite_write_tx(pdir, db_file=db_file) as conn:
+            _maybe_migrate_legacy_json_in_tx(conn, pdir)
+            cached = _db_lookup_idempotency(conn, idem_key, "log_opportunity", req_hash)
+            if cached is not None:
+                replayed_result = cached
+            else:
+                existing_opp_ids = {
+                    str(r[0]) for r in conn.execute("SELECT opportunity_id FROM opportunities").fetchall()
+                }
+                now = utc_now_str()
+                opp_id = _generate_opportunity_id(clean_sym, existing_opp_ids)
+                opp_record = {
+                    "opportunity_id": opp_id,
+                    "symbol": clean_sym,
+                    "market": clean_market,
+                    "sector_theme": clean_sector,
+                    "direction": norm_dir,
+                    "kind": norm_kind,
+                    "status": norm_status,
+                    "anchor_price": anc,
+                    "planned_stop_price": pstop,
+                    "unit_1r_distance": unit_1r,
+                    "subsequent_extreme_price": ext,
+                    "missed_move_pct": missed_pct,
+                    "missed_r_multiple": missed_r,
+                    "root_cause_tag": clean_root_tag,
+                    "lesson_note": clean_lesson,
+                    "linked_position_id": clean_linked,
+                    "created_at_utc": now,
+                    "updated_at_utc": now,
+                }
+                _db_upsert_opportunity(conn, opp_record)
+                _db_store_idempotency(conn, idem_key, "log_opportunity", req_hash, opp_record, now)
+
+        mirror_ok, mirror_err = _safe_export_mirrors_unlocked(pdir, db_file=db_file)
+        if replayed_result is not None:
+            return {
+                **replayed_result,
+                "opportunity": dict(replayed_result),
+                "idempotent_replay": True,
+                "mirror_sync_ok": mirror_ok,
+                "mirror_sync_error": mirror_err,
+            }
+        assert opp_record is not None
+        return {
+            **opp_record,
+            "opportunity": dict(opp_record),
+            "mirror_sync_ok": mirror_ok,
+            "mirror_sync_error": mirror_err,
+        }
+
+
+def update_opportunity(
+    opportunity_id: str,
+    subsequent_extreme_price: float | None = _UNSET,
+    status: str | None = _UNSET,
+    root_cause_tag: str | None = _UNSET,
+    lesson_note: str | None = _UNSET,
+    db_path: Path | str | None = None,
+    portfolio_dir: Path | str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    """Update a shadow opportunity record and recompute missed move % and missed R-multiple.
+
+    Omitted fields default to ``_UNSET`` (leave unchanged). Explicitly passing ``None`` for
+    ``subsequent_extreme_price`` clears it along with ``missed_move_pct`` and ``missed_r_multiple``;
+    passing ``None`` or ``""`` for ``root_cause_tag`` clears it to ``None``; passing ``None`` for
+    ``lesson_note`` clears it to ``""``.
+    """
+    opp_id_clean = (opportunity_id or "").strip()
+    if not opp_id_clean:
+        raise PortfolioError("opportunity_id must be a non-empty string")
+    norm_status: str | None = None
+    if status is not _UNSET:
+        if status is None:
+            raise PortfolioError(f"status must be one of {list(VALID_OPPORTUNITY_STATUSES)}, got None")
+        norm_status = str(status).strip().lower()
+        if norm_status not in VALID_OPPORTUNITY_STATUSES:
+            raise PortfolioError(f"status must be one of {list(VALID_OPPORTUNITY_STATUSES)}, got {status!r}")
+
+    idem_key = _normalize_idempotency_key(idempotency_key)
+    req_payload: dict[str, Any] = {"opportunity_id": opp_id_clean}
+    if subsequent_extreme_price is not _UNSET:
+        req_payload["subsequent_extreme_price"] = subsequent_extreme_price
+    if status is not _UNSET:
+        req_payload["status"] = norm_status
+    if root_cause_tag is not _UNSET:
+        req_payload["root_cause_tag"] = (
+            None if root_cause_tag is None else (str(root_cause_tag).strip() or None)
+        )
+    if lesson_note is not _UNSET:
+        req_payload["lesson_note"] = "" if lesson_note is None else str(lesson_note).strip()
+
+    req_hash = _compute_request_hash("update_opportunity", req_payload) if idem_key is not None else ""
+    pdir, db_file = _resolve_storage(portfolio_dir=portfolio_dir, db_path=db_path)
+
+    with _portfolio_lock(pdir):
+        replayed_result: dict[str, Any] | None = None
+        updated_opp: dict[str, Any] | None = None
+        with _sqlite_write_tx(pdir, db_file=db_file) as conn:
+            _maybe_migrate_legacy_json_in_tx(conn, pdir)
+            cached = _db_lookup_idempotency(conn, idem_key, "update_opportunity", req_hash)
+            if cached is not None:
+                replayed_result = cached
+            else:
+                row = conn.execute(
+                    "SELECT payload_json FROM opportunities WHERE opportunity_id = ?",
+                    (opp_id_clean,),
+                ).fetchone()
+                if row is None:
+                    raise PortfolioError(f"Opportunity not found: {opp_id_clean}")
+                opp = dict(json.loads(row[0]))
+
+                if subsequent_extreme_price is _UNSET:
+                    eff_ext_in = opp.get("subsequent_extreme_price")
+                else:
+                    eff_ext_in = subsequent_extreme_price
+
+                unit_1r, ext, missed_pct, missed_r = _compute_opportunity_metrics(
+                    str(opp["direction"]),
+                    float(opp["anchor_price"]),
+                    float(opp["planned_stop_price"]),
+                    eff_ext_in,
+                )
+                opp["unit_1r_distance"] = unit_1r
+                opp["subsequent_extreme_price"] = ext
+                opp["missed_move_pct"] = missed_pct
+                opp["missed_r_multiple"] = missed_r
+                if status is not _UNSET:
+                    opp["status"] = norm_status
+                if root_cause_tag is not _UNSET:
+                    opp["root_cause_tag"] = (
+                        None if root_cause_tag is None else (str(root_cause_tag).strip() or None)
+                    )
+                if lesson_note is not _UNSET:
+                    opp["lesson_note"] = "" if lesson_note is None else _normalize_lesson_note(lesson_note)
+                now = utc_now_str()
+                opp["updated_at_utc"] = now
+                updated_opp = opp
+                _db_upsert_opportunity(conn, updated_opp)
+                _db_store_idempotency(conn, idem_key, "update_opportunity", req_hash, updated_opp, now)
+
+        mirror_ok, mirror_err = _safe_export_mirrors_unlocked(pdir, db_file=db_file)
+        if replayed_result is not None:
+            return {
+                **replayed_result,
+                "opportunity": dict(replayed_result),
+                "idempotent_replay": True,
+                "mirror_sync_ok": mirror_ok,
+                "mirror_sync_error": mirror_err,
+            }
+        assert updated_opp is not None
+        return {
+            **updated_opp,
+            "opportunity": dict(updated_opp),
+            "mirror_sync_ok": mirror_ok,
+            "mirror_sync_error": mirror_err,
+        }
+
+
+def load_opportunities(
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = 200,
+    db_path: Path | str | None = None,
+    portfolio_dir: Path | str | None = None,
+) -> list[dict[str, Any]]:
+    """Load shadow opportunity entries ordered newest-first."""
+    norm_status: str | None = None
+    if status is not None:
+        norm_status = str(status).strip().lower()
+        if norm_status not in VALID_OPPORTUNITY_STATUSES:
+            raise PortfolioError(f"status must be one of {list(VALID_OPPORTUNITY_STATUSES)}, got {status!r}")
+    norm_kind: str | None = None
+    if kind is not None:
+        norm_kind = str(kind).strip().lower()
+        if norm_kind not in VALID_OPPORTUNITY_KINDS:
+            raise PortfolioError(f"kind must be one of {list(VALID_OPPORTUNITY_KINDS)}, got {kind!r}")
+    eff_limit = int(limit)
+    if eff_limit <= 0:
+        raise PortfolioError(f"limit must be > 0, got {limit}")
+
+    pdir, db_file = _resolve_storage(portfolio_dir=portfolio_dir, db_path=db_path)
+    opp_mirror_path = _opportunities_path(pdir)
+    if not os.path.exists(db_file) and not os.path.exists(opp_mirror_path):
+        return []
+
+    with _portfolio_lock(pdir):
+        if os.path.exists(db_file):
+            conn = _connect_db(pdir, db_file=db_file)
+            try:
+                clauses: list[str] = []
+                params: list[Any] = []
+                if norm_status is not None:
+                    clauses.append("status = ?")
+                    params.append(norm_status)
+                if norm_kind is not None:
+                    clauses.append("kind = ?")
+                    params.append(norm_kind)
+                where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                sql = f"SELECT payload_json FROM opportunities {where_sql} ORDER BY seq DESC LIMIT ?"
+                params.append(eff_limit)
+                rows = conn.execute(sql, tuple(params)).fetchall()
+                return [json.loads(r[0]) for r in rows]
+            finally:
+                conn.close()
+
+        raw_rows = list(reversed(_read_opportunities_unlocked(pdir, db_file=db_file)))
+        filtered = [
+            r
+            for r in raw_rows
+            if (norm_status is None or r.get("status") == norm_status)
+            and (norm_kind is None or r.get("kind") == norm_kind)
+        ]
+        return filtered[:eff_limit]
+
+
+def compute_attribution_analytics(
+    db_path: Path | str | None = None,
+    portfolio_dir: Path | str | None = None,
+) -> dict[str, Any]:
+    """Compute post-trade R-multiple expectancy, right-tail skewness, mistake leakage, and shadow opportunity metrics.
+
+    Note on signed R conventions:
+      - ``avg_loss_r``, ``max_loss_r``, ``pilot_friction_loss_r``, and ``preventable_mistake_loss_r`` are
+        signed negative (e.g. ``-0.85``; ``0.0`` when there are no matching losing trades).
+      - ``avg_loss_r_abs`` is unsigned non-negative (``abs(avg_loss_r)``, e.g. ``0.85``).
+    """
+    taxonomy = [
+        {"tag": tag, "label": meta["label"], "category": meta["category"]}
+        for tag, meta in ATTRIBUTION_TAGS.items()
+    ]
+    pdir, db_file = _resolve_storage(portfolio_dir=portfolio_dir, db_path=db_path)
+    account_path, positions_path, _ = _paths(pdir)
+    opp_path = _opportunities_path(pdir)
+
+    has_any_storage = (
+        os.path.exists(db_file)
+        or os.path.exists(account_path)
+        or os.path.exists(positions_path)
+        or os.path.exists(opp_path)
+    )
+
+    initialized = False
+    positions: list[dict[str, Any]] = []
+    all_opps: list[dict[str, Any]] = []
+
+    if has_any_storage:
+        with _portfolio_lock(pdir):
+            if os.path.exists(db_file):
+                conn = _connect_db(pdir, db_file=db_file)
+                try:
+                    if _db_has_state(conn):
+                        initialized = True
+                        doc = _db_read_positions_doc(conn, pdir)
+                        positions = [_apply_position_defaults(p) for p in (doc.get("positions") or [])]
+                    all_opps = list(reversed(_db_read_opportunities_asc(conn)))
+                finally:
+                    conn.close()
+            if not initialized and os.path.exists(account_path) and os.path.exists(positions_path):
+                initialized = True
+                with open(positions_path, "r", encoding="utf-8") as f:
+                    doc = json.load(f)
+                positions = [_apply_position_defaults(p) for p in (doc.get("positions") or [])]
+                if not all_opps and os.path.exists(opp_path):
+                    all_opps = list(reversed(_read_opportunities_unlocked(pdir, db_file=db_file)))
+
+    closed_positions = [p for p in positions if p.get("status") == "closed"]
+    closed_count = len(closed_positions)
+
+    pnl_list: list[float] = []
+    win_pnls: list[float] = []
+    loss_pnls: list[float] = []
+    r_list: list[float] = []
+    win_r_list: list[float] = []
+    loss_r_list: list[float] = []
+    multi_r_winners_count = 0
+    pilot_friction_loss_r_sum = 0.0
+    preventable_mistake_loss_r_sum = 0.0
+    untagged_closed_count = 0
+
+    tag_buckets: dict[str, dict[str, Any]] = {}
+
+    for pos in closed_positions:
+        pnl = float(pos.get("realized_pnl") or 0.0)
+        pnl_list.append(pnl)
+        if pnl > 1e-9:
+            win_pnls.append(pnl)
+        elif pnl < -1e-9:
+            loss_pnls.append(pnl)
+
+        raw_r = pos.get("campaign_r_multiple")
+        if raw_r is None:
+            raw_r = pos.get("r_multiple")
+        eff_r: float | None = None
+        if raw_r is not None:
+            try:
+                f_r = float(raw_r)
+                if math.isfinite(f_r):
+                    eff_r = f_r
+            except (TypeError, ValueError):
+                eff_r = None
+
+        if eff_r is not None:
+            r_list.append(eff_r)
+            if pnl > 1e-9:
+                win_r_list.append(eff_r)
+            elif pnl < -1e-9:
+                loss_r_list.append(eff_r)
+            if eff_r >= 2.5 - 1e-9:
+                multi_r_winners_count += 1
+
+        raw_tag = (pos.get("attribution_tag") or "").strip()
+        if not raw_tag:
+            untagged_closed_count += 1
+        else:
+            meta = ATTRIBUTION_TAGS.get(raw_tag, {"label": raw_tag, "category": "unknown"})
+            if pnl < -1e-9 and eff_r is not None:
+                if meta["category"] == "pilot_friction":
+                    pilot_friction_loss_r_sum += eff_r
+                elif meta["category"] == "mistake":
+                    preventable_mistake_loss_r_sum += eff_r
+
+            bkt = tag_buckets.setdefault(
+                raw_tag,
+                {
+                    "tag": raw_tag,
+                    "label": meta["label"],
+                    "category": meta["category"],
+                    "count": 0,
+                    "total_pnl": 0.0,
+                    "total_r": 0.0,
+                    "_r_count": 0,
+                },
+            )
+            bkt["count"] += 1
+            bkt["total_pnl"] += pnl
+            if eff_r is not None:
+                bkt["total_r"] += eff_r
+                bkt["_r_count"] += 1
+
+    win_count = len(win_pnls)
+    loss_count = len(loss_pnls)
+    flat_count = closed_count - win_count - loss_count
+    win_rate_pct = round((win_count / closed_count) * 100.0, 4) if closed_count > 0 else 0.0
+
+    total_realized_pnl = round(sum(pnl_list), 2) + 0.0
+    gross_profit = round(sum(win_pnls), 2) + 0.0
+    gross_loss = round(abs(sum(loss_pnls)), 2) + 0.0
+    profit_factor = round(gross_profit / gross_loss, 4) if gross_loss > 0 else None
+
+    total_realized_r = round(sum(r_list), 4) + 0.0 if r_list else 0.0
+    avg_win_r = round(sum(win_r_list) / len(win_r_list), 4) + 0.0 if win_r_list else 0.0
+    avg_loss_r = round(sum(loss_r_list) / len(loss_r_list), 4) + 0.0 if loss_r_list else 0.0
+    avg_loss_r_abs = round(abs(avg_loss_r), 4) + 0.0
+    payoff_ratio_r = (
+        round(avg_win_r / abs(avg_loss_r), 4) if (avg_loss_r < 0 and avg_win_r > 0) else None
+    )
+    expectancy_r = round(sum(r_list) / len(r_list), 4) + 0.0 if r_list else 0.0
+    max_win_r = round(max(win_r_list), 4) + 0.0 if win_r_list else 0.0
+    max_loss_r = round(min(loss_r_list), 4) + 0.0 if loss_r_list else 0.0
+
+    top_20pct_winner_count = max(1, math.ceil(win_count * 0.2)) if win_count > 0 else 0
+    if top_20pct_winner_count > 0 and gross_profit > 0:
+        top_winners_pnl = sum(sorted(win_pnls, reverse=True)[:top_20pct_winner_count])
+        top_20pct_profit_share_pct = round(min(100.0, max(0.0, (top_winners_pnl / gross_profit) * 100.0)), 4)
+    else:
+        top_20pct_profit_share_pct = 0.0
+
+    by_tag: list[dict[str, Any]] = []
+    for bkt in tag_buckets.values():
+        r_cnt = int(bkt["_r_count"])
+        tot_r = round(float(bkt["total_r"]), 4) + 0.0
+        by_tag.append(
+            {
+                "tag": bkt["tag"],
+                "label": bkt["label"],
+                "category": bkt["category"],
+                "count": int(bkt["count"]),
+                "total_pnl": round(float(bkt["total_pnl"]), 2) + 0.0,
+                "total_r": tot_r,
+                "avg_r": round(float(bkt["total_r"]) / r_cnt, 4) + 0.0 if r_cnt > 0 else 0.0,
+            }
+        )
+    by_tag.sort(key=lambda item: (-abs(item["total_r"]), -abs(item["total_pnl"]), item["tag"]))
+
+    opp_missed_r_vals: list[float] = []
+    for opp in all_opps:
+        mr = opp.get("missed_r_multiple")
+        if mr is not None:
+            try:
+                f_mr = float(mr)
+                if math.isfinite(f_mr):
+                    opp_missed_r_vals.append(f_mr)
+            except (TypeError, ValueError):
+                pass
+
+    top_missed = sorted(
+        [o for o in all_opps if o.get("missed_r_multiple") is not None],
+        key=lambda o: float(o.get("missed_r_multiple") or 0.0),
+        reverse=True,
+    )[:5]
+
+    shadow_summary = {
+        "total_count": len(all_opps),
+        "tracking_count": sum(1 for o in all_opps if o.get("status") == "tracking"),
+        "missed_entry_count": sum(1 for o in all_opps if o.get("kind") == "missed_entry"),
+        "shaken_out_count": sum(1 for o in all_opps if o.get("kind") == "shaken_out"),
+        "premature_exit_count": sum(1 for o in all_opps if o.get("kind") == "premature_exit"),
+        "total_missed_r": round(sum(opp_missed_r_vals), 4) + 0.0 if opp_missed_r_vals else 0.0,
+        "max_missed_r": round(max(opp_missed_r_vals), 4) + 0.0 if opp_missed_r_vals else 0.0,
+        "top_missed": top_missed,
+    }
+
+    return {
+        "initialized": initialized,
+        "closed_count": closed_count,
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "flat_count": flat_count,
+        "win_rate_pct": win_rate_pct,
+        "total_realized_pnl": total_realized_pnl,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        "profit_factor": profit_factor,
+        "total_realized_r": total_realized_r,
+        "avg_win_r": avg_win_r,
+        "avg_loss_r": avg_loss_r,
+        "avg_loss_r_abs": avg_loss_r_abs,
+        "payoff_ratio_r": payoff_ratio_r,
+        "expectancy_r": expectancy_r,
+        "max_win_r": max_win_r,
+        "max_loss_r": max_loss_r,
+        "skewness": {
+            "top_20pct_winner_count": top_20pct_winner_count,
+            "top_20pct_profit_share_pct": top_20pct_profit_share_pct,
+            "multi_r_winners_count": multi_r_winners_count,
+            "pilot_friction_loss_r": round(pilot_friction_loss_r_sum, 4) + 0.0,
+            "preventable_mistake_loss_r": round(preventable_mistake_loss_r_sum, 4) + 0.0,
+            "untagged_closed_count": untagged_closed_count,
+        },
+        "by_tag": by_tag,
+        "shadow_summary": shadow_summary,
+        "taxonomy": taxonomy,
     }
 
 
@@ -3292,6 +4931,7 @@ def main(argv: list[str] | None = None) -> int:
     p_open.add_argument("--allow-equity-margin", action="store_true", default=False)
     p_open.add_argument("--fx-to-account", type=float, default=None)
     p_open.add_argument("--asset-class", default=None)
+    p_open.add_argument("--campaign-1r-amount", type=float, default=None)
     p_open.add_argument("--reason", default="initial_entry")
     p_open.add_argument("--notes", default="")
     p_open.add_argument("--idempotency-key", default=None)
@@ -3301,6 +4941,9 @@ def main(argv: list[str] | None = None) -> int:
     p_rot.add_argument("--old-id", required=True)
     p_rot.add_argument("--exit-price", type=float, required=True)
     p_rot.add_argument("--exit-reason", required=True)
+    p_rot.add_argument("--exit-category", default="leader_rotation")
+    p_rot.add_argument("--attribution-tag", default=None)
+    p_rot.add_argument("--lesson-note", default="")
     p_rot.add_argument("--symbol", required=True)
     p_rot.add_argument("--direction", required=True, choices=["long", "short"])
     p_rot.add_argument("--entry", type=float, required=True)
@@ -3308,6 +4951,7 @@ def main(argv: list[str] | None = None) -> int:
     p_rot.add_argument("--daily-stop", type=float, default=None)
     p_rot.add_argument("--target", type=float, default=None)
     p_rot.add_argument("--quantity", type=float, required=True)
+    p_rot.add_argument("--campaign-1r-amount", type=float, default=None)
     p_rot.add_argument("--macro-factors", default="")
     p_rot.add_argument("--red-line", action="append", default=[])
     p_rot.add_argument("--contract-symbol", default=None)
@@ -3324,6 +4968,10 @@ def main(argv: list[str] | None = None) -> int:
     p_add.add_argument("--price", type=float, required=True)
     p_add.add_argument("--quantity", type=float, required=True)
     p_add.add_argument("--new-stop", type=float, default=None)
+    p_add.add_argument("--new-daily-stop", type=float, default=None)
+    p_add.add_argument("--require-breakeven-lock", action="store_true", default=False)
+    p_add.add_argument("--max-profit-cushion-ratio", type=float, default=0.65)
+    p_add.add_argument("--max-leverage", type=float, default=None)
     p_add.add_argument("--reason", default="profit_pyramid")
     p_add.add_argument("--idempotency-key", default=None)
 
@@ -3333,6 +4981,10 @@ def main(argv: list[str] | None = None) -> int:
     p_scale.add_argument("--quantity", "--add-quantity", dest="quantity", type=float, required=True)
     p_scale.add_argument("--price", "--add-price", dest="price", type=float, required=True)
     p_scale.add_argument("--new-stop", "--new-stop-loss", dest="new_stop", type=float, default=None)
+    p_scale.add_argument("--new-daily-stop", type=float, default=None)
+    p_scale.add_argument("--require-breakeven-lock", action="store_true", default=False)
+    p_scale.add_argument("--max-profit-cushion-ratio", type=float, default=0.65)
+    p_scale.add_argument("--max-leverage", type=float, default=None)
     p_scale.add_argument("--fx-rate-to-base", "--fx-to-account", dest="fx_rate_to_base", type=float, default=None)
     p_scale.add_argument("--note", default="")
     p_scale.add_argument("--idempotency-key", default=None)
@@ -3346,12 +4998,24 @@ def main(argv: list[str] | None = None) -> int:
     p_trail.add_argument("--reason", default="trail_stop")
     p_trail.add_argument("--idempotency-key", default=None)
 
+    # stop-regime
+    p_regime = sub.add_parser("stop-regime", help="Hand over active stop governance between tactical_30m and daily_structure")
+    p_regime.add_argument("--id", required=True)
+    p_regime.add_argument("--regime", required=True, choices=list(VALID_STOP_REGIMES))
+    p_regime.add_argument("--new-daily-stop", type=float, default=None)
+    p_regime.add_argument("--new-stop", "--new-stop-30m", dest="new_stop_30m", type=float, default=None)
+    p_regime.add_argument("--current-price", type=float, default=None)
+    p_regime.add_argument("--reason", default="")
+    p_regime.add_argument("--idempotency-key", default=None)
+
     # trim
     p_trim = sub.add_parser("trim", help="Partially reduce an open position and book partial realized PnL")
     p_trim.add_argument("--id", required=True)
     p_trim.add_argument("--price", "--trim-price", dest="price", type=float, required=True)
     p_trim.add_argument("--quantity", "--trim-quantity", dest="quantity", type=float, required=True)
     p_trim.add_argument("--reason", default="partial_take_profit")
+    p_trim.add_argument("--attribution-tag", default=None)
+    p_trim.add_argument("--lesson-note", default="")
     p_trim.add_argument("--idempotency-key", default=None)
 
     # close
@@ -3360,6 +5024,8 @@ def main(argv: list[str] | None = None) -> int:
     p_close.add_argument("--exit-price", type=float, required=True)
     p_close.add_argument("--exit-reason", required=True)
     p_close.add_argument("--exit-category", default="manual")
+    p_close.add_argument("--attribution-tag", default=None)
+    p_close.add_argument("--lesson-note", default="")
     p_close.add_argument("--update-equity", dest="update_equity", action="store_true", default=True)
     p_close.add_argument("--no-update-equity", dest="update_equity", action="store_false")
     p_close.add_argument("--idempotency-key", default=None)
@@ -3369,6 +5035,42 @@ def main(argv: list[str] | None = None) -> int:
     p_void.add_argument("--id", required=True)
     p_void.add_argument("--reason", default="误录作废")
     p_void.add_argument("--idempotency-key", default=None)
+
+    # opportunity-log
+    p_opp_log = sub.add_parser("opportunity-log", help="Log a shadow opportunity (missed_entry, shaken_out, premature_exit)")
+    p_opp_log.add_argument("--symbol", required=True)
+    p_opp_log.add_argument("--market", required=True)
+    p_opp_log.add_argument("--sector", "--sector-theme", dest="sector_theme", required=True)
+    p_opp_log.add_argument("--direction", required=True, choices=["long", "short"])
+    p_opp_log.add_argument("--kind", required=True, choices=list(VALID_OPPORTUNITY_KINDS))
+    p_opp_log.add_argument("--anchor-price", type=float, required=True)
+    p_opp_log.add_argument("--planned-stop", "--planned-stop-price", dest="planned_stop_price", type=float, required=True)
+    p_opp_log.add_argument("--extreme-price", "--subsequent-extreme-price", dest="subsequent_extreme_price", type=float, default=None)
+    p_opp_log.add_argument("--root-cause-tag", default=None)
+    p_opp_log.add_argument("--lesson-note", default="")
+    p_opp_log.add_argument("--linked-position-id", default=None)
+    p_opp_log.add_argument("--status", choices=list(VALID_OPPORTUNITY_STATUSES), default="tracking")
+    p_opp_log.add_argument("--idempotency-key", default=None)
+
+    # opportunity-update
+    p_opp_upd = sub.add_parser("opportunity-update", help="Update subsequent extreme price or review status on a shadow opportunity")
+    p_opp_upd.add_argument("--id", "--opportunity-id", dest="opportunity_id", required=True)
+    p_opp_upd.add_argument("--extreme-price", "--subsequent-extreme-price", dest="subsequent_extreme_price", type=float, default=None)
+    p_opp_upd.add_argument("--clear-extreme", action="store_true", default=False)
+    p_opp_upd.add_argument("--status", choices=list(VALID_OPPORTUNITY_STATUSES), default=None)
+    p_opp_upd.add_argument("--root-cause-tag", default=None)
+    p_opp_upd.add_argument("--clear-root-cause", action="store_true", default=False)
+    p_opp_upd.add_argument("--lesson-note", default=None)
+    p_opp_upd.add_argument("--idempotency-key", default=None)
+
+    # opportunity-list
+    p_opp_list = sub.add_parser("opportunity-list", help="List shadow opportunities (newest first)")
+    p_opp_list.add_argument("--status", choices=list(VALID_OPPORTUNITY_STATUSES), default=None)
+    p_opp_list.add_argument("--kind", choices=list(VALID_OPPORTUNITY_KINDS), default=None)
+    p_opp_list.add_argument("--limit", type=int, default=200)
+
+    # attribution
+    sub.add_parser("attribution", help="Compute structured post-trade attribution, R-expectancy, skewness, and shadow metrics")
 
     args = parser.parse_args(argv)
 
@@ -3427,12 +5129,16 @@ def main(argv: list[str] | None = None) -> int:
                 portfolio_dir=args.portfolio_dir,
                 allow_equity_margin=args.allow_equity_margin,
                 idempotency_key=args.idempotency_key,
+                campaign_1r_amount=args.campaign_1r_amount,
             )
         elif args.command == "rotate":
             res = rotate_leader(
                 old_position_id=args.old_id,
                 exit_price=args.exit_price,
                 exit_reason=args.exit_reason,
+                exit_category=args.exit_category,
+                attribution_tag=args.attribution_tag,
+                lesson_note=args.lesson_note,
                 new_position_kwargs={
                     "symbol": args.symbol,
                     "direction": args.direction,
@@ -3441,6 +5147,7 @@ def main(argv: list[str] | None = None) -> int:
                     "structural_stop_daily": args.daily_stop,
                     "target_price": args.target,
                     "quantity": args.quantity,
+                    "campaign_1r_amount": args.campaign_1r_amount,
                     "macro_factors": _split_csv(args.macro_factors),
                     "exit_red_lines": args.red_line,
                     "contract_symbol": args.contract_symbol,
@@ -3462,6 +5169,10 @@ def main(argv: list[str] | None = None) -> int:
                 reason=args.reason,
                 portfolio_dir=args.portfolio_dir,
                 idempotency_key=args.idempotency_key,
+                require_breakeven_lock=args.require_breakeven_lock,
+                max_profit_cushion_ratio=args.max_profit_cushion_ratio,
+                new_daily_stop=args.new_daily_stop,
+                max_leverage=args.max_leverage,
             )
         elif args.command == "scale-in":
             res = scale_in_position(
@@ -3473,6 +5184,10 @@ def main(argv: list[str] | None = None) -> int:
                 note=args.note,
                 portfolio_dir=args.portfolio_dir,
                 idempotency_key=args.idempotency_key,
+                require_breakeven_lock=args.require_breakeven_lock,
+                max_profit_cushion_ratio=args.max_profit_cushion_ratio,
+                new_daily_stop=args.new_daily_stop,
+                max_leverage=args.max_leverage,
             )
         elif args.command == "trail-stop":
             res = trail_stop(
@@ -3484,6 +5199,17 @@ def main(argv: list[str] | None = None) -> int:
                 portfolio_dir=args.portfolio_dir,
                 idempotency_key=args.idempotency_key,
             )
+        elif args.command == "stop-regime":
+            res = set_stop_regime(
+                position_id=args.id,
+                regime=args.regime,
+                new_daily_stop=args.new_daily_stop,
+                new_stop_30m=args.new_stop_30m,
+                current_price=args.current_price,
+                reason=args.reason,
+                idempotency_key=args.idempotency_key,
+                portfolio_dir=args.portfolio_dir,
+            )
         elif args.command == "trim":
             res = trim_position(
                 position_id=args.id,
@@ -3492,6 +5218,8 @@ def main(argv: list[str] | None = None) -> int:
                 reason=args.reason,
                 portfolio_dir=args.portfolio_dir,
                 idempotency_key=args.idempotency_key,
+                attribution_tag=args.attribution_tag,
+                lesson_note=args.lesson_note,
             )
         elif args.command == "close":
             res = close_position(
@@ -3502,6 +5230,8 @@ def main(argv: list[str] | None = None) -> int:
                 portfolio_dir=args.portfolio_dir,
                 update_account_equity=args.update_equity,
                 idempotency_key=args.idempotency_key,
+                attribution_tag=args.attribution_tag,
+                lesson_note=args.lesson_note,
             )
         elif args.command == "void":
             res = void_position(
@@ -3510,6 +5240,58 @@ def main(argv: list[str] | None = None) -> int:
                 portfolio_dir=args.portfolio_dir,
                 idempotency_key=args.idempotency_key,
             )
+        elif args.command == "opportunity-log":
+            res = log_opportunity(
+                symbol=args.symbol,
+                market=args.market,
+                sector_theme=args.sector_theme,
+                direction=args.direction,
+                kind=args.kind,
+                anchor_price=args.anchor_price,
+                planned_stop_price=args.planned_stop_price,
+                subsequent_extreme_price=args.subsequent_extreme_price,
+                root_cause_tag=args.root_cause_tag,
+                lesson_note=args.lesson_note,
+                linked_position_id=args.linked_position_id,
+                status=args.status,
+                idempotency_key=args.idempotency_key,
+                portfolio_dir=args.portfolio_dir,
+            )
+        elif args.command == "opportunity-update":
+            if args.clear_extreme and args.subsequent_extreme_price is not None:
+                raise PortfolioError("Cannot specify both --extreme-price and --clear-extreme")
+            if args.clear_root_cause and args.root_cause_tag is not None:
+                raise PortfolioError("Cannot specify both --root-cause-tag and --clear-root-cause")
+            ext_arg: Any = (
+                None
+                if args.clear_extreme
+                else (args.subsequent_extreme_price if args.subsequent_extreme_price is not None else _UNSET)
+            )
+            tag_arg: Any = (
+                None
+                if args.clear_root_cause
+                else (args.root_cause_tag if args.root_cause_tag is not None else _UNSET)
+            )
+            res = update_opportunity(
+                opportunity_id=args.opportunity_id,
+                subsequent_extreme_price=ext_arg,
+                status=args.status if args.status is not None else _UNSET,
+                root_cause_tag=tag_arg,
+                lesson_note=args.lesson_note if args.lesson_note is not None else _UNSET,
+                portfolio_dir=args.portfolio_dir,
+                idempotency_key=args.idempotency_key,
+            )
+        elif args.command == "opportunity-list":
+            res = {
+                "opportunities": load_opportunities(
+                    status=args.status,
+                    kind=args.kind,
+                    limit=args.limit,
+                    portfolio_dir=args.portfolio_dir,
+                )
+            }
+        elif args.command == "attribution":
+            res = compute_attribution_analytics(portfolio_dir=args.portfolio_dir)
         else:  # pragma: no cover
             parser.error(f"Unknown command: {args.command}")
             return 2

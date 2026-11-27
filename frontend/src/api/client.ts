@@ -13,9 +13,11 @@ import type {
   EvidenceItem,
   FxReferenceResponse,
   HealthResponse,
+  LogOpportunityBody,
   MacroCompassRequest,
   MarketDualResponse,
   OpenPositionBody,
+  PortfolioAttributionAnalytics,
   PortfolioInitBody,
   PortfolioSummaryResponse,
   PersistedScanRun,
@@ -25,6 +27,8 @@ import type {
   ScaleInBody,
   ScaleInResponse,
   SentinelResponse,
+  SetStopRegimeBody,
+  ShadowOpportunity,
   SymbolSearchItem,
   TaskEventEnvelope,
   TaskRecord,
@@ -33,6 +37,7 @@ import type {
   TrailStopBody,
   TrimBody,
   UniversePool,
+  UpdateOpportunityBody,
   VoidBody,
   WarehouseSummary,
 } from "./types";
@@ -146,6 +151,8 @@ export const api = {
   openPosition: (body: OpenPositionBody) => post<unknown>("/portfolio/positions/open", body),
   trailStop: (id: string, body: TrailStopBody) =>
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/trail-stop`, body),
+  setStopRegime: (positionId: string, body: SetStopRegimeBody) =>
+    post<unknown>(`/portfolio/positions/${encodeURIComponent(positionId)}/stop-regime`, body),
   trimPosition: (id: string, body: TrimBody) =>
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/trim`, body),
   scaleInPosition: (id: string, body: ScaleInBody) =>
@@ -156,6 +163,21 @@ export const api = {
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/void`, body),
   rotatePosition: (id: string, body: RotatePositionBody) =>
     post<unknown>(`/portfolio/positions/${encodeURIComponent(id)}/rotate`, body),
+  getPortfolioAttribution: (signal?: AbortSignal) =>
+    get<PortfolioAttributionAnalytics>("/portfolio/attribution", undefined, signal),
+  getPortfolioOpportunities: (
+    params?: { status?: string; kind?: string; limit?: number },
+    signal?: AbortSignal,
+  ) =>
+    get<{ opportunities: ShadowOpportunity[] }>("/portfolio/opportunities", params, signal),
+  logOpportunity: (body: LogOpportunityBody) =>
+    post<ShadowOpportunity & { opportunity?: ShadowOpportunity }>("/portfolio/opportunities", body),
+  updateOpportunity: (opportunityId: string, body: UpdateOpportunityBody) =>
+    request<ShadowOpportunity & { opportunity?: ShadowOpportunity }>(
+      "PATCH",
+      `/portfolio/opportunities/${encodeURIComponent(opportunityId)}`,
+      { body },
+    ),
   sentinel: (
     q: { include_watchlist: boolean; skip_research?: boolean; event_window_days?: number; refresh?: boolean },
     signal?: AbortSignal,

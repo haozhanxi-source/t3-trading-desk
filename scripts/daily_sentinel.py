@@ -18,6 +18,7 @@ import argparse
 import calendar as cal_lib
 import copy
 import inspect
+import itertools
 import json
 import math
 import os
@@ -26,7 +27,7 @@ import statistics
 import sys
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -41,6 +42,8 @@ import market_snapshot as ms_mod
 import research_archive as ra_mod
 import research_data as rd_mod
 import research_extensions as rext
+
+UTC = timezone.utc  # noqa: UP017
 
 ROOT_DIR = os.path.dirname(os.path.dirname(__file__))
 DEFAULT_PORTFOLIO_DIR = os.path.join(ROOT_DIR, "portfolio")
@@ -316,7 +319,7 @@ def _default_tz_for_asset_class(asset_class: str | None) -> Any:
         return ZoneInfo("Asia/Shanghai")
     if ac in {"us_stock_or_etf", "commodity"}:
         return ZoneInfo("America/New_York")
-    return timezone.utc
+    return UTC
 
 
 def _parse_bar_timestamp(
@@ -335,12 +338,12 @@ def _parse_bar_timestamp(
         return None, None, False, False
     if isinstance(val, datetime):
         if val.tzinfo is not None:
-            return val.astimezone(timezone.utc), val.date(), True, True
+            return val.astimezone(UTC), val.date(), True, True
         tz = _default_tz_for_asset_class(asset_class)
         localized = val.replace(tzinfo=tz)
-        return localized.astimezone(timezone.utc), localized.date(), True, False
+        return localized.astimezone(UTC), localized.date(), True, False
     if isinstance(val, date):
-        return datetime(val.year, val.month, val.day, tzinfo=timezone.utc), val, False, False
+        return datetime(val.year, val.month, val.day, tzinfo=UTC), val, False, False
 
     s = str(val).strip()
     if not s or s.lower() in {"none", "null", "nan", "nat", "n/a", "na"}:
@@ -351,14 +354,14 @@ def _parse_bar_timestamp(
     if m_date:
         try:
             d = date(int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)))
-            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc), d, False, False
+            return datetime(d.year, d.month, d.day, tzinfo=UTC), d, False, False
         except ValueError:
             return None, None, False, False
     m_date8 = re.fullmatch(r"(\d{4})(\d{2})(\d{2})", s)
     if m_date8:
         try:
             d = date(int(m_date8.group(1)), int(m_date8.group(2)), int(m_date8.group(3)))
-            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc), d, False, False
+            return datetime(d.year, d.month, d.day, tzinfo=UTC), d, False, False
         except ValueError:
             return None, None, False, False
 
@@ -381,10 +384,10 @@ def _parse_bar_timestamp(
     try:
         dt = datetime.fromisoformat(s_norm)
         if dt.tzinfo is not None:
-            return dt.astimezone(timezone.utc), dt.date(), True, True
+            return dt.astimezone(UTC), dt.date(), True, True
         tz = _default_tz_for_asset_class(asset_class)
         localized = dt.replace(tzinfo=tz)
-        return localized.astimezone(timezone.utc), localized.date(), True, explicit_tz
+        return localized.astimezone(UTC), localized.date(), True, explicit_tz
     except ValueError:
         pass
 
@@ -401,10 +404,10 @@ def _parse_bar_timestamp(
                 py_dt = ts.to_pydatetime()
                 if isinstance(py_dt, datetime):
                     if not has_time_tok:
-                        return datetime(py_dt.year, py_dt.month, py_dt.day, tzinfo=timezone.utc), py_dt.date(), False, False
+                        return datetime(py_dt.year, py_dt.month, py_dt.day, tzinfo=UTC), py_dt.date(), False, False
                     tz = _default_tz_for_asset_class(asset_class)
                     localized = py_dt.replace(tzinfo=tz)
-                    return localized.astimezone(timezone.utc), localized.date(), True, False
+                    return localized.astimezone(UTC), localized.date(), True, False
         except (ValueError, TypeError):
             return None, None, False, False
 
@@ -476,9 +479,9 @@ def _is_intraday_older_than_daily(
                     close_hh, close_mm = (15, 15) if (ac == "cn_future" and is_bond) else (15, 0)
                     close_dt_utc = datetime(
                         d_local.year, d_local.month, d_local.day, close_hh, close_mm, tzinfo=sh_tz
-                    ).astimezone(timezone.utc)
+                    ).astimezone(UTC)
                     # Only enforce same-day post-close lag once wall-clock time has actually reached official close
-                    if now_utc is None or now_utc.astimezone(timezone.utc) >= close_dt_utc:
+                    if now_utc is None or now_utc.astimezone(UTC) >= close_dt_utc:
                         anchor = str((intra_tech or {}).get("bar_timestamp_anchor") or "end").strip().lower()
                         iv_raw = str((intra_tech or {}).get("bar_interval") or "30m").strip().lower()
                         iv_m = re.fullmatch(r"(\d+)\s*(m|min|h)", iv_raw)
@@ -505,7 +508,7 @@ def _bar_age_days(
     if bar_dt_utc is None and bar_local_date is None:
         return None
     if now_utc is not None and bar_dt_utc is not None and has_time:
-        now_norm = now_utc.astimezone(timezone.utc) if now_utc.tzinfo is not None else now_utc.replace(tzinfo=timezone.utc)
+        now_norm = now_utc.astimezone(UTC) if now_utc.tzinfo is not None else now_utc.replace(tzinfo=UTC)
         return (now_norm - bar_dt_utc).total_seconds() / 86400.0
     ref_d = bar_local_date or (bar_dt_utc.date() if bar_dt_utc is not None else None)
     if ref_d is None:
@@ -567,7 +570,7 @@ def _price_display_dp(price: float, asset_class: str | None = None) -> int:
 
 def _quantize_display_price(price: float, dp: int) -> Decimal | None:
     try:
-        q = Decimal("1") if dp <= 0 else Decimal("1").scaleb(-dp)
+        q = Decimal(1) if dp <= 0 else Decimal(1).scaleb(-dp)
         return Decimal(str(price)).quantize(q, rounding=ROUND_HALF_UP)
     except (InvalidOperation, ValueError):
         return None
@@ -892,7 +895,7 @@ def extract_sentinel_observations(
     quote mismatch), strictly withholds price/stop/30m observations from both ``snapshot`` and
     ``research_bundle['snapshot']`` to guarantee zero cross-contract contamination.
     """
-    anchor = ref_date or datetime.now(timezone.utc).date()
+    anchor = ref_date or datetime.now(UTC).date()
     effective_snap = snapshot if isinstance(snapshot, dict) else (
         research_bundle.get("snapshot")
         if isinstance(research_bundle, dict) and isinstance(research_bundle.get("snapshot"), dict)
@@ -1885,12 +1888,11 @@ def _infer_dominant_contract_from_bundle(
                         rank,
                         {**cinfo, "inferred_from": raw_contract_sym, "selection_basis": "open_interest"},
                     )
-            elif vol > 0.0:
-                if best_by_vol is None or vol > best_by_vol[0]:
-                    best_by_vol = (
-                        vol,
-                        {**cinfo, "inferred_from": raw_contract_sym, "selection_basis": "volume"},
-                    )
+            elif vol > 0.0 and (best_by_vol is None or vol > best_by_vol[0]):
+                best_by_vol = (
+                    vol,
+                    {**cinfo, "inferred_from": raw_contract_sym, "selection_basis": "volume"},
+                )
     if best_by_oi is not None:
         return best_by_oi[1]
     if best_by_vol is not None:
@@ -1990,18 +1992,20 @@ def _is_red_trigger(trig_result: dict[str, Any]) -> bool:
 def _resolve_effective_stop_ts(
     opened_at_utc: Any,
     stop_updated_at_utc: Any,
+    *extra_ts_utc: Any,
     asset_class: str | None = None,
 ) -> tuple[datetime | None, Any]:
-    """Return ``(effective_dt_utc, raw_effective_value)`` as ``max(opened_at, stop_updated_at)``."""
-    o_dt, _, _, _ = _parse_bar_timestamp(opened_at_utc, asset_class=asset_class)
-    u_dt, _, _, _ = _parse_bar_timestamp(stop_updated_at_utc, asset_class=asset_class)
-    if o_dt is not None and u_dt is not None:
-        if u_dt >= o_dt:
-            return u_dt, stop_updated_at_utc
-        return o_dt, opened_at_utc
-    if u_dt is not None:
-        return u_dt, stop_updated_at_utc
-    return o_dt, opened_at_utc
+    """Return ``(effective_dt_utc, raw_effective_value)`` as ``max(opened_at, stop_updated_at, *extra_ts)``."""
+    best_dt: datetime | None = None
+    best_raw: Any = opened_at_utc
+    for raw_val in (opened_at_utc, stop_updated_at_utc, *extra_ts_utc):
+        if raw_val is None:
+            continue
+        parsed_dt, _, _, _ = _parse_bar_timestamp(raw_val, asset_class=asset_class)
+        if parsed_dt is not None and (best_dt is None or parsed_dt >= best_dt):
+            best_dt = parsed_dt
+            best_raw = raw_val
+    return best_dt, best_raw
 
 
 def _parse_intraday_bar_duration_minutes(bar_interval: Any) -> int:
@@ -2059,9 +2063,7 @@ def _is_known_exchange_intraday_break(
         ):
             return True
         # Day-to-night break (15:00 day close -> 21:00 night open)
-        if curr_s_hm == (21, 0) and (prev_e_hm == (15, 0) or prev_s_hm == (15, 0)):
-            return True
-        return False
+        return bool(curr_s_hm == (21, 0) and (prev_e_hm == (15, 0) or prev_s_hm == (15, 0)))
 
     if ac_norm in {"commodity", "fx"}:
         ny_tz = ZoneInfo("America/New_York")
@@ -2118,9 +2120,9 @@ def _collect_eligible_ohlc_extrema(
     eff_now: datetime | None = None
     if now_utc is not None:
         eff_now = (
-            now_utc.astimezone(timezone.utc)
+            now_utc.astimezone(UTC)
             if now_utc.tzinfo is not None
-            else now_utc.replace(tzinfo=timezone.utc)
+            else now_utc.replace(tzinfo=UTC)
         )
 
     def _is_future_dt(dt_utc: datetime | None) -> bool:
@@ -2307,7 +2309,7 @@ def _collect_eligible_ohlc_extrema(
 
         # 1d. Internal same-session missing bar gap detection (excluding official exchange breaks)
         sorted_starts = sorted(set(eligible_bar_starts))
-        for prev_start, curr_start in zip(sorted_starts, sorted_starts[1:], strict=False):
+        for prev_start, curr_start in itertools.pairwise(sorted_starts):
             if prev_start.astimezone(ex_tz).date() != curr_start.astimezone(ex_tz).date():
                 continue
             delta = curr_start - prev_start
@@ -2412,6 +2414,159 @@ def _collect_eligible_ohlc_extrema(
 # 3. Core Holding Health Evaluator (100% Pure & Offline Testable)
 # ---------------------------------------------------------------------------
 
+def _resolve_unit_1r_price_dist(
+    norm_sym: str,
+    asset_class: str | None,
+    pos: dict[str, Any],
+    anchors: dict[str, Any],
+    entry_price: float | None,
+    tactical_stop_30m: float | None,
+) -> float | None:
+    """Resolve 1R unit price distance from initial entry/stop, 1R dollar budget, or active 30m stop."""
+    init_entry = _to_float(pos.get("initial_entry_price"))
+    if init_entry is None:
+        init_entry = _to_float(anchors.get("initial_entry_price"))
+    if init_entry is None:
+        init_entry = entry_price
+
+    init_stop = _to_float(pos.get("initial_stop_30m"))
+    if init_stop is None:
+        init_stop = _to_float(pos.get("initial_tactical_stop_30m"))
+    if init_stop is None:
+        init_stop = _to_float(anchors.get("initial_stop_30m"))
+
+    if (
+        init_entry is not None
+        and init_entry > 0
+        and init_stop is not None
+        and init_stop > 0
+        and abs(init_entry - init_stop) > 1e-9
+    ):
+        return round(abs(init_entry - init_stop), 6)
+
+    risk_amt = (
+        _to_float(pos.get("campaign_1r_amount"))
+        or _to_float(pos.get("initial_risk_amount"))
+        or _to_float(anchors.get("campaign_1r_amount"))
+        or _to_float(anchors.get("initial_risk_amount"))
+    )
+    init_qty = (
+        _to_float(pos.get("initial_quantity"))
+        or _to_float(pos.get("pilot_quantity"))
+        or _to_float(pos.get("quantity"))
+    )
+    if risk_amt is not None and risk_amt > 0 and init_qty is not None and init_qty > 0:
+        mult_val = _to_float(pos.get("multiplier")) or _to_float(pos.get("effective_multiplier"))
+        if mult_val is None:
+            try:
+                import trade_planner as tp_mod
+
+                spec_m = tp_mod.get_contract_spec(norm_sym, asset_class=asset_class)
+                mult_val = _to_float(spec_m.get("multiplier"))
+            except Exception:  # noqa: BLE001
+                mult_val = None
+        fx_val = _to_float(pos.get("fx_to_account")) or _to_float(pos.get("fx_rate"))
+        if fx_val is None:
+            acct_c = str(pos.get("account_currency") or "").strip().upper()
+            quote_c = str(pos.get("quote_currency") or pos.get("currency") or "").strip().upper()
+            if not acct_c or not quote_c or acct_c == quote_c:
+                fx_val = 1.0
+        if mult_val is not None and mult_val > 0 and fx_val is not None and fx_val > 0:
+            denom = init_qty * mult_val * fx_val
+            if denom > 0:
+                return round(risk_amt / denom, 6)
+
+    explicit_dist = (
+        _to_float(pos.get("unit_1r_price_distance"))
+        or _to_float(pos.get("unit_1r_price_dist"))
+        or _to_float(anchors.get("unit_1r_price_distance"))
+        or _to_float(anchors.get("unit_1r_price_dist"))
+    )
+    if explicit_dist is not None and explicit_dist > 0:
+        return round(explicit_dist, 6)
+
+    if (
+        entry_price is not None
+        and entry_price > 0
+        and tactical_stop_30m is not None
+        and tactical_stop_30m > 0
+        and abs(entry_price - tactical_stop_30m) > 1e-9
+    ):
+        return round(abs(entry_price - tactical_stop_30m), 6)
+
+    return None
+
+
+def _round_protective_6(value: float | None, direction: str | None) -> float | None:
+    """Round price protectively to 6 decimal places (ceil for long, floor for short) using exact Decimal."""
+    if value is None or not math.isfinite(value):
+        return None
+    rounding = ROUND_CEILING if direction == "long" else ROUND_FLOOR
+    return float(Decimal.from_float(float(value)).quantize(Decimal("0.000001"), rounding=rounding))
+
+
+def _resolve_campaign_breakeven_floor(
+    norm_sym: str,
+    asset_class: str | None,
+    norm_dir: str | None,
+    entry_price: float | None,
+    pos: dict[str, Any],
+) -> float | None:
+    """Resolve true campaign breakeven floor price, accounting for any negative ``partial_realized_pnl``.
+
+    Returns ``None`` (fail-closed) if ``entry_price``/direction is invalid or if prior partial
+    realized loss cannot be converted into a valid positive floor price.
+    """
+    if (
+        norm_dir not in {"long", "short"}
+        or entry_price is None
+        or not math.isfinite(entry_price)
+        or entry_price <= 0
+    ):
+        return None
+
+    partial_pnl = _to_float(pos.get("partial_realized_pnl"))
+    if partial_pnl is not None and math.isfinite(partial_pnl) and partial_pnl < -1e-9:
+        qty_val = _to_float(pos.get("quantity"))
+        mult_val = _to_float(pos.get("multiplier")) or _to_float(pos.get("effective_multiplier"))
+        if mult_val is None:
+            try:
+                import trade_planner as tp_mod
+
+                spec_m = tp_mod.get_contract_spec(norm_sym, asset_class=asset_class)
+                mult_val = _to_float(spec_m.get("multiplier"))
+            except Exception:  # noqa: BLE001
+                mult_val = None
+        fx_val = _to_float(pos.get("fx_to_account")) or _to_float(pos.get("fx_rate"))
+        if fx_val is None:
+            acct_c = str(pos.get("account_currency") or "").strip().upper()
+            quote_c = str(pos.get("quote_currency") or pos.get("currency") or "").strip().upper()
+            if not acct_c or not quote_c or acct_c == quote_c:
+                fx_val = 1.0
+        if (
+            qty_val is None
+            or not math.isfinite(qty_val)
+            or qty_val <= 0
+            or mult_val is None
+            or not math.isfinite(mult_val)
+            or mult_val <= 0
+            or fx_val is None
+            or not math.isfinite(fx_val)
+            or fx_val <= 0
+        ):
+            return None
+        denom = qty_val * mult_val * fx_val
+        if denom <= 0 or not math.isfinite(denom):
+            return None
+        offset = abs(partial_pnl) / denom
+        floor_price = (entry_price + offset) if norm_dir == "long" else (entry_price - offset)
+        if not math.isfinite(floor_price) or floor_price <= 0:
+            return None
+        return floor_price
+
+    return entry_price
+
+
 def evaluate_holding_health(
     symbol: str,
     direction: str | None,
@@ -2434,14 +2589,14 @@ def evaluate_holding_health(
     eff_now_utc: datetime | None = None
     if now_utc is not None:
         eff_now_utc = (
-            now_utc.astimezone(timezone.utc)
+            now_utc.astimezone(UTC)
             if now_utc.tzinfo is not None
-            else now_utc.replace(tzinfo=timezone.utc)
+            else now_utc.replace(tzinfo=UTC)
         )
     elif ref_date is None:
-        eff_now_utc = datetime.now(timezone.utc)
+        eff_now_utc = datetime.now(UTC)
 
-    anchor = ref_date or (eff_now_utc.date() if eff_now_utc is not None else datetime.now(timezone.utc).date())
+    anchor = ref_date or (eff_now_utc.date() if eff_now_utc is not None else datetime.now(UTC).date())
     pos = position if isinstance(position, dict) else {}
     state = archive_state if isinstance(archive_state, dict) else {}
     inst = state.get("instrument") if isinstance(state.get("instrument"), dict) else {}
@@ -2663,13 +2818,17 @@ def evaluate_holding_health(
     if tactical_stop_30m is None:
         tactical_stop_30m = _to_float(anchors.get("tactical_stop"))
 
-    structural_stop_daily = _to_float(pos.get("structural_stop_daily"))
-    if structural_stop_daily is None:
-        structural_stop_daily = _to_float(pos.get("structural_invalidation"))
-    if structural_stop_daily is None:
-        structural_stop_daily = _to_float(anchors.get("structural_stop_daily"))
-    if structural_stop_daily is None:
-        structural_stop_daily = _to_float(anchors.get("structural_invalidation"))
+    has_portfolio_record = bool(isinstance(position, dict) and bool(position))
+    ledger_structural_stop_daily = _to_float(pos.get("structural_stop_daily"))
+    if ledger_structural_stop_daily is None:
+        ledger_structural_stop_daily = _to_float(pos.get("structural_invalidation"))
+
+    structural_stop_daily = ledger_structural_stop_daily
+    if not has_portfolio_record:
+        if structural_stop_daily is None:
+            structural_stop_daily = _to_float(anchors.get("structural_stop_daily"))
+        if structural_stop_daily is None:
+            structural_stop_daily = _to_float(anchors.get("structural_invalidation"))
 
     raw_unrealized_pnl_pct = _compute_raw_unrealized_pnl_pct(
         last_price,
@@ -2682,6 +2841,74 @@ def evaluate_holding_health(
         norm_dir,
         asset_class=asset_class,
     )
+
+    if has_portfolio_record:
+        raw_stop_regime = pos.get("active_stop_regime") or "tactical_30m"
+    else:
+        raw_stop_regime = (
+            anchors.get("active_stop_regime")
+            or state.get("active_stop_regime")
+            or "tactical_30m"
+        )
+    active_stop_regime = str(raw_stop_regime).strip()
+    if active_stop_regime not in {"tactical_30m", "daily_structure"}:
+        active_stop_regime = "tactical_30m"
+
+    raw_lifecycle = (
+        pos.get("lifecycle_stage")
+        or anchors.get("lifecycle_stage")
+        or state.get("lifecycle_stage")
+        or "pilot"
+    )
+    lifecycle_stage = str(raw_lifecycle).strip() or "pilot"
+
+    unit_1r_price_dist = _resolve_unit_1r_price_dist(
+        norm_sym=norm_sym,
+        asset_class=asset_class,
+        pos=pos,
+        anchors=anchors,
+        entry_price=entry_price,
+        tactical_stop_30m=tactical_stop_30m,
+    )
+    required_breakeven_floor = _resolve_campaign_breakeven_floor(
+        norm_sym=norm_sym,
+        asset_class=asset_class,
+        norm_dir=norm_dir,
+        entry_price=entry_price,
+        pos=pos,
+    )
+
+    daily_regime_effective = False
+    if active_stop_regime == "daily_structure":
+        regime_daily_stop = ledger_structural_stop_daily if has_portfolio_record else structural_stop_daily
+        valid_daily_stop = (
+            regime_daily_stop is not None
+            and math.isfinite(regime_daily_stop)
+            and regime_daily_stop > 0
+        )
+        profit_or_be_side = bool(
+            valid_daily_stop
+            and required_breakeven_floor is not None
+            and (
+                (norm_dir == "long" and regime_daily_stop >= required_breakeven_floor - 1e-9)
+                or (norm_dir == "short" and regime_daily_stop <= required_breakeven_floor + 1e-9)
+            )
+        )
+        if profit_or_be_side:
+            daily_regime_effective = True
+        else:
+            daily_regime_effective = False
+            yellow_alerts.append({
+                "layer": "price_stop",
+                "code": "invalid_daily_regime_fallback",
+                "message": "主升防线缺少账本保本侧日线止损，已自动回退至 30min 战术止损严管",
+                "detail": (
+                    f"active_stop_regime='daily_structure', direction={norm_dir}, "
+                    f"entry_price={entry_price}, required_breakeven_floor={required_breakeven_floor}, "
+                    f"ledger_structural_stop_daily={ledger_structural_stop_daily}, "
+                    f"structural_stop_daily={structural_stop_daily}"
+                ),
+            })
 
     # ------------------------------------------------------------------
     # Layer 5 (early): Price Feed, Daily/30m Freshness & Chanlun Completeness
@@ -2931,6 +3158,9 @@ def evaluate_holding_health(
             "detail": "tactical_stop_30m=None, structural_stop_daily=None",
         })
 
+    price_is_future = False
+    tactical_30m_reference_crossed = False
+
     if last_price is not None and norm_dir in {"long", "short"}:
         daily_breached = False
         tactical_breached = False
@@ -2938,10 +3168,15 @@ def evaluate_holding_health(
         # Resolve per-stop effective timestamps BEFORE comparing last_price against stops
         opened_at = pos.get("opened_at_utc") or pos.get("entry_timestamp_utc")
         tactical_eff_dt, tactical_eff_raw = _resolve_effective_stop_ts(
-            opened_at, pos.get("stop_updated_at_utc"), asset_class=asset_class
+            opened_at,
+            pos.get("stop_updated_at_utc"),
+            pos.get("tactical_stop_active_since_utc"),
+            asset_class=asset_class,
         )
         structural_eff_dt, structural_eff_raw = _resolve_effective_stop_ts(
-            opened_at, pos.get("structural_stop_updated_at_utc"), asset_class=asset_class
+            opened_at,
+            pos.get("structural_stop_updated_at_utc"),
+            asset_class=asset_class,
         )
 
         # Determine timestamp & bar end of whichever technicals block supplied last_price
@@ -2969,7 +3204,7 @@ def evaluate_holding_health(
                 ex_tz_px = _default_tz_for_asset_class(asset_class)
                 price_bar_end_utc = datetime(
                     p_local_d.year, p_local_d.month, p_local_d.day, 23, 59, 59, tzinfo=ex_tz_px
-                ).astimezone(timezone.utc)
+                ).astimezone(UTC)
 
         # Future timestamp guard: corrupted future price MUST NOT emit false RED_EXIT
         price_is_future = (
@@ -3018,7 +3253,13 @@ def evaluate_holding_health(
                     })
 
             if tactical_stop_30m is not None:
-                if not tactical_price_allowed and tactical_eff_dt is not None and price_bar_end_utc is not None:
+                if daily_regime_effective:
+                    if tactical_price_allowed and (
+                        (norm_dir == "long" and last_price <= tactical_stop_30m)
+                        or (norm_dir == "short" and last_price >= tactical_stop_30m)
+                    ):
+                        tactical_30m_reference_crossed = True
+                elif not tactical_price_allowed and tactical_eff_dt is not None and price_bar_end_utc is not None:
                     predate_details.append(
                         f"30min 战术止损生效于 {tactical_eff_dt.isoformat()}，"
                         f"最新行情收盘于 {price_bar_end_utc.isoformat()} ({price_bar_label or price_source})"
@@ -3027,6 +3268,7 @@ def evaluate_holding_health(
                     norm_dir == "short" and last_price >= tactical_stop_30m
                 ):
                     tactical_breached = True
+                    tactical_30m_reference_crossed = True
                     cmp_op = "<=" if norm_dir == "long" else ">="
                     red_alerts.append({
                         "layer": "price_stop",
@@ -3156,8 +3398,14 @@ def evaluate_holding_health(
             t_min_low, t_low_meta, t_max_high, t_high_meta, t_gap, t_straddle = _get_ohlc_for(
                 tactical_eff_dt, tactical_eff_raw
             )
-            if norm_dir == "long" and t_min_low is not None and t_min_low <= tactical_stop_30m:
+            if daily_regime_effective:
+                if (norm_dir == "long" and t_min_low is not None and t_min_low <= tactical_stop_30m) or (
+                    norm_dir == "short" and t_max_high is not None and t_max_high >= tactical_stop_30m
+                ):
+                    tactical_30m_reference_crossed = True
+            elif norm_dir == "long" and t_min_low is not None and t_min_low <= tactical_stop_30m:
                 tactical_breached = True
+                tactical_30m_reference_crossed = True
                 meta_txt = (
                     f"bar={t_low_meta['bar']}, tf={t_low_meta['tf']}"
                     if isinstance(t_low_meta, dict)
@@ -3174,6 +3422,7 @@ def evaluate_holding_health(
                 })
             elif norm_dir == "short" and t_max_high is not None and t_max_high >= tactical_stop_30m:
                 tactical_breached = True
+                tactical_30m_reference_crossed = True
                 meta_txt = (
                     f"bar={t_high_meta['bar']}, tf={t_high_meta['tf']}"
                     if isinstance(t_high_meta, dict)
@@ -3225,10 +3474,14 @@ def evaluate_holding_health(
         # Proximity check for non-breached stops (skip corrupted future or pre-effective prices)
         if not price_is_future:
             proximity_hits: list[str] = []
-            stop_checks = [
-                ("30min 战术止损", tactical_stop_30m, tactical_breached, tactical_price_allowed),
-                ("日线结构失效位", structural_stop_daily, daily_breached, structural_price_allowed),
-            ]
+            stop_checks = (
+                [("日线结构失效位", structural_stop_daily, daily_breached, structural_price_allowed)]
+                if daily_regime_effective
+                else [
+                    ("30min 战术止损", tactical_stop_30m, tactical_breached, tactical_price_allowed),
+                    ("日线结构失效位", structural_stop_daily, daily_breached, structural_price_allowed),
+                ]
+            )
             for label, stop_val, breached, price_allowed in stop_checks:
                 if stop_val is None or breached or (not price_allowed) or last_price <= 0:
                     continue
@@ -3322,6 +3575,9 @@ def evaluate_holding_health(
             dual = cl_mod.assess_dual_timeframe_alignment(daily_cl, intra_cl, desired_direction=norm_dir)
         except (ValueError, TypeError, KeyError):
             dual = None
+
+    daily_zd: float | None = None
+    daily_zg: float | None = None
 
     if norm_dir in {"long", "short"}:
         # Daily Chanlun assessment (prefer structured signal_meta; NEVER false-RED on candidates/weak strokes)
@@ -3422,10 +3678,20 @@ def evaluate_holding_health(
                 "detail": "；".join(dict.fromkeys(intra_weak_reasons)),
             })
 
-        # Trailing Stop Suggestion: ONLY from valid, fresh traded price_snap's 30m Zhongshu (never stale cache or cross-contract!)
+        # Trailing Stop Suggestion: ONLY from valid, fresh traded price_snap's Zhongshu (never stale cache or cross-contract!)
         price_cl = (
             price_snap.get("chanlun")
             if isinstance(price_snap, dict) and isinstance(price_snap.get("chanlun"), dict)
+            else {}
+        )
+        price_daily_cl = (
+            price_cl.get("daily")
+            if isinstance(price_cl.get("daily"), dict) and not price_cl["daily"].get("error")
+            else {}
+        )
+        price_daily_zs = (
+            price_daily_cl.get("latest_zhongshu")
+            if isinstance(price_daily_cl.get("latest_zhongshu"), dict)
             else {}
         )
         price_intra_cl = _get_intraday_chanlun(price_cl) or {}
@@ -3439,6 +3705,18 @@ def evaluate_holding_health(
             if isinstance(price_cl.get("dual_alignment"), dict)
             else {}
         )
+        daily_zd = _to_float(price_daily_zs.get("zd"))
+        if daily_zd is None:
+            daily_zd = _to_float(price_dual.get("daily_zd"))
+        if daily_zd is None and price_snap is chanlun_snap and isinstance(dual, dict):
+            daily_zd = _to_float(dual.get("daily_zd"))
+
+        daily_zg = _to_float(price_daily_zs.get("zg"))
+        if daily_zg is None:
+            daily_zg = _to_float(price_dual.get("daily_zg"))
+        if daily_zg is None and price_snap is chanlun_snap and isinstance(dual, dict):
+            daily_zg = _to_float(dual.get("daily_zg"))
+
         intra_zd = _to_float(price_intra_zs.get("zd"))
         if intra_zd is None:
             intra_zd = _to_float(price_dual.get("intraday_zd"))
@@ -3446,35 +3724,108 @@ def evaluate_holding_health(
         if intra_zg is None:
             intra_zg = _to_float(price_dual.get("intraday_zg"))
 
-        if (
+        pnl_label = (
+            f"+{raw_unrealized_pnl_pct:.4f}%"
+            if (raw_unrealized_pnl_pct is not None and 0.0 < raw_unrealized_pnl_pct < 0.01)
+            else f"+{(unrealized_pnl_pct if unrealized_pnl_pct is not None else (raw_unrealized_pnl_pct or 0.0)):.2f}%"
+        )
+
+        last_price_r6 = _round_finite(last_price, 6)
+        if daily_regime_effective:
+            if (
+                daily_cl_valid
+                and not daily_bar_missing
+                and not daily_bar_stale
+                and last_price is not None
+                and last_price_r6 is not None
+                and entry_price is not None
+                and structural_stop_daily is not None
+            ):
+                cur_daily_r6 = _round_finite(structural_stop_daily, 6)
+                daily_zd_r6 = _round_finite(daily_zd, 6)
+                daily_zg_r6 = _round_finite(daily_zg, 6)
+                if (
+                    norm_dir == "long"
+                    and last_price > entry_price
+                    and (raw_unrealized_pnl_pct is None or raw_unrealized_pnl_pct > 0)
+                    and daily_zd is not None
+                    and cur_daily_r6 is not None
+                    and daily_zd_r6 is not None
+                    and structural_stop_daily < daily_zd < last_price
+                    and cur_daily_r6 < daily_zd_r6 < last_price_r6
+                ):
+                    suggested_trail_stop = {
+                        "stop_field": "structural_stop_daily",
+                        "current_stop": cur_daily_r6,
+                        "suggested_stop": daily_zd_r6,
+                        "improvement_pct": _round_finite((daily_zd / structural_stop_daily - 1.0) * 100.0, 2)
+                        if structural_stop_daily > 0
+                        else None,
+                        "buffer_to_price_pct": _round_finite((1.0 - daily_zd / last_price) * 100.0, 2),
+                        "anchor": "daily_zhongshu_zd",
+                        "rationale": (
+                            f"主升期多头浮盈 {pnl_label}，最新日线中枢下沿 ZD={daily_zd_r6} "
+                            f"严格高于原日线结构止损 {cur_daily_r6} 且位于现价 {last_price_r6} 下方，建议上移日线主升止损锁定利润。"
+                        ),
+                    }
+                    info_notes.append(suggested_trail_stop["rationale"])
+                elif (
+                    norm_dir == "short"
+                    and last_price < entry_price
+                    and (raw_unrealized_pnl_pct is None or raw_unrealized_pnl_pct > 0)
+                    and daily_zg is not None
+                    and cur_daily_r6 is not None
+                    and daily_zg_r6 is not None
+                    and last_price < daily_zg < structural_stop_daily
+                    and last_price_r6 < daily_zg_r6 < cur_daily_r6
+                ):
+                    suggested_trail_stop = {
+                        "stop_field": "structural_stop_daily",
+                        "current_stop": cur_daily_r6,
+                        "suggested_stop": daily_zg_r6,
+                        "improvement_pct": _round_finite((1.0 - daily_zg / structural_stop_daily) * 100.0, 2)
+                        if structural_stop_daily > 0
+                        else None,
+                        "buffer_to_price_pct": _round_finite((daily_zg / last_price - 1.0) * 100.0, 2),
+                        "anchor": "daily_zhongshu_zg",
+                        "rationale": (
+                            f"主升期空头浮盈 {pnl_label}，最新日线中枢上沿 ZG={daily_zg_r6} "
+                            f"严格低于原日线结构止损 {cur_daily_r6} 且位于现价 {last_price_r6} 上方，建议下移日线主升止损锁定利润。"
+                        ),
+                    }
+                    info_notes.append(suggested_trail_stop["rationale"])
+        elif (
             not chanlun_intra_untrusted
             and last_price is not None
+            and last_price_r6 is not None
             and entry_price is not None
             and tactical_stop_30m is not None
         ):
-            pnl_label = (
-                f"+{raw_unrealized_pnl_pct:.4f}%"
-                if (raw_unrealized_pnl_pct is not None and 0.0 < raw_unrealized_pnl_pct < 0.01)
-                else f"+{(unrealized_pnl_pct if unrealized_pnl_pct is not None else (raw_unrealized_pnl_pct or 0.0)):.2f}%"
-            )
+            cur_tact_r6 = _round_finite(tactical_stop_30m, 6)
+            intra_zd_r6 = _round_finite(intra_zd, 6)
+            intra_zg_r6 = _round_finite(intra_zg, 6)
             if (
                 norm_dir == "long"
                 and last_price > entry_price
                 and (raw_unrealized_pnl_pct is None or raw_unrealized_pnl_pct > 0)
                 and intra_zd is not None
+                and cur_tact_r6 is not None
+                and intra_zd_r6 is not None
                 and tactical_stop_30m < intra_zd < last_price
+                and cur_tact_r6 < intra_zd_r6 < last_price_r6
             ):
                 suggested_trail_stop = {
-                    "current_stop": _round_finite(tactical_stop_30m, 4),
-                    "suggested_stop": _round_finite(intra_zd, 4),
+                    "stop_field": "tactical_stop_30m",
+                    "current_stop": cur_tact_r6,
+                    "suggested_stop": intra_zd_r6,
                     "improvement_pct": _round_finite((intra_zd / tactical_stop_30m - 1.0) * 100.0, 2)
                     if tactical_stop_30m > 0
                     else None,
                     "buffer_to_price_pct": _round_finite((1.0 - intra_zd / last_price) * 100.0, 2),
                     "anchor": "30m_zhongshu_zd",
                     "rationale": (
-                        f"多头浮盈 {pnl_label}，最新 30min 中枢下沿 ZD={intra_zd} "
-                        f"严格高于原战术止损 {tactical_stop_30m} 且位于现价 {last_price} 下方，建议上移追踪止损锁定浮盈。"
+                        f"多头浮盈 {pnl_label}，最新 30min 中枢下沿 ZD={intra_zd_r6} "
+                        f"严格高于原战术止损 {cur_tact_r6} 且位于现价 {last_price_r6} 下方，建议上移追踪止损锁定浮盈。"
                     ),
                 }
                 info_notes.append(suggested_trail_stop["rationale"])
@@ -3483,19 +3834,23 @@ def evaluate_holding_health(
                 and last_price < entry_price
                 and (raw_unrealized_pnl_pct is None or raw_unrealized_pnl_pct > 0)
                 and intra_zg is not None
+                and cur_tact_r6 is not None
+                and intra_zg_r6 is not None
                 and last_price < intra_zg < tactical_stop_30m
+                and last_price_r6 < intra_zg_r6 < cur_tact_r6
             ):
                 suggested_trail_stop = {
-                    "current_stop": _round_finite(tactical_stop_30m, 4),
-                    "suggested_stop": _round_finite(intra_zg, 4),
+                    "stop_field": "tactical_stop_30m",
+                    "current_stop": cur_tact_r6,
+                    "suggested_stop": intra_zg_r6,
                     "improvement_pct": _round_finite((1.0 - intra_zg / tactical_stop_30m) * 100.0, 2)
                     if tactical_stop_30m > 0
                     else None,
                     "buffer_to_price_pct": _round_finite((intra_zg / last_price - 1.0) * 100.0, 2),
                     "anchor": "30m_zhongshu_zg",
                     "rationale": (
-                        f"空头浮盈 {pnl_label}，最新 30min 中枢上沿 ZG={intra_zg} "
-                        f"严格低于原战术止损 {tactical_stop_30m} 且位于现价 {last_price} 上方，建议下移追踪止损锁定浮盈。"
+                        f"空头浮盈 {pnl_label}，最新 30min 中枢上沿 ZG={intra_zg_r6} "
+                        f"严格低于原战术止损 {cur_tact_r6} 且位于现价 {last_price_r6} 上方，建议下移追踪止损锁定浮盈。"
                     ),
                 }
                 info_notes.append(suggested_trail_stop["rationale"])
@@ -3541,7 +3896,7 @@ def evaluate_holding_health(
     unevaluated_triggers: list[str] = []
     verifiable_trigger_ids: list[str] = []
     if armed_triggers:
-        eval_now_utc = now_utc if now_utc is not None else (None if ref_date is not None else datetime.now(timezone.utc))
+        eval_now_utc = now_utc if now_utc is not None else (None if ref_date is not None else datetime.now(UTC))
         trigger_results = ra_mod.evaluate_triggers(
             {"triggers": armed_triggers},
             observations,
@@ -3552,11 +3907,10 @@ def evaluate_holding_health(
             tid = str(tr.get("id") or "?")
             metric = tr.get("metric")
             is_auto = ra_mod.is_trigger_auto_metric(tr)
-            if tr.get("error"):
-                # Only surface hard evaluation errors as upstream data warnings when auto metric failed;
-                # stale/uncertain policy verifications are handled cleanly under unevaluated_triggers.
-                if is_auto and not tr.get("verification_stale"):
-                    data_warnings.append(f"trigger[{tid}]: {tr['error']}")
+            # Only surface hard evaluation errors as upstream data warnings when auto metric failed;
+            # stale/uncertain policy verifications are handled cleanly under unevaluated_triggers.
+            if tr.get("error") and is_auto and not tr.get("verification_stale"):
+                data_warnings.append(f"trigger[{tid}]: {tr['error']}")
             if tr.get("evaluated") is not True:
                 if not is_auto:
                     if tid != "?" and tid not in verifiable_trigger_ids:
@@ -3887,8 +4241,68 @@ def evaluate_holding_health(
         "no_data_warnings": len(data_warnings) == 0,
         "contract_quote_verified": not contract_quote_mismatch,
         "valid_direction": norm_dir in {"long", "short"},
-        "stops_configured": (tactical_stop_30m is not None or structural_stop_daily is not None),
+        "stops_configured": (
+            (
+                (ledger_structural_stop_daily is not None)
+                if has_portfolio_record
+                else (structural_stop_daily is not None)
+            )
+            if daily_regime_effective
+            else (tactical_stop_30m is not None or structural_stop_daily is not None)
+        ),
     }
+
+    # Unified integrity gate for main-wave 30m de-noising and tactical->daily handover:
+    # NEVER claim "日线结构与核心领先指标稳固" if any trigger is fired/unverified/missing or data is degraded/unclosed!
+    has_daily_reversal = any(a.get("code") == "daily_direction_reversed" for a in red_alerts)
+    has_daily_loosening = any(a.get("code") == "daily_structure_loosening" for a in yellow_alerts)
+    has_fired_triggers = (
+        any(str(a.get("code") or "").startswith("trigger_red_") for a in red_alerts)
+        or any(str(a.get("code") or "").startswith("trigger_yellow_") for a in yellow_alerts)
+    )
+    has_trigger_or_governance_gap = (
+        len(unevaluated_triggers) > 0
+        or len(armed_triggers) == 0
+        or any(
+            a.get("layer") in {"trigger_integrity", "governance"}
+            or a.get("code") in {"no_exit_red_lines", "manual_red_lines_only", "unevaluated_triggers"}
+            for a in yellow_alerts
+        )
+    )
+    has_data_integrity_issue = (
+        (not all(green_preconditions.values()))
+        or len(data_warnings) > 0
+        or price_is_future
+        or any(
+            a.get("layer") == "data_integrity"
+            or a.get("code") in {"price_predates_stop_effective_ts", "straddling_bar_stop_ambiguity"}
+            for a in yellow_alerts
+        )
+    )
+    main_wave_integrity_clean = (
+        not red_alerts
+        and not has_daily_reversal
+        and not has_daily_loosening
+        and not has_fired_triggers
+        and not has_trigger_or_governance_gap
+        and not has_data_integrity_issue
+    )
+
+    main_wave_pullback_watch: dict[str, Any] | None = None
+    if (
+        daily_regime_effective
+        and main_wave_integrity_clean
+        and any(a.get("code") == "intraday_30m_weakening" for a in yellow_alerts)
+    ):
+        yellow_alerts = [a for a in yellow_alerts if a.get("code") != "intraday_30m_weakening"]
+        main_wave_pullback_watch = {
+            "active": True,
+            "message": (
+                "主升期 30min 正常回踩观察：日线结构与核心领先指标稳固，严守日线防线，"
+                "不因 30min 噪音下车；若在日线中枢上方出现 30min 分型确认可评估保本推仓"
+            ),
+        }
+        info_notes.append(main_wave_pullback_watch["message"])
 
     if not red_alerts and not yellow_alerts and not all(green_preconditions.values()):
         failed_keys = [k for k, ok in green_preconditions.items() if not ok]
@@ -3899,6 +4313,193 @@ def evaluate_holding_health(
             "detail": f"未通过项: {', '.join(failed_keys)}",
         })
 
+    unrealized_r: float | None = None
+    if (
+        last_price is not None
+        and not price_is_future
+        and entry_price is not None
+        and entry_price > 0
+        and norm_dir in {"long", "short"}
+        and unit_1r_price_dist is not None
+        and unit_1r_price_dist > 0
+    ):
+        raw_r = (
+            (last_price - entry_price) if norm_dir == "long" else (entry_price - last_price)
+        ) / unit_1r_price_dist
+        if math.isfinite(raw_r):
+            r_rounded = round(raw_r, 4)
+            unrealized_r = 0.0 if r_rounded == 0 else r_rounded
+
+    if daily_regime_effective:
+        is_breakeven_locked = True
+    elif (
+        norm_dir == "long"
+        and tactical_stop_30m is not None
+        and required_breakeven_floor is not None
+        and required_breakeven_floor > 0
+    ):
+        is_breakeven_locked = bool(tactical_stop_30m >= required_breakeven_floor - 1e-9)
+    elif (
+        norm_dir == "short"
+        and tactical_stop_30m is not None
+        and required_breakeven_floor is not None
+        and required_breakeven_floor > 0
+    ):
+        is_breakeven_locked = bool(tactical_stop_30m <= required_breakeven_floor + 1e-9)
+    else:
+        is_breakeven_locked = False
+
+    if daily_regime_effective:
+        effective_stop_price = _round_finite(structural_stop_daily, 6)
+    elif tactical_stop_30m is not None and structural_stop_daily is not None and norm_dir in {"long", "short"}:
+        effective_stop_price = _round_finite(
+            max(tactical_stop_30m, structural_stop_daily)
+            if norm_dir == "long"
+            else min(tactical_stop_30m, structural_stop_daily),
+            6,
+        )
+    elif tactical_stop_30m is not None:
+        effective_stop_price = _round_finite(tactical_stop_30m, 6)
+    else:
+        effective_stop_price = _round_finite(structural_stop_daily, 6)
+
+    suggested_breakeven_stop: dict[str, Any] | None = None
+    suggested_regime_handover: dict[str, Any] | None = None
+    if (
+        not daily_regime_effective
+        and norm_dir in {"long", "short"}
+        and last_price is not None
+        and not price_is_future
+        and required_breakeven_floor is not None
+        and required_breakeven_floor > 0
+    ):
+        be_floor = required_breakeven_floor
+        be_floor_r6 = _round_protective_6(be_floor, norm_dir)
+        last_price_h6 = _round_finite(last_price, 6)
+        tact_r6 = _round_finite(tactical_stop_30m, 6)
+        struct_daily_r6 = _round_finite(structural_stop_daily, 6)
+        be_protective = (
+            be_floor_r6 is not None
+            and be_floor_r6 > 0
+            and last_price_h6 is not None
+            and (
+                (norm_dir == "long" and be_floor < last_price and be_floor_r6 < last_price_h6)
+                or (norm_dir == "short" and be_floor > last_price and be_floor_r6 > last_price_h6)
+            )
+        )
+        be_strictly_tighter = (
+            tact_r6 is None
+            or (
+                be_floor_r6 is not None
+                and ((norm_dir == "long" and be_floor_r6 > tact_r6) or (norm_dir == "short" and be_floor_r6 < tact_r6))
+            )
+        )
+        if (
+            unrealized_r is not None
+            and unrealized_r >= 1.0
+            and not is_breakeven_locked
+            and not red_alerts
+            and be_protective
+            and be_strictly_tighter
+            and be_floor_r6 is not None
+        ):
+            move_verb = "上移" if norm_dir == "long" else "下移"
+            suggested_breakeven_stop = {
+                "recommended_stop": be_floor_r6,
+                "stop_field": "tactical_stop_30m",
+                "reason": f"浮盈已达 +{unrealized_r:.2f}R，建议{move_verb} 30min 止损至保本位锁死零本金风险",
+            }
+
+        if (
+            unrealized_r is not None
+            and unrealized_r >= 1.5
+            and main_wave_integrity_clean
+            and be_protective
+            and be_floor_r6 is not None
+            and last_price_h6 is not None
+        ):
+            cand_daily_r6: float | None = None
+            ready_for_handover = False
+            if norm_dir == "long":
+                cands_r6: list[float] = []
+                for idx_c, c in enumerate((be_floor, structural_stop_daily, daily_zd)):
+                    if c is None or not math.isfinite(c) or not (0 < c < last_price):
+                        continue
+                    c_r6 = be_floor_r6 if idx_c == 0 else _round_finite(c, 6)
+                    if (
+                        c_r6 is not None
+                        and c_r6 > 0
+                        and be_floor_r6 <= c_r6 < last_price_h6
+                        and (struct_daily_r6 is None or c_r6 >= struct_daily_r6)
+                    ):
+                        cands_r6.append(c_r6)
+                if cands_r6:
+                    best_c_r6 = max(cands_r6)
+                    cand_daily_r6 = best_c_r6
+                    daily_zd_h6 = _round_finite(daily_zd, 6)
+                    ready_for_handover = (
+                        is_breakeven_locked
+                        or (
+                            daily_zd is not None
+                            and daily_zd_h6 is not None
+                            and be_floor - 1e-9 <= daily_zd < last_price
+                            and be_floor_r6 <= daily_zd_h6 < last_price_h6
+                        )
+                        or (unrealized_r >= 2.0)
+                    )
+            else:
+                cands_r6 = []
+                for idx_c, c in enumerate((be_floor, structural_stop_daily, daily_zg)):
+                    if c is None or not math.isfinite(c) or not (c > last_price):
+                        continue
+                    c_r6 = be_floor_r6 if idx_c == 0 else _round_finite(c, 6)
+                    if (
+                        c_r6 is not None
+                        and c_r6 > 0
+                        and last_price_h6 < c_r6 <= be_floor_r6
+                        and (struct_daily_r6 is None or c_r6 <= struct_daily_r6)
+                    ):
+                        cands_r6.append(c_r6)
+                if cands_r6:
+                    best_c_r6 = min(cands_r6)
+                    cand_daily_r6 = best_c_r6
+                    daily_zg_h6 = _round_finite(daily_zg, 6)
+                    ready_for_handover = (
+                        is_breakeven_locked
+                        or (
+                            daily_zg is not None
+                            and daily_zg_h6 is not None
+                            and last_price < daily_zg <= be_floor + 1e-9
+                            and last_price_h6 < daily_zg_h6 <= be_floor_r6
+                        )
+                        or (unrealized_r >= 2.0)
+                    )
+
+            if cand_daily_r6 is not None and ready_for_handover:
+                suggested_regime_handover = {
+                    "target_regime": "daily_structure",
+                    "recommended_daily_stop": cand_daily_r6,
+                    "unrealized_r": unrealized_r,
+                    "reason": (
+                        f"浮盈 +{unrealized_r:.2f}R 已脱离成本区且日线与领先指标稳固，"
+                        "可移交日线中枢防线进入主升持有期"
+                    ),
+                }
+
+    campaign_status = {
+        "lifecycle_stage": lifecycle_stage,
+        "active_stop_regime": "daily_structure" if daily_regime_effective else "tactical_30m",
+        "configured_stop_regime": active_stop_regime,
+        "effective_stop_price": effective_stop_price,
+        "unit_1r_price_dist": unit_1r_price_dist,
+        "unrealized_r": unrealized_r,
+        "is_breakeven_locked": is_breakeven_locked,
+        "tactical_30m_reference_crossed": tactical_30m_reference_crossed,
+        "main_wave_pullback_watch": main_wave_pullback_watch,
+        "suggested_breakeven_stop": suggested_breakeven_stop,
+        "suggested_regime_handover": suggested_regime_handover,
+    }
+
     if red_alerts:
         status = STATUS_RED
         action_headline = red_alerts[0]["message"]
@@ -3907,7 +4508,11 @@ def evaluate_holding_health(
         action_headline = yellow_alerts[0]["message"]
     else:
         status = STATUS_GREEN
-        action_headline = "日线与 30min 结构稳固、核心触发器已核验且未松动，按计划持有"
+        action_headline = (
+            "日线主升结构与核心触发器稳固，严守日线防线骑乘主升浪"
+            if daily_regime_effective
+            else "日线与 30min 结构稳固、核心触发器已核验且未松动，按计划持有"
+        )
 
     return _sanitize_for_json({
         "symbol": norm_sym,
@@ -3925,17 +4530,18 @@ def evaluate_holding_health(
         "status": status,
         "status_zh": STATUS_ZH_MAP[status],
         "action_headline": action_headline,
-        "last_price": _round_finite(last_price, 4),
+        "last_price": _round_finite(last_price, 6),
         "price_source": price_source,
-        "entry_price": _round_finite(entry_price, 4),
-        "tactical_stop_30m": _round_finite(tactical_stop_30m, 4),
-        "structural_stop_daily": _round_finite(structural_stop_daily, 4),
-        "target_price": _round_finite(target_price, 4),
+        "entry_price": _round_finite(entry_price, 6),
+        "tactical_stop_30m": _round_finite(tactical_stop_30m, 6),
+        "structural_stop_daily": _round_finite(structural_stop_daily, 6),
+        "target_price": _round_finite(target_price, 6),
         "unrealized_pnl_pct": unrealized_pnl_pct,
         "red_alerts": red_alerts,
         "yellow_alerts": yellow_alerts,
         "info_notes": info_notes,
         "suggested_trail_stop": suggested_trail_stop,
+        "campaign_status": campaign_status,
         "trigger_results": trigger_results,
         "verifiable_trigger_ids": verifiable_trigger_ids,
         "upcoming_events": upcoming_events,
@@ -4268,9 +4874,9 @@ def run_daily_sentinel(
     explicit_now_utc: datetime | None = None
     if isinstance(now_utc, datetime):
         explicit_now_utc = (
-            now_utc.astimezone(timezone.utc)
+            now_utc.astimezone(UTC)
             if now_utc.tzinfo is not None
-            else now_utc.replace(tzinfo=timezone.utc)
+            else now_utc.replace(tzinfo=UTC)
         )
 
     def _resolve_eval_clock() -> tuple[date, datetime | None]:
@@ -4278,7 +4884,7 @@ def run_daily_sentinel(
             return (ref_date or explicit_now_utc.date()), explicit_now_utc
         if ref_date is not None:
             return ref_date, None
-        live_now = datetime.now(timezone.utc)
+        live_now = datetime.now(UTC)
         return live_now.date(), live_now
 
     anchor, _ = _resolve_eval_clock()
@@ -4730,6 +5336,21 @@ def format_sentinel_markdown(report: dict[str, Any]) -> str:
                     f"- **追踪止损建议**：`{trail.get('current_stop')}` -> `{trail.get('suggested_stop')}`"
                     f"（{trail.get('rationale')}）"
                 )
+
+            camp = h.get("campaign_status")
+            if isinstance(camp, dict):
+                be_sug = camp.get("suggested_breakeven_stop")
+                if isinstance(be_sug, dict):
+                    lines.append(
+                        f"- **保本上移建议**：`{be_sug.get('stop_field')}` -> `{be_sug.get('recommended_stop')}`"
+                        f"（{be_sug.get('reason')}）"
+                    )
+                ho_sug = camp.get("suggested_regime_handover")
+                if isinstance(ho_sug, dict):
+                    lines.append(
+                        f"- **主升防线移交建议**：切换 `{ho_sug.get('target_regime')}` · 日线止损 `{ho_sug.get('recommended_daily_stop')}`"
+                        f"（{ho_sug.get('reason')}）"
+                    )
 
             for note in h.get("info_notes") or []:
                 if isinstance(trail, dict) and note == trail.get("rationale"):

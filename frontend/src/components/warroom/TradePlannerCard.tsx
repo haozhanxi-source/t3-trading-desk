@@ -14,6 +14,7 @@ import {
   GitBranch,
   Lock,
   PlusCircle,
+  Rocket,
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
@@ -86,6 +87,85 @@ function formatQtyDisplay(qty: number, fractional: boolean): string {
   if (!Number.isFinite(qty)) return "";
   if (!fractional) return String(Math.round(qty));
   return Number(qty.toFixed(4)).toString();
+}
+
+const _f64Buf = new ArrayBuffer(8);
+const _f64View = new DataView(_f64Buf);
+
+function splitIeee754(x: number): { neg: boolean; num: bigint; den: bigint } | null {
+  if (!Number.isFinite(x)) return null;
+  if (x === 0) return { neg: false, num: 0n, den: 1n };
+  _f64View.setFloat64(0, x, false);
+  const bits = _f64View.getBigUint64(0, false);
+  const neg = (bits >> 63n) !== 0n;
+  const expBits = Number((bits >> 52n) & 0x7ffn);
+  const fracBits = bits & 0xfffffffffffffn;
+  const mantissa = expBits === 0 ? fracBits : (1n << 52n) | fracBits;
+  const exp = expBits === 0 ? -1074 : expBits - 1075;
+  if (exp >= 0) {
+    return { neg, num: mantissa << BigInt(exp), den: 1n };
+  }
+  return { neg, num: mantissa, den: 1n << BigInt(-exp) };
+}
+
+/** Exact bit-for-bit match to Python 3 `round(x, 6)` returned in 1e-6 micro-units. */
+function roundPython6Micros(n: number): bigint | null {
+  const parts = splitIeee754(n);
+  if (!parts) return null;
+  if (parts.num === 0n) return 0n;
+  const scaledNum = parts.num * 1_000_000n;
+  let q = scaledNum / parts.den;
+  const rem = scaledNum % parts.den;
+  const twiceRem = rem * 2n;
+  if (twiceRem > parts.den || (twiceRem === parts.den && (q & 1n) === 1n)) {
+    q += 1n;
+  }
+  return parts.neg ? -q : q;
+}
+
+/**
+ * Compute the minimal 6-decimal target price string guaranteed to satisfy R:R >= 2.5
+ * after backend 6-decimal quantization, rounding outward (ceiling for long, floor for short).
+ */
+function computeRr25TargetStr(
+  entry: number,
+  stop: number,
+  direction: Direction,
+): string | null {
+  const eM = roundPython6Micros(entry);
+  const sM = roundPython6Micros(stop);
+  if (eM === null || sM === null || eM <= 0n || sM <= 0n) return null;
+  const distM = direction === "long" ? eM - sM : sM - eM;
+  if (distM <= 0n) return null;
+  // Exact ceil(distM * 2.5) = ceil(distM * 5 / 2) = (distM * 5n + 1n) / 2n
+  const reqRewardM = (distM * 5n + 1n) / 2n;
+  const targetM = direction === "long" ? eM + reqRewardM : eM - reqRewardM;
+  if (targetM <= 0n) return null;
+  const SCALE = 1_000_000n;
+  const intPart = targetM / SCALE;
+  const fracPart = (targetM % SCALE).toString().padStart(6, "0").replace(/0+$/, "");
+  return fracPart ? `${intPart}.${fracPart}` : `${intPart}`;
+}
+
+function fmtRrDisplay(
+  rawVal: number | null | undefined,
+  displayVal: number | null | undefined,
+  threshold = 2.5,
+): string {
+  const effective = rawVal ?? displayVal;
+  if (effective == null || !Number.isFinite(effective)) return "—";
+  const std = fmtRatio(effective);
+  const stdNum = Number(std.replace(/R$/, "").replace(/,/g, ""));
+  if (effective < threshold && Number.isFinite(stdNum) && stdNum >= threshold) {
+    for (const dp of [3, 4, 5, 6, 8]) {
+      const s = effective.toFixed(dp);
+      if (Number(s) < threshold) {
+        return `${s.replace(/0+$/, "").replace(/\.$/, "")}R`;
+      }
+    }
+    return `<${threshold.toFixed(2)}R`;
+  }
+  return std;
 }
 
 function assetUnitLabel(
@@ -824,28 +904,59 @@ export function TradePlannerCard({
       }
     }
 
-    const stopDist = entry != null && stop != null ? Math.abs(entry - stop) : null;
+    const rawStopDist = entry != null && stop != null ? Math.abs(entry - stop) : null;
+    const entryM = entry != null ? roundPython6Micros(entry) : null;
+    const stopM = stop != null ? roundPython6Micros(stop) : null;
+    const targetM = target != null ? roundPython6Micros(target) : null;
+    const entryStopQuantizedValid =
+      entryM != null &&
+      stopM != null &&
+      entryM > 0n &&
+      stopM > 0n &&
+      (direction === "long" ? entryM > stopM : entryM < stopM);
+    const distM = entryStopQuantizedValid
+      ? direction === "long"
+        ? entryM - stopM
+        : stopM - entryM
+      : null;
+    const targetQuantizedValid =
+      entryM != null &&
+      targetM != null &&
+      entryM > 0n &&
+      targetM > 0n &&
+      (direction === "long" ? targetM > entryM : targetM < entryM);
+    const rewardM = targetQuantizedValid
+      ? direction === "long"
+        ? targetM - entryM
+        : entryM - targetM
+      : null;
+    const stopPrecisionCollapsed =
+      rawStopDist != null && rawStopDist > 0 && entryM != null && stopM != null && !entryStopQuantizedValid;
+    const stopDist = distM != null && distM > 0n ? Number(distM) / 1_000_000 : null;
     const stopDistPct =
-      entry != null && entry > 0 && stopDist != null ? (stopDist / entry) * 100 : null;
-    const rewardDist =
-      entry != null && target != null
-        ? direction === "long"
-          ? target - entry
-          : entry - target
+      entryStopQuantizedValid && distM != null && distM > 0n
+        ? (Number(distM) / Number(entryM)) * 100
         : null;
     const rrRatio =
-      stopDist != null && stopDist > 0 && rewardDist != null && rewardDist > 0
-        ? rewardDist / stopDist
+      distM != null && distM > 0n && rewardM != null && rewardM > 0n
+        ? Number(rewardM) / Number(distM)
         : null;
-    const rr25Target =
-      entry != null && stopDist != null && stopDist > 0
-        ? direction === "long"
-          ? entry + stopDist * 2.5
-          : Math.max(0.0001, entry - stopDist * 2.5)
+    const rrBelow25 =
+      distM != null && distM > 0n && rewardM != null && rewardM > 0n
+        ? rewardM * 2n < distM * 5n
+        : false;
+    const rr25TargetStr =
+      entryStopQuantizedValid && entry != null && stop != null
+        ? computeRr25TargetStr(entry, stop, direction)
         : null;
+    const rr25Target = rr25TargetStr != null ? Number(rr25TargetStr) : null;
 
     const unitNotional =
-      entry != null && activeSpec.multiplier != null && fx != null && fx > 0
+      entry != null &&
+      (entryM == null || entryM > 0n) &&
+      activeSpec.multiplier != null &&
+      fx != null &&
+      fx > 0
         ? entry * activeSpec.multiplier * fx
         : null;
     const unitCost =
@@ -895,7 +1006,7 @@ export function TradePlannerCard({
       }
     } else if (sizingDriver === "amount") {
       const amt = optNum(allocAmount);
-      if (amt != null && amt > 0 && unitCost != null && unitCost > 0) {
+      if (!stopPrecisionCollapsed && (entryM == null || entryM > 0n) && amt != null && amt > 0 && unitCost != null && unitCost > 0) {
         estQty = quantizeQtyDown(amt / unitCost, activeSpec.minOrderQty, activeSpec.lotStep, activeSpec.fractional);
         belowMinLot = estQty === 0;
         estOutlay = estQty * unitCost;
@@ -913,7 +1024,7 @@ export function TradePlannerCard({
       }
     } else if (sizingDriver === "qty") {
       const qRaw = optNum(manualQty);
-      if (qRaw != null && qRaw > 0) {
+      if (!stopPrecisionCollapsed && (entryM == null || entryM > 0n) && qRaw != null && qRaw > 0) {
         estQty = quantizeQtyDown(qRaw, activeSpec.minOrderQty, activeSpec.lotStep, activeSpec.fractional);
         belowMinLot = estQty === 0;
         if (unitCost != null && unitCost > 0) {
@@ -945,8 +1056,11 @@ export function TradePlannerCard({
       fx,
       stopDist,
       stopDistPct,
+      stopPrecisionCollapsed,
       rrRatio,
+      rrBelow25,
       rr25Target,
+      rr25TargetStr,
       unitNotional,
       unitCost,
       unitRisk,
@@ -1254,6 +1368,10 @@ export function TradePlannerCard({
   const gate = plan?.four_quadrant_gate;
   const carry = plan?.expression_and_carry;
   const pos = plan?.position_plan;
+  const offensiveCampaign = pos?.offensive_campaign ?? null;
+  const egSummary = plan?.expectation_gap_summary ?? gate?.expectation_gap_summary ?? null;
+  const isCrowdedExpectationGap =
+    String(egSummary?.crowding_assessment || "").trim().toLowerCase() === "crowded";
 
   const planAssetClass = (pos?.asset_class ?? carry?.asset_class ?? resolvedAssetClass).toLowerCase();
   const planIsEquity = planAssetClass === "us_stock_or_etf" || planAssetClass === "a_share";
@@ -1362,6 +1480,7 @@ export function TradePlannerCard({
       "";
     const tranches = Array.isArray(computedPos.tranches) ? computedPos.tranches : [];
     const firstTranche = tranches.length > 0 ? tranches[0] : null;
+    const oc = computedPos.offensive_campaign ?? null;
 
     onOpenPositionSeed({
       symbol: computedPos.symbol,
@@ -1372,10 +1491,11 @@ export function TradePlannerCard({
       tactical_stop_30m: computedPos.tactical_stop_30m ?? null,
       structural_stop_daily: computedPos.structural_stop_daily ?? null,
       target_price: computedPos.target_price ?? null,
-      quantity: computedPos.total_quantity ?? null,
-      first_tranche_qty: firstTranche?.quantity ?? null,
+      quantity: oc?.full_pilot_qty ?? computedPos.total_quantity ?? null,
+      first_tranche_qty: oc?.split_pilot_qty ?? firstTranche?.quantity ?? null,
       first_tranche_weight: firstTranche?.weight ?? null,
-      full_plan_qty: computedPos.total_quantity ?? null,
+      full_plan_qty: oc?.full_pilot_qty ?? computedPos.total_quantity ?? null,
+      campaign_1r_amount: oc?.campaign_1r_amount ?? null,
       tranches,
       fx_to_account: inheritFx,
     });
@@ -1866,7 +1986,11 @@ export function TradePlannerCard({
             className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline-soft pt-2 text-[11.5px] text-ink-2"
           >
             <div className="tnum flex flex-wrap items-center gap-x-3 gap-y-1">
-              {sizingPreview.estQty != null && sizingPreview.estQty > 0 ? (
+              {sizingPreview.stopPrecisionCollapsed ? (
+                <span className="text-critical">
+                  入场价或 30m 止损价在 6 位小数精度下归零或重合，后端将拒绝算仓（数量归零），请调整价格或扩大止损间距。
+                </span>
+              ) : sizingPreview.estQty != null && sizingPreview.estQty > 0 ? (
                 <>
                   <span>
                     预估仓位：
@@ -1935,10 +2059,10 @@ export function TradePlannerCard({
                       名义盈亏比：
                       <strong
                         className={`font-mono ${
-                          sizingPreview.rrRatio >= 2.5 ? "text-good" : "text-warning"
+                          !sizingPreview.rrBelow25 ? "text-good" : "text-warning"
                         }`}
                       >
-                        {fmtRatio(sizingPreview.rrRatio)}
+                        {fmtRrDisplay(sizingPreview.rrRatio, sizingPreview.rrRatio)}
                       </strong>
                     </span>
                   ) : null}
@@ -2011,17 +2135,17 @@ export function TradePlannerCard({
                 </button>
               ) : null}
               {sizingPreview.rrRatio != null &&
-              sizingPreview.rrRatio < 2.5 &&
-              sizingPreview.rr25Target != null ? (
+              sizingPreview.rrBelow25 &&
+              sizingPreview.rr25TargetStr != null ? (
                 <button
                   type="button"
                   className="chip py-0.5 text-[11px]"
                   onClick={() => {
-                    setTargetPrice(fmtInputPrice(sizingPreview.rr25Target));
+                    setTargetPrice(sizingPreview.rr25TargetStr!);
                     markStale();
                   }}
                 >
-                  目标价调至 2.5R ({fmtInputPrice(sizingPreview.rr25Target)})
+                  目标价调至 2.5R ({sizingPreview.rr25TargetStr})
                 </button>
               ) : null}
             </div>
@@ -2406,7 +2530,25 @@ export function TradePlannerCard({
                   label={`档案方向：${formatResearchDirectionZh(gate.research_direction)}`}
                 />
               ) : null}
+              {isCrowdedExpectationGap ? (
+                <StatusBadge tone="critical" label="预期差拥挤警示" />
+              ) : null}
             </div>
+
+            {isCrowdedExpectationGap ? (
+              <div
+                role="alert"
+                className="flex items-start gap-2 rounded-md border border-critical/45 bg-critical/10 px-2.5 py-2 text-xs text-ink"
+              >
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-critical" aria-hidden="true" />
+                <div className="min-w-0">
+                  <div className="font-semibold text-critical">共识拥挤警示 (Crowded)</div>
+                  <div className="mt-0.5 text-[11px] text-ink-2">
+                    研究档案评估该逻辑已进入拥挤区，禁止远离中枢追高，须等待 30min 结构完全确认且严守首仓 1R 纪律。
+                  </div>
+                </div>
+              </div>
+            ) : null}
 
             {needsArchiveDirectionConfirm && gate ? (
               <div
@@ -2499,35 +2641,30 @@ export function TradePlannerCard({
                     </button>
                   </>
                 ) : null}
-                {pos?.rr_ratio != null &&
-                pos.rr_ratio < 2.5 &&
-                pos.entry_price != null &&
-                pos.tactical_stop_30m != null ? (
-                  <button
-                    type="button"
-                    className="chip py-0.5 text-[11px]"
-                    onClick={() => {
-                      const dist = Math.abs(pos.entry_price! - pos.tactical_stop_30m!);
-                      const t25 =
-                        direction === "long"
-                          ? pos.entry_price! + dist * 2.5
-                          : Math.max(0.0001, pos.entry_price! - dist * 2.5);
-                      setTargetPrice(fmtInputPrice(t25));
-                      markStale();
-                    }}
-                  >
-                    目标价设为 2.5R (
-                    {fmtInputPrice(
-                      direction === "long"
-                        ? pos.entry_price + Math.abs(pos.entry_price - pos.tactical_stop_30m) * 2.5
-                        : Math.max(
-                            0.0001,
-                            pos.entry_price - Math.abs(pos.entry_price - pos.tactical_stop_30m) * 2.5,
-                          ),
-                    )}
-                    )
-                  </button>
-                ) : null}
+                {(() => {
+                  const needs25Btn =
+                    (((pos?.rr_ratio_raw ?? pos?.rr_ratio) != null &&
+                      (pos!.rr_ratio_raw ?? pos!.rr_ratio)! < 2.5) ||
+                      gate?.decision === "watchlist_poor_rr") &&
+                    pos?.entry_price != null &&
+                    pos?.tactical_stop_30m != null;
+                  const target25Str = needs25Btn
+                    ? computeRr25TargetStr(pos!.entry_price!, pos!.tactical_stop_30m!, direction)
+                    : null;
+                  if (!target25Str) return null;
+                  return (
+                    <button
+                      type="button"
+                      className="chip py-0.5 text-[11px]"
+                      onClick={() => {
+                        setTargetPrice(target25Str);
+                        markStale();
+                      }}
+                    >
+                      目标价设为 2.5R ({target25Str})
+                    </button>
+                  );
+                })()}
                 {!archiveVerifiedL1L2 && !needsArchiveDirectionConfirm && onJumpArchive ? (
                   <button
                     type="button"
@@ -2728,7 +2865,10 @@ export function TradePlannerCard({
                 <div className="metric-cell">
                   <span className="metric-label">计入 Carry 后 R:R</span>
                   <span className="metric-val">
-                    {fmtRatio(carry?.carry_adjusted_rr_ratio ?? pos?.carry_adjusted_rr_ratio)}
+                    {fmtRrDisplay(
+                      carry?.carry_adjusted_rr_ratio_raw ?? pos?.carry_adjusted_rr_ratio_raw,
+                      carry?.carry_adjusted_rr_ratio ?? pos?.carry_adjusted_rr_ratio,
+                    )}
                   </span>
                 </div>
                 <div className="metric-cell">
@@ -2740,7 +2880,10 @@ export function TradePlannerCard({
                   <span className="metric-val">
                     {planAssetClass === "fx" || planAssetClass === "crypto"
                       ? formatAssetClassZh(planAssetClass)
-                      : fmtRatio(carry?.near_carry_stress_rr_ratio)}
+                      : fmtRrDisplay(
+                          carry?.near_carry_stress_rr_ratio_raw,
+                          carry?.near_carry_stress_rr_ratio,
+                        )}
                   </span>
                 </div>
               </div>
@@ -2809,7 +2952,7 @@ export function TradePlannerCard({
               </div>
               <div className="metric-cell">
                 <span className="metric-label">名义盈亏比</span>
-                <span className="metric-val">{fmtRatio(pos?.rr_ratio)}</span>
+                <span className="metric-val">{fmtRrDisplay(pos?.rr_ratio_raw, pos?.rr_ratio)}</span>
               </div>
               <div className="metric-cell">
                 <span className="metric-label">
@@ -2942,6 +3085,121 @@ export function TradePlannerCard({
               </div>
             ) : null}
           </div>
+        </div>
+      ) : null}
+
+      {/* 3-Stage Offensive Campaign Blueprint */}
+      {plan && offensiveCampaign ? (
+        <div
+          className={`flex flex-col gap-3 border-t border-hairline pt-3.5 ${
+            planStale && !openedReceipt ? "opacity-60" : ""
+          }`}
+          aria-label="三阶段进攻推仓蓝图"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Rocket className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
+              <span className="section-title">三阶段进攻推仓蓝图（零新增本金风险推仓 + 日线主升持有）</span>
+            </div>
+            <div className="tnum flex flex-wrap items-center gap-2 font-mono text-[11px] text-muted">
+              <span>标准战役 1R = {fmtMoney(offensiveCampaign.campaign_1r_amount, pos?.account_currency)}</span>
+              <span>·</span>
+              <span>单位 1R 距 = {fmtPrice(offensiveCampaign.unit_1r_price_distance)}</span>
+            </div>
+          </div>
+
+          <div className="metric-strip grid-cols-2 sm:grid-cols-4 lg:grid-cols-7">
+            <div className="metric-cell">
+              <span className="metric-label">满额 1R 首仓</span>
+              <span className="metric-val text-accent">
+                {fmtNum(offensiveCampaign.full_pilot_qty, planFractional ? 4 : 0)} {planUnitLabel}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">保守 40% 首仓</span>
+              <span className="metric-val text-ink-2">
+                {fmtNum(offensiveCampaign.split_pilot_qty, planFractional ? 4 : 0)} {planUnitLabel}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">+1.0R 保本移损价</span>
+              <span className="metric-val text-bull">
+                {fmtPrice(offensiveCampaign.breakeven_trigger_price)}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">+1.5R 最大零险推仓</span>
+              <span className="metric-val text-bull">
+                +{fmtNum(offensiveCampaign.max_zero_risk_add_qty, planFractional ? 4 : 0)} {planUnitLabel}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">推仓后综合保本位</span>
+              <span className="metric-val">
+                {fmtPrice(offensiveCampaign.post_add_breakeven_stop)}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">+2.0R 主升移交位</span>
+              <span className="metric-val text-accent">
+                {fmtPrice(offensiveCampaign.main_wave_trigger_price)}
+              </span>
+            </div>
+            <div className="metric-cell">
+              <span className="metric-label">初始日线保本防线</span>
+              <span className="metric-val">
+                {fmtPrice(offensiveCampaign.initial_main_wave_stop)}
+              </span>
+            </div>
+          </div>
+
+          {Array.isArray(offensiveCampaign.stages) && offensiveCampaign.stages.length > 0 ? (
+            <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-3">
+              {offensiveCampaign.stages.map((st, idx) => {
+                const isPilot = st.stage === "pilot";
+                const isPyramid = st.stage === "breakeven_pyramid";
+                const stageAccent = isPilot
+                  ? "border-t-2 border-t-accent"
+                  : isPyramid
+                    ? "border-t-2 border-t-bull"
+                    : "border-t-2 border-t-good";
+                return (
+                  <div
+                    key={st.stage || idx}
+                    className={`flex flex-col gap-1.5 rounded-md border border-hairline bg-sunken/60 p-3 text-xs ${stageAccent}`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="font-semibold text-ink">{st.title}</span>
+                      <StatusBadge
+                        tone={st.principal_risk_amount <= 0 ? "good" : "info"}
+                        label={
+                          st.principal_risk_amount <= 0
+                            ? "零本金风险"
+                            : `风险 ${fmtMoney(st.principal_risk_amount, pos?.account_currency)}`
+                        }
+                      />
+                    </div>
+                    <div className="tnum flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[11px] text-ink-2">
+                      <span>
+                        触发：<strong className="text-ink">{fmtPrice(st.trigger_price)}</strong>
+                        {st.trigger_r > 0 ? ` (+${st.trigger_r.toFixed(1)}R)` : " (0R)"}
+                      </span>
+                      <span>
+                        数量：<strong className="text-ink">
+                          {isPyramid ? "+" : ""}
+                          {fmtNum(st.recommended_qty, planFractional ? 4 : 0)} {planUnitLabel}
+                        </strong>
+                      </span>
+                      <span>
+                        防线：<strong className="text-bear">{fmtPrice(st.stop_price)}</strong>
+                      </span>
+                    </div>
+                    <p className="m-0 text-[11px] leading-relaxed text-muted">{st.rule_summary}</p>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </section>

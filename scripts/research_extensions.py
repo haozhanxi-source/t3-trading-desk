@@ -25,6 +25,7 @@ import re
 import sys
 import threading
 import time
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from fractions import Fraction
@@ -3193,6 +3194,341 @@ def fetch_polymarket_macro_odds(timeout_seconds: float = 6.0) -> dict[str, Any]:
     return parse_polymarket_events(raw_by_cat, category_errors=cat_errors)
 
 
+# ============================================================================
+# 7. CFTC 52-Week Derivatives Crowding Overview (Disaggregated + TFF)
+# ============================================================================
+
+CFTC_DISAGG_HISTORY_ZIP_URL = "https://www.cftc.gov/files/dea/history/fut_disagg_txt_{year}.zip"
+CFTC_TFF_HISTORY_ZIP_URL = "https://www.cftc.gov/files/dea/history/fut_fin_txt_{year}.zip"
+
+CFTC_CROWDING_BENCHMARKS: tuple[dict[str, Any], ...] = (
+    {
+        "symbol": "CL=F",
+        "label": "WTI原油",
+        "report_type": "disagg",
+        "code": "067651",
+        "patterns": ["WTI-PHYSICAL - NEW YORK MERCANTILE EXCHANGE"],
+        "invert_pair": False,
+        "cohort": "Managed Money",
+    },
+    {
+        "symbol": "GC=F",
+        "label": "COMEX黄金",
+        "report_type": "disagg",
+        "code": "088691",
+        "patterns": ["GOLD - COMMODITY EXCHANGE INC."],
+        "invert_pair": False,
+        "cohort": "Managed Money",
+    },
+    {
+        "symbol": "HG=F",
+        "label": "COMEX铜",
+        "report_type": "disagg",
+        "code": "085692",
+        "patterns": ["COPPER- #1 - COMMODITY EXCHANGE", "COPPER- #1"],
+        "invert_pair": False,
+        "cohort": "Managed Money",
+    },
+    {
+        "symbol": "SI=F",
+        "label": "COMEX白银",
+        "report_type": "disagg",
+        "code": "084691",
+        "patterns": ["SILVER - COMMODITY EXCHANGE INC."],
+        "invert_pair": False,
+        "cohort": "Managed Money",
+    },
+    {
+        "symbol": "NG=F",
+        "label": "美国天然气",
+        "report_type": "disagg",
+        "code": "023651",
+        "patterns": ["NAT GAS NYME - NEW YORK MERCANTILE EXCHANGE"],
+        "invert_pair": False,
+        "cohort": "Managed Money",
+    },
+    {
+        "symbol": "EURUSD=X",
+        "label": "欧元/美元",
+        "report_type": "tff",
+        "code": "099741",
+        "patterns": ["EURO FX - CHICAGO MERCANTILE EXCHANGE"],
+        "invert_pair": False,
+        "cohort": "Leveraged Money",
+    },
+    {
+        "symbol": "USDJPY=X",
+        "label": "美元/日元",
+        "report_type": "tff",
+        "code": "097741",
+        "patterns": ["JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE"],
+        "invert_pair": True,
+        "cohort": "Leveraged Money",
+    },
+    {
+        "symbol": "AUDUSD=X",
+        "label": "澳元/美元",
+        "report_type": "tff",
+        "code": "232741",
+        "patterns": ["AUSTRALIAN DOLLAR - CHICAGO MERCANTILE EXCHANGE"],
+        "invert_pair": False,
+        "cohort": "Leveraged Money",
+    },
+    {
+        "symbol": "SPY",
+        "label": "标普500期货",
+        "report_type": "tff",
+        "code": "13874A",
+        "patterns": ["E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE", "S&P 500 Consolidated"],
+        "invert_pair": False,
+        "cohort": "Leveraged Money",
+    },
+)
+
+
+def _match_cftc_crowding_spec(
+    market_name: str,
+    contract_code: str,
+    specs: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    code_up = contract_code.strip().upper()
+    name_up = market_name.strip().upper()
+    for spec in specs:
+        if code_up and code_up == str(spec["code"]).upper():
+            return spec
+    for spec in specs:
+        if any(pat.upper() in name_up for pat in spec.get("patterns") or []):
+            return spec
+    return None
+
+
+def _parse_cftc_archive_rows(
+    csv_texts: list[str],
+    *,
+    report_type: str,
+) -> dict[str, dict[str, tuple[float, float]]]:
+    """Parse CFTC Disaggregated or TFF annual CSV texts into {symbol: {date_iso: (net_contracts, net_pct_oi)}}."""
+    specs = [s for s in CFTC_CROWDING_BENCHMARKS if s["report_type"] == report_type]
+    by_symbol: dict[str, dict[str, tuple[float, float]]] = {s["symbol"]: {} for s in specs}
+
+    for raw_text in csv_texts:
+        if not raw_text:
+            continue
+        reader = csv.reader(io.StringIO(raw_text))
+        for row in reader:
+            if len(row) < 16:
+                continue
+            market_name = row[0].strip()
+            if market_name.upper().startswith("MARKET_AND_EXCHANGE"):
+                continue
+            report_date = row[2].strip()
+            if len(report_date) != 10 or report_date[4] != "-" or report_date[7] != "-":
+                continue
+            contract_code = row[3].strip()
+            spec = _match_cftc_crowding_spec(market_name, contract_code, specs)
+            if spec is None:
+                continue
+            oi = _to_float(row[7])
+            if oi is None or oi <= 0:
+                continue
+            if report_type == "disagg":
+                pos_long = _to_float(row[13])
+                pos_short = _to_float(row[14])
+            else:
+                pos_long = _to_float(row[14])
+                pos_short = _to_float(row[15])
+            if pos_long is None or pos_short is None:
+                continue
+            net = pos_long - pos_short
+            if spec.get("invert_pair"):
+                net = -net
+            net_pct_oi = (net / oi) * 100.0
+            if not math.isfinite(net_pct_oi):
+                continue
+            by_symbol[spec["symbol"]][report_date] = (net, net_pct_oi)
+
+    return by_symbol
+
+
+def parse_cftc_crowding_history(
+    disagg_csv_texts: list[str],
+    tff_csv_texts: list[str],
+    *,
+    as_of_date: date | None = None,
+    window_weeks: int = 52,
+    min_weeks_for_pct: int = 20,
+    max_stale_days: int = 14,
+    fetched_at_utc: str | None = None,
+    source_errors: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Compute 52-week CFTC net-positioning crowding percentiles (>=90% crowded_long, <=10% crowded_short)."""
+    now_iso = fetched_at_utc or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    today = as_of_date or datetime.now(timezone.utc).date()
+    win = max(12, int(window_weeks))
+    min_req = max(8, int(min_weeks_for_pct))
+
+    disagg_series = _parse_cftc_archive_rows(disagg_csv_texts, report_type="disagg")
+    tff_series = _parse_cftc_archive_rows(tff_csv_texts, report_type="tff")
+    merged = {**disagg_series, **tff_series}
+
+    items: list[dict[str, Any]] = []
+    crowded_long: list[dict[str, Any]] = []
+    crowded_short: list[dict[str, Any]] = []
+    stale_symbols: list[str] = []
+    latest_dates: list[str] = []
+
+    for spec in CFTC_CROWDING_BENCHMARKS:
+        sym = spec["symbol"]
+        date_map = merged.get(sym) or {}
+        if not date_map:
+            continue
+        sorted_dates = sorted(date_map.keys())
+        window_dates = sorted_dates[-win:]
+        latest_dt_str = window_dates[-1]
+        latest_dates.append(latest_dt_str)
+        latest_net, latest_pct = date_map[latest_dt_str]
+        window_pcts = [date_map[d][1] for d in window_dates]
+
+        age_days: int | None = None
+        is_stale = False
+        try:
+            dt_obj = date.fromisoformat(latest_dt_str)
+            age_days = (today - dt_obj).days
+            is_stale = age_days > max_stale_days
+        except ValueError:
+            is_stale = True
+
+        pct_rank: float | None = None
+        if len(window_pcts) >= min_req:
+            below = sum(1 for v in window_pcts if v < latest_pct)
+            equal = sum(1 for v in window_pcts if v == latest_pct)
+            pct_rank = _round_finite(((below + 0.5 * equal) / len(window_pcts)) * 100.0, 1)
+
+        if pct_rank is None:
+            state = "insufficient_history"
+        elif pct_rank >= 90.0 and latest_pct > 0:
+            state = "crowded_long"
+        elif pct_rank <= 10.0 and latest_pct < 0:
+            state = "crowded_short"
+        elif pct_rank >= 90.0:
+            state = "short_covering_extreme"
+        elif pct_rank <= 10.0:
+            state = "long_washout_extreme"
+        else:
+            state = "neutral"
+
+        item = {
+            "symbol": sym,
+            "label": spec["label"],
+            "report_type": spec["report_type"],
+            "cohort": spec["cohort"],
+            "pair_inverted": bool(spec.get("invert_pair")),
+            "latest_date": latest_dt_str,
+            "age_days": age_days,
+            "is_stale": is_stale,
+            "weeks_observed": len(window_pcts),
+            "net_contracts": int(round(latest_net)),
+            "net_pct_oi": _round_finite(latest_pct, 2),
+            "percentile_52w": pct_rank,
+            "crowding_state": state,
+        }
+        items.append(item)
+        if is_stale:
+            stale_symbols.append(sym)
+        elif state == "crowded_long":
+            crowded_long.append(item)
+        elif state == "crowded_short":
+            crowded_short.append(item)
+
+    errors = dict(source_errors or {})
+    if not items:
+        status = "error"
+    elif errors or len(items) < len(CFTC_CROWDING_BENCHMARKS):
+        status = "partial"
+    else:
+        status = "ok"
+
+    out: dict[str, Any] = {
+        "status": status,
+        "source": "CFTC Weekly COT Annual Archives (Disagg + TFF)",
+        "fetched_at_utc": now_iso,
+        "latest_report_date": max(latest_dates) if latest_dates else None,
+        "window_weeks": win,
+        "benchmarks_ok": len(items),
+        "benchmarks_total": len(CFTC_CROWDING_BENCHMARKS),
+        "items": items,
+        "crowded_long": crowded_long,
+        "crowded_short": crowded_short,
+        "stale_symbols": stale_symbols,
+    }
+    if errors:
+        out["source_errors"] = errors
+    return _sanitize_for_json(out)
+
+
+def _download_cftc_zip_csv(url: str, *, timeout: float) -> str:
+    resp = requests.get(
+        url,
+        headers=DEFAULT_BROWSER_HEADERS,
+        timeout=(min(3.0, timeout), timeout),
+    )
+    resp.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        txt_names = [n for n in zf.namelist() if n.lower().endswith(".txt")]
+        if not txt_names:
+            raise ValueError(f"No .txt archive found inside {url}")
+        return zf.read(txt_names[0]).decode("utf-8", errors="replace")
+
+
+def fetch_cftc_crowding_overview(timeout_seconds: float = 8.0) -> dict[str, Any]:
+    """Fetch CFTC Disaggregated + TFF 52-week weekly archives and compute crowding percentiles."""
+    budget = max(1.0, min(15.0, float(timeout_seconds)))
+    today = datetime.now(timezone.utc).date()
+    years = [today.year]
+    # Before late December, fetch prior year too so rolling 52-week window is complete.
+    if today.timetuple().tm_yday < 355:
+        years.insert(0, today.year - 1)
+
+    jobs: list[tuple[str, int, str]] = []
+    for yr in years:
+        jobs.append(("disagg", yr, CFTC_DISAGG_HISTORY_ZIP_URL.format(year=yr)))
+        jobs.append(("tff", yr, CFTC_TFF_HISTORY_ZIP_URL.format(year=yr)))
+
+    disagg_texts: list[str] = []
+    tff_texts: list[str] = []
+    source_errors: dict[str, str] = {}
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(jobs))
+    try:
+        fut_map = {
+            ex.submit(_download_cftc_zip_csv, url, timeout=budget): (kind, yr)
+            for kind, yr, url in jobs
+        }
+        done, not_done = concurrent.futures.wait(list(fut_map.keys()), timeout=budget)
+        for fut in done:
+            kind, yr = fut_map[fut]
+            try:
+                txt = fut.result(timeout=0)
+                if kind == "disagg":
+                    disagg_texts.append(txt)
+                else:
+                    tff_texts.append(txt)
+            except Exception as exc:  # noqa: BLE001
+                source_errors[f"{kind}_{yr}"] = str(exc)
+        for fut in not_done:
+            kind, yr = fut_map[fut]
+            source_errors[f"{kind}_{yr}"] = f"timeout after {budget:.1f}s"
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+
+    return parse_cftc_crowding_history(
+        disagg_texts,
+        tff_texts,
+        as_of_date=today,
+        source_errors=source_errors or None,
+    )
+
+
 __all__ = [
     "HTTP_TIMEOUT",
     "FUTURES_MONTH_CODES",
@@ -3202,6 +3538,7 @@ __all__ = [
     "FREIGHT_ROUTING",
     "FREIGHT_COLUMN_MAP",
     "CFTC_TFF_FX_SPECS",
+    "CFTC_CROWDING_BENCHMARKS",
     "FX_RATE_DIFF_SPECS",
     "FARSIDE_ETF_SPECS",
     "POLYMARKET_GAMMA_EVENTS_URL",
@@ -3217,6 +3554,8 @@ __all__ = [
     "fetch_freight_indices",
     "parse_cftc_tff",
     "fetch_cftc_fx_cot",
+    "parse_cftc_crowding_history",
+    "fetch_cftc_crowding_overview",
     "parse_bond_zh_us_rate_df",
     "fetch_fx_rate_differential",
     "compute_ashare_valuation_percentiles",

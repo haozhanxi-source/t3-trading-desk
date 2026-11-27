@@ -213,7 +213,7 @@ class LogOpportunityReq(_Strict):
     market: str
     sector_theme: str
     direction: Direction
-    kind: Literal["missed_entry", "shaken_out", "premature_exit"]
+    kind: Literal["missed_entry", "shaken_out", "premature_exit", "l1_direction_call", "l1_abstention"]
     anchor_price: float = Field(gt=0)
     planned_stop_price: float = Field(gt=0)
     subsequent_extreme_price: float | None = Field(default=None, gt=0)
@@ -222,6 +222,16 @@ class LogOpportunityReq(_Strict):
     linked_position_id: str | None = None
     status: Literal["tracking", "reviewed"] = "tracking"
     idempotency_key: str | None = None
+
+
+class CompassLogOpportunityReq(_Strict):
+    kind: Literal["l1_direction_call", "l1_abstention"] = "l1_direction_call"
+    card_id: str | None = None
+    symbol: str | None = None
+    direction: Direction | None = None
+    anchor_price: float | None = Field(default=None, gt=0)
+    planned_stop_price: float | None = Field(default=None, gt=0)
+    note: str = ""
 
 
 class UpdateOpportunityReq(_Strict):
@@ -1558,6 +1568,200 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         if detail is None:
             raise HTTPException(status_code=404, detail=f"Compass run not found: {run_id}")
         return ok(detail)
+
+    @app.post("/api/compass/history/{run_id}/log-opportunity")
+    async def compass_log_opportunity(run_id: str, req: CompassLogOpportunityReq):
+        detail = macro_compass.get_compass_run(run_id)
+        if detail is None:
+            raise HTTPException(status_code=404, detail=f"Compass run not found: {run_id}")
+
+        res_obj = detail.get("result") if isinstance(detail.get("result"), dict) else {}
+        anchor_map: dict[str, dict[str, Any]] = {}
+        snap_sum = res_obj.get("macro_snapshot_summary") if isinstance(res_obj.get("macro_snapshot_summary"), dict) else {}
+        for it in snap_sum.get("anchors_items") or []:
+            if isinstance(it, dict) and it.get("symbol"):
+                anchor_map[str(it["symbol"]).strip().upper()] = it
+        hit_ov, cached_ov = macro_compass.CACHE.get(("compass_macro_overview",))
+        if hit_ov and isinstance(cached_ov, dict):
+            for it in (cached_ov.get("anchors") or {}).get("items") or []:
+                if isinstance(it, dict) and it.get("symbol"):
+                    anchor_map.setdefault(str(it["symbol"]).strip().upper(), it)
+
+        asset_class_to_market = {
+            "us_stock_or_etf": "US_STOCK",
+            "a_share": "A_SHARE",
+            "commodity": "US_FUTURES",
+            "overseas_commodity": "US_FUTURES",
+            "cn_future": "CN_FUTURES",
+            "cn_futures": "CN_FUTURES",
+            "fx": "FX",
+            "crypto": "CRYPTO",
+            "macro": "MACRO",
+        }
+        scope_default_symbol = {
+            "a_shares": "510300.SS",
+            "us_equities": "SPY",
+            "commodities": "HG=F",
+            "fx": "EURUSD=X",
+            "crypto": "BTC-USD",
+            "cross_asset": "SPY",
+        }
+
+        if req.kind == "l1_abstention":
+            if not res_obj.get("abstained"):
+                raise HTTPException(
+                    status_code=422,
+                    detail="该推演记录未触发宪法第 4 条战略留白（abstained=false），无法记为 l1_abstention",
+                )
+            scopes = res_obj.get("focus_scopes") if isinstance(res_obj.get("focus_scopes"), list) else []
+            default_sym = "510300.SS" if scopes == ["a_shares"] else "SPY"
+            raw_sym = (req.symbol or "").strip() or default_sym
+            direction = req.direction or "long"
+            sector_theme = "l1_strategic_abstention"
+            idem_prefix = f"l1-abstain:{run_id}"
+            root_cause_tag = "l1_constitutional_abstention"
+            abstain_rsn = str(res_obj.get("abstain_reason") or "").strip()
+            regime_ttl = str(res_obj.get("regime_title") or "").strip()
+            base_note = f"[L1战略留白 {run_id}] {regime_ttl} | {abstain_rsn}"
+            if req.note.strip():
+                base_note = f"{base_note} | 备注: {req.note.strip()}"
+        else:
+            if not (req.card_id and req.card_id.strip()):
+                raise HTTPException(status_code=422, detail="记入 l1_direction_call 必须指定 card_id")
+            cards = res_obj.get("directions") if isinstance(res_obj.get("directions"), list) else []
+            card = next(
+                (c for c in cards if isinstance(c, dict) and str(c.get("id") or "") == req.card_id.strip()),
+                None,
+            )
+            if card is None:
+                raise HTTPException(status_code=404, detail=f"Compass direction card not found: {req.card_id}")
+            card_dir = str(card.get("direction") or "long").lower()
+            direction = req.direction or ("long" if card_dir == "pair" else card_dir)
+            if direction not in ("long", "short"):
+                direction = "long"
+
+            ref_anchors = [str(s).strip() for s in (card.get("reference_anchors") or []) if str(s or "").strip()]
+            leaders = [
+                str(ld.get("symbol") or "").strip()
+                for ld in (card.get("leaders") or [])
+                if isinstance(ld, dict) and str(ld.get("symbol") or "").strip()
+            ]
+            fallback_sym = scope_default_symbol.get(str(card.get("asset_scope") or ""), "SPY")
+            raw_sym = (req.symbol or "").strip() or (ref_anchors[0] if ref_anchors else (leaders[0] if leaders else fallback_sym))
+            sector_theme = str(card.get("id") or card.get("title") or "l1_direction")
+            idem_prefix = f"l1-call:{run_id}:{card['id']}"
+            root_cause_tag = f"l1_{card.get('conviction') or 'medium'}_{card_dir}"
+            p_dim = str((card.get("primary_driver") or {}).get("dimension") or "")
+            s_dim = str((card.get("secondary_driver") or {}).get("dimension") or "")
+            gap = str(card.get("unpriced_gap") or card.get("thesis") or "").strip()
+            base_note = (
+                f"[L1方向调用 {run_id}] {card.get('title') or card['id']} ({card.get('horizon') or '1Q~2Q'}) | "
+                f"{p_dim}+{s_dim} | 预期差: {gap}"
+            )
+            if req.note.strip():
+                base_note = f"{base_note} | 备注: {req.note.strip()}"
+
+        try:
+            canon_sym, asset_class = market_snapshot.normalize_symbol(raw_sym)
+        except Exception:  # noqa: BLE001
+            canon_sym, asset_class = raw_sym.strip().upper(), "us_stock_or_etf"
+        market = asset_class_to_market.get(asset_class, "US_STOCK")
+        idem_key = f"{idem_prefix}:{canon_sym.upper()}:{direction}"
+
+        # Fast-path idempotent replay for default auto-priced clicks: prevents live-price or
+        # cache-TTL drift from triggering HTTP 409 request_hash conflicts on page refresh/retry.
+        if req.anchor_price is None and req.planned_stop_price is None and not req.note.strip():
+            existing_logged = _portfolio_op(
+                pm.lookup_idempotent_result,
+                idempotency_key=idem_key,
+                expected_operation="log_opportunity",
+            )
+            if isinstance(existing_logged, dict) and existing_logged.get("opportunity_id"):
+                existing_note = str(existing_logged.get("lesson_note") or "")
+                return ok(
+                    {
+                        **existing_logged,
+                        "opportunity": dict(existing_logged),
+                        "idempotent_replay": True,
+                        "run_id": run_id,
+                        "card_id": req.card_id,
+                        "stop_is_proxy": "[止损采用L1 8%结构代理]" in existing_note,
+                        **_safe_attribution_refresh(),
+                    }
+                )
+
+        anchor_item = anchor_map.get(canon_sym.upper()) or anchor_map.get(raw_sym.strip().upper())
+        anchor_price = req.anchor_price
+        if anchor_price is None and isinstance(anchor_item, dict):
+            raw_last = anchor_item.get("last")
+            if isinstance(raw_last, (int, float)) and raw_last > 0:
+                anchor_price = float(raw_last)
+        if anchor_price is None:
+            try:
+                snap = await asyncio.to_thread(
+                    market_snapshot.get_snapshot,
+                    canon_sym,
+                    period="3mo",
+                    include_macro=False,
+                    include_fundamentals=False,
+                )
+                snap_price = (
+                    (snap.get("technicals") or {}).get("last_close")
+                    or snap.get("latest_price")
+                    or (snap.get("quote") or {}).get("last")
+                )
+                if isinstance(snap_price, (int, float)) and snap_price > 0:
+                    anchor_price = float(snap_price)
+            except Exception:  # noqa: BLE001
+                anchor_price = None
+
+        if anchor_price is None or anchor_price <= 0:
+            raise HTTPException(
+                status_code=422,
+                detail=f"未能自动获取 {canon_sym} 的有效参考价，请手动传入 anchor_price 后再记入影子机会账本",
+            )
+
+        planned_stop = req.planned_stop_price
+        stop_is_proxy = False
+        if planned_stop is None and isinstance(anchor_item, dict):
+            cl_hint = anchor_item.get("chanlun_hint") if isinstance(anchor_item.get("chanlun_hint"), dict) else {}
+            if direction == "long":
+                zd = cl_hint.get("latest_zd")
+                if isinstance(zd, (int, float)) and 0 < float(zd) < anchor_price:
+                    planned_stop = float(zd)
+            else:
+                zg = cl_hint.get("latest_zg")
+                if isinstance(zg, (int, float)) and float(zg) > anchor_price:
+                    planned_stop = float(zg)
+        if planned_stop is None:
+            planned_stop = round(anchor_price * (0.92 if direction == "long" else 1.08), 6)
+            stop_is_proxy = True
+
+        lesson_note = f"{base_note} [止损采用L1 8%结构代理]" if stop_is_proxy else base_note
+        logged = _portfolio_op(
+            pm.log_opportunity,
+            symbol=canon_sym,
+            market=market,
+            sector_theme=sector_theme,
+            direction=direction,
+            kind=req.kind,
+            anchor_price=anchor_price,
+            planned_stop_price=planned_stop,
+            root_cause_tag=root_cause_tag,
+            lesson_note=lesson_note[:500],
+            status="tracking",
+            idempotency_key=idem_key,
+        )
+        return ok(
+            {
+                **logged,
+                "idempotent_replay": bool(logged.get("idempotent_replay", False)),
+                "run_id": run_id,
+                "card_id": req.card_id,
+                "stop_is_proxy": stop_is_proxy,
+                **_safe_attribution_refresh(),
+            }
+        )
 
     @app.post("/api/tasks/macro-compass", status_code=202)
     async def task_macro_compass(req: MacroCompassTaskReq):

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import {
   AlertTriangle,
   ArrowRight,
+  BookmarkCheck,
+  BookmarkPlus,
   BookOpen,
   CheckCircle2,
   Clock,
@@ -13,6 +15,7 @@ import {
   RefreshCw,
   Scale,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Square,
   TrendingDown,
@@ -432,6 +435,11 @@ export function Layer1CompassPanel({
     runId?: string;
   } | null>(null);
 
+  /* Track C L1 -> Shadow Opportunity Ledger 1-click logging */
+  const [loggingOppKey, setLoggingOppKey] = useState<string | null>(null);
+  const [loggedOppMap, setLoggedOppMap] = useState<Record<string, { symbol: string; idempotent?: boolean }>>({});
+  const [oppLogFeedback, setOppLogFeedback] = useState<{ tone: "ok" | "err"; text: string } | null>(null);
+
   /* Live SSE task progress & concurrency/unmount guards */
   const [activeRun, setActiveRun] = useState<ActiveCompassRun | null>(null);
   const [cancelling, setCancelling] = useState(false);
@@ -514,6 +522,7 @@ export function Layer1CompassPanel({
             if (viewingLatestRef.current && selectionReqSeqRef.current === reqAtDone) {
               setCurrentRun(res.latest);
               setSelectedRunId(res.latest.run_id);
+              setOppLogFeedback(null);
             }
           }
         })
@@ -730,6 +739,7 @@ export function Layer1CompassPanel({
       setCurrentRun(detail);
       setSelectedRunId(detail.run_id);
       setDirFilter("all");
+      setOppLogFeedback(null);
     } catch {
       /* ignore aborted/stale history fetches */
     } finally {
@@ -781,6 +791,45 @@ export function Layer1CompassPanel({
       setCancelling(false);
     }
   };
+
+  const handleLogCompassOpportunity = async (kind: "l1_direction_call" | "l1_abstention", cardId?: string) => {
+    const runId = currentRun?.run_id;
+    if (!runId || loggingOppKey) return;
+    const opKey = `${runId}:${cardId || "abstain"}`;
+    setLoggingOppKey(opKey);
+    setOppLogFeedback(null);
+    try {
+      const res = await api.logCompassOpportunity(runId, {
+        kind,
+        ...(cardId ? { card_id: cardId } : {}),
+      });
+      if (!mountedRef.current) return;
+      const sym = res.opportunity?.symbol || "";
+      setLoggedOppMap((prev) => ({
+        ...prev,
+        [opKey]: { symbol: sym, idempotent: Boolean(res.idempotent_replay) },
+      }));
+      setOppLogFeedback({
+        tone: "ok",
+        text: res.idempotent_replay
+          ? `已存在同条 L1 影子账本记录（${sym}，幂等复用）`
+          : `已记入 Track C 影子机会账本：${sym}${res.stop_is_proxy ? "（8% 结构代理止损）" : ""}`,
+      });
+    } catch (ex) {
+      if (!mountedRef.current) return;
+      setOppLogFeedback({
+        tone: "err",
+        text: `记入影子账本失败：${errorMessage(ex)}`,
+      });
+    } finally {
+      if (mountedRef.current) setLoggingOppKey(null);
+    }
+  };
+
+  const cftcItems = useMemo(() => {
+    const items = macro?.cftc_crowding?.items ?? [];
+    return items.filter((it) => Boolean(it && it.symbol));
+  }, [macro]);
 
   const anchorGroups = useMemo(() => {
     const items = macro?.anchors?.items ?? [];
@@ -1224,6 +1273,57 @@ export function Layer1CompassPanel({
             </div>
           </details>
         ) : null}
+
+        {/* On-demand Native Disclosure: CFTC 52-Week Derivatives Crowding (Disagg + TFF) */}
+        {cftcItems.length > 0 ? (
+          <details className="border-t border-hairline-soft pt-2">
+            <summary className="cursor-pointer select-none text-[11px] font-medium text-muted hover:text-ink">
+              展开 CFTC 52 周衍生品持仓拥挤度（{macro?.cftc_crowding?.benchmarks_ok ?? cftcItems.length}/{macro?.cftc_crowding?.benchmarks_total ?? cftcItems.length} 实时基准
+              {macro?.cftc_crowding?.latest_report_date ? ` · 截至 ${macro.cftc_crowding.latest_report_date}` : ""}
+              {macro?.cftc_crowding?.stale_fallback ? " · 陈旧缓存" : ""}）
+            </summary>
+            <div className="mt-2.5 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
+              {cftcItems.map((it) => {
+                const state = it.crowding_state || "neutral";
+                const badge = it.is_stale
+                  ? { label: "观测陈旧", cls: "border-hairline bg-surface text-muted" }
+                  : state === "crowded_long"
+                    ? { label: "多头拥挤 ≥90%", cls: "border-warning/45 bg-warning/10 text-warning" }
+                    : state === "crowded_short"
+                      ? { label: "空头拥挤 ≤10%", cls: "border-bear/45 bg-bear/10 text-bear" }
+                      : state === "short_covering_extreme"
+                        ? { label: "空头回补极值", cls: "border-accent/40 bg-accent/10 text-accent" }
+                        : state === "long_washout_extreme"
+                          ? { label: "多头出清极值", cls: "border-accent/40 bg-accent/10 text-accent" }
+                          : { label: "中性区间", cls: "border-hairline-soft bg-surface text-muted" };
+                return (
+                  <div
+                    key={it.symbol}
+                    className="flex items-center justify-between gap-2 rounded-md border border-hairline-soft bg-sunken/50 px-2.5 py-1.5 text-[11px]"
+                  >
+                    <div className="min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => onJumpWarRoom(it.symbol)}
+                        className="cursor-pointer truncate border-0 bg-transparent p-0 text-left font-medium text-ink hover:text-accent"
+                        title={`打开 ${it.label} (${it.symbol}) 缠论战情室`}
+                      >
+                        {it.label} <span className="font-mono text-[10px] text-muted">{it.symbol}</span>
+                      </button>
+                      <div className="font-mono text-[10px] text-muted tabular-nums">
+                        净持仓/OI {it.net_pct_oi != null ? `${it.net_pct_oi >= 0 ? "+" : ""}${it.net_pct_oi.toFixed(1)}%` : "—"} · 52W分位{" "}
+                        {it.percentile_52w != null ? `${it.percentile_52w.toFixed(0)}%` : "—"}
+                      </div>
+                    </div>
+                    <span className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-medium ${badge.cls}`}>
+                      {badge.label}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </details>
+        ) : null}
       </div>
 
       {/* 2. Layer 1 AI 7-Dimension Top-Down Strategic Compass */}
@@ -1531,6 +1631,83 @@ export function Layer1CompassPanel({
               </div>
             </div>
 
+            {/* Factor Concentration Warning & Constitutional Audit Strip */}
+            {(payload.factor_concentration?.concentrated ||
+              (payload.constitutional_audit &&
+                (payload.constitutional_audit.rejected_count > 0 ||
+                  payload.constitutional_audit.conviction_caps_applied > 0 ||
+                  payload.constitutional_audit.flagged_cards_count > 0))) ? (
+              <div className="flex flex-col gap-2">
+                {payload.factor_concentration?.concentrated ? (
+                  <div
+                    role="alert"
+                    className="flex flex-col gap-1.5 rounded-lg border border-warning/45 bg-warning/10 px-3 py-2.5 text-xs"
+                  >
+                    <div className="flex flex-wrap items-center gap-1.5 font-semibold text-warning">
+                      <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                      <span>
+                        跨卡片宏大因子集中度预警（共 {payload.factor_concentration.dominant_factors?.length ?? 0} 项因子同向叠加）
+                      </span>
+                    </div>
+                    <ul className="m-0 flex list-none flex-col gap-1 pl-0 text-[11px] text-ink-2">
+                      {payload.factor_concentration.warnings.map((w, idx) => (
+                        <li key={`fc-w-${idx}`} className="leading-snug">
+                          • {w}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {payload.constitutional_audit &&
+                (payload.constitutional_audit.rejected_count > 0 ||
+                  payload.constitutional_audit.conviction_caps_applied > 0 ||
+                  payload.constitutional_audit.flagged_cards_count > 0) ? (
+                  <div className="flex flex-wrap items-center gap-2 rounded-md border border-hairline bg-sunken/60 px-3 py-1.5 text-[11px] text-ink-2">
+                    <span className="inline-flex items-center gap-1 font-semibold text-accent">
+                      <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                      <span>程序化宪法护栏审计</span>
+                    </span>
+                    {payload.constitutional_audit.rejected_count > 0 ? (
+                      <span className="rounded border border-bear/35 bg-bear/10 px-1.5 py-0.5 text-[10.5px] font-medium text-bear">
+                        硬拦截 {payload.constitutional_audit.rejected_count} 张
+                      </span>
+                    ) : null}
+                    {payload.constitutional_audit.conviction_caps_applied > 0 ? (
+                      <span className="rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 text-[10.5px] font-medium text-warning">
+                        降档确信度 {payload.constitutional_audit.conviction_caps_applied} 张
+                      </span>
+                    ) : null}
+                    {payload.constitutional_audit.flagged_cards_count > 0 ? (
+                      <span className="rounded border border-hairline bg-surface px-1.5 py-0.5 text-[10.5px] text-muted">
+                        风险警示标记 {payload.constitutional_audit.flagged_cards_count} 张
+                      </span>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
+            ) : null}
+
+            {oppLogFeedback ? (
+              <div
+                role={oppLogFeedback.tone === "err" ? "alert" : "status"}
+                className={`flex items-center justify-between gap-2 rounded-md border px-3 py-1.5 text-xs ${
+                  oppLogFeedback.tone === "err"
+                    ? "border-bear/45 bg-bear/10 text-bear"
+                    : "border-bull/40 bg-bull/10 text-bull"
+                }`}
+              >
+                <span>{oppLogFeedback.text}</span>
+                <button
+                  type="button"
+                  className="cursor-pointer border-0 bg-transparent text-[11px] text-muted hover:text-ink"
+                  onClick={() => setOppLogFeedback(null)}
+                >
+                  关闭
+                </button>
+              </div>
+            ) : null}
+
             {/* Direction Filter Tabs */}
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="按多空方向筛选">
@@ -1562,14 +1739,41 @@ export function Layer1CompassPanel({
             {directions.length === 0 ? (
               <div
                 role="status"
-                className="flex flex-col gap-1.5 rounded-lg border border-dashed border-accent/40 bg-sunken/50 px-4 py-5 text-xs"
+                className="flex flex-col gap-2.5 rounded-lg border border-dashed border-accent/40 bg-sunken/50 px-4 py-5 text-xs"
               >
-                <div className="font-semibold text-ink">
-                  本期触发《Layer 1 思考宪法》第 4 条 · 战略留白与持币观望
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="font-semibold text-ink">
+                    本期触发《Layer 1 思考宪法》第 4 条 · 战略留白与持币观望
+                  </div>
+                  {currentRun?.run_id && payload.abstained ? (
+                    (() => {
+                      const abKey = `${currentRun.run_id}:abstain`;
+                      const isLogged = Boolean(loggedOppMap[abKey]);
+                      const isBusy = loggingOppKey === abKey;
+                      return (
+                        <button
+                          type="button"
+                          className="btn btn-sm border-accent/40 text-accent"
+                          disabled={Boolean(loggingOppKey) || isLogged}
+                          onClick={() => void handleLogCompassOpportunity("l1_abstention")}
+                          title="将本期战略留白决策记入 Track C 影子账本，供 1~4 周后回测验证留白是否正确"
+                        >
+                          {isBusy ? (
+                            <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                          ) : isLogged ? (
+                            <BookmarkCheck className="h-3 w-3 text-bull" aria-hidden="true" />
+                          ) : (
+                            <BookmarkPlus className="h-3 w-3" aria-hidden="true" />
+                          )}
+                          <span>{isLogged ? "已记入留白影子账本" : "记入 L1 战略留白账本"}</span>
+                        </button>
+                      );
+                    })()
+                  ) : null}
                 </div>
                 <p className="m-0 leading-relaxed text-ink-2">
                   {payload.abstain_reason ||
-                    "当前锁定战场未出现符合两段式龙头护盾与两维共振门槛的高赔率方向，按宁缺毋滥原则保持空仓观望，请重点参考上方逆风回避与衍生策略。"}
+                    "当前战场未出现符合宪法硬护栏与两维共振门槛的高赔率方向，按宁缺毋滥原则保持空仓观望，请重点参考上方逆风回避与衍生策略。"}
                 </p>
               </div>
             ) : filteredDirections.length === 0 ? (
@@ -1792,6 +1996,26 @@ export function Layer1CompassPanel({
                         </div>
                       ) : null}
 
+                      {/* Programmatic Constitutional Guardrail Flags */}
+                      {card.constitutional_flags && card.constitutional_flags.length > 0 ? (
+                        <div className="flex flex-col gap-1 rounded-md border border-warning/40 bg-warning/10 px-2.5 py-1.5 text-[10.5px]">
+                          {card.constitutional_flags.map((fl, fi) => (
+                            <div key={`${card.id}-cf-${fi}`} className="flex items-start gap-1.5 leading-snug text-ink-2">
+                              <ShieldAlert className="mt-0.5 h-3 w-3 shrink-0 text-warning" aria-hidden="true" />
+                              <span>
+                                <span className="font-semibold text-warning">{fl.article}</span>
+                                {fl.action === "cap_conviction_to_medium" ? (
+                                  <span className="ml-1 rounded bg-warning/20 px-1 font-mono text-[9.5px] text-warning">
+                                    已封顶中等确信
+                                  </span>
+                                ) : null}
+                                <span className="ml-1">{fl.message}</span>
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+
                       {/* Evidence Disclosure (Native <details>, no heading inside <summary>) */}
                       {card.evidence.length > 0 ? (
                         <details className="text-[11px]">
@@ -1840,25 +2064,52 @@ export function Layer1CompassPanel({
                       ) : null}
                     </div>
 
-                    {/* Card Action Footer: Dedicated L1 Mini-Pool Leader Picker */}
+                    {/* Card Action Footer: Dedicated L1 Mini-Pool Leader Picker + Track C Shadow Ledger */}
                     <div className="flex flex-wrap items-center justify-between gap-2 border-t border-hairline-soft pt-2.5">
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-primary"
-                        disabled={scanBusy}
-                        onClick={() =>
-                          setPickerTarget({
-                            card,
-                            runId: currentRun?.run_id,
-                          })
-                        }
-                        title="在专属小池中自主挑选符合本 L1 逻辑的 1~3 只标的并做日线缠论联立过筛"
-                      >
-                        <span>自选标的过筛</span>
-                        <ArrowRight className="h-3 w-3" aria-hidden="true" />
-                      </button>
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-primary"
+                          disabled={scanBusy}
+                          onClick={() =>
+                            setPickerTarget({
+                              card,
+                              runId: currentRun?.run_id,
+                            })
+                          }
+                          title="在专属小池中自主挑选符合本 L1 逻辑的 1~3 只标的并做日线缠论联立过筛"
+                        >
+                          <span>自选标的过筛</span>
+                          <ArrowRight className="h-3 w-3" aria-hidden="true" />
+                        </button>
+                        {currentRun?.run_id ? (
+                          (() => {
+                            const opKey = `${currentRun.run_id}:${card.id}`;
+                            const isLogged = Boolean(loggedOppMap[opKey]);
+                            const isBusy = loggingOppKey === opKey;
+                            return (
+                              <button
+                                type="button"
+                                className="btn btn-sm"
+                                disabled={Boolean(loggingOppKey) || isLogged}
+                                onClick={() => void handleLogCompassOpportunity("l1_direction_call", card.id)}
+                                title="将本张 L1 方向卡片记入 Track C 影子机会账本，追踪 1~4 周后续 R 倍数兑现"
+                              >
+                                {isBusy ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                                ) : isLogged ? (
+                                  <BookmarkCheck className="h-3 w-3 text-bull" aria-hidden="true" />
+                                ) : (
+                                  <BookmarkPlus className="h-3 w-3" aria-hidden="true" />
+                                )}
+                                <span>{isLogged ? "已入影子账本" : "记入影子账本"}</span>
+                              </button>
+                            );
+                          })()
+                        ) : null}
+                      </div>
                       <span className="text-[10.5px] text-muted">
-                        专属小池独立校验 · 不混入大类杂池
+                        专属小池独立校验 · Track C 归因可追踪
                       </span>
                     </div>
                   </article>

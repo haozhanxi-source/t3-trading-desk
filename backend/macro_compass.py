@@ -43,6 +43,8 @@ CommitResultFn = Callable[[Callable[[], Any]], Any]
 
 TTL_COMPASS_MACRO_SECONDS = 600.0
 TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS = 60.0
+TTL_COMPASS_CFTC_SECONDS = 3600.0
+TTL_COMPASS_CFTC_DEGRADED_SECONDS = 120.0
 TTL_COMPASS_MACRO_DEGRADED_SECONDS = 30.0
 CORE_MACRO_SOURCES: tuple[str, ...] = (
     "live_macro",
@@ -192,6 +194,8 @@ _MACRO_INFLIGHT_LOCK = threading.Lock()
 _MACRO_INFLIGHT_FUTURE: concurrent.futures.Future[dict[str, Any]] | None = None
 _PM_RETRY_INFLIGHT_LOCK = threading.Lock()
 _PM_RETRY_INFLIGHT_FUTURE: concurrent.futures.Future[tuple[dict[str, Any], str, dict[str, Any] | None]] | None = None
+_CFTC_RETRY_INFLIGHT_LOCK = threading.Lock()
+_CFTC_RETRY_INFLIGHT_FUTURE: concurrent.futures.Future[tuple[dict[str, Any], str, dict[str, Any] | None]] | None = None
 _LAST_GOOD_LOCK = threading.Lock()
 _LAST_GOOD_MACRO_SOURCES: dict[str, dict[str, Any]] = {}
 _LAST_GOOD_POLYMARKET_CATS: dict[str, dict[str, Any]] = {}
@@ -677,6 +681,7 @@ def _build_headline_metrics_and_tags(
     live_ctx: dict[str, Any],
     fred_macro: dict[str, Any],
     china_macro: dict[str, Any],
+    cftc_crowding: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Assemble compact headline KPI tiles with single-source observation provenance."""
     series = fred_macro.get("series") if isinstance(fred_macro.get("series"), dict) else {}
@@ -693,6 +698,7 @@ def _build_headline_metrics_and_tags(
     dfii10, dfii10_chg, dfii10_dt = _fred_val("DFII10")
     t10yie, t10yie_chg, t10yie_dt = _fred_val("T10YIE")
     dgs10, dgs10_chg, dgs10_dt = _fred_val("DGS10")
+    hy_oas, hy_oas_chg, hy_oas_dt = _fred_val("BAMLH0A0HYM2")
     fedfunds, _, fed_dt = _fred_val("FEDFUNDS")
     copper_m, copper_chg, copper_dt = _fred_val("PCOPPUSDM")
 
@@ -791,6 +797,16 @@ def _build_headline_metrics_and_tags(
             "source": "FRED",
         },
         {
+            "key": "HY_OAS",
+            "label": "高收益信用利差",
+            "value": round(hy_oas, 2) if hy_oas is not None else None,
+            "unit": "%",
+            "delta": round(hy_oas_chg, 2) if hy_oas_chg is not None else None,
+            "delta_unit": "pp",
+            "as_of": hy_oas_dt,
+            "source": "FRED",
+        },
+        {
             "key": "PCOPPUSDM",
             "label": "全球铜价锚",
             "value": round(copper_m, 0) if copper_m is not None else None,
@@ -810,6 +826,13 @@ def _build_headline_metrics_and_tags(
             tags.append({"label": f"实际利率宽松 ({dfii10:.2f}%)", "tone": "good"})
         else:
             tags.append({"label": f"实际利率中性 ({dfii10:.2f}%)", "tone": "neutral"})
+    if hy_oas is not None:
+        if hy_oas >= 5.0:
+            tags.append({"label": f"信用利差高压 ({hy_oas:.2f}%)", "tone": "critical"})
+        elif hy_oas >= 4.0:
+            tags.append({"label": f"信用利差走阔 ({hy_oas:.2f}%)", "tone": "warning"})
+        elif hy_oas <= 3.2:
+            tags.append({"label": f"信用利差紧致 ({hy_oas:.2f}%)", "tone": "good"})
     if vix_val is not None:
         if vix_val >= 25.0:
             tags.append({"label": f"VIX高波避险 ({vix_val:.1f})", "tone": "critical"})
@@ -830,6 +853,13 @@ def _build_headline_metrics_and_tags(
             tags.append({"label": f"中国PMI扩张 ({v:.1f})", "tone": "good"})
         else:
             tags.append({"label": f"中国PMI收缩 ({v:.1f})", "tone": "warning"})
+    if isinstance(cftc_crowding, dict) and cftc_crowding.get("status") in ("ok", "partial") and not cftc_crowding.get("stale_fallback"):
+        c_long = [str(it.get("label") or it.get("symbol") or "") for it in (cftc_crowding.get("crowded_long") or []) if isinstance(it, dict)]
+        c_short = [str(it.get("label") or it.get("symbol") or "") for it in (cftc_crowding.get("crowded_short") or []) if isinstance(it, dict)]
+        if c_long:
+            tags.append({"label": f"CFTC多头拥挤 ({'/'.join(c_long[:2])})", "tone": "warning"})
+        if c_short:
+            tags.append({"label": f"CFTC空头拥挤 ({'/'.join(c_short[:2])})", "tone": "warning"})
 
     return metrics, tags
 
@@ -1043,6 +1073,60 @@ def fetch_polymarket_macro_odds(*, timeout_seconds: float = 6.0) -> dict[str, An
     return research_extensions.fetch_polymarket_macro_odds(timeout_seconds=timeout_seconds)
 
 
+def fetch_cftc_crowding_overview(*, timeout_seconds: float = 8.0) -> dict[str, Any]:
+    """Fetch CFTC 52-week weekly COT archives (Disagg + TFF) for derivatives crowding telemetry."""
+    return research_extensions.fetch_cftc_crowding_overview(timeout_seconds=timeout_seconds)
+
+
+def _resolve_cftc_crowding_source(
+    raw_val: Any,
+    err_str: str | None,
+    now_iso: str,
+) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+    """Resolve optional CFTC crowding telemetry with last-known-good stale fallback."""
+    val = raw_val if isinstance(raw_val, dict) else {}
+    raw_status = str(val.get("status") or "")
+    if err_str is None and raw_status in ("ok", "partial") and isinstance(val.get("items"), list) and len(val["items"]) > 0:
+        clean_val = {**val, "stale_fallback": False}
+        with _LAST_GOOD_LOCK:
+            _LAST_GOOD_MACRO_SOURCES["cftc_crowding"] = {"data": clean_val, "fetched_at_utc": now_iso}
+        stale_info = (
+            {"last_good_at_utc": now_iso, "error": "; ".join(f"{k}: {v}" for k, v in (val.get("source_errors") or {}).items())}
+            if raw_status == "partial" and val.get("source_errors")
+            else None
+        )
+        return clean_val, raw_status, stale_info
+
+    err_msg = err_str or (str(val.get("error")) if val.get("error") else "fetch failed")
+    with _LAST_GOOD_LOCK:
+        prior = _LAST_GOOD_MACRO_SOURCES.get("cftc_crowding")
+    if prior is not None and isinstance(prior.get("data"), dict):
+        stale_data = {
+            **prior["data"],
+            "status": "stale",
+            "stale_fallback": True,
+            "last_good_at_utc": prior["fetched_at_utc"],
+        }
+        return stale_data, "stale", {"last_good_at_utc": prior["fetched_at_utc"], "error": err_msg}
+
+    empty_err = {
+        "status": "error",
+        "source": "CFTC Weekly COT Annual Archives (Disagg + TFF)",
+        "fetched_at_utc": now_iso,
+        "latest_report_date": None,
+        "window_weeks": 52,
+        "benchmarks_ok": 0,
+        "benchmarks_total": len(research_extensions.CFTC_CROWDING_BENCHMARKS),
+        "items": [],
+        "crowded_long": [],
+        "crowded_short": [],
+        "stale_symbols": [],
+        "stale_fallback": False,
+        "error": err_msg,
+    }
+    return empty_err, "error", {"last_good_at_utc": None, "error": err_msg}
+
+
 def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = False) -> dict[str, Any]:
     """Execute one bounded parallel macro overview fetch without blocking on timed-out threads."""
     now_iso = _utc_iso()
@@ -1054,6 +1138,18 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
 
     cn_timeout = max(0.2, min(9.0, deadline_seconds * 0.9))
     pm_timeout = max(0.2, min(6.0, deadline_seconds * 0.85))
+    cftc_timeout = max(0.5, min(8.0, deadline_seconds * 0.85))
+    reused_cftc_tuple: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None
+    if not refresh:
+        hit_cftc_cached, cached_cftc_val = CACHE.get(("compass_cftc_crowding",))
+        if (
+            hit_cftc_cached
+            and isinstance(cached_cftc_val, tuple)
+            and len(cached_cftc_val) == 3
+            and cached_cftc_val[1] == "ok"
+        ):
+            reused_cftc_tuple = cached_cftc_val
+
     fut_map: dict[concurrent.futures.Future[Any], str] = {
         _MACRO_EXECUTOR.submit(_wrapped, market_snapshot.fetch_macro_context): "live_macro",
         _MACRO_EXECUTOR.submit(_wrapped, research_data.fetch_fred_macro): "us_fred",
@@ -1066,6 +1162,12 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
             lambda: fetch_polymarket_macro_odds(timeout_seconds=pm_timeout)
         ): "polymarket_odds",
     }
+    if reused_cftc_tuple is None:
+        fut_map[
+            _MACRO_EXECUTOR.submit(
+                lambda: fetch_cftc_crowding_overview(timeout_seconds=cftc_timeout)
+            )
+        ] = "cftc_crowding"
 
     done, not_done = concurrent.futures.wait(
         list(fut_map.keys()),
@@ -1163,6 +1265,14 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
         errors.get("polymarket_odds"),
         now_iso,
     )
+    if reused_cftc_tuple is not None:
+        cftc_crowding, st_cftc, stale_cftc = reused_cftc_tuple
+    else:
+        cftc_crowding, st_cftc, stale_cftc = _resolve_cftc_crowding_source(
+            raw_results.get("cftc_crowding"),
+            errors.get("cftc_crowding"),
+            now_iso,
+        )
 
     merged_items: list[dict[str, Any]] = [
         *(yf_anchors.get("items") or []),
@@ -1189,6 +1299,7 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
         "cross_asset_anchors": st_anc,
         "cn_futures_anchors": st_cn_anc,
         "polymarket_odds": st_pm,
+        "cftc_crowding": st_cftc,
     }
     stale_sources = {
         k: info
@@ -1199,17 +1310,25 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
             ("cross_asset_anchors", stale_anc),
             ("cn_futures_anchors", stale_cn_anc),
             ("polymarket_odds", stale_pm),
+            ("cftc_crowding", stale_cftc),
         )
         if info is not None
     }
 
-    headline_metrics, regime_tags = _build_headline_metrics_and_tags(live_ctx, fred_macro, china_macro)
+    headline_metrics, regime_tags = _build_headline_metrics_and_tags(
+        live_ctx,
+        fred_macro,
+        china_macro,
+        cftc_crowding=cftc_crowding,
+    )
     core_fresh = all(sources_status.get(k) in ("ok", "partial") for k in CORE_MACRO_SOURCES)
     pm_fresh = sources_status.get("polymarket_odds") == "ok"
-    # Core 5 sources keep full 600s TTL even if optional Polymarket Gamma API is degraded;
-    # Polymarket maintains its own independent retry cache slot below.
+    cftc_fresh = sources_status.get("cftc_crowding") == "ok"
+    # Core 5 sources keep full 600s TTL even if optional Polymarket/CFTC sources are degraded;
+    # optional sources maintain their own independent retry cache slots below.
     ttl = TTL_COMPASS_MACRO_SECONDS if core_fresh else TTL_COMPASS_MACRO_DEGRADED_SECONDS
     pm_ttl = TTL_COMPASS_MACRO_SECONDS if pm_fresh else TTL_COMPASS_POLYMARKET_DEGRADED_SECONDS
+    cftc_ttl = TTL_COMPASS_CFTC_SECONDS if cftc_fresh else TTL_COMPASS_CFTC_DEGRADED_SECONDS
 
     bundle = sanitize(
         {
@@ -1225,34 +1344,114 @@ def _fetch_macro_overview_uncached(deadline_seconds: float, *, refresh: bool = F
             "anchors": anchors,
             "tape_movers": tape_movers,
             "polymarket_odds": polymarket_odds,
+            "cftc_crowding": cftc_crowding,
         }
     )
     CACHE.set(("compass_macro_overview",), bundle, ttl)
     CACHE.set(("compass_polymarket_odds",), (polymarket_odds, st_pm, stale_pm), pm_ttl)
+    if reused_cftc_tuple is None:
+        CACHE.set(("compass_cftc_crowding",), (cftc_crowding, st_cftc, stale_cftc), cftc_ttl)
     return bundle
+
+
+def _overlay_optional_sources_on_overview(
+    base: dict[str, Any],
+    pm_tuple: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None,
+    cftc_tuple: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None,
+) -> dict[str, Any]:
+    """Return a fresh, atomically consistent overview dict combining immutable core snapshot + optional sources."""
+    out = dict(base)
+    new_sources_status = dict(base.get("sources_status") or {})
+    new_stale = dict(base.get("stale_sources") or {})
+    if pm_tuple is not None:
+        pm_odds, st_pm, stale_pm = pm_tuple
+        new_sources_status["polymarket_odds"] = st_pm
+        if stale_pm is not None:
+            new_stale["polymarket_odds"] = stale_pm
+        else:
+            new_stale.pop("polymarket_odds", None)
+        out["polymarket_odds"] = pm_odds
+    if cftc_tuple is not None:
+        cftc_data, st_cftc, stale_cftc = cftc_tuple
+        new_sources_status["cftc_crowding"] = st_cftc
+        if stale_cftc is not None:
+            new_stale["cftc_crowding"] = stale_cftc
+        else:
+            new_stale.pop("cftc_crowding", None)
+        out["cftc_crowding"] = cftc_data
+        metrics, tags = _build_headline_metrics_and_tags(
+            base.get("live_macro") if isinstance(base.get("live_macro"), dict) else {},
+            base.get("us_fred") if isinstance(base.get("us_fred"), dict) else {},
+            base.get("china_macro") if isinstance(base.get("china_macro"), dict) else {},
+            cftc_crowding=cftc_data,
+        )
+        out["headline_metrics"] = metrics
+        out["regime_tags"] = tags
+    out["cache_hit"] = True
+    out["sources_status"] = new_sources_status
+    out["stale_sources"] = new_stale
+    return sanitize(out)
 
 
 def _overlay_polymarket_on_overview(
     base: dict[str, Any],
     pm_tuple: tuple[dict[str, Any], str, dict[str, Any] | None],
 ) -> dict[str, Any]:
-    """Return a fresh, atomically consistent overview dict combining immutable core snapshot + Polymarket tuple."""
-    pm_odds, st_pm, stale_pm = pm_tuple
-    new_sources_status = {**(base.get("sources_status") or {}), "polymarket_odds": st_pm}
-    new_stale = dict(base.get("stale_sources") or {})
-    if stale_pm is not None:
-        new_stale["polymarket_odds"] = stale_pm
-    else:
-        new_stale.pop("polymarket_odds", None)
-    return sanitize(
-        {
-            **base,
-            "cache_hit": True,
-            "sources_status": new_sources_status,
-            "stale_sources": new_stale,
-            "polymarket_odds": pm_odds,
-        }
-    )
+    return _overlay_optional_sources_on_overview(base, pm_tuple=pm_tuple)
+
+
+def _refresh_cftc_crowding_singleflight(
+    *,
+    timeout_seconds: float = 8.0,
+) -> tuple[dict[str, Any], str, dict[str, Any] | None]:
+    """Coalesce concurrent independent CFTC crowding retries into a single upstream fetch."""
+    global _CFTC_RETRY_INFLIGHT_FUTURE
+    cftc_cache_key = ("compass_cftc_crowding",)
+    hit, existing_cftc = CACHE.get(cftc_cache_key)
+    if hit and isinstance(existing_cftc, tuple) and len(existing_cftc) == 3:
+        return existing_cftc
+
+    leader = False
+    with _CFTC_RETRY_INFLIGHT_LOCK:
+        hit2, existing_cftc2 = CACHE.get(cftc_cache_key)
+        if hit2 and isinstance(existing_cftc2, tuple) and len(existing_cftc2) == 3:
+            return existing_cftc2
+        if _CFTC_RETRY_INFLIGHT_FUTURE is not None:
+            shared_future = _CFTC_RETRY_INFLIGHT_FUTURE
+        else:
+            shared_future = concurrent.futures.Future()
+            _CFTC_RETRY_INFLIGHT_FUTURE = shared_future
+            leader = True
+
+    if not leader:
+        return shared_future.result(timeout=max(0.5, timeout_seconds + 2.0))
+
+    try:
+        now_iso = _utc_iso()
+        try:
+            raw_cftc = fetch_cftc_crowding_overview(timeout_seconds=min(8.0, max(0.5, timeout_seconds)))
+            err_cftc = None
+        except Exception as exc:  # noqa: BLE001
+            raw_cftc = None
+            err_cftc = str(exc)
+
+        cftc_tuple = _resolve_cftc_crowding_source(raw_cftc, err_cftc, now_iso)
+        _, st_cftc, _ = cftc_tuple
+        cftc_ttl = TTL_COMPASS_CFTC_SECONDS if st_cftc == "ok" else TTL_COMPASS_CFTC_DEGRADED_SECONDS
+        with _CFTC_RETRY_INFLIGHT_LOCK:
+            CACHE.set(cftc_cache_key, cftc_tuple, cftc_ttl)
+            if not shared_future.done():
+                shared_future.set_result(cftc_tuple)
+            if _CFTC_RETRY_INFLIGHT_FUTURE is shared_future:
+                _CFTC_RETRY_INFLIGHT_FUTURE = None
+        return cftc_tuple
+    except BaseException as exc:
+        with _CFTC_RETRY_INFLIGHT_LOCK:
+            if not shared_future.done():
+                shared_future.set_exception(exc)
+            if _CFTC_RETRY_INFLIGHT_FUTURE is shared_future:
+                _CFTC_RETRY_INFLIGHT_FUTURE = None
+        raise
 
 
 def _refresh_polymarket_singleflight(
@@ -1325,13 +1524,29 @@ def collect_macro_overview(
         hit, cached = CACHE.get(cache_key)
         if hit and isinstance(cached, dict):
             pm_hit, pm_tuple = CACHE.get(("compass_polymarket_odds",))
+            resolved_pm: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None
             if pm_hit and isinstance(pm_tuple, tuple) and len(pm_tuple) == 3:
-                return _overlay_polymarket_on_overview(cached, pm_tuple)
-            if (cached.get("sources_status") or {}).get("polymarket_odds") != "ok":
-                fresh_pm_tuple = _refresh_polymarket_singleflight(
+                resolved_pm = pm_tuple
+            elif (cached.get("sources_status") or {}).get("polymarket_odds") != "ok":
+                resolved_pm = _refresh_polymarket_singleflight(
                     timeout_seconds=min(6.0, deadline_seconds * 0.85),
                 )
-                return _overlay_polymarket_on_overview(cached, fresh_pm_tuple)
+
+            cftc_hit, cftc_tuple = CACHE.get(("compass_cftc_crowding",))
+            resolved_cftc: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None
+            if cftc_hit and isinstance(cftc_tuple, tuple) and len(cftc_tuple) == 3:
+                resolved_cftc = cftc_tuple
+            elif (cached.get("sources_status") or {}).get("cftc_crowding") not in ("ok", None):
+                resolved_cftc = _refresh_cftc_crowding_singleflight(
+                    timeout_seconds=min(8.0, deadline_seconds * 0.85),
+                )
+
+            if resolved_pm is not None or resolved_cftc is not None:
+                return _overlay_optional_sources_on_overview(
+                    cached,
+                    pm_tuple=resolved_pm,
+                    cftc_tuple=resolved_cftc,
+                )
             return {**cached, "cache_hit": True}
 
     leader = False
@@ -1585,13 +1800,16 @@ def compute_constitutional_diagnostics(
     dfii10, dfii10_chg, dfii10_dt = _fval("DFII10")
     t10yie, _, t10yie_dt = _fval("T10YIE")
     dgs10, dgs10_chg, dgs10_dt = _fval("DGS10")
+    hy_oas, hy_oas_chg, hy_oas_dt = _fval("BAMLH0A0HYM2")
     fedfunds, _, fedfunds_dt = _fval("FEDFUNDS")
 
     dfii10_fresh = (dfii10 is not None) and (not fred_is_stale) and _is_obs_fresh(dfii10_dt, max_age_days=10)
     t10yie_fresh = (t10yie is not None) and (not fred_is_stale) and _is_obs_fresh(t10yie_dt, max_age_days=10)
     dgs10_fresh = (dgs10 is not None) and (not fred_is_stale) and _is_obs_fresh(dgs10_dt, max_age_days=10)
+    hy_oas_fresh = (hy_oas is not None) and (not fred_is_stale) and _is_obs_fresh(hy_oas_dt, max_age_days=10)
     fedfunds_fresh = (fedfunds is not None) and (not fred_is_stale) and _is_obs_fresh(fedfunds_dt, max_age_days=45)
     dfii10_status = "ok" if dfii10_fresh else ("stale" if dfii10 is not None else "missing")
+    hy_oas_status = "ok" if hy_oas_fresh else ("stale" if hy_oas is not None else "missing")
 
     vix_obj = live_macro.get("VIX") if isinstance(live_macro.get("VIX"), dict) else {}
     us10y_obj = live_macro.get("US10Y_Yield") if isinstance(live_macro.get("US10Y_Yield"), dict) else {}
@@ -1758,6 +1976,67 @@ def compute_constitutional_diagnostics(
         vix_data_status = "ok"
         systemic_panic = bool(vix_live >= 30.0)
 
+    # Article 2 Credit Spread & CFTC 52-Week Derivatives Crowding Telemetry
+    if not hy_oas_fresh or hy_oas is None:
+        credit_stress_level = hy_oas_status
+    elif hy_oas >= 5.0:
+        credit_stress_level = "stress_crisis"
+    elif hy_oas >= 4.0 or (hy_oas_chg is not None and hy_oas_chg >= 0.35):
+        credit_stress_level = "stress_widening"
+    elif hy_oas <= 3.2:
+        credit_stress_level = "complacent_tight"
+    else:
+        credit_stress_level = "normal"
+
+    cftc_raw = macro_overview.get("cftc_crowding") if isinstance(macro_overview.get("cftc_crowding"), dict) else None
+    cftc_is_stale_source = (
+        (sources_status.get("cftc_crowding") == "stale")
+        or bool(cftc_raw and cftc_raw.get("stale_fallback"))
+        or str((cftc_raw or {}).get("status") or "") == "stale"
+    )
+    crowded_long_90pct: list[dict[str, Any]] = []
+    crowded_short_10pct: list[dict[str, Any]] = []
+    cftc_latest_date: str | None = None
+    if cftc_raw is None or not isinstance(cftc_raw.get("items"), list) or len(cftc_raw.get("items") or []) == 0:
+        cftc_status = "missing"
+    elif cftc_is_stale_source or str(cftc_raw.get("status") or "") not in ("ok", "partial"):
+        cftc_status = "stale" if str(cftc_raw.get("status") or "") == "stale" or cftc_is_stale_source else "missing"
+        cftc_latest_date = cftc_raw.get("latest_report_date")
+    else:
+        cftc_status = str(cftc_raw.get("status"))
+        cftc_latest_date = cftc_raw.get("latest_report_date")
+        for it in cftc_raw.get("items") or []:
+            if not isinstance(it, dict) or it.get("is_stale"):
+                continue
+            compact = {
+                "symbol": it.get("symbol"),
+                "label": it.get("label"),
+                "cohort": it.get("cohort"),
+                "net_pct_oi": it.get("net_pct_oi"),
+                "percentile_52w": it.get("percentile_52w"),
+                "latest_date": it.get("latest_date"),
+            }
+            if it.get("crowding_state") == "crowded_long":
+                crowded_long_90pct.append(compact)
+            elif it.get("crowding_state") == "crowded_short":
+                crowded_short_10pct.append(compact)
+
+    credit_crowding_notes: list[str] = []
+    if credit_stress_level == "stress_crisis":
+        credit_crowding_notes.append(f"美高收益信用利差处于高压区({hy_oas:.2f}%)，严防晚周期顺周期权益补跌，谨慎高确信度做多风险资产")
+    elif credit_stress_level == "stress_widening":
+        credit_crowding_notes.append(f"美高收益信用利差走阔({hy_oas:.2f}%)，须核验实体信用地基再决定做多豁免权")
+    elif credit_stress_level in ("missing", "stale"):
+        credit_crowding_notes.append("美高收益信用利差(BAMLH0A0HYM2)观测缺失或陈旧，已置空避免误判，须联网核实信贷利差")
+    if crowded_long_90pct:
+        syms = "/".join(str(x.get("label") or x.get("symbol")) for x in crowded_long_90pct[:3])
+        credit_crowding_notes.append(f"CFTC 52周净多头极端拥挤(≥90%分位且净多): {syms}，触及宪法第2条一段护盾警戒，禁止高确信度追多")
+    if crowded_short_10pct:
+        syms = "/".join(str(x.get("label") or x.get("symbol")) for x in crowded_short_10pct[:3])
+        credit_crowding_notes.append(f"CFTC 52周净空头极端拥挤(≤10%分位且净空): {syms}，警惕空头踩踏轧空，谨慎高确信度追空")
+    if not credit_crowding_notes:
+        credit_crowding_notes.append("信贷利差与CFTC衍生品拥挤度暂未触发极端红线")
+
     return {
         "article1_denominator_truth": {
             "data_status": art1_data_status,
@@ -1773,6 +2052,18 @@ def compute_constitutional_diagnostics(
             "guidance": art1_guidance,
         },
         "article2_bellwether_shields": bellwether_shields,
+        "article2_credit_and_crowding": {
+            "hy_oas_status": hy_oas_status,
+            "hy_oas_pct": hy_oas if hy_oas_fresh else None,
+            "hy_oas_chg_pp": hy_oas_chg if hy_oas_fresh else None,
+            "hy_oas_as_of": hy_oas_dt,
+            "credit_stress_level": credit_stress_level,
+            "cftc_status": cftc_status,
+            "cftc_latest_date": cftc_latest_date,
+            "crowded_long_90pct": crowded_long_90pct,
+            "crowded_short_10pct": crowded_short_10pct,
+            "guidance": "；".join(credit_crowding_notes),
+        },
         "article3_panic_pendulum_gate": {
             "vix_data_status": vix_data_status,
             "vix_last": vix_live,
@@ -1844,6 +2135,26 @@ def build_compass_brief(
             if isinstance(ev, dict)
         ],
     }
+    cftc_raw = macro_overview.get("cftc_crowding")
+    cftc_compact: dict[str, Any] = {
+        "status": str(cftc_raw.get("status") or "unavailable") if isinstance(cftc_raw, dict) else "unavailable",
+        "latest_report_date": cftc_raw.get("latest_report_date") if isinstance(cftc_raw, dict) else None,
+        "stale_fallback": bool(cftc_raw.get("stale_fallback")) if isinstance(cftc_raw, dict) else False,
+        "items": [
+            {
+                "symbol": it.get("symbol"),
+                "label": it.get("label"),
+                "cohort": it.get("cohort"),
+                "net_pct_oi": it.get("net_pct_oi"),
+                "percentile_52w": it.get("percentile_52w"),
+                "crowding_state": it.get("crowding_state"),
+                "latest_date": it.get("latest_date"),
+                "is_stale": bool(it.get("is_stale")),
+            }
+            for it in ((cftc_raw.get("items") or []) if isinstance(cftc_raw, dict) else [])
+            if isinstance(it, dict)
+        ],
+    }
     return sanitize(
         {
             "generated_at_utc": _utc_iso(),
@@ -1856,6 +2167,7 @@ def build_compass_brief(
             "tape_movers": tape_movers,
             "constitutional_diagnostics": constitutional_diagnostics,
             "polymarket_odds": pm_compact,
+            "cftc_crowding": cftc_compact,
             "macro_overview": {
                 "fetched_at_utc": macro_overview.get("fetched_at_utc"),
                 "sources_status": macro_overview.get("sources_status"),
@@ -1885,7 +2197,7 @@ def build_compass_prompt(
         ]
         scopes_block = (
             "\n【用户锁定的重点深挖战场（多选 · 必须严格聚焦）】\n"
-            "用户本次明确指定只深挖以下战场，请将全部方向卡片集中分配在这些战场内（仅输出真正过线的高把握方向卡 1~5 张，不要把名额浪费在未勾选市场；若所选战场为严格禁空市场且恰逢全面逆风无合规多头机会，允许行使宪法第 4 条留白权输出空数组并填写 `abstain_reason`）：\n"
+            "用户本次明确指定只深挖以下战场，请将全部方向卡片集中分配在这些战场内（仅输出真正过线的高把握方向卡 1~5 张，不要把名额浪费在未勾选市场；若当前信号严重冲突、拥挤度极端或缺乏真正高赔率预期差，允许行使宪法第 4 条全市场战略留白权输出空数组并填写充分的 `abstain_reason` 与 `avoid_sectors`）：\n"
             + "\n".join(lines)
             + "\n"
         )
@@ -1900,7 +2212,7 @@ def build_compass_prompt(
         "- **宪法第 1 条（分母真伪辨识律 · 剥离恶性通胀与温和宽松）**：评判实际利率前先核查通胀锚是否失控——温和通胀下的低/负实际利率利好权益久期；但**因恶性高通胀失锚叠加名义长债飙升压缩算出的低/负实际利率，通杀股票与类债防御板块，此时唯独实物能源与贵金属受益**。\n"
         "- **宪法第 2 条（统治权归属与真龙头两段式护盾律）**：先比分子与分母量级——当板块具备非线性分子爆发（如资本开支与盈利二阶加速）或主权外储刚性买盘、信贷利差平稳且**板块基准定价锚护盾完好（未出日线确认卖点，实物储备须同时处于跨年正趋势）**时，分子统治分母，豁免高利率利空；**一段护盾（高位分歧退观望）**：若基准定价锚在大中枢 `ZD` 上方首现日线确认卖点或衍生品持仓极端拥挤（>90%分位），**立即收回做多豁免权退居观望（列入 `avoid_sectors` 或留白，绝不硬推做多，也绝不在 `ZD` 上方左侧摸顶做空）**；**二段破位警报与分层空头权限**：一旦基准定价锚实质跌破大中枢 `ZD`，哪怕央行正在降息也无条件严禁凭降息惯性抄底（列入回避观察）；至于能否反手输出 `short` 或充当 `pair` 空头腿，必须严守跨资产权限与分层边界——**大宗商品/外汇/加密**在供需过剩或利差逻辑共振下可顺势做空，**美股/美股行业 ETF** 唯有同时具备“高实际利率/金融条件紧缩压制估值 + 未来 1~3 年盈利/CapEx 增长故事证伪或强周期景气见顶反转”的戴维斯双杀基本面前提方可输出空头（具体真龙头日线与 30min 缠论结构交由 Layer 2/4 独立验证），**A 股在任何情形下均严格禁止直接做空及充当 `pair` 配对空头腿**。\n"
         "- **宪法第 3 条（恐慌反应函数二分律 · 禁空绝对化、抄底条件化）**：**上半句（无条件铁律）**：在 `VIX ≥ 30` 恐慌极值或标的已落入深坑暴跌区（见 `deep_hole_short_chase_ban`），**无条件禁止直接市价追空**（若中期仍过剩，必须在 `value_chain_focus` 注明等反抽二卖/三卖）；**下半句（双前提解锁）**：唯有同时满足“① 央行未被高通胀绑手（短端利率停止上行/转向降息）+ ② 标的未处实质破 `ZD` 自由落体”双前提时，才解锁流动性兜底做多，缺一则持币观望。\n"
-        "- **宪法第 4 条（认知谦逊与动态留白权 · 废除强凑满额方向卡）**：真正高赔率的主矛盾方向在多数时期只有 **1~4 个**（上限 5 个）。只输出确信度真正过硬的方向卡（`1~5` 张）；在全面紧缩或无主线震荡期宁可只出 **1~2 张** 狙击卡，**严禁为凑满名额塞入二流凑数多头或左侧摸顶空头**！（仅当用户锁定了单一禁空市场且恰逢全面逆风无任何合规做多机会时，才允许输出 `\"directions\": []` 并必填 `\"abstain_reason\"` 与 `\"avoid_sectors\"`）。\n"
+        "- **宪法第 4 条（认知谦逊与全市场战略留白权 · 废除强凑满额方向卡）**：真正高赔率的主矛盾方向在多数时期只有 **1~4 个**（上限 5 个）。只输出确信度真正过硬的方向卡（`0~5` 张）；在全面紧缩或无主线震荡期宁可只出 **1~2 张** 狙击卡，**严禁为凑满名额塞入二流凑数多头或左侧摸顶空头**！当全市场或所选战场均处于宏观信号剧烈撕裂、共识高度拥挤（如 `article2_credit_and_crowding` 显示信贷高压/CFTC 极端拥挤）或缺乏清晰 1Q~1Y 非对称预期差时，**任何市场范围均可主动行使战略留白权**，输出 `\"directions\": []` 并必填充分的 `\"abstain_reason\"`（≥15字讲清为何持币优于硬开仓）与至少 1 条 `\"avoid_sectors\"`（禁止无理由偷懒留白）。\n"
         "- **二级溯源与取证规程（严禁走捷径）**：① **反常劈叉仅作侦探警报**：对“逆古典宏观走强”的品种，必须先核查全市场顺周期权益与信贷地基——信贷与顺周期企稳才是真新主线；若顺周期权益与信贷已崩盘、仅剩下游高烧商品独强，必须警惕晚周期需求坍塌补跌诱多（Catch-down），严禁免检追涨；② **物理供给严禁靠 K 线臆测**：绝不凭过去涨跌幅猜“稀缺”或“过剩”，商品多空必须联网查实未来 `1Q~1Y` 真实物理新增产能投产表与成本曲线；③ **定价主权归属**：中国内需定价品种（A股/黑色建材/内盘化工）锚定国内信用与产业政策，不机械外推美联储。\n\n"
         "【Layer 1 职责边界与铁律（严格遵守）】\n"
         "1. **极端盘面异动强制归因（Tape-to-Macro Radar · 警报器而非选品清单！）**：\n"
@@ -1926,7 +2238,7 @@ def build_compass_prompt(
         "     - **大宗商品（海外 + 国内期货）、外汇（FX）、加密货币**：多空完全对称，`short` 做空与 `long` 同等重要！商品即使短期低库存呈大 B 结构，强现实弱预期劈叉照样可以做空。\n"
         "   - **强制追踪跨资产产业链传导**：每当某个超大权重权益主线进入戴维斯双杀或宏观收缩（例如算力硬件/半导体 CapEx 放缓、或中国地产/信用收缩），必须顺藤摸瓜同时审视其**上游工业/电子金属（如电子焊料金属、数据中心用铜、黑色原料）与商品货币**的联动空头机会——最强的主跌空头直接升格进 `directions`！\n"
         "   - **每一条 `avoid_sectors` 逆风点都必须延伸出可落地策略（`derived_strategy`）**：说明能否直接通过美股/ETF、商品期货、外汇或加密空头表达（A 股严禁直接做空，但可延伸至上游商品/外汇代理空头或反向受益轮动），并如实填写 `short_proxy_possible` 与 `short_proxy_hint`。\n"
-        "6. **0-编造红线**：引用宏观数据必须与 `brief.json` 或最新联网来源一致（且标明日期）；每个板块必须给出 **≥2 条**真实联网证据，含精确 `YYYY-MM-DD` 日期、来源机构名、`L1~L4` 证据等级与可验证的 `https://` 链接。\n"
+        "6. **0-编造红线与硬证据底线**：引用宏观数据必须与 `brief.json`（含 `article2_credit_and_crowding` 信用利差与 CFTC 52周持仓拥挤度）或最新联网来源一致（且标明日期）；每个板块必须给出 **≥2 条**真实联网证据，且**至少包含 1 条 `L1` 或 `L2` 级别硬事实/官方数据/权威指引证据**（严禁仅凭 `L3/L4` 传闻或研报成卡），含精确 `YYYY-MM-DD` 日期、来源机构名与可验证的 `https://` 链接。\n"
         f"{scopes_block}"
         f"{focus_block}\n"
         "【输出格式铁律】\n"
@@ -1986,7 +2298,7 @@ def build_compass_prompt(
         '  "risk_warnings": ["1~3条当前宏观与跨资产层面最需警惕的尾部风险或因子重叠提醒"]\n'
         "}\n"
         "```\n"
-        "要求：严格遵循《Layer 1 思考宪法》，`directions` 按真实机会多寡动态输出 **1~5 个**按优先级排序（`rank` 1..N）的高共振板块方向（宁缺毋滥，全面紧缩或震荡期可仅输出 1~2 个最强主矛盾方向，绝不凑数；仅在锁定禁空战场且全面逆风时允许 `directions: []` 配合非空 `abstain_reason` 与 `avoid_sectors`），必须以**未来 1Q~1Y 尚未充分定价的增量预期差**为核心，每个板块至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据，严格遵守 A 股禁空铁律（美股双杀、商品、外汇、加密均允许做空）。"
+        "要求：严格遵循《Layer 1 思考宪法》，`directions` 按真实机会多寡动态输出 **0~5 个**按优先级排序（`rank` 1..N）的高共振板块方向（宁缺毋滥，全面紧缩或震荡期可仅输出 1~2 个最强主矛盾方向，绝不凑数；当缺乏清晰 1Q~1Y 非对称预期差或宏观拥挤撕裂时，任意市场均可输出 `directions: []` 配合充分的 `abstain_reason`（≥15字）与至少 1 条 `avoid_sectors`），必须以**未来 1Q~1Y 尚未充分定价的增量预期差**为核心，每个板块至少 2 条带 `YYYY-MM-DD` 日期与来源的真实证据且至少 1 条为 `L1/L2` 硬证据，严格遵守 A 股禁空铁律（美股双杀、商品、外汇、加密均允许做空）。"
     )
 
 
@@ -2106,6 +2418,415 @@ def _make_non_colliding_slug(base_slug: str, existing_keys: set[str]) -> str:
     return cand
 
 
+_PULLBACK_DISCIPLINE_RE = re.compile(
+    r"(?:反抽|反弹|二卖|三卖|30min|30分钟|不追空|严禁.{0,6}追空|等待.{0,8}(?:结构|卖点|反抽|反弹)|回抽|pullback|bounce|wait\s+for)",
+    re.IGNORECASE,
+)
+_BOTTOM_CONFIRM_DISCIPLINE_RE = re.compile(
+    r"(?:一买|二买|底背驰|底部结构|左侧严禁|等待.{0,8}(?:底|买点|企稳|放量|背驰)|bottom\s+divergence|1st\s+buy|2nd\s+buy)",
+    re.IGNORECASE,
+)
+_RATE_SENSITIVE_DURATION_RE = re.compile(
+    r"(?:公用事业|红利|地产|长债|高估值|长久期|软件|saas|reit|xlu|tlt|bond\s*proxy|duration|utilities|real\s*estate)",
+    re.IGNORECASE,
+)
+_BENCHMARK_NAME_ALIAS_TO_SYMBOL: dict[str, str] = {
+    "标普500": "SPY",
+    "纳指100": "QQQ",
+    "半导体": "SMH",
+    "电力公用": "XLU",
+    "comex黄金": "GC=F",
+    "comex白银": "SI=F",
+    "comex铜": "HG=F",
+    "wti原油": "CL=F",
+    "美国天然气": "NG=F",
+    "沪铜": "CU0",
+    "沪锡": "SN0",
+    "沪铝": "AL0",
+    "沪镍": "NI0",
+    "铁矿石": "I0",
+    "碳酸锂": "LC0",
+    "欧元/美元": "EURUSD=X",
+    "美元/日元": "USDJPY=X",
+    "澳元/美元": "AUDUSD=X",
+    "美元/人民币": "USDCNY=X",
+}
+
+_MACRO_FACTOR_BUCKETS: tuple[dict[str, Any], ...] = (
+    {
+        "id": "usd_rates_tightening",
+        "label_long": "强美元/紧缩利率顺风",
+        "label_short": "强美元/高实际利率压制",
+        "anchors": frozenset({"DXY", "DX-Y.NYB", "USDJPY=X", "USDCNY=X", "US10Y", "DFII10"}),
+        "keywords": ("强美元", "美元走强", "鹰派", "加息", "缩表", "利率上行", "实际利率上行", "美债上行", "紧缩", "tightening", "hawkish", "strong usd", "higher for longer"),
+    },
+    {
+        "id": "china_credit_cycle",
+        "label_long": "中国信用/内需周期顺风",
+        "label_short": "中国信用/地产内需收缩",
+        "anchors": frozenset({"510300.SS", "510880.SS", "I0", "RB0", "HC0", "JM0", "J0", "CU0", "AL0", "NI0", "LC0", "AUDUSD=X"}),
+        "keywords": ("中国", "内需", "地产", "社融", "财政刺激", "反内卷", "黑色", "铁矿", "螺纹", "a股", "china", "pmi"),
+    },
+    {
+        "id": "ai_capex_tech",
+        "label_long": "AI算力/科技资本开支扩张",
+        "label_short": "AI算力/科技资本开支放缓或双杀",
+        "anchors": frozenset({"QQQ", "SMH", "NVDA", "SN0", "XLU"}),
+        "keywords": ("ai", "算力", "半导体", "光模块", "数据中心", "gpu", "hbm", "capex", "电网", "电力", "机器人"),
+    },
+    {
+        "id": "energy_geopolitics",
+        "label_long": "能源供给/地缘溢价",
+        "label_short": "能源过剩/地缘溢价回吐",
+        "anchors": frozenset({"CL=F", "BZ=F", "NG=F", "SC0", "XLE", "EC0"}),
+        "keywords": ("原油", "石油", "天然气", "能源", "opec", "霍尔木兹", "红海", "油运", "航运", "crude", "oil", "lng"),
+    },
+    {
+        "id": "precious_monetary_hedge",
+        "label_long": "黄金/主权去美元避险",
+        "label_short": "贵金属/避险溢价回落",
+        "anchors": frozenset({"GC=F", "SI=F", "AU0", "AG0", "BTC-USD", "BTC"}),
+        "keywords": ("黄金", "白银", "贵金属", "央行购金", "去美元", "主权外储", "避险", "gold", "silver", "bitcoin", "比特币"),
+    },
+    {
+        "id": "industrial_metals_supply",
+        "label_long": "工业金属供给约束/再通胀",
+        "label_short": "工业金属过剩/需求下修",
+        "anchors": frozenset({"HG=F", "ALI=F", "COPX", "XLB", "CU0", "AL0", "NI0", "SN0", "LC0"}),
+        "keywords": ("铜", "铝", "镍", "锡", "锌", "锂", "碳酸锂", "有色", "矿产", "冶炼", "copper", "aluminum", "nickel", "lithium"),
+    },
+)
+
+
+def _extract_card_referenced_symbols(
+    *,
+    reference_anchors: list[str],
+    leaders: list[dict[str, Any]],
+    sector_keywords: list[str],
+    title: str,
+) -> set[str]:
+    syms: set[str] = set()
+    for a in reference_anchors:
+        s = str(a or "").strip().upper()
+        if s:
+            syms.add(s)
+    for ld in leaders:
+        if isinstance(ld, dict):
+            s = str(ld.get("symbol") or "").strip().upper()
+            if s:
+                syms.add(s)
+    blob_low = " ".join([title, *sector_keywords]).lower()
+    for alias, sym in _BENCHMARK_NAME_ALIAS_TO_SYMBOL.items():
+        if alias in blob_low:
+            syms.add(sym)
+    return syms
+
+
+def _evaluate_card_constitutional_guardrails(
+    *,
+    title: str,
+    direction: str,
+    conviction: str,
+    asset_scope: str,
+    thesis: str,
+    value_chain_focus: str,
+    invalidation: str,
+    sector_keywords: list[str],
+    reference_anchors: list[str],
+    leaders: list[dict[str, Any]],
+    constitutional_diagnostics: dict[str, Any] | None,
+) -> tuple[str | None, str, list[dict[str, str]]]:
+    """Enforce programmatic constitutional guardrails against macro_overview diagnostics.
+
+    Returns ``(reject_reason_or_none, adjusted_conviction, constitutional_flags)``.
+    """
+    if not isinstance(constitutional_diagnostics, dict):
+        return None, conviction, []
+
+    flags: list[dict[str, str]] = []
+    adj_conviction = conviction
+    card_syms = _extract_card_referenced_symbols(
+        reference_anchors=reference_anchors,
+        leaders=leaders,
+        sector_keywords=sector_keywords,
+        title=title,
+    )
+    text_blob = f"{title} {thesis} {value_chain_focus} {invalidation} {' '.join(sector_keywords)}"
+
+    # Article 3: Panic / Deep-Hole Short-Chase Guardrail
+    art3 = constitutional_diagnostics.get("article3_panic_pendulum_gate")
+    if isinstance(art3, dict) and direction == "short":
+        systemic_panic = bool(art3.get("systemic_panic_active"))
+        deep_hole_syms = {
+            str(x.get("symbol") or "").strip().upper()
+            for x in (art3.get("deep_hole_short_chase_ban") or [])
+            if isinstance(x, dict) and x.get("symbol")
+        }
+        hit_deep = sorted(card_syms & deep_hole_syms)
+        has_pullback_rule = bool(_PULLBACK_DISCIPLINE_RE.search(f"{value_chain_focus} {thesis} {invalidation}"))
+        if hit_deep:
+            if not has_pullback_rule:
+                return (
+                    f"{title}: 触发宪法第3条深坑禁直接追空红线（{', '.join(hit_deep)}），"
+                    "未明确要求等待反抽二卖/三卖或30min结构卖点",
+                    adj_conviction,
+                    flags,
+                )
+            flags.append(
+                {
+                    "article": "article_3",
+                    "severity": "info",
+                    "code": "deep_hole_pullback_verified",
+                    "message": f"涉及深坑区锚点({', '.join(hit_deep)})，已明确要求等待反抽结构卖点而非市价追空",
+                }
+            )
+        if systemic_panic:
+            if not has_pullback_rule:
+                adj_conviction = "medium"
+                flags.append(
+                    {
+                        "article": "article_3",
+                        "severity": "warning",
+                        "action": "cap_conviction_to_medium",
+                        "code": "panic_short_pullback_required",
+                        "message": "VIX≥30 恐慌极值区间做空，须等待反抽二卖/三卖结构确认（确信度自动封顶 medium）",
+                    }
+                )
+            else:
+                flags.append(
+                    {
+                        "article": "article_3",
+                        "severity": "info",
+                        "code": "panic_short_pullback_verified",
+                        "message": "VIX≥30 恐慌极值区间做空，已附带反抽结构卖点纪律",
+                    }
+                )
+
+    # Article 2: Bellwether < ZD Breakdown Long Rejection
+    shields = constitutional_diagnostics.get("article2_bellwether_shields")
+    if isinstance(shields, list) and direction == "long":
+        broken_zd_syms: set[str] = set()
+        for sh in shields:
+            if not isinstance(sh, dict):
+                continue
+            posture = str(sh.get("shield_posture") or "")
+            cl_hint = sh.get("chanlun_hint") if isinstance(sh.get("chanlun_hint"), dict) else {}
+            if posture == "broken_below_zd_breakdown" or cl_hint.get("shield_state") == "broken_below_zd_breakdown":
+                s = str(sh.get("symbol") or "").strip().upper()
+                if s:
+                    broken_zd_syms.add(s)
+        hit_broken = sorted(card_syms & broken_zd_syms)
+        if hit_broken:
+            has_bottom_rule = bool(_BOTTOM_CONFIRM_DISCIPLINE_RE.search(f"{value_chain_focus} {thesis} {invalidation}"))
+            if not has_bottom_rule:
+                return (
+                    f"{title}: 触发宪法第2条实质破ZD防线禁逆势抄底（{', '.join(hit_broken)}），"
+                    "未明确等待日线底背驰一买/二买结构",
+                    adj_conviction,
+                    flags,
+                )
+            adj_conviction = "medium"
+            flags.append(
+                {
+                    "article": "article_2",
+                    "severity": "warning",
+                    "action": "cap_conviction_to_medium",
+                    "code": "broken_zd_bottom_confirmation_only",
+                    "message": f"基准锚({', '.join(hit_broken)})仍处破ZD区，仅限等待日线底背驰一买/二买（确信度封顶 medium）",
+                }
+            )
+
+    # Article 1: Unanchored Inflation vs Long Duration Equities
+    art1 = constitutional_diagnostics.get("article1_denominator_truth")
+    if (
+        isinstance(art1, dict)
+        and art1.get("data_status") == "ok"
+        and art1.get("state") == "unanchored_inflation_nominal_pressure"
+        and direction == "long"
+        and asset_scope in ("us_equities", "a_shares", "cross_asset")
+        and _RATE_SENSITIVE_DURATION_RE.search(text_blob)
+    ):
+        adj_conviction = "medium"
+        flags.append(
+            {
+                "article": "article_1",
+                "severity": "warning",
+                "action": "cap_conviction_to_medium",
+                "code": "unanchored_inflation_duration_risk",
+                "message": "通胀预期失锚叠加名义长债上行，长久期/类债防御多头受分母压制（确信度自动封顶 medium）",
+            }
+        )
+
+    # Article 2: Credit Spread Stress & CFTC 52-Week Crowding
+    art2_cc = constitutional_diagnostics.get("article2_credit_and_crowding")
+    if isinstance(art2_cc, dict):
+        credit_level = str(art2_cc.get("credit_stress_level") or "")
+        if credit_level == "stress_crisis" and direction == "long" and asset_scope in ("us_equities", "a_shares", "crypto"):
+            adj_conviction = "medium"
+            hy_v = art2_cc.get("hy_oas_pct")
+            flags.append(
+                {
+                    "article": "article_2",
+                    "severity": "warning",
+                    "action": "cap_conviction_to_medium",
+                    "code": "hy_credit_stress_warning",
+                    "message": f"美高收益信用利差高压({hy_v}%)，风险资产做多须防范顺周期晚周期补跌（确信度封顶 medium）",
+                }
+            )
+
+        if direction == "long":
+            crowded_long_map = {
+                str(x.get("symbol") or "").strip().upper(): x
+                for x in (art2_cc.get("crowded_long_90pct") or [])
+                if isinstance(x, dict) and x.get("symbol")
+            }
+            hit_cl = sorted(card_syms & set(crowded_long_map.keys()))
+            if hit_cl:
+                adj_conviction = "medium"
+                desc = "、".join(
+                    f"{crowded_long_map[s].get('label') or s}({crowded_long_map[s].get('percentile_52w')}%)"
+                    for s in hit_cl
+                )
+                flags.append(
+                    {
+                        "article": "article_2",
+                        "severity": "warning",
+                        "action": "cap_conviction_to_medium",
+                        "code": "cftc_crowded_long_90pct",
+                        "message": f"CFTC 52周净多头极端拥挤({desc})，触发一段护盾警戒（确信度封顶 medium）",
+                    }
+                )
+        elif direction == "short":
+            crowded_short_map = {
+                str(x.get("symbol") or "").strip().upper(): x
+                for x in (art2_cc.get("crowded_short_10pct") or [])
+                if isinstance(x, dict) and x.get("symbol")
+            }
+            hit_cs = sorted(card_syms & set(crowded_short_map.keys()))
+            if hit_cs:
+                adj_conviction = "medium"
+                desc = "、".join(
+                    f"{crowded_short_map[s].get('label') or s}({crowded_short_map[s].get('percentile_52w')}%)"
+                    for s in hit_cs
+                )
+                flags.append(
+                    {
+                        "article": "article_2",
+                        "severity": "warning",
+                        "action": "cap_conviction_to_medium",
+                        "code": "cftc_crowded_short_10pct",
+                        "message": f"CFTC 52周净空头极端拥挤({desc})，警惕空头踩踏轧空（确信度封顶 medium）",
+                    }
+                )
+
+    return None, adj_conviction, flags
+
+
+def analyze_macro_factor_concentration(directions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Deterministically detect cross-card macro beta stacking across directional Layer 1 cards."""
+    directional_cards = [d for d in directions if isinstance(d, dict) and d.get("direction") in ("long", "short")]
+    pair_count = sum(1 for d in directions if isinstance(d, dict) and d.get("direction") == "pair")
+    if len(directional_cards) < 2:
+        return {
+            "concentrated": False,
+            "directional_cards_count": len(directional_cards),
+            "hedged_pair_count": pair_count,
+            "dominant_factors": [],
+            "warnings": [],
+        }
+
+    bucket_hits: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    driver_hits: dict[tuple[str, str], list[dict[str, Any]]] = {}
+
+    for card in directional_cards:
+        c_dir = str(card.get("direction") or "")
+        p_dim = str((card.get("primary_driver") or {}).get("dimension") or "").strip()
+        if p_dim:
+            driver_hits.setdefault((p_dim, c_dir), []).append(card)
+
+        card_syms = _extract_card_referenced_symbols(
+            reference_anchors=[str(x) for x in (card.get("reference_anchors") or [])],
+            leaders=card.get("leaders") if isinstance(card.get("leaders"), list) else [],
+            sector_keywords=[str(x) for x in (card.get("sector_keywords") or [])],
+            title=str(card.get("title") or ""),
+        )
+        blob = " ".join(
+            [
+                str(card.get("title") or ""),
+                str(card.get("thesis") or ""),
+                str((card.get("primary_driver") or {}).get("summary") or ""),
+                str((card.get("secondary_driver") or {}).get("summary") or ""),
+                *[str(k) for k in (card.get("sector_keywords") or [])],
+            ]
+        ).lower()
+
+        for spec in _MACRO_FACTOR_BUCKETS:
+            anchor_match = bool(card_syms & spec["anchors"])
+            kw_hits = sum(1 for kw in spec["keywords"] if kw in blob)
+            if anchor_match or kw_hits >= 2:
+                bucket_hits.setdefault((str(spec["id"]), c_dir), []).append(card)
+
+    spec_by_id = {str(s["id"]): s for s in _MACRO_FACTOR_BUCKETS}
+    dominant_factors: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    total_dir = len(directional_cards)
+
+    for (bid, c_dir), cards in sorted(bucket_hits.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        if len(cards) < 2:
+            continue
+        spec = spec_by_id[bid]
+        label = spec["label_long"] if c_dir == "long" else spec["label_short"]
+        share_pct = round((len(cards) / total_dir) * 100.0, 1)
+        titles = [str(c.get("title") or c.get("id")) for c in cards]
+        dominant_factors.append(
+            {
+                "factor_id": f"{bid}:{c_dir}",
+                "label": label,
+                "direction": c_dir,
+                "count": len(cards),
+                "share_pct": share_pct,
+                "card_ids": [str(c.get("id") or "") for c in cards],
+                "card_titles": titles,
+            }
+        )
+        dir_cn = "做多" if c_dir == "long" else "做空"
+        warnings.append(
+            f"跨卡宏观因子重叠警戒：{len(cards)}/{total_dir} 张方向卡同向押注【{label}】"
+            f"（{dir_cn}：{'、'.join(titles)}），请共享同一份宏观因子风险预算，严禁叠加满仓"
+        )
+
+    # Also catch >=3 directional cards stacking the exact same primary dimension & direction
+    for (p_dim, c_dir), cards in sorted(driver_hits.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+        if len(cards) < 3:
+            continue
+        share_pct = round((len(cards) / total_dir) * 100.0, 1)
+        titles = [str(c.get("title") or c.get("id")) for c in cards]
+        dominant_factors.append(
+            {
+                "factor_id": f"driver:{p_dim}:{c_dir}",
+                "label": f"同主驱动({p_dim})",
+                "direction": c_dir,
+                "count": len(cards),
+                "share_pct": share_pct,
+                "card_ids": [str(c.get("id") or "") for c in cards],
+                "card_titles": titles,
+            }
+        )
+        dir_cn = "做多" if c_dir == "long" else "做空"
+        warnings.append(
+            f"主驱动维度集中提醒：{len(cards)}/{total_dir} 张方向卡均以【{p_dim}】为同向{dir_cn}主驱动"
+            f"（{'、'.join(titles)}），建议优中选优保留赔率最高代表"
+        )
+
+    return {
+        "concentrated": len(dominant_factors) > 0,
+        "directional_cards_count": total_dir,
+        "hedged_pair_count": pair_count,
+        "dominant_factors": dominant_factors[:5],
+        "warnings": warnings[:4],
+    }
+
+
 def normalize_compass_output(
     payload: dict[str, Any],
     *,
@@ -2113,6 +2834,7 @@ def normalize_compass_output(
     universes: dict[str, Any] | None = None,
     open_positions: list[dict[str, str]] | None = None,
     focus_scopes: list[str] | None = None,
+    constitutional_diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Strictly validate blind Layer 1 sector output and perform post-hoc universe/portfolio mapping."""
     if not isinstance(payload, dict):
@@ -2170,11 +2892,12 @@ def normalize_compass_output(
     raw_abstain = payload.get("abstain_reason")
     abstain_reason = raw_abstain.strip() if isinstance(raw_abstain, str) else ""
     raw_dirs = payload.get("directions")
+    # Article 4 Full-Market Strategic Abstention Right (with strict anti-laziness guards:
+    # explicit empty directions=[], substantive abstain_reason >= 15 chars, and >= 1 avoid_sector).
     can_abstain_zero_cards = (
         isinstance(raw_dirs, list)
         and len(raw_dirs) == 0
-        and clean_scopes == ["a_shares"]
-        and bool(abstain_reason)
+        and len(abstain_reason) >= 15
         and isinstance(raw_avoid_input, list)
         and len(avoid_sectors) >= 1
     )
@@ -2195,11 +2918,25 @@ def normalize_compass_output(
                 "directions": [],
                 "abstained": True,
                 "abstain_reason": abstain_reason,
+                "abstain_scope": clean_scopes if clean_scopes else ["global_all_markets"],
                 "rejected_cards_count": 0,
                 "risk_warnings": risk_warnings_abstain,
+                "factor_concentration": analyze_macro_factor_concentration([]),
+                "constitutional_audit": {
+                    "enforced": True,
+                    "diagnostics_attached": isinstance(constitutional_diagnostics, dict),
+                    "rejected_count": 0,
+                    "rejected_reasons": [],
+                    "flagged_cards_count": 0,
+                    "conviction_caps_applied": 0,
+                },
             }
         )
     if not isinstance(raw_dirs, list) or len(raw_dirs) == 0:
+        if isinstance(raw_dirs, list) and len(raw_dirs) == 0:
+            raise ValueError(
+                "战略留白（directions 为空）未通过反偷懒校验：必须填写至少 15 字的实质 abstain_reason 且列出至少 1 条 avoid_sectors"
+            )
         raise ValueError("战略推演未输出任何有效板块方向卡片（directions 为空）")
 
     universes_map = universes if isinstance(universes, dict) else {k: {"symbols": [], "description": ""} for k in valid_universes}
@@ -2209,6 +2946,7 @@ def normalize_compass_output(
     directions: list[dict[str, Any]] = []
     rejected_reasons: list[str] = []
     seen_ids: set[str] = set()
+    capped_card_ids: set[str] = set()
 
     for idx, raw_d in enumerate(raw_dirs[:10], start=1):
         if not isinstance(raw_d, dict):
@@ -2393,6 +3131,10 @@ def normalize_compass_output(
             rejected_reasons.append(f"{title}: 有效证据不足 2 条（需含有效日期、来源与 L1~L4 等级）")
             continue
 
+        if not any(ev["level"] in ("L1", "L2") for ev in evidence):
+            rejected_reasons.append(f"{title}: 缺少 L1/L2 一手硬证据支撑（禁止仅凭 L3/L4 传闻或研报成卡）")
+            continue
+
         did = _sanitize_pool_slug(str(raw_d.get("id") or f"sector_{idx}")) or f"sector_{idx}"
         while did in seen_ids:
             did = f"{did}_{idx}"
@@ -2409,6 +3151,27 @@ def normalize_compass_output(
             for k in (raw_d.get("sector_keywords") or [])
             if str(k or "").strip()
         ][:8]
+
+        invalidation_str = str(raw_d.get("invalidation") or "").strip()
+        guard_reject, adjusted_conviction, constitutional_flags = _evaluate_card_constitutional_guardrails(
+            title=title,
+            direction=direction,
+            conviction=conviction,
+            asset_scope=asset_scope,
+            thesis=thesis,
+            value_chain_focus=value_chain_focus,
+            invalidation=invalidation_str,
+            sector_keywords=sector_keywords,
+            reference_anchors=reference_anchors,
+            leaders=leaders,
+            constitutional_diagnostics=constitutional_diagnostics,
+        )
+        if guard_reject:
+            rejected_reasons.append(guard_reject)
+            continue
+        if conviction == "high" and adjusted_conviction != "high":
+            capped_card_ids.add(did)
+        conviction = adjusted_conviction
 
         # Post-hoc deterministic mapping to existing universes.json (AI never saw existing_universes!)
         rec_univs: list[str] = []
@@ -2468,12 +3231,13 @@ def normalize_compass_output(
                 "sector_keywords": sector_keywords,
                 "reference_anchors": reference_anchors,
                 "key_catalyst": str(raw_d.get("key_catalyst") or "").strip(),
-                "invalidation": str(raw_d.get("invalidation") or "").strip(),
+                "invalidation": invalidation_str,
                 "recommended_universes": rec_univs,
                 "is_new_theme": is_new_theme,
                 "suggested_pool_name": suggested_pool_name,
                 "suggested_pool_description": suggested_pool_description,
                 "portfolio_overlap": portfolio_overlap,
+                "constitutional_flags": constitutional_flags,
                 "leaders": leaders,
                 "evidence": evidence,
             }
@@ -2488,6 +3252,8 @@ def normalize_compass_output(
     for i, d in enumerate(directions, start=1):
         d["rank"] = i
 
+    factor_concentration = analyze_macro_factor_concentration(directions)
+
     raw_warn_input = payload.get("risk_warnings")
     warn_iter = raw_warn_input if isinstance(raw_warn_input, list) else []
     risk_warnings = [
@@ -2495,6 +3261,12 @@ def normalize_compass_output(
         for x in warn_iter
         if isinstance(x, str) and x.strip()
     ][:6]
+    for fw in factor_concentration.get("warnings") or []:
+        if fw not in risk_warnings and len(risk_warnings) < 8:
+            risk_warnings.append(fw)
+
+    flagged_cards_count = sum(1 for d in directions if d.get("constitutional_flags"))
+    conviction_caps_applied = sum(1 for d in directions if d["id"] in capped_card_ids)
 
     return sanitize(
         {
@@ -2507,6 +3279,15 @@ def normalize_compass_output(
             "abstain_reason": "",
             "rejected_cards_count": len(rejected_reasons),
             "risk_warnings": risk_warnings,
+            "factor_concentration": factor_concentration,
+            "constitutional_audit": {
+                "enforced": True,
+                "diagnostics_attached": isinstance(constitutional_diagnostics, dict),
+                "rejected_count": len(rejected_reasons),
+                "rejected_reasons": rejected_reasons[:8],
+                "flagged_cards_count": flagged_cards_count,
+                "conviction_caps_applied": conviction_caps_applied,
+            },
         }
     )
 
@@ -2683,6 +3464,7 @@ def run_macro_compass(
         universes=universes,
         open_positions=open_positions,
         focus_scopes=focus_scopes,
+        constitutional_diagnostics=brief.get("constitutional_diagnostics"),
     )
 
     finished_at = _utc_iso()
@@ -2699,6 +3481,7 @@ def run_macro_compass(
                 "fetched_at_utc": macro_overview.get("fetched_at_utc"),
                 "regime_tags": macro_overview.get("regime_tags") or [],
                 "headline_metrics": macro_overview.get("headline_metrics") or [],
+                "anchors_items": (macro_overview.get("anchors") or {}).get("items") or [],
             },
             "run_meta": run_meta,
         }

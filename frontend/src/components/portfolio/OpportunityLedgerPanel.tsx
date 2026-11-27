@@ -79,6 +79,8 @@ const KIND_META: Record<string, { label: string; tone: Tone }> = {
   missed_entry: { label: "看对未上车", tone: "warning" },
   shaken_out: { label: "30m洗飞", tone: "critical" },
   premature_exit: { label: "过早止盈", tone: "info" },
+  l1_direction_call: { label: "L1方向立项", tone: "good" },
+  l1_abstention: { label: "L1战略留白", tone: "neutral" },
 };
 
 const TAG_CATEGORY_ZH: Record<string, { label: string; tone: Tone }> = {
@@ -347,6 +349,8 @@ export function OpportunityLedgerPanel({
                 ["missed_entry", "看对未上车"],
                 ["shaken_out", "30m洗飞"],
                 ["premature_exit", "过早止盈"],
+                ["l1_direction_call", "L1方向立项"],
+                ["l1_abstention", "L1战略留白"],
               ] as const
             ).map(([k, label]) => (
               <button
@@ -680,6 +684,8 @@ function LogOpportunityModal({
               <option value="missed_entry">看对未上车 (missed_entry)</option>
               <option value="shaken_out">30m噪音洗飞 (shaken_out)</option>
               <option value="premature_exit">过早止盈卖飞 (premature_exit)</option>
+              <option value="l1_direction_call">L1方向立项 (l1_direction_call)</option>
+              <option value="l1_abstention">L1战略留白 (l1_abstention)</option>
             </select>
           </label>
         </div>

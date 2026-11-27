@@ -5,6 +5,8 @@ import type {
   ArchiveState,
   CloseBody,
   CompassLatestResponse,
+  CompassLogOpportunityBody,
+  CompassLogOpportunityResponse,
   CompassMacroOverview,
   CompassRunRecord,
   CompassRunSummary,
@@ -257,6 +259,11 @@ export const api = {
     get<{ runs: CompassRunSummary[] }>("/compass/history", { limit }, signal),
   compassHistoryDetail: (runId: string, signal?: AbortSignal) =>
     get<CompassRunRecord>(`/compass/history/${encodeURIComponent(runId)}`, undefined, signal),
+  logCompassOpportunity: (runId: string, body: CompassLogOpportunityBody) =>
+    post<CompassLogOpportunityResponse>(
+      `/compass/history/${encodeURIComponent(runId)}/log-opportunity`,
+      body,
+    ),
   startMacroCompass: async (body: MacroCompassRequest = {}) => {
     const raw = await post<TaskRecord & { already_running?: boolean }>("/tasks/macro-compass", {
       engine: body.engine ?? "",

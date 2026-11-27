@@ -1057,10 +1057,11 @@ details.disclosure:not([open])::details-content {
  * ------------------------------------------------------------------ */
 .detail-drawer-sheet {
   position: fixed;
-  inset-block: 0;
+  top: 0;
+  bottom: 0;
   inset-inline-end: 0;
   z-index: 45;
-  width: min(470px, 92vw);
+  width: min(460px, 92vw);
   height: 100svh;
   display: flex;
   flex-direction: column;
@@ -1068,6 +1069,13 @@ details.disclosure:not([open])::details-content {
   border-inline-start: 1px solid var(--hairline);
   box-shadow: -14px 0 40px rgba(0, 0, 0, 0.28);
   overscroll-behavior: contain;
+}
+@media (min-width: 1024px) {
+  .detail-drawer-sheet {
+    top: 52px;
+    height: calc(100svh - 52px);
+    border-top: 1px solid var(--hairline-soft);
+  }
 }
 @media (prefers-reduced-motion: no-preference) {
   .detail-drawer-sheet {

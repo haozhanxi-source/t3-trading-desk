@@ -2176,8 +2176,28 @@ def compute_regime_signal_lights(
     cn_raw = macro_overview.get("china_macro") if isinstance(macro_overview.get("china_macro"), dict) else {}
     pmi_obj = cn_raw.get("pmi_manufacturing") if isinstance(cn_raw.get("pmi_manufacturing"), dict) else {}
     pmi_val = _to_float(pmi_obj.get("latest") if pmi_obj.get("latest") is not None else pmi_obj.get("latest_value"))
-    cn_stale = ("china_macro" in (macro_overview.get("stale_sources") or {})) or (
-        (macro_overview.get("sources_status") or {}).get("china_macro") == "stale"
+    if pmi_val is None:
+        pmi_block = cn_raw.get("pmi") if isinstance(cn_raw.get("pmi"), dict) else {}
+        pmi_records = pmi_block.get("records") if isinstance(pmi_block.get("records"), list) else []
+        if pmi_records and isinstance(pmi_records[0], dict):
+            pmi_val = _to_float(
+                pmi_records[0].get("制造业-指数")
+                or pmi_records[0].get("manufacturing_pmi")
+                or pmi_records[0].get("value")
+            )
+    if pmi_val is None:
+        for hm in macro_overview.get("headline_metrics") or []:
+            if isinstance(hm, dict) and str(hm.get("key") or "").upper() in ("CN_PMI", "CHINA_PMI"):
+                pmi_val = _to_float(hm.get("value"))
+                if pmi_val is not None:
+                    break
+    stale_sources = macro_overview.get("stale_sources") or {}
+    sources_status = macro_overview.get("sources_status") or {}
+    cn_stale = (
+        ("china_macro" in stale_sources)
+        or ("cn_macro" in stale_sources)
+        or (sources_status.get("china_macro") == "stale")
+        or (sources_status.get("cn_macro") == "stale")
     )
     if pmi_val is None or cn_stale:
         cn_level = "neutral"

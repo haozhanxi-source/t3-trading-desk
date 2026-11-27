@@ -556,6 +556,7 @@ export function WorkbenchView({
   } | null>(null);
   const [logCardSignal, setLogCardSignal] = useState<{ cardId: string; seq: number } | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [showPriorScanForMismatch, setShowPriorScanForMismatch] = useState(false);
 
   const l2TabRefs = useRef<Record<"l1_track" | "manual", HTMLButtonElement | null>>({
     l1_track: null,
@@ -1191,19 +1192,40 @@ export function WorkbenchView({
     };
   }, [historyOpen]);
 
-  const handleSelectCardForL2 = useCallback((card: CompassDirectionCard, runId?: string) => {
-    setSelectedL1Track({ card, runId });
-    setL2Mode("l1_track");
-    window.setTimeout(() => {
-      const el = layer2Ref.current;
-      if (!el) return;
-      const rect = el.getBoundingClientRect();
-      // Only scroll gently if Layer 2 picker is below the visible viewport fold
-      if (rect.top > window.innerHeight - 180 || rect.top < 0) {
-        el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  const handleSelectCardForL2 = useCallback(
+    (card: CompassDirectionCard, runId?: string) => {
+      setSelectedL1Track({ card, runId });
+      setL2Mode("l1_track");
+      setShowPriorScanForMismatch(false);
+
+      // Automatically surface matching L2 scan history for this L1 track if one already exists
+      const exactMatch = tasks.find((t) => {
+        const ctx = extractCompassContext(t);
+        if (!ctx || ctx.direction_id !== card.id) return false;
+        return runId ? ctx.run_id === runId : true;
+      });
+      const fallbackMatch =
+        exactMatch ??
+        tasks.find((t) => {
+          const ctx = extractCompassContext(t);
+          return Boolean(ctx && ctx.direction_id === card.id);
+        });
+      if (fallbackMatch) {
+        setActiveTaskId(fallbackMatch.id);
       }
-    }, 40);
-  }, []);
+
+      window.setTimeout(() => {
+        const el = layer2Ref.current;
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        // Only scroll gently if Layer 2 picker is below the visible viewport fold
+        if (rect.top > window.innerHeight - 180 || rect.top < 0) {
+          el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+        }
+      }, 40);
+    },
+    [tasks],
+  );
 
   const handleL2TabKeyDown = (e: KeyboardEvent<HTMLButtonElement>, current: "l1_track" | "manual") => {
     const order: ("l1_track" | "manual")[] = ["l1_track", "manual"];
@@ -1752,7 +1774,68 @@ export function WorkbenchView({
         </div>
 
           {/* Results & Live Progress Card */}
+          {(() => {
+            const isMismatchedWithSelectedTrack =
+              l2Mode === "l1_track" &&
+              Boolean(selectedL1Track) &&
+              (!activeCompassContext || activeCompassContext.direction_id !== selectedL1Track!.card.id);
+            const hideUnrelatedTable = isMismatchedWithSelectedTrack && !showPriorScanForMismatch;
+
+            if (hideUnrelatedTable && selectedL1Track) {
+              const rawSyms = Array.isArray(activeTask?.params?.symbols)
+                ? (activeTask.params.symbols as string[])
+                : [];
+              const priorLabel =
+                activeCompassContext?.direction_title ||
+                (rawSyms.length > 0 ? rawSyms.slice(0, 3).join(", ") : "上一次扫描");
+              return (
+                <section className="card flex flex-col gap-3 p-4" aria-label="当前轨道尚未过筛">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[13px] font-semibold text-ink">日线缠论过筛结果</span>
+                      <span className="rounded bg-accent/12 px-2 py-0.5 text-[11px] font-medium text-accent">
+                        {selectedL1Track.card.title}
+                      </span>
+                    </div>
+                    {activeTask && scanRows.length > 0 ? (
+                      <button
+                        type="button"
+                        className="btn btn-ghost btn-sm !min-h-[26px] !text-[11px]"
+                        onClick={() => setShowPriorScanForMismatch(true)}
+                      >
+                        <History className="h-3.5 w-3.5" aria-hidden="true" />
+                        <span>
+                          展开上一条无关扫描：{priorLabel} ({scanRows.length} 只)
+                        </span>
+                      </button>
+                    ) : null}
+                  </div>
+                  <div className="flex flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed border-hairline bg-sunken/40 py-7 text-center text-[12px] text-muted">
+                    <p className="font-medium text-ink">
+                      当前 L1 轨道「{selectedL1Track.card.title}」尚未运行日线缠论过筛
+                    </p>
+                    <p>请在上方选入 1~3 只细分真龙头（或勾选基准参照锚），点击「启动 L2 日线过筛」查看日线中枢与同向结构。</p>
+                  </div>
+                </section>
+              );
+            }
+
+            return (
           <section className="card flex flex-col gap-3 p-4" aria-label="扫描结果与实时进度">
+            {isMismatchedWithSelectedTrack && selectedL1Track ? (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-1.5 text-[11.5px] text-warning">
+                <span>
+                  提示：下方展示的是上一条历史扫描，尚未针对当前轨道「{selectedL1Track.card.title}」运行过筛。
+                </span>
+                <button
+                  type="button"
+                  className="text-[11px] font-medium underline"
+                  onClick={() => setShowPriorScanForMismatch(false)}
+                >
+                  收起无关历史
+                </button>
+              </div>
+            ) : null}
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex flex-wrap items-center gap-2">
                 <span className="text-[13px] font-semibold text-ink">
@@ -2239,6 +2322,8 @@ export function WorkbenchView({
               </div>
             </details>
           </section>
+            );
+          })()}
       </div>
       </div>
 

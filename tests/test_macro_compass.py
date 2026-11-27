@@ -2550,6 +2550,28 @@ def test_regime_signal_lights_and_short_card_fields():
     assert by_id["derivatives_crowding"]["level"] == "amber"
     assert by_id["china_cycle"]["level"] == "green"
 
+    # Also verify live NBS china_macro.pmi.records["制造业-指数"] & CN_PMI headline fallback
+    nbs_ov = {
+        "china_macro": {
+            "status": "ok",
+            "pmi": {"status": "ok", "records": [{"月份": "2026年10月份", "制造业-指数": 49.3}]},
+        },
+        "sources_status": {"cn_macro": "ok"},
+        "stale_sources": {},
+    }
+    nbs_lights = {x["id"]: x for x in macro_compass.compute_regime_signal_lights(nbs_ov)}
+    assert nbs_lights["china_cycle"]["level"] == "red"
+    assert nbs_lights["china_cycle"]["tag"] == "景气收缩"
+    assert nbs_lights["china_cycle"]["metric"] == "PMI 49.3"
+
+    hm_only_ov = {
+        "headline_metrics": [{"key": "CN_PMI", "value": 50.1}],
+        "sources_status": {"cn_macro": "ok"},
+    }
+    hm_lights = {x["id"]: x for x in macro_compass.compute_regime_signal_lights(hm_only_ov)}
+    assert hm_lights["china_cycle"]["level"] == "amber"
+    assert hm_lights["china_cycle"]["metric"] == "PMI 50.1"
+
     payload = {
         "regime_title": "高波动分化",
         "regime_summary": "测试简短摘要字段透传。",

@@ -33,6 +33,7 @@ interface Layer1DetailDrawerProps {
   drawer: Layer1DrawerState;
   result: CompassResultPayload | null;
   runId?: string;
+  isActiveL2?: boolean;
   onClose: () => void;
   onActivateL2Card: (card: CompassDirectionCard) => void;
   onLaunchAvoidShort?: (item: CompassAvoidSectorItem, index: number) => void;
@@ -87,6 +88,7 @@ function isHeadwindShortable(item: CompassAvoidSectorItem): boolean {
 export function Layer1DetailDrawer({
   drawer,
   result,
+  isActiveL2 = false,
   onClose,
   onActivateL2Card,
   onLaunchAvoidShort,
@@ -119,7 +121,7 @@ export function Layer1DetailDrawer({
       <aside
         role="complementary"
         aria-labelledby={titleId}
-        className="detail-drawer-sheet fixed inset-y-0 right-0 z-50 flex w-full max-w-[460px] flex-col border-l border-hairline bg-surface shadow-2xl"
+        className="detail-drawer-sheet fixed inset-y-0 right-0 z-50 flex w-full max-w-[460px] flex-col border-l border-hairline bg-surface shadow-2xl lg:top-[52px] lg:h-[calc(100svh-52px)]"
       >
         {/* Sticky Drawer Header */}
         <div className="flex items-start justify-between gap-3 border-b border-hairline-soft bg-sunken/80 px-4 py-3">
@@ -495,17 +497,27 @@ export function Layer1DetailDrawer({
             ) : (
               <span />
             )}
-            <button
-              type="button"
-              className="btn btn-primary btn-sm"
-              onClick={() => {
-                onActivateL2Card(drawer.card);
-                onClose();
-              }}
-            >
-              <span>去 L2 轨道选真龙头</span>
-              <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
-            </button>
+            {isActiveL2 ? (
+              <button
+                type="button"
+                className="btn btn-sm border-accent/45 bg-accent/12 font-medium text-accent hover:bg-accent/20"
+                onClick={onClose}
+              >
+                <span>● 已在 L2 轨道 · 关闭抽屉</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-primary btn-sm"
+                onClick={() => {
+                  onActivateL2Card(drawer.card);
+                  onClose();
+                }}
+              >
+                <span>去 L2 轨道选真龙头</span>
+                <ArrowRight className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            )}
           </div>
         ) : drawer.kind === "avoid" && isHeadwindShortable(drawer.item) && onLaunchAvoidShort ? (
           <div className="flex items-center justify-end gap-2 border-t border-hairline-soft bg-sunken/80 px-4 py-3">

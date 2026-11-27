@@ -191,7 +191,7 @@ export function CommandPalette({ open, onClose, onNavigateScreen, onJumpSymbol }
       className="palette mx-auto mt-[10vh] mb-auto"
     >
       <div className="flex max-h-[72dvh] flex-col">
-        <div className="flex items-center gap-2.5 border-b border-hairline px-4 py-2.5">
+        <div className="flex items-center gap-2.5 border-b border-hairline px-4 py-2.5 transition-colors focus-within:border-accent focus-within:bg-elevated/40">
           <Search className="h-4 w-4 shrink-0 text-muted" aria-hidden="true" />
           <input
             type="search"

@@ -3987,7 +3987,7 @@ function ExpectationGapCard({
             {/* Side-by-Side Consensus vs Variant View */}
             <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
               <div className="rounded-md border border-hairline-soft bg-sunken/60 p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-wide text-muted">
+                <div className="text-[11px] font-semibold text-muted">
                   现价已计入共识 (Priced-in Consensus)
                 </div>
                 <p className="m-0 mt-1 text-xs leading-relaxed text-ink-2">
@@ -3995,7 +3995,7 @@ function ExpectationGapCard({
                 </p>
               </div>
               <div className="rounded-md border border-accent/30 bg-accent/6 p-3">
-                <div className="text-[11px] font-semibold uppercase tracking-wide text-accent">
+                <div className="text-[11px] font-semibold text-accent">
                   我们的二阶预期差 (Our Variant View)
                 </div>
                 <p className="m-0 mt-1 text-xs leading-relaxed text-ink">

@@ -33,31 +33,33 @@
 
   --ink-light: #0f172a;
   --ink-dark: #eef2f6;
-  --ink-2-light: #475569;
+  --ink-2-light: #3f4d63;
   --ink-2-dark: #b4becc;
-  --muted-light: #64748b;
-  --muted-dark: #7c889a;
+  --muted-light: #515f73;
+  --muted-dark: #8e9bae;
 
-  /* Cobalt interactive accent — never collides with bull/bear/risk */
-  --accent-light: #2563eb;
-  --accent-dark: #4f8cff;
+  /* Cobalt interactive accent — never collides with bull/bear/risk (WCAG AA calibrated) */
+  --accent-light: #1d4ed8;
+  --accent-dark: #5b95ff;
+  --accent-hover-light: #1e40af;
+  --accent-hover-dark: #79aaff;
   --accent-fg-light: #ffffff;
-  --accent-fg-dark: #ffffff;
+  --accent-fg-dark: #080a0d;
 
-  /* Dedicated directional & risk semantics */
-  --bull-light: #0d9462;
+  /* Dedicated directional & risk semantics (WCAG AA >= 4.5:1 across all surfaces & 14% tints) */
+  --bull-light: #046c4e;
   --bull-dark: #2ebd85;
-  --bear-light: #dc2626;
-  --bear-dark: #f06565;
+  --bear-light: #b91c1c;
+  --bear-dark: #f26b6b;
 
-  --good-light: #0d9462;
+  --good-light: #046c4e;
   --good-dark: #2ebd85;
-  --warning-light: #b45309;
+  --warning-light: #92400e;
   --warning-dark: #f59e0b;
-  --serious-light: #c2410c;
+  --serious-light: #9a3412;
   --serious-dark: #fb923c;
-  --critical-light: #dc2626;
-  --critical-dark: #f06565;
+  --critical-light: #b91c1c;
+  --critical-dark: #f26b6b;
 
   --shadow-card-light: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 12px rgba(15, 23, 42, 0.025);
   --shadow-card-dark: inset 0 1px 0 rgba(255, 255, 255, 0.035), 0 2px 10px rgba(0, 0, 0, 0.28);
@@ -76,6 +78,7 @@
   --ink-2: var(--ink-2-light);
   --muted: var(--muted-light);
   --accent: var(--accent-light);
+  --accent-hover: var(--accent-hover-light);
   --accent-fg: var(--accent-fg-light);
   --bull: var(--bull-light);
   --bear: var(--bear-light);
@@ -86,14 +89,14 @@
   --shadow-card: var(--shadow-card-light);
 
   /* Chart & categorical slots (CVD-aware) */
-  --slot1: #2563eb;
-  --slot2: #d97706;
-  --slot3: #0d9462;
-  --slot4: #b45309;
-  --slot5: #db2777;
-  --slot6: #0891b2;
-  --slot7: #7c3aed;
-  --slot8: #dc2626;
+  --slot1: #1d4ed8;
+  --slot2: #b45309;
+  --slot3: #046c4e;
+  --slot4: #92400e;
+  --slot5: #be185d;
+  --slot6: #0e7490;
+  --slot7: #6d28d9;
+  --slot8: #b91c1c;
 
   --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
     "Microsoft YaHei", sans-serif;
@@ -121,6 +124,7 @@
     --ink-2: var(--ink-2-dark);
     --muted: var(--muted-dark);
     --accent: var(--accent-dark);
+    --accent-hover: var(--accent-hover-dark);
     --accent-fg: var(--accent-fg-dark);
     --bull: var(--bull-dark);
     --bear: var(--bear-dark);
@@ -129,14 +133,14 @@
     --serious: var(--serious-dark);
     --critical: var(--critical-dark);
     --shadow-card: var(--shadow-card-dark);
-    --slot1: #60a5fa;
+    --slot1: #5b95ff;
     --slot2: #f59e0b;
     --slot3: #2ebd85;
     --slot4: #fbbf24;
     --slot5: #f472b6;
     --slot6: #22d3ee;
     --slot7: #a78bfa;
-    --slot8: #f06565;
+    --slot8: #f26b6b;
   }
 
   @supports (color: light-dark(white, black)) {
@@ -153,6 +157,7 @@
     --ink-2: light-dark(var(--ink-2-light), var(--ink-2-dark));
     --muted: light-dark(var(--muted-light), var(--muted-dark));
     --accent: light-dark(var(--accent-light), var(--accent-dark));
+    --accent-hover: light-dark(var(--accent-hover-light), var(--accent-hover-dark));
     --accent-fg: light-dark(var(--accent-fg-light), var(--accent-fg-dark));
     --bull: light-dark(var(--bull-light), var(--bull-dark));
     --bear: light-dark(var(--bear-light), var(--bear-dark));
@@ -160,14 +165,14 @@
     --warning: light-dark(var(--warning-light), var(--warning-dark));
     --serious: light-dark(var(--serious-light), var(--serious-dark));
     --critical: light-dark(var(--critical-light), var(--critical-dark));
-    --slot1: light-dark(#2563eb, #60a5fa);
-    --slot2: light-dark(#d97706, #f59e0b);
-    --slot3: light-dark(#0d9462, #2ebd85);
-    --slot4: light-dark(#b45309, #fbbf24);
-    --slot5: light-dark(#db2777, #f472b6);
-    --slot6: light-dark(#0891b2, #22d3ee);
-    --slot7: light-dark(#7c3aed, #a78bfa);
-    --slot8: light-dark(#dc2626, #f06565);
+    --slot1: light-dark(#1d4ed8, #5b95ff);
+    --slot2: light-dark(#b45309, #f59e0b);
+    --slot3: light-dark(#046c4e, #2ebd85);
+    --slot4: light-dark(#92400e, #fbbf24);
+    --slot5: light-dark(#be185d, #f472b6);
+    --slot6: light-dark(#0e7490, #22d3ee);
+    --slot7: light-dark(#6d28d9, #a78bfa);
+    --slot8: light-dark(#b91c1c, #f26b6b);
   }
 }
 
@@ -186,6 +191,7 @@
   --ink-2: var(--ink-2-dark);
   --muted: var(--muted-dark);
   --accent: var(--accent-dark);
+  --accent-hover: var(--accent-hover-dark);
   --accent-fg: var(--accent-fg-dark);
   --bull: var(--bull-dark);
   --bear: var(--bear-dark);
@@ -194,14 +200,14 @@
   --serious: var(--serious-dark);
   --critical: var(--critical-dark);
   --shadow-card: var(--shadow-card-dark);
-  --slot1: #60a5fa;
+  --slot1: #5b95ff;
   --slot2: #f59e0b;
   --slot3: #2ebd85;
   --slot4: #fbbf24;
   --slot5: #f472b6;
   --slot6: #22d3ee;
   --slot7: #a78bfa;
-  --slot8: #f06565;
+  --slot8: #f26b6b;
 }
 
 :root[data-theme="light"] {
@@ -219,6 +225,7 @@
   --ink-2: var(--ink-2-light);
   --muted: var(--muted-light);
   --accent: var(--accent-light);
+  --accent-hover: var(--accent-hover-light);
   --accent-fg: var(--accent-fg-light);
   --bull: var(--bull-light);
   --bear: var(--bear-light);
@@ -227,14 +234,14 @@
   --serious: var(--serious-light);
   --critical: var(--critical-light);
   --shadow-card: var(--shadow-card-light);
-  --slot1: #2563eb;
-  --slot2: #d97706;
-  --slot3: #0d9462;
-  --slot4: #b45309;
-  --slot5: #db2777;
-  --slot6: #0891b2;
-  --slot7: #7c3aed;
-  --slot8: #dc2626;
+  --slot1: #1d4ed8;
+  --slot2: #b45309;
+  --slot3: #046c4e;
+  --slot4: #92400e;
+  --slot5: #be185d;
+  --slot6: #0e7490;
+  --slot7: #6d28d9;
+  --slot8: #b91c1c;
 }
 
 @theme inline {
@@ -251,6 +258,7 @@
   --color-ink-2: var(--ink-2);
   --color-muted: var(--muted);
   --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
   --color-accent-fg: var(--accent-fg);
   --color-bull: var(--bull);
   --color-bear: var(--bear);
@@ -280,8 +288,14 @@ html {
   font-family: var(--font-sans);
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   accent-color: var(--accent);
+  caret-color: var(--accent);
   scrollbar-color: var(--muted) transparent;
   scrollbar-width: thin;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+  color: var(--ink);
 }
 
 body {
@@ -623,8 +637,7 @@ dialog.modal-dialog.palette {
 }
 .prose-desk blockquote {
   background: color-mix(in srgb, var(--accent) 7%, var(--sunken));
-  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
-  border-inline-start: 3px solid var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
   border-radius: 6px;
   padding: 10px 14px;
   color: var(--ink-2);
@@ -743,10 +756,11 @@ select.input {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-fg);
+  font-weight: 600;
 }
 .btn-primary:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--accent) 88%, #000);
-  border-color: color-mix(in srgb, var(--accent) 88%, #000);
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
 }
 .btn-danger {
   background: transparent;
@@ -955,8 +969,7 @@ details.disclosure:not([open])::details-content {
   padding: 10px 14px;
   border-radius: 8px;
   background: color-mix(in srgb, var(--accent) 7%, var(--sunken));
-  border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent);
-  border-inline-start: 3px solid var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 26%, transparent);
 }
 
 .section-title {

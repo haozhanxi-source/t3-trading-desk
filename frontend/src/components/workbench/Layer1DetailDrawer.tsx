@@ -121,7 +121,7 @@ export function Layer1DetailDrawer({
       <aside
         role="complementary"
         aria-labelledby={titleId}
-        className="detail-drawer-sheet fixed inset-y-0 right-0 z-50 flex w-full max-w-[460px] flex-col border-l border-hairline bg-surface shadow-2xl lg:top-[52px] lg:h-[calc(100svh-52px)]"
+        className="detail-drawer-sheet"
       >
         {/* Sticky Drawer Header */}
         <div className="flex items-start justify-between gap-3 border-b border-hairline-soft bg-sunken/80 px-4 py-3">
@@ -134,17 +134,17 @@ export function Layer1DetailDrawer({
                     const Icon = dm.Icon;
                     return (
                       <span
-                        className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${dm.cls}`}
+                        className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[11px] font-semibold ${dm.cls}`}
                       >
                         <Icon className="h-3 w-3" aria-hidden="true" />
                         {dm.label}
                       </span>
                     );
                   })()}
-                  <span className="rounded bg-subtle px-1.5 py-0.5 font-mono text-[10px] text-muted">
+                  <span className="rounded bg-subtle px-1.5 py-0.5 font-mono text-[11px] text-muted">
                     {drawer.card.horizon || "1Q~1Y"}
                   </span>
-                  <span className="rounded bg-subtle px-1.5 py-0.5 text-[10px] text-muted">
+                  <span className="rounded bg-subtle px-1.5 py-0.5 text-[11px] text-muted">
                     置信度: {drawer.card.conviction === "high" ? "高" : drawer.card.conviction === "medium" ? "中" : "低"}
                   </span>
                 </div>
@@ -154,7 +154,7 @@ export function Layer1DetailDrawer({
               </>
             ) : drawer.kind === "avoid" ? (
               <>
-                <div className="inline-flex items-center gap-1 rounded border border-bear/35 bg-bear/12 px-1.5 py-0.5 text-[10px] font-semibold text-bear">
+                <div className="inline-flex items-center gap-1 rounded border border-bear/35 bg-bear/12 px-1.5 py-0.5 text-[11px] font-semibold text-bear">
                   <XCircle className="h-3 w-3" aria-hidden="true" />
                   规避 / 逆风板块详情
                 </div>
@@ -164,7 +164,7 @@ export function Layer1DetailDrawer({
               </>
             ) : drawer.kind === "audit" ? (
               <>
-                <div className="inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/12 px-1.5 py-0.5 text-[10px] font-semibold text-warning">
+                <div className="inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/12 px-1.5 py-0.5 text-[11px] font-semibold text-warning">
                   <ShieldAlert className="h-3 w-3" aria-hidden="true" />
                   宪法护栏与同源因子审计
                 </div>
@@ -174,7 +174,7 @@ export function Layer1DetailDrawer({
               </>
             ) : (
               <>
-                <div className="inline-flex items-center gap-1 rounded border border-accent/35 bg-accent/12 px-1.5 py-0.5 text-[10px] font-semibold text-accent">
+                <div className="inline-flex items-center gap-1 rounded border border-accent/35 bg-accent/12 px-1.5 py-0.5 text-[11px] font-semibold text-accent">
                   <Layers className="h-3 w-3" aria-hidden="true" />
                   本轮宏观四维推演底座
                 </div>
@@ -229,7 +229,7 @@ export function Layer1DetailDrawer({
               {/* Priced-in vs Unpriced Gap */}
               <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
                 <div className="rounded-md border border-hairline-soft bg-sunken/70 p-3">
-                  <div className="text-[10.5px] font-semibold uppercase tracking-wide text-muted">
+                  <div className="text-[11px] font-semibold text-muted">
                     市场已定价（共识预期）
                   </div>
                   <p className="mt-1 text-[12px] text-ink-2">
@@ -237,7 +237,7 @@ export function Layer1DetailDrawer({
                   </p>
                 </div>
                 <div className="rounded-md border border-bull/30 bg-bull/6 p-3">
-                  <div className="text-[10.5px] font-semibold uppercase tracking-wide text-bull">
+                  <div className="text-[11px] font-semibold text-bull">
                     真预期差（尚未定价）
                   </div>
                   <p className="mt-1 text-[12px] font-medium text-ink">
@@ -251,13 +251,13 @@ export function Layer1DetailDrawer({
                 <div className="text-[11px] font-semibold text-ink">双维共振驱动拆解</div>
                 <div className="space-y-1.5 text-[12px]">
                   <div>
-                    <span className="mr-1.5 inline-block rounded bg-accent/12 px-1.5 py-px text-[10px] font-semibold text-accent">
+                    <span className="mr-1.5 inline-block rounded bg-accent/12 px-1.5 py-px text-[11px] font-semibold text-accent">
                       主驱动 · {drawer.card.primary_driver?.dimension || "未标注"}
                     </span>
                     <span className="text-ink-2">{drawer.card.primary_driver?.summary || "—"}</span>
                   </div>
                   <div>
-                    <span className="mr-1.5 inline-block rounded bg-subtle px-1.5 py-px text-[10px] font-semibold text-ink-2">
+                    <span className="mr-1.5 inline-block rounded bg-subtle px-1.5 py-px text-[11px] font-semibold text-ink-2">
                       次驱动 · {drawer.card.secondary_driver?.dimension || "未标注"}
                     </span>
                     <span className="text-ink-2">{drawer.card.secondary_driver?.summary || "—"}</span>

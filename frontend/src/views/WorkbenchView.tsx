@@ -1341,7 +1341,7 @@ export function WorkbenchView({
         <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-hairline-soft pb-1 pt-1">
           <div className="flex flex-wrap items-center gap-3">
             <div className="flex items-center gap-1.5">
-              <span className="inline-flex items-center rounded border border-hairline bg-elevated px-1.5 py-0.5 font-mono text-[10px] font-semibold uppercase tracking-wide text-ink-2">
+              <span className="inline-flex items-center rounded border border-hairline bg-elevated px-1.5 py-0.5 font-mono text-[11px] font-semibold text-ink-2">
                 Layer 2
               </span>
               <h2 className="m-0 text-sm font-semibold text-ink">日线缠论过筛台</h2>
@@ -1364,7 +1364,7 @@ export function WorkbenchView({
                 <Compass className="h-3.5 w-3.5" aria-hidden="true" />
                 <span>按 L1 轨道过筛</span>
                 {selectedL1Track ? (
-                  <span className="max-w-[140px] truncate rounded bg-accent/14 px-1.5 py-px text-[10px] font-medium text-accent">
+                  <span className="max-w-[140px] truncate rounded bg-accent/14 px-1.5 py-px text-[11px] font-medium text-accent">
                     {selectedL1Track.card.title}
                   </span>
                 ) : null}
@@ -1531,7 +1531,7 @@ export function WorkbenchView({
                   setPickerExpanded(true);
                 }}
               >
-                或切换到「手动自由选池」→
+                或切换到「手动自由选池」
               </button>
             </div>
           )}
@@ -2047,10 +2047,17 @@ export function WorkbenchView({
                       return (
                         <tr
                           key={`${row.market}-${row.symbol}`}
+                          tabIndex={0}
                           className={`clickable ${
                             compassAlign?.status === "aligned" ? "bg-bull/[0.03]" : ""
                           }`}
                           onClick={() => onJumpWarRoom(row.symbol)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              onJumpWarRoom(row.symbol);
+                            }
+                          }}
                         >
                           <th scope="row" style={{ paddingInline: 8 }}>
                             <div
@@ -2062,7 +2069,7 @@ export function WorkbenchView({
                                   {row.symbol}
                                 </span>
                                 {marketLabel ? (
-                                  <span className="truncate text-[10px] font-normal text-muted">
+                                  <span className="truncate text-[11px] font-normal text-muted">
                                     {marketLabel}
                                   </span>
                                 ) : null}

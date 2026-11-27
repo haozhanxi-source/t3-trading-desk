@@ -792,7 +792,7 @@ export function Layer1CompassPanel({
             <h2 className="text-[14px] font-semibold text-ink">第一层 · 宏观战略罗盘</h2>
           </div>
           {history.length > 0 ? (
-            <div className="inline-flex items-center gap-1 rounded-md border border-hairline-soft bg-sunken px-2 py-0.5 text-[11px]">
+            <div className="inline-flex items-center gap-1 rounded-md border border-hairline-soft bg-sunken px-2 py-0.5 text-[11px] focus-within:outline-2 focus-within:outline-offset-2 focus-within:outline-accent">
               <History className="h-3 w-3 text-muted" aria-hidden="true" />
               <select
                 aria-label="切换历史 L1 推演记录"
@@ -813,7 +813,7 @@ export function Layer1CompassPanel({
             <button
               type="button"
               onClick={() => setDrawer({ kind: "audit" })}
-              className="inline-flex items-center gap-1 rounded-full border border-warning/40 bg-warning/10 px-2 py-0.5 text-[10.5px] font-medium text-warning transition-colors hover:bg-warning/20"
+              className="inline-flex items-center gap-1 rounded-md border border-warning/40 bg-warning/10 px-2 py-0.5 text-[11px] font-medium text-warning transition-colors hover:bg-warning/20"
               title="点击查看宪法护栏拦截与降档明细"
             >
               <ShieldAlert className="h-3 w-3" aria-hidden="true" />
@@ -1026,7 +1026,7 @@ export function Layer1CompassPanel({
                   >
                     <span>{item.sector}</span>
                     {shortable ? (
-                      <span className="rounded bg-bear/16 px-1 py-px text-[9.5px] font-semibold text-bear">
+                      <span className="rounded bg-bear/16 px-1 py-px text-[11px] font-semibold text-bear">
                         可空
                       </span>
                     ) : null}
@@ -1178,7 +1178,6 @@ export function Layer1CompassPanel({
             const firstFlagMsg = cappedFlag?.message || flags[0]?.message || null;
 
             const sharedFactors = concentratedCardFactors.get(card.id) ?? [];
-            const isFactorDimmed = Boolean(highlightFactor && !sharedFactors.includes(highlightFactor));
             const isFactorHighlighted = Boolean(highlightFactor && sharedFactors.includes(highlightFactor));
             const isActiveL2 = activeL2CardId === card.id;
             const logged = isCardLogged(card.id);
@@ -1202,7 +1201,7 @@ export function Layer1CompassPanel({
                     : isFactorHighlighted
                       ? "border-warning ring-1 ring-warning/45"
                       : "border-hairline hover:border-ink-2/40"
-                } ${isFactorDimmed ? "opacity-45" : ""}`}
+                }`}
               >
                 {/* Shared Macro Factor Top Color Strip (Mandatory Redline #2) */}
                 {sharedFactors.length > 0 ? (
@@ -1237,36 +1236,36 @@ export function Layer1CompassPanel({
                   <div className="flex flex-wrap items-center justify-between gap-1.5">
                     <div className="flex flex-wrap items-center gap-1">
                       <span
-                        className={`inline-flex items-center gap-0.5 rounded border px-1.5 py-px text-[10px] font-semibold ${dirCls}`}
+                        className={`inline-flex items-center gap-0.5 rounded border px-1.5 py-px text-[11px] font-semibold ${dirCls}`}
                       >
                         <DirIcon className="h-3 w-3" aria-hidden="true" />
                         {dirLabel}
                       </span>
                       {cappedFlag ? (
                         <span
-                          className="inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/12 px-1.5 py-px text-[10px] font-semibold text-warning"
+                          className="inline-flex items-center gap-1 rounded border border-warning/40 bg-warning/12 px-1.5 py-px text-[11px] font-semibold text-warning"
                           title={cappedFlag.message}
                         >
-                          <span className="line-through opacity-65">高</span>
+                          <span className="line-through">高</span>
                           <span>降档·中</span>
                         </span>
                       ) : (
-                        <span className="rounded bg-subtle px-1.5 py-px text-[10px] font-medium text-ink-2">
+                        <span className="rounded bg-subtle px-1.5 py-px text-[11px] font-medium text-ink-2">
                           {card.conviction === "high" ? "高确信" : card.conviction === "medium" ? "中确信" : "观察"}
                         </span>
                       )}
-                      <span className="rounded bg-subtle px-1.5 py-px text-[10px] text-muted">
+                      <span className="rounded bg-subtle px-1.5 py-px text-[11px] text-muted">
                         {assetScopeLabel(card.asset_scope)}
                       </span>
                       {sharedFactors.length > 0 ? (
-                        <span className="rounded bg-warning/14 px-1.5 py-px text-[9.5px] font-medium text-warning">
+                        <span className="rounded bg-warning/14 px-1.5 py-px text-[11px] font-medium text-warning">
                           共因子: {sharedFactors[0]}
                         </span>
                       ) : null}
                     </div>
                     {logged ? (
                       <span
-                        className="inline-flex items-center gap-0.5 rounded bg-bull/14 px-1.5 py-px text-[9.5px] font-semibold text-bull"
+                        className="inline-flex items-center gap-0.5 rounded bg-bull/14 px-1.5 py-px text-[11px] font-semibold text-bull"
                         title="已记入 Track C 影子机会账本"
                       >
                         <BookmarkCheck className="h-3 w-3" aria-hidden="true" />

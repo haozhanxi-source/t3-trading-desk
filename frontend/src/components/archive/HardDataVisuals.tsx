@@ -907,7 +907,7 @@ function EquityHardDataCard({
                   href={typeof f.url === "string" ? f.url : "#"}
                   target="_blank"
                   rel="noreferrer"
-                  className={`btn btn-sm ${isPost && isCap ? "border-amber-500/60" : ""}`}
+                  className={`btn btn-sm ${isPost && isCap ? "border-warning/60" : ""}`}
                   title={Array.isArray(f.item_labels) ? (f.item_labels as unknown[]).map(String).join(" · ") : undefined}
                 >
                   <span className="font-mono">

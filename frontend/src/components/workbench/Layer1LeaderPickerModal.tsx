@@ -391,15 +391,19 @@ export function Layer1LeaderPickerModal({
         {isPair ? (
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             <div
-              onClick={() => setActiveLeg("long")}
-              className={`flex cursor-pointer flex-col gap-1.5 rounded-md border p-2.5 transition-colors ${
+              className={`relative flex flex-col gap-1.5 rounded-md border p-2.5 transition-colors ${
                 activeLeg === "long" ? "border-bull bg-bull/8" : "border-hairline bg-sunken/50"
               }`}
             >
-              <div className="flex items-center justify-between text-[11px]">
+              <button
+                type="button"
+                aria-pressed={activeLeg === "long"}
+                onClick={() => setActiveLeg("long")}
+                className="flex w-full cursor-pointer items-center justify-between gap-2 text-left text-[11px] after:absolute after:inset-0 after:rounded-md"
+              >
                 <span className="font-semibold text-bull">多头腿标的 ({longSymbols.length})</span>
-                {activeLeg === "long" ? <span className="text-[10px] text-bull">正在添加至此腿</span> : null}
-              </div>
+                {activeLeg === "long" ? <span className="text-bull">正在添加至此腿</span> : null}
+              </button>
               <div className="flex min-h-7 flex-wrap items-center gap-1.5">
                 {longSymbols.length === 0 ? (
                   <span className="text-[11px] text-muted">点击选中后在下方搜索/点选添加</span>
@@ -413,11 +417,8 @@ export function Layer1LeaderPickerModal({
                       <button
                         type="button"
                         aria-label={`移除 ${sym}`}
-                        className="cursor-pointer border-0 bg-transparent p-0 text-muted hover:text-critical"
-                        onClick={(ev) => {
-                          ev.stopPropagation();
-                          setLongSymbols((prev) => prev.filter((x) => x !== sym));
-                        }}
+                        className="relative z-10 cursor-pointer border-0 bg-transparent p-0 text-muted hover:text-critical"
+                        onClick={() => setLongSymbols((prev) => prev.filter((x) => x !== sym))}
                       >
                         <X className="h-3 w-3" aria-hidden="true" />
                       </button>
@@ -428,15 +429,19 @@ export function Layer1LeaderPickerModal({
             </div>
 
             <div
-              onClick={() => setActiveLeg("short")}
-              className={`flex cursor-pointer flex-col gap-1.5 rounded-md border p-2.5 transition-colors ${
+              className={`relative flex flex-col gap-1.5 rounded-md border p-2.5 transition-colors ${
                 activeLeg === "short" ? "border-bear bg-bear/8" : "border-hairline bg-sunken/50"
               }`}
             >
-              <div className="flex items-center justify-between text-[11px]">
+              <button
+                type="button"
+                aria-pressed={activeLeg === "short"}
+                onClick={() => setActiveLeg("short")}
+                className="flex w-full cursor-pointer items-center justify-between gap-2 text-left text-[11px] after:absolute after:inset-0 after:rounded-md"
+              >
                 <span className="font-semibold text-bear">空头腿标的 ({shortSymbols.length}) · A股禁空</span>
-                {activeLeg === "short" ? <span className="text-[10px] text-bear">正在添加至此腿</span> : null}
-              </div>
+                {activeLeg === "short" ? <span className="text-bear">正在添加至此腿</span> : null}
+              </button>
               <div className="flex min-h-7 flex-wrap items-center gap-1.5">
                 {shortSymbols.length === 0 ? (
                   <span className="text-[11px] text-muted">点击选中后在下方搜索/点选添加</span>
@@ -450,11 +455,8 @@ export function Layer1LeaderPickerModal({
                       <button
                         type="button"
                         aria-label={`移除 ${sym}`}
-                        className="cursor-pointer border-0 bg-transparent p-0 text-muted hover:text-critical"
-                        onClick={(ev) => {
-                          ev.stopPropagation();
-                          setShortSymbols((prev) => prev.filter((x) => x !== sym));
-                        }}
+                        className="relative z-10 cursor-pointer border-0 bg-transparent p-0 text-muted hover:text-critical"
+                        onClick={() => setShortSymbols((prev) => prev.filter((x) => x !== sym))}
                       >
                         <X className="h-3 w-3" aria-hidden="true" />
                       </button>

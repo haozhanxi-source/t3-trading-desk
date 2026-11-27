@@ -1,0 +1,165 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-27T09:00:00.000Z",
+  "title": "Design System: T3 Trading Desk",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Terminal Cobalt Dark",
+        "canonical": "#5b95ff",
+        "tonalRamp": ["#0b1a36", "#142f66", "#1d4ed8", "#3b76f6", "#5b95ff", "#79aaff", "#a8c7ff", "#dce8ff"]
+      },
+      "primary-light": {
+        "role": "primary",
+        "displayName": "Institutional Cobalt Light",
+        "canonical": "#1d4ed8",
+        "tonalRamp": ["#0b1a36", "#152c69", "#1e40af", "#1d4ed8", "#3b82f6", "#60a5fa", "#93c5fd", "#dbeafe"]
+      },
+      "bull": {
+        "role": "secondary",
+        "displayName": "Jade Bull",
+        "canonical": "#2ebd85",
+        "tonalRamp": ["#06241a", "#064e3b", "#046c4e", "#0d9462", "#2ebd85", "#5bd3a3", "#9ee6c8", "#dcf7ec"]
+      },
+      "bear": {
+        "role": "secondary",
+        "displayName": "Signal Crimson Bear",
+        "canonical": "#f26b6b",
+        "tonalRamp": ["#330c0c", "#7f1d1d", "#b91c1c", "#dc2626", "#f26b6b", "#f89494", "#fcc2c2", "#fee6e6"]
+      },
+      "warning": {
+        "role": "secondary",
+        "displayName": "Desk Amber Warning",
+        "canonical": "#f59e0b",
+        "tonalRamp": ["#2d1604", "#6b2e07", "#92400e", "#c97409", "#f59e0b", "#fbbf24", "#fcd87a", "#fef3c7"]
+      },
+      "obsidian-surface": {
+        "role": "neutral",
+        "displayName": "Obsidian Surface",
+        "canonical": "#12151b",
+        "tonalRamp": ["#080a0d", "#0c0e12", "#12151b", "#191d26", "#222733", "#4c566a", "#8e9bae", "#eef2f6"]
+      },
+      "slate-surface": {
+        "role": "neutral",
+        "displayName": "Pure Card White",
+        "canonical": "#ffffff",
+        "tonalRamp": ["#0f172a", "#3f4d63", "#515f73", "#94a3b8", "#e2e8f0", "#e9edf2", "#f3f5f8", "#ffffff"]
+      }
+    },
+    "typographyMeta": {
+      "headline-page": { "displayName": "Page Headline", "purpose": "Top-level view header across the four workspace screens." },
+      "headline-editorial": { "displayName": "Editorial Headline", "purpose": "Strictly reserved for long-form research thesis titles." },
+      "kpi-figure": { "displayName": "KPI Figure", "purpose": "Monospace tabular numerals for account equity, risk budget, and macro KPIs." },
+      "body-ui": { "displayName": "UI Body", "purpose": "Dense operational copy, table rows, and form inputs." },
+      "body-editorial": { "displayName": "Editorial Body", "purpose": "72ch long-form thesis reading inside .prose-desk." },
+      "label-meta": { "displayName": "Meta Label", "purpose": "11px minimum floor for badges, column headers, and timestamps." }
+    },
+    "shadows": [
+      { "name": "card-dark", "value": "inset 0 1px 0 rgba(255, 255, 255, 0.035), 0 2px 10px rgba(0, 0, 0, 0.28)", "purpose": "Subtle top edge catchlight and grounding for Obsidian Dark panels." },
+      { "name": "card-light", "value": "0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 12px rgba(15, 23, 42, 0.025)", "purpose": "Whisper-soft card grounding on Crisp Slate Light pages." },
+      { "name": "drawer-lateral", "value": "-14px 0 40px rgba(0, 0, 0, 0.28)", "purpose": "Directional separation for the non-modal right detail drawer." },
+      { "name": "dialog-modal", "value": "0 24px 64px rgba(0, 0, 0, 0.48)", "purpose": "High-elevation framing for native <dialog> modals and Command Palette." }
+    ],
+    "motion": [
+      { "name": "control-fast", "value": "120ms ease", "purpose": "Hover, border, and selection feedback on buttons, inputs, chips, and tabs." },
+      { "name": "drawer-enter", "value": "170ms cubic-bezier(0.22, 1, 0.36, 1)", "purpose": "Lateral slide-in for the right inspection drawer under reduced-motion guard." },
+      { "name": "disclosure-expand", "value": "180ms ease-out", "purpose": "Height interpolation for native <details class='disclosure'> panels." }
+    ],
+    "breakpoints": [
+      { "name": "table-stack", "value": "600px" },
+      { "name": "sm", "value": "640px" },
+      { "name": "md", "value": "768px" },
+      { "name": "lg", "value": "1024px" },
+      { "name": "container-max", "value": "1680px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary commitment action using decoupled cobalt fill with WCAG AA dark-on-cobalt contrast in dark mode.",
+      "html": "<button class=\"ds-btn-primary\" type=\"button\">执行缠论扫描</button>",
+      "css": ".ds-btn-primary { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--accent, #5b95ff); background: var(--accent, #5b95ff); color: var(--accent-fg, #080a0d); font-family: var(--font-sans, Inter, sans-serif); font-size: 12.5px; font-weight: 600; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease, transform 80ms ease; } .ds-btn-primary:hover { background: var(--accent-hover, #79aaff); border-color: var(--accent-hover, #79aaff); } .ds-btn-primary:focus-visible { outline: 2px solid var(--accent, #5b95ff); outline-offset: 2px; } .ds-btn-primary:active { transform: translateY(0.5px); }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "Default desk control resting on surface with hairline perimeter.",
+      "html": "<button class=\"ds-btn-secondary\" type=\"button\">刷新快照</button>",
+      "css": ".ds-btn-secondary { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 32px; padding: 4px 12px; border-radius: 6px; border: 1px solid var(--hairline, rgba(255,255,255,0.085)); background: var(--surface, #12151b); color: var(--ink, #eef2f6); font-family: var(--font-sans, Inter, sans-serif); font-size: 12.5px; font-weight: 500; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease; } .ds-btn-secondary:hover { background: var(--elevated, #191d26); border-color: rgba(238,242,246,0.22); } .ds-btn-secondary:focus-visible { outline: 2px solid var(--accent, #5b95ff); outline-offset: 2px; }"
+    },
+    {
+      "name": "Filter Chip",
+      "kind": "chip",
+      "refersTo": "chip-filter",
+      "description": "Interactive 6px micro-radius toggle chip with tinted selected state.",
+      "html": "<button class=\"ds-chip\" type=\"button\" aria-pressed=\"true\">已对齐多头 · 4</button>",
+      "css": ".ds-chip { display: inline-flex; align-items: center; gap: 5px; min-height: 26px; padding: 2px 9px; border-radius: 6px; border: 1px solid var(--hairline, rgba(255,255,255,0.085)); background: transparent; color: var(--ink-2, #b4becc); font-size: 12px; font-weight: 500; cursor: pointer; transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease; } .ds-chip:hover { background: var(--elevated, #191d26); color: var(--ink, #eef2f6); } .ds-chip[aria-pressed='true'] { background: rgba(91,149,255,0.14); border-color: rgba(91,149,255,0.52); color: var(--ink, #eef2f6); font-weight: 600; } .ds-chip:focus-visible { outline: 2px solid var(--accent, #5b95ff); outline-offset: 2px; }"
+    },
+    {
+      "name": "Recessed Input Field",
+      "kind": "input",
+      "refersTo": "input-field",
+      "description": "Sunken numerical/text input with tabular numerals and crisp cobalt focus ring.",
+      "html": "<input class=\"ds-input\" type=\"text\" value=\"NI0 · 沪镍主力\" aria-label=\"标的代码\" />",
+      "css": ".ds-input { min-height: 32px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--hairline, rgba(255,255,255,0.085)); background: var(--sunken, #080a0d); color: var(--ink, #eef2f6); font-size: 13px; font-variant-numeric: tabular-nums; transition: border-color 120ms ease, background-color 120ms ease; } .ds-input:hover { border-color: rgba(238,242,246,0.24); } .ds-input:focus-visible { outline: 2px solid var(--accent, #5b95ff); outline-offset: 0; border-color: transparent; background: var(--surface, #12151b); }"
+    },
+    {
+      "name": "Segmented Navigation",
+      "kind": "nav",
+      "refersTo": "button-secondary",
+      "description": "Ordered four-stage workflow switcher inside a recessed 8px track.",
+      "html": "<div class=\"ds-segmented\" role=\"tablist\"><button class=\"ds-seg-btn\" aria-selected=\"true\">哨兵总控</button><button class=\"ds-seg-btn\" aria-selected=\"false\">机会扫描</button><button class=\"ds-seg-btn\" aria-selected=\"false\">研报档案</button></div>",
+      "css": ".ds-segmented { display: inline-flex; align-items: center; gap: 2px; padding: 2px; border-radius: 8px; border: 1px solid var(--hairline, rgba(255,255,255,0.085)); background: var(--sunken, #080a0d); } .ds-seg-btn { min-height: 26px; padding: 2px 10px; border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--muted, #8e9bae); font-size: 12px; font-weight: 500; cursor: pointer; transition: background-color 120ms ease, color 120ms ease; } .ds-seg-btn:hover { color: var(--ink, #eef2f6); } .ds-seg-btn[aria-selected='true'] { background: var(--surface, #12151b); color: var(--ink, #eef2f6); font-weight: 600; border-color: rgba(255,255,255,0.045); box-shadow: 0 1px 2px rgba(0,0,0,0.14); }"
+    },
+    {
+      "name": "Hairline Metric Strip",
+      "kind": "custom",
+      "refersTo": "card-panel",
+      "description": "Border-divided KPI strip replacing nested box-in-box cards inside panels.",
+      "html": "<div class=\"ds-metric-strip\"><div class=\"ds-metric-cell\"><span class=\"ds-metric-label\">日线中枢区间</span><span class=\"ds-metric-val\">124,800 – 131,200</span></div><div class=\"ds-metric-cell\"><span class=\"ds-metric-label\">30m 紧凑止损</span><span class=\"ds-metric-val\">-1.42%</span></div></div>",
+      "css": ".ds-metric-strip { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 14px; padding: 8px 0; border-top: 1px solid rgba(255,255,255,0.045); border-bottom: 1px solid rgba(255,255,255,0.045); background: var(--surface, #12151b); } .ds-metric-cell { display: flex; flex-direction: column; gap: 2px; padding-inline-start: 10px; border-inline-start: 2px solid rgba(255,255,255,0.085); } .ds-metric-label { font-size: 11px; color: var(--muted, #8e9bae); } .ds-metric-val { font-family: var(--font-mono, JetBrains Mono, monospace); font-variant-numeric: tabular-nums; font-size: 13px; font-weight: 600; color: var(--ink, #eef2f6); }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Precision Quantitative Terminal × Institutional IC Memo",
+    "overview": "T3 Trading Desk is an authenticated Operate-mode workbench built for medium-to-long-horizon (1Q–1Y) multi-asset macro research, daily + 30-minute Chanlun structural analysis, and disciplined portfolio risk execution. The interface rejects marketing theatrics and retail-broker clutter in favor of instrument-grade clarity: dense where quantitative comparison demands scanability, calm and paper-warm where investment-committee theses (thesis.md) require sustained reading.",
+    "keyCharacteristics": [
+      "Strict semantic decoupling: Cobalt interactive accent is reserved exclusively for actions, active navigation, and focus states.",
+      "Tonal layering over heavy shadows: Depth comes from stepped obsidian/slate luminance planes and hairline borders.",
+      "Micro-radius precision: Crisp 4px–10px corner geometry distinguishes read-only badges, interactive controls, tables, and workspace panels.",
+      "Tabular numerical discipline: Prices, percentages, stop distances, and risk budgets always render in monospace with tabular-nums.",
+      "Paper-grade thesis reading: Long-form research memos sit inside a 72ch measure with 1.8 line-height."
+    ],
+    "rules": [
+      { "name": "The Decoupled Cobalt Rule", "body": "Cobalt (primary) communicates interaction and focus only; green/red/amber communicate market direction and risk only. Never color a neutral action button green or use cobalt to imply a bullish call.", "section": "colors" },
+      { "name": "The Dual-Theme Contrast Floor Rule", "body": "Every foreground token—including muted metadata and tinted semantic badges—must hold at least 4.5:1 contrast against every surface it can sit on in both Obsidian Dark and Crisp Slate Light.", "section": "colors" },
+      { "name": "The Zero-Hardcoded-Palette Rule", "body": "UI components reference semantic CSS custom properties and never hardcode Tailwind utility hues like text-amber-400 or border-amber-500/60.", "section": "colors" },
+      { "name": "The 11px Floor Rule", "body": "No legible UI text—especially Chinese characters or financial numerals—may drop below 11px (0.6875rem).", "section": "typography" },
+      { "name": "The No-Uppercase-CJK-Eyebrow Rule", "body": "Never apply uppercase tracking-wider eyebrow kickers above section headings or Chinese labels.", "section": "typography" },
+      { "name": "The Tabular Monospace Rule", "body": "Monospace is strictly functional—used for tickers, prices, dates, percentages, R-multiples, and code identifiers.", "section": "typography" },
+      { "name": "The No-Nested-Cards Rule", "body": "Never nest .card inside .card or wrap KPI cells in individual bordered boxes inside a card.", "section": "elevation" },
+      { "name": "The Single-Elevation-Source Rule", "body": "Overlay containers define their positioning, border, and shadow once in CSS; never stack conflicting shadow utilities.", "section": "elevation" },
+      { "name": "The No-Side-Tab-Bar Rule", "body": "Never place a thick one-sided accent bar along the edge of a rounded card, callout, or blockquote.", "section": "shapes" }
+    ],
+    "dos": [
+      "Do keep Cobalt (primary) strictly for interactive controls, active tabs, and focus rings, and reserve green/red/amber solely for market direction and sentinel risk.",
+      "Do validate every text/surface combination against WCAG AA (>= 4.5:1) in both Obsidian Dark and Crisp Slate Light using npx @google/design.md lint DESIGN.md.",
+      "Do use 11px (0.6875rem) as the hard minimum font size across all badges, chart legends, table headers, and metadata.",
+      "Do format all prices, percentages, stop distances, and risk figures with font-mono and tabular-nums (.tnum / td.num).",
+      "Do ensure every clickable card, table row, SVG data point, and composite input has full keyboard focus (:focus-visible / :focus-within) and Enter/Space handling.",
+      "Do use .metric-strip and .card-subtle for internal hierarchy inside panels instead of stacking bordered cards inside cards."
+    ],
+    "donts": [
+      "Don't put thick one-sided accent bars (border-l-[3px], border-inline-start: 3px solid) on rounded cards, callouts, or blockquotes.",
+      "Don't hardcode Tailwind color utilities (text-amber-400, border-amber-500/60, bg-blue-500) in components; always consume semantic CSS tokens.",
+      "Don't put decorative trailing arrows (→) inside CTA buttons or uppercase tracking-wider eyebrow kickers above Chinese headings.",
+      "Don't stack opacity-45/opacity-60 on already-muted text (text-muted), which collapses contrast well below WCAG AA.",
+      "Don't mix rounded-full filter pills with 6px .chip controls or bypass .data-table / .btn / .input primitives without an explicit domain reason.",
+      "Don't use decorative gradients, gratuitous page-load animations, or emojis as replacement icons when lucide-react strokes belong there."
+    ]
+  }
+}

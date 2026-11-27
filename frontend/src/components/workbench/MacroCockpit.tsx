@@ -141,11 +141,11 @@ function MicroRulerRow({
         <span className="truncate text-muted">{label}</span>
         <div className="flex shrink-0 items-baseline gap-1">
           {badgeText ? (
-            <span className={`rounded px-1 py-px text-[9px] font-medium ${badgeCls}`}>{badgeText}</span>
+            <span className={`rounded px-1 py-px text-[11px] font-medium ${badgeCls}`}>{badgeText}</span>
           ) : null}
           <span className="font-mono text-[12px] font-semibold tabular-nums text-ink">{valueText}</span>
           {deltaText ? (
-            <span className="font-mono text-[9.5px] tabular-nums text-muted">{deltaText}</span>
+            <span className="font-mono text-[11px] tabular-nums text-muted">{deltaText}</span>
           ) : null}
         </div>
       </div>
@@ -428,11 +428,11 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
         {/* Group 1: US Rates & Credit */}
         <div className="flex flex-col gap-2">
           <div className="flex flex-wrap items-center justify-between gap-1.5">
-            <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-muted">
+            <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-muted">
               <Scale className="h-3 w-3 text-accent" aria-hidden="true" />
               美债分母与信用地基
             </span>
-            <span className="font-mono text-[10px] tabular-nums text-muted">
+            <span className="font-mono text-[11px] tabular-nums text-muted">
               10Y {fmtMetricVal(mNom)} · 通胀 {fmtMetricVal(mBreakeven)} · DXY {fmtMetricVal(mDxy)}
             </span>
           </div>
@@ -495,11 +495,11 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
         {/* Group 2: Volatility & Breadth */}
         <div className="flex flex-col gap-2">
           <div className="flex items-center justify-between gap-2">
-            <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-muted">
+            <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-muted">
               <Activity className="h-3 w-3 text-accent" aria-hidden="true" />
               恐慌摆锤与跨资产宽度
             </span>
-            <span className="font-mono text-[10px] tabular-nums text-muted">
+            <span className="font-mono text-[11px] tabular-nums text-muted">
               FedFunds {fmtMetricVal(mFed)}
             </span>
           </div>
@@ -644,7 +644,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                 {fmtMetricVal(mCopper)}
               </span>
               {fmtDeltaShort(mCopper) ? (
-                <span className="font-mono text-[9.5px] tabular-nums text-muted">
+                <span className="font-mono text-[11px] tabular-nums text-muted">
                   {fmtDeltaShort(mCopper)}
                 </span>
               ) : null}
@@ -674,7 +674,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
               <BarChart3 className="h-3.5 w-3.5" aria-hidden="true" />
               <span>跨资产动量</span>
               {brokenShieldsCount > 0 ? (
-                <span className="rounded bg-bear/14 px-1 py-px font-mono text-[9px] font-semibold text-bear">
+                <span className="rounded bg-bear/14 px-1 py-px font-mono text-[11px] font-semibold text-bear">
                   {brokenShieldsCount}破ZD
                 </span>
               ) : null}
@@ -696,7 +696,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
               <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
               <span>CFTC 52W</span>
               {cftcExtremesCount > 0 ? (
-                <span className="rounded bg-warning/16 px-1 py-px font-mono text-[9px] font-semibold text-warning">
+                <span className="rounded bg-warning/16 px-1 py-px font-mono text-[11px] font-semibold text-warning">
                   {cftcExtremesCount}极端
                 </span>
               ) : null}
@@ -718,7 +718,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
               <TrendingUp className="h-3.5 w-3.5" aria-hidden="true" />
               <span>Polymarket</span>
               {pmBigShifts > 0 ? (
-                <span className="rounded bg-accent/14 px-1 py-px font-mono text-[9px] font-semibold text-accent">
+                <span className="rounded bg-accent/14 px-1 py-px font-mono text-[11px] font-semibold text-accent">
                   {pmBigShifts}异动
                 </span>
               ) : null}
@@ -730,7 +730,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
               <div className="segmented" role="group" aria-label="动量图视图切换">
                 <button
                   type="button"
-                  className="segmented-btn !min-h-[22px] !px-2 !text-[10px]"
+                  className="segmented-btn !min-h-[22px] !px-2 !text-[11px]"
                   aria-pressed={anchorView === "bars"}
                   onClick={() => setAnchorView("bars")}
                 >
@@ -800,7 +800,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                     <span className="h-2 w-2 rounded-full" style={{ background: "var(--bear)" }} />
                     20D下跌
                   </span>
-                  <span className="text-[9.5px] opacity-85">· 破ZD = 跌破日线中枢</span>
+                  <span className="text-[11px] text-muted">· 破ZD = 跌破日线中枢</span>
                 </div>
               ) : (
                 <div className="flex flex-wrap items-center gap-2 text-muted">
@@ -846,11 +846,18 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                       return (
                         <tr
                           key={it.symbol}
+                          tabIndex={0}
                           className="cursor-pointer border-t border-hairline-soft hover:bg-elevated/70"
                           onClick={() => onJumpWarRoom?.(it.symbol)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              onJumpWarRoom?.(it.symbol);
+                            }
+                          }}
                         >
                           <td className="px-2 py-1 font-medium text-ink">
-                            {it.name} <span className="font-mono text-[10px] text-muted">{it.symbol}</span>
+                            {it.name} <span className="font-mono text-[11px] text-muted">{it.symbol}</span>
                           </td>
                           <td
                             className={`px-2 py-1 text-right font-mono font-medium ${
@@ -864,11 +871,11 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                           </td>
                           <td className="px-2 py-1 text-ink-2">
                             {badge ? (
-                              <span className={`rounded border px-1 py-px text-[9.5px] font-medium ${badge.cls}`}>
+                              <span className={`rounded border px-1 py-px text-[11px] font-medium ${badge.cls}`}>
                                 {badge.label}
                               </span>
                             ) : (
-                              <span className="text-[10px] text-muted">—</span>
+                              <span className="text-[11px] text-muted">—</span>
                             )}
                           </td>
                         </tr>
@@ -902,7 +909,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                       >
                         <div className="flex w-[124px] shrink-0 items-baseline justify-between gap-1">
                           <span className="truncate text-[11px] font-medium text-ink">{it.name}</span>
-                          <span className="shrink-0 font-mono text-[9.5px] text-muted">
+                          <span className="shrink-0 font-mono text-[11px] text-muted">
                             {it.symbol.replace(/=X$|-USD$|\.SS$/i, "")}
                           </span>
                         </div>
@@ -945,14 +952,14 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                           </div>
                         </div>
 
-                        <div className="flex w-[86px] shrink-0 items-center justify-end gap-1.5">
+                        <div className="flex w-[94px] shrink-0 items-center justify-end gap-1.5">
                           {badge ? (
-                            <span className={`rounded border px-1 py-px text-[9px] font-semibold leading-none ${badge.cls}`}>
+                            <span className={`rounded border px-1 py-px text-[11px] font-semibold leading-none ${badge.cls}`}>
                               {badge.label}
                             </span>
                           ) : null}
                           <span
-                            className={`font-mono text-[10.5px] font-medium tabular-nums ${
+                            className={`font-mono text-[11px] font-medium tabular-nums ${
                               isPos ? "text-bull" : "text-bear"
                             }`}
                           >
@@ -1037,10 +1044,21 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                     return (
                       <g
                         key={it.symbol}
+                        role="button"
+                        tabIndex={0}
+                        aria-label={`${it.name} (${it.symbol}) 跳转战情室`}
                         className="cursor-pointer"
                         onMouseEnter={() => setHoveredAnchor(it)}
                         onMouseLeave={() => setHoveredAnchor((prev) => (prev?.symbol === it.symbol ? null : prev))}
+                        onFocus={() => setHoveredAnchor(it)}
+                        onBlur={() => setHoveredAnchor((prev) => (prev?.symbol === it.symbol ? null : prev))}
                         onClick={() => onJumpWarRoom?.(it.symbol)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter" || e.key === " ") {
+                            e.preventDefault();
+                            onJumpWarRoom?.(it.symbol);
+                          }
+                        }}
                       >
                         {broken ? (
                           <circle
@@ -1068,7 +1086,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                             y={labelPos.y}
                             textAnchor={labelPos.anchor}
                             fill="var(--ink-2)"
-                            fontSize={10}
+                            fontSize={11}
                             fontWeight={500}
                           >
                             {it.name.slice(0, 6)}
@@ -1207,11 +1225,11 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                         onClick={() => onJumpWarRoom?.(it.symbol)}
                         className={`flex w-full cursor-pointer items-center gap-2.5 rounded px-1.5 py-1 text-left transition-colors ${
                           isHover ? "bg-elevated" : "hover:bg-elevated/60"
-                        } ${it.is_stale ? "opacity-55" : ""}`}
+                        } ${it.is_stale ? "opacity-80" : ""}`}
                       >
                         <div className="flex w-[124px] shrink-0 items-baseline justify-between gap-1">
                           <span className="truncate text-[11px] font-medium text-ink">{it.label}</span>
-                          <span className="shrink-0 font-mono text-[9.5px] text-muted">
+                          <span className="shrink-0 font-mono text-[11px] text-muted">
                             {it.symbol.replace(/=X$/i, "")}
                           </span>
                         </div>
@@ -1246,21 +1264,21 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                           />
                         </div>
 
-                        <div className="flex w-[84px] shrink-0 items-center justify-end gap-1.5">
+                        <div className="flex w-[92px] shrink-0 items-center justify-end gap-1.5">
                           {it.is_stale ? (
-                            <span className="rounded bg-subtle px-1 py-px text-[9px] text-muted" title="该品种 CFTC 报告日期滞后，未计入极端拥挤警报">
+                            <span className="rounded bg-subtle px-1 py-px text-[11px] text-muted" title="该品种 CFTC 报告日期滞后，未计入极端拥挤警报">
                               滞后
                             </span>
                           ) : isShortExt ? (
-                            <span className="rounded bg-bear/14 px-1 py-px text-[9px] font-semibold text-bear">
+                            <span className="rounded bg-bear/14 px-1 py-px text-[11px] font-semibold text-bear">
                               极空
                             </span>
                           ) : isLongExt ? (
-                            <span className="rounded bg-warning/16 px-1 py-px text-[9px] font-semibold text-warning">
+                            <span className="rounded bg-warning/16 px-1 py-px text-[11px] font-semibold text-warning">
                               极多
                             </span>
                           ) : null}
-                          <span className="font-mono text-[10.5px] font-medium tabular-nums text-ink">
+                          <span className="font-mono text-[11px] font-medium tabular-nums text-ink">
                             {p.toFixed(0)}%
                           </span>
                         </div>
@@ -1361,13 +1379,13 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                         </span>
                       </div>
                       <div className="flex shrink-0 items-center gap-1.5">
-                        <span className="max-w-[110px] truncate text-[10px] text-muted">{ev.leading_option}</span>
+                        <span className="max-w-[110px] truncate text-[11px] text-muted">{ev.leading_option}</span>
                         <span className="font-mono text-[11px] font-semibold tabular-nums text-ink">
                           {prob.toFixed(0)}%
                         </span>
                         {chg7 != null ? (
                           <span
-                            className={`rounded px-1 py-px font-mono text-[9.5px] tabular-nums ${
+                            className={`rounded px-1 py-px font-mono text-[11px] tabular-nums ${
                               bigShift ? "bg-accent/14 font-semibold text-accent" : "text-muted"
                             }`}
                           >

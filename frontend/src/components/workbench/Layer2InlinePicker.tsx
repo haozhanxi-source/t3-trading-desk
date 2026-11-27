@@ -488,7 +488,7 @@ export function Layer2InlinePicker({
                     title="点击可将参照锚纳入 L2 扫描作为板块对比基线（不代表最终龙头）"
                   >
                     <SymbolLabel symbol={sym} size="sm" badgeTicker={false} />
-                    <span className="text-[9.5px]">{active ? "✓对比" : "+对比"}</span>
+                    <span className="text-[11px]">{active ? "✓对比" : "+对比"}</span>
                   </button>
                 );
               })}
@@ -496,7 +496,7 @@ export function Layer2InlinePicker({
           ) : (
             <p className="text-[11px] text-muted">本逻辑未附带固定基准锚，请直接在右侧填入真龙头。</p>
           )}
-          <p className="text-[10px] text-muted">
+          <p className="text-[11px] text-muted">
             去锚定原则：参照锚不自动填入龙头槽；请按最受益环节亲选 1~3 只真龙头或双寡头。
           </p>
         </div>
@@ -511,7 +511,7 @@ export function Layer2InlinePicker({
               <div className="segmented" role="group" aria-label="多空腿选择">
                 <button
                   type="button"
-                  className="segmented-btn !min-h-[22px] !px-2 !text-[10.5px]"
+                  className="segmented-btn !min-h-[22px] !px-2 !text-[11px]"
                   aria-pressed={activeLeg === "long"}
                   onClick={() => setActiveLeg("long")}
                 >
@@ -519,7 +519,7 @@ export function Layer2InlinePicker({
                 </button>
                 <button
                   type="button"
-                  className="segmented-btn !min-h-[22px] !px-2 !text-[10.5px]"
+                  className="segmented-btn !min-h-[22px] !px-2 !text-[11px]"
                   aria-pressed={activeLeg === "short"}
                   onClick={() => setActiveLeg("short")}
                 >
@@ -538,7 +538,7 @@ export function Layer2InlinePicker({
                     key={`L-${sym}`}
                     className="inline-flex items-center gap-1 rounded border border-bull/45 bg-bull/12 px-2 py-0.5 text-[11px] font-medium text-bull"
                   >
-                    <span className="text-[9.5px]">多</span>
+                    <span className="text-[11px]">多</span>
                     <SymbolLabel symbol={sym} size="sm" badgeTicker={false} />
                     <button
                       type="button"
@@ -555,7 +555,7 @@ export function Layer2InlinePicker({
                     key={`S-${sym}`}
                     className="inline-flex items-center gap-1 rounded border border-bear/45 bg-bear/12 px-2 py-0.5 text-[11px] font-medium text-bear"
                   >
-                    <span className="text-[9.5px]">空</span>
+                    <span className="text-[11px]">空</span>
                     <SymbolLabel symbol={sym} size="sm" badgeTicker={false} />
                     <button
                       type="button"

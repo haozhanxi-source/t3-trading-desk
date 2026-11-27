@@ -102,10 +102,12 @@ class SignalCalloutRenderer implements IPrimitivePaneRenderer {
       }
 
       /* Crisp tinted backdrop + color border so label remains legible over candles/gridlines */
-      ctx.fillStyle = isDark ? "rgba(12, 14, 18, 0.90)" : "rgba(255, 255, 255, 0.94)";
+      ctx.fillStyle = isDark ? this._palette.page : this._palette.surface;
+      ctx.globalAlpha = isDark ? 0.92 : 0.95;
       ctx.beginPath();
       ctx.roundRect(pillX, pillY, pillW, pillH, 4);
       ctx.fill();
+      ctx.globalAlpha = 1;
 
       ctx.strokeStyle = item.color;
       ctx.globalAlpha = 0.65;
@@ -980,7 +982,7 @@ export function ChanlunChart({
         <div className="flex min-w-0 flex-wrap items-center gap-1.5">
           <h2 className="m-0 text-[13px] font-semibold tracking-tight text-ink">{title}</h2>
           {chanlun?.macro_structure ? (
-            <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[10.5px] text-ink-2">
+            <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[11px] text-ink-2">
               {chanlun.macro_structure}
             </span>
           ) : null}
@@ -992,13 +994,13 @@ export function ChanlunChart({
                   segUserToggledRef.current = true;
                   setShowSegmentZhongshu(true);
                 }}
-                className="rounded border border-amber-500/45 bg-amber-500/10 px-1.5 py-0.5 text-[10.5px] text-amber-400 transition-colors hover:bg-amber-500/20"
+                className="rounded border border-warning/45 bg-warning/12 px-1.5 py-0.5 text-[11px] font-medium text-warning transition-colors hover:bg-warning/20"
                 title="当前引擎主判已升级至线段中枢，点击立即叠加段枢图层"
               >
                 {chanlun.zhongshu_level_label} · 叠加段枢
               </button>
             ) : (
-              <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[10.5px] text-muted">
+              <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[11px] text-muted">
                 {chanlun.zhongshu_level_label}
               </span>
             )

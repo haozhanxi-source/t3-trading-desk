@@ -399,7 +399,7 @@ export function DeepResearchDialog({
                   onClick={() => setEngine(eng.id)}
                   className={`flex items-start justify-between gap-2 rounded-md border px-3 py-2 text-left text-xs transition-colors ${
                     !eng.available
-                      ? "cursor-not-allowed border-hairline-soft bg-sunken/30 text-muted opacity-60"
+                      ? "cursor-not-allowed border-hairline-soft bg-sunken/50 text-muted"
                       : selected
                         ? "cursor-pointer border-accent bg-accent/10 text-ink"
                         : "cursor-pointer border-hairline bg-sunken/50 text-ink-2 hover:border-hairline-strong"
@@ -410,7 +410,7 @@ export function DeepResearchDialog({
                     <div className="mt-0.5 text-[11px] text-muted">{eng.description}</div>
                   </div>
                   <span
-                    className={`mt-0.5 rounded px-1.5 py-0.5 font-mono text-[10px] ${
+                    className={`mt-0.5 rounded px-1.5 py-0.5 font-mono text-[11px] ${
                       eng.available ? "bg-bull/15 text-bull" : "bg-sunken text-muted"
                     }`}
                   >

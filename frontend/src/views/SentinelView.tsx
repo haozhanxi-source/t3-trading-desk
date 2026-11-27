@@ -860,10 +860,10 @@ export function SentinelView({
                 h.unrealized_pnl_pct <= 0;
               const edgeCls =
                 h.status === "RED_EXIT"
-                  ? "border-l-[3px] border-l-critical"
+                  ? "border-critical/50 bg-[color:color-mix(in_srgb,var(--critical)_4%,var(--surface))]"
                   : h.status === "YELLOW_LOOSENING"
-                    ? "border-l-[3px] border-l-warning"
-                    : "border-l-[3px] border-l-bull";
+                    ? "border-warning/45"
+                    : "";
 
               const prioritizedAlerts = [
                 ...h.red_alerts.map((alert, idx) => ({
@@ -905,7 +905,7 @@ export function SentinelView({
                           <StatusBadge tone={stageMeta.tone} label={stageMeta.label} />
                         ) : null}
                         <span
-                          className={`rounded border px-1.5 py-0.5 text-[10.5px] font-medium ${
+                          className={`rounded border px-1.5 py-0.5 text-[11px] font-medium ${
                             activeRegime === "daily_structure"
                               ? "border-bull/45 bg-bull/10 text-bull"
                               : "border-hairline-soft bg-sunken text-ink-2"
@@ -1236,7 +1236,7 @@ export function SentinelView({
                         </button>
                         <button
                           type="button"
-                          className={`btn btn-sm${isScaleInUnprofitable ? " text-muted opacity-65" : ""}`}
+                          className={`btn btn-sm${isScaleInUnprofitable ? " text-muted" : ""}`}
                           title={
                             isScaleInUnprofitable
                               ? "当前处于浮亏/平价，纪律禁止摊平（需严格浮盈确认后加仓；点击可查看纪律说明或输入更高触发价预演）"

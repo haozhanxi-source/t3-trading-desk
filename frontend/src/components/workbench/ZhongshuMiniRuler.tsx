@@ -120,9 +120,9 @@ export function ZhongshuMiniRuler({ last, zd, zg }: ZhongshuMiniRulerProps) {
           />
         ) : null}
       </svg>
-      <div className="flex items-center justify-center gap-1 font-mono text-[9.5px] tabular-nums text-muted">
+      <div className="flex items-center justify-center gap-1 font-mono text-[11px] tabular-nums text-muted">
         <span>[{fmtNum(zd, decimals)}</span>
-        <span className="opacity-60">~</span>
+        <span>~</span>
         <span>{fmtNum(zg, decimals)}]</span>
       </div>
     </div>

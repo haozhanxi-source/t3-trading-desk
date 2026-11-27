@@ -47,14 +47,17 @@ export function StatusBadge({
   tone,
   label,
   className,
+  title,
 }: {
   tone: Tone;
   label: string;
   className?: string;
+  title?: string;
 }) {
   const s = TONE_STYLES[tone];
   return (
     <span
+      title={title}
       className={cn(
         "inline-flex items-center gap-1.5 rounded border px-2 py-0.5 text-[11px] font-medium leading-snug whitespace-nowrap",
         s.border,

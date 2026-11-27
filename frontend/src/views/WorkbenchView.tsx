@@ -48,10 +48,15 @@ import {
   shortTime,
 } from "../lib/format";
 import { formatSymbolWithCode, getSymbolName } from "../lib/symbols";
+import {
+  classifyRowWithCompass,
+  classifyScanRow,
+  detectShortChaseWarning,
+  resolveExpectedDirection,
+  type CompassRowAlignment,
+  type RowFilter,
+} from "../lib/scanAlignment";
 import { formatTaskStatus, getUniverseLabel, groupUniverses } from "../lib/universes";
-
-type RowFilter = "all" | "long" | "short" | "watch" | "aligned" | "counter" | "pool_unverified" | "degraded";
-type CompassRowAlignment = "aligned" | "counter" | "watch" | "pool_unverified" | "degraded";
 
 function extractCompassContext(task: TaskRecord | null): CompassScanContext | null {
   const raw = task?.params?.compass_context;
@@ -76,56 +81,6 @@ function extractCompassContext(task: TaskRecord | null): CompassScanContext | nu
     value_chain_focus: typeof obj.value_chain_focus === "string" ? obj.value_chain_focus : "",
     expected_directions: expected,
   };
-}
-
-function resolveExpectedDirection(
-  row: ScanRow,
-  ctx: CompassScanContext,
-): { expected: "long" | "short" | null; boundToL1: boolean } {
-  const sym = (row.symbol || "").trim().toUpperCase();
-  if (sym && ctx.expected_directions[sym]) {
-    return { expected: ctx.expected_directions[sym], boundToL1: true };
-  }
-  const stripped = sym.replace(/\.(SS|SH|SZ|BJ)$/, "");
-  if (stripped && stripped !== sym && ctx.expected_directions[stripped]) {
-    return { expected: ctx.expected_directions[stripped], boundToL1: true };
-  }
-  if (/^\d{6}$/.test(stripped)) {
-    for (const [k, v] of Object.entries(ctx.expected_directions)) {
-      if (k.replace(/\.(SS|SH|SZ|BJ)$/, "") === stripped) {
-        return { expected: v, boundToL1: true };
-      }
-    }
-  }
-  /* Only treat symbols explicitly entered by the user (market === "adhoc") as bound to the staged L1 sector thesis;
-     do NOT blindly broadcast a narrow L1 thesis (e.g. phosphate/sulfur) onto unrelated members of a broad pool (e.g. rubber RU0)! */
-  const isUserCustom = (row.market || "").trim().toLowerCase() === "adhoc";
-  if (isUserCustom && (ctx.direction === "long" || ctx.direction === "short")) {
-    return { expected: ctx.direction, boundToL1: true };
-  }
-  return { expected: null, boundToL1: false };
-}
-
-function classifyRowWithCompass(
-  row: ScanRow,
-  ctx: CompassScanContext,
-): { status: CompassRowAlignment; expected: "long" | "short" | null; actual: "long" | "short" | "watch"; boundToL1: boolean } {
-  const { expected, boundToL1 } = resolveExpectedDirection(row, ctx);
-  const sigType = (row.signal_type || "").trim().toLowerCase();
-  if (row.error || row.quality_grade === "degraded" || sigType === "data_quality_degraded") {
-    return { status: "degraded", expected, actual: "watch", boundToL1 };
-  }
-  const actual = classifyScanRow(row);
-  if (!boundToL1 || !expected) {
-    return { status: "pool_unverified", expected: null, actual, boundToL1: false };
-  }
-  if (actual === expected) {
-    return { status: "aligned", expected, actual, boundToL1: true };
-  }
-  if ((actual === "long" && expected === "short") || (actual === "short" && expected === "long")) {
-    return { status: "counter", expected, actual, boundToL1: true };
-  }
-  return { status: "watch", expected, actual, boundToL1: true };
 }
 
 function formatDirectionBiasZh(dir: string | null | undefined): string {
@@ -249,43 +204,6 @@ function mergeScanRows(prev: ScanRow[], nextRows: ScanRow[]): ScanRow[] {
     map.set(`${r.market}::${r.symbol}`, r);
   }
   return Array.from(map.values());
-}
-
-function classifyScanRow(row: ScanRow): "long" | "short" | "watch" {
-  const sigType = (row.signal_type || "").trim().toLowerCase();
-  const tierTxt = (row.signal_tier || "").trim();
-
-  /* Exclude degraded quality feeds, unconfirmed candidates, weak-momentum warnings, exhaustion alerts, and watch tiers */
-  if (
-    row.quality_grade === "degraded" ||
-    sigType === "data_quality_degraded" ||
-    row.signal_confirmed === false ||
-    sigType.includes("candidate") ||
-    sigType.includes("weak_momentum") ||
-    sigType.includes("divergence_watch") ||
-    sigType.includes("exhaustion") ||
-    /(?:观察|待确认|勿追|警告|数据质量降级)/.test(tierTxt)
-  ) {
-    return "watch";
-  }
-
-  /* 1. Authoritative confirmed backend signal_meta.direction */
-  const explicitDir = (row.signal_direction || "").trim().toLowerCase();
-  if (explicitDir === "long" || explicitDir === "bullish" || explicitDir === "up") return "long";
-  if (explicitDir === "short" || explicitDir === "bearish" || explicitDir === "down") return "short";
-  if (explicitDir === "neutral") return "watch";
-
-  /* 2. Conservative fallback for persisted legacy rows without signal_meta */
-  const cleaned = `${tierTxt} ${row.action_bias || ""}`
-    .replace(/买卖点信号/g, "")
-    .replace(/(?:严禁|禁止|切勿|勿|不可|非|待确认|观察)[^，,。；;]*/g, "")
-    .toLowerCase();
-
-  const isShort = /(?:一卖|二卖|三卖|1卖|2卖|3卖|空头资金一致)/.test(cleaned);
-  const isLong = /(?:一买|二买|三买|1买|2买|3买|多头资金一致)/.test(cleaned);
-  if (isShort && !isLong) return "short";
-  if (isLong && !isShort) return "long";
-  return "watch";
 }
 
 function signalTierRank(row: ScanRow): number {
@@ -1129,14 +1047,19 @@ export function WorkbenchView({
     let shortCount = 0;
     let watchCount = 0;
     let alignedCount = 0;
+    let alignedSignalCount = 0;
+    let alignedMomentumCount = 0;
     let counterCount = 0;
     let poolUnverifiedCount = 0;
     let degradedCount = 0;
     for (const r of scanRows) {
       if (activeCompassContext) {
         const res = classifyRowWithCompass(r, activeCompassContext);
-        if (res.status === "aligned") alignedCount += 1;
-        else if (res.status === "counter") counterCount += 1;
+        if (res.status === "aligned") {
+          alignedCount += 1;
+          if (res.alignKind === "momentum") alignedMomentumCount += 1;
+          else alignedSignalCount += 1;
+        } else if (res.status === "counter") counterCount += 1;
         else if (res.status === "pool_unverified") poolUnverifiedCount += 1;
         else if (res.status === "degraded") degradedCount += 1;
         else watchCount += 1;
@@ -1153,6 +1076,8 @@ export function WorkbenchView({
       short: shortCount,
       watch: watchCount,
       aligned: alignedCount,
+      alignedSignal: alignedSignalCount,
+      alignedMomentum: alignedMomentumCount,
       counter: counterCount,
       pool_unverified: poolUnverifiedCount,
       degraded: degradedCount,
@@ -1309,6 +1234,9 @@ export function WorkbenchView({
         const tierDiff = signalTierRank(a) - signalTierRank(b);
         if (tierDiff !== 0) return tierDiff;
 
+        const chaseDiff = (ca.chaseWarning ? 1 : 0) - (cb.chaseWarning ? 1 : 0);
+        if (chaseDiff !== 0) return chaseDiff;
+
         const dirA = ca.expected ?? (ca.actual === "short" ? "short" : "long");
         const dirB = cb.expected ?? (cb.actual === "short" ? "short" : "long");
         const r20Diff =
@@ -1329,6 +1257,9 @@ export function WorkbenchView({
         if (tierDiff !== 0) return tierDiff;
         const dirA = classifyScanRow(a) === "short" ? "short" : "long";
         const dirB = classifyScanRow(b) === "short" ? "short" : "long";
+        const chaseA = dirA === "short" && detectShortChaseWarning(a) ? 1 : 0;
+        const chaseB = dirB === "short" && detectShortChaseWarning(b) ? 1 : 0;
+        if (chaseA !== chaseB) return chaseA - chaseB;
         const r20Diff =
           directionalReturnScore(b["ret_20d_%"], dirB) -
           directionalReturnScore(a["ret_20d_%"], dirA);
@@ -1892,6 +1823,11 @@ export function WorkbenchView({
                         className="chip chip-bull"
                         aria-pressed={rowFilter === "aligned"}
                         onClick={() => setRowFilter("aligned")}
+                        title={
+                          filterCounts.aligned > 0
+                            ? `确认买卖点 ${filterCounts.alignedSignal} 只 · 趋势推进 ${filterCounts.alignedMomentum} 只`
+                            : undefined
+                        }
                       >
                         同向通过 ({filterCounts.aligned})
                       </button>
@@ -2089,6 +2025,11 @@ export function WorkbenchView({
                       const compassAlign = activeCompassContext
                         ? classifyRowWithCompass(row, activeCompassContext)
                         : null;
+                      const chaseWarning = compassAlign
+                        ? compassAlign.chaseWarning
+                        : classifyScanRow(row) === "short"
+                          ? detectShortChaseWarning(row)
+                          : null;
                       const signalBadge = resolveSignalBadge(row);
                       const structureSubline = [
                         `${row.daily_zs_count ?? 0}${row.daily_zs_level === "segment" ? "段" : "笔"}枢`,
@@ -2186,18 +2127,35 @@ export function WorkbenchView({
                                       <StatusBadge
                                         tone={
                                           compassAlign.status === "aligned"
-                                            ? "good"
+                                            ? compassAlign.alignKind === "momentum"
+                                              ? compassAlign.chaseWarning
+                                                ? "warning"
+                                                : "info"
+                                              : "good"
                                             : compassAlign.status === "counter"
                                               ? "critical"
                                               : compassAlign.status === "degraded"
                                                 ? "warning"
                                                 : "neutral"
                                         }
+                                        title={
+                                          compassAlign.status === "aligned" && compassAlign.alignKind === "momentum"
+                                            ? compassAlign.chaseWarning
+                                              ? `日线已顺向进入资金一致推进，但${compassAlign.chaseWarning.detail}`
+                                              : "日线已顺向进入资金一致推进，去 30min 等回踩/反抽结构精确落地"
+                                            : compassAlign.status === "counter" && compassAlign.alignKind === "momentum"
+                                              ? "日线处于反向资金一致推进，严禁逆势对抗"
+                                              : undefined
+                                        }
                                         label={
                                           compassAlign.status === "aligned"
-                                            ? `L1同向通过(${compassAlign.expected === "short" ? "空" : "多"})`
+                                            ? compassAlign.alignKind === "momentum"
+                                              ? `L1同向·趋势推进(${compassAlign.expected === "short" ? "空" : "多"})`
+                                              : `L1同向通过(${compassAlign.expected === "short" ? "空" : "多"})`
                                             : compassAlign.status === "counter"
-                                              ? `L1反向(${compassAlign.expected === "short" ? "空" : "多"})`
+                                              ? compassAlign.alignKind === "momentum"
+                                                ? `L1反向·趋势对抗(${compassAlign.expected === "short" ? "空" : "多"})`
+                                                : `L1反向(${compassAlign.expected === "short" ? "空" : "多"})`
                                               : compassAlign.status === "pool_unverified"
                                                 ? "池内参考·需核实归属"
                                                 : compassAlign.status === "degraded"
@@ -2208,6 +2166,13 @@ export function WorkbenchView({
                                     ) : null}
                                     {signalBadge ? (
                                       <StatusBadge tone={signalBadge.tone} label={signalBadge.label} />
+                                    ) : null}
+                                    {chaseWarning ? (
+                                      <StatusBadge
+                                        tone="warning"
+                                        label={chaseWarning.label}
+                                        title={chaseWarning.detail}
+                                      />
                                     ) : null}
                                     {row.quality_grade === "caution" ? (
                                       <span

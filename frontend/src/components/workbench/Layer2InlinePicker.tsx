@@ -4,6 +4,7 @@ import {
   BookmarkCheck,
   BookmarkPlus,
   BookOpen,
+  Check,
   Compass,
   Play,
   Plus,
@@ -407,7 +408,7 @@ export function Layer2InlinePicker({
             <span className="text-[13.5px] font-semibold text-ink">{card.title}</span>
           </div>
           {card.value_chain_focus ? (
-            <p className="text-[11.5px] text-ink-2">
+            <p className="line-clamp-2 text-[11.5px] leading-snug text-ink-2" title={card.value_chain_focus}>
               <span className="font-medium text-ink">最受益环节：</span>
               {card.value_chain_focus}
             </p>
@@ -665,33 +666,43 @@ export function Layer2InlinePicker({
             </button>
           </div>
 
-          {/* Recommended Pool Quick Cherry-Pick Chips */}
+          {/* Recommended Pool Quick Cherry-Pick Chips (deduplicated against Stage 1 reference anchors) */}
           {referencePoolCandidates.length > 0 || customPools.length > 0 ? (
             <div className="flex flex-col gap-1.5 pt-0.5">
-              {referencePoolCandidates.slice(0, 2).map((sec) => (
-                <div key={sec.poolKey} className="flex flex-wrap items-center gap-1">
-                  <span className="mr-1 text-[10px] font-medium text-muted">参考池 · {sec.label}:</span>
-                  {sec.symbols.slice(0, 10).map((sym) => {
-                    const active = (targetLeg === "short" ? shortLeaders : longLeaders).includes(
-                      sym.toUpperCase(),
-                    );
-                    return (
-                      <button
-                        key={sym}
-                        type="button"
-                        onClick={() => toggleLeaderOnActiveLeg(sym)}
-                        className={`rounded border px-1.5 py-0.5 font-mono text-[10.5px] transition-colors ${
-                          active
-                            ? "border-accent bg-accent/14 font-semibold text-accent"
-                            : "border-hairline-soft bg-surface text-ink-2 hover:border-hairline"
-                        }`}
-                      >
-                        <SymbolLabel symbol={sym} size="sm" badgeTicker={false} />
-                      </button>
-                    );
-                  })}
-                </div>
-              ))}
+              {referencePoolCandidates.slice(0, 2).map((sec) => {
+                const anchorSet = new Set(referenceAnchors.map((a) => a.toUpperCase()));
+                const deduped = sec.symbols.filter((s) => !anchorSet.has(s.toUpperCase()));
+                const chips = (deduped.length > 0 ? deduped : sec.symbols).slice(0, 10);
+                return (
+                  <div key={sec.poolKey} className="flex flex-wrap items-center gap-1">
+                    <span className="mr-1 text-[10px] font-medium text-muted">参考池 · {sec.label}:</span>
+                    {chips.map((sym) => {
+                      const active = (targetLeg === "short" ? shortLeaders : longLeaders).includes(
+                        sym.toUpperCase(),
+                      );
+                      return (
+                        <button
+                          key={sym}
+                          type="button"
+                          onClick={() => toggleLeaderOnActiveLeg(sym)}
+                          className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[10.5px] transition-colors ${
+                            active
+                              ? "border-accent bg-accent/14 font-semibold text-accent"
+                              : "border-hairline-soft bg-surface text-ink-2 hover:border-accent/55 hover:text-ink"
+                          }`}
+                        >
+                          {active ? (
+                            <Check className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
+                          ) : (
+                            <Plus className="h-2.5 w-2.5 shrink-0 text-muted" aria-hidden="true" />
+                          )}
+                          <SymbolLabel symbol={sym} size="sm" badgeTicker={false} />
+                        </button>
+                      );
+                    })}
+                  </div>
+                );
+              })}
               {customPools.length > 0 ? (
                 <div className="flex flex-wrap items-center gap-1">
                   <span className="mr-1 text-[10px] font-medium text-muted">我的主题池:</span>
@@ -772,7 +783,9 @@ export function Layer2InlinePicker({
             type="submit"
             disabled={submitting || scanBusy || effectiveScanCount === 0 || pairIncomplete}
             className={`btn btn-sm ${
-              onlyBaselineMode ? "border-warning/50 bg-warning/15 text-warning hover:bg-warning/25" : "btn-primary"
+              onlyBaselineMode
+                ? "border-warning/65 bg-warning/18 font-medium text-ink hover:bg-warning/28"
+                : "btn-primary"
             }`}
           >
             <Play className="h-3.5 w-3.5" aria-hidden="true" />
@@ -780,7 +793,7 @@ export function Layer2InlinePicker({
               {submitting || scanBusy
                 ? "日线过筛中…"
                 : onlyBaselineMode
-                  ? `仅扫基准锚 (${effectiveScanCount} 只 · 建议补入真龙头)`
+                  ? `先扫基准锚 (${effectiveScanCount} 只 · 建议补入龙头)`
                   : `启动 L2 日线过筛 (${effectiveScanCount} 只)`}
             </span>
           </button>

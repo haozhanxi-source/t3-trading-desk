@@ -6,6 +6,7 @@ import {
   BookmarkPlus,
   BookOpen,
   CheckCircle2,
+  ChevronRight,
   Clock,
   Compass,
   Crosshair,
@@ -176,7 +177,7 @@ function buildShortCardFromHeadwind(item: CompassAvoidSectorItem, index: number)
 function computeAnchorTemperature(
   card: CompassDirectionCard,
   anchorBySym: Map<string, CrossAssetAnchorItem>,
-): { kind: "aligned" | "divergent" | "neutral"; label: string; detail: string } | null {
+): { kind: "aligned" | "divergent" | "chase_warn" | "neutral"; label: string; detail: string } | null {
   const anchors = (card.reference_anchors ?? [])
     .map((sym) => anchorBySym.get(sym.toUpperCase()))
     .filter((it): it is CrossAssetAnchorItem => Boolean(it && it.status === "ok" && it.ret_20d_pct !== null));
@@ -184,31 +185,43 @@ function computeAnchorTemperature(
 
   const avg20 = anchors.reduce((sum, it) => sum + (it.ret_20d_pct ?? 0), 0) / anchors.length;
   const broken = anchors.some((it) => it.chanlun_hint?.shield_state === "below_zd_breakdown");
+  const lead = anchors[0]!;
+  const leadTag =
+    anchors.length === 1
+      ? `${lead.symbol.replace(/=X$|-USD$|\.SS$/i, "")} ${lead.ret_20d_pct! >= 0 ? "+" : ""}${lead.ret_20d_pct!.toFixed(1)}%`
+      : `均值 ${avg20 >= 0 ? "+" : ""}${avg20.toFixed(1)}%`;
   const summary = anchors
-    .map((a) => `${a.name}(20D ${a.ret_20d_pct! >= 0 ? "+" : ""}${a.ret_20d_pct!.toFixed(1)}%)`)
+    .map((a) => `${a.name}(${a.symbol} 20D ${a.ret_20d_pct! >= 0 ? "+" : ""}${a.ret_20d_pct!.toFixed(1)}%)`)
     .join(" · ");
 
   if (card.direction === "long") {
     if (avg20 >= 0 && !broken) {
-      return { kind: "aligned", label: "锚温同向 ✓", detail: `板块参照锚 20D 均值 +${avg20.toFixed(1)}% · ${summary}` };
+      return { kind: "aligned", label: `${leadTag} · 同向 ✓`, detail: `板块参照锚顺势 · ${summary}` };
     }
     return {
       kind: "divergent",
-      label: "锚点背离 · 需L2甄别",
-      detail: `参照锚偏弱 (${avg20.toFixed(1)}%)，切忌盲买宽基，需在 L2 甄别逆势真龙头或观望 · ${summary}`,
+      label: `${leadTag} · 背离需L2甄别`,
+      detail: `参照锚偏弱，切忌盲买宽基，需在 L2 甄别逆势真龙头或观望 · ${summary}`,
     };
   }
   if (card.direction === "short") {
+    if (avg20 <= -15) {
+      return {
+        kind: "chase_warn",
+        label: `${leadTag} · ⚠ 防深坑追空`,
+        detail: `参照锚 20D 已深跌 ${avg20.toFixed(1)}%，严禁急跌末端盲目追空，务必在 L2 等反抽不过 ZD 的二卖/三卖 · ${summary}`,
+      };
+    }
     if (avg20 <= 0) {
-      return { kind: "aligned", label: "锚温同向 ✓", detail: `板块参照锚 20D 均值 ${avg20.toFixed(1)}% · ${summary}` };
+      return { kind: "aligned", label: `${leadTag} · 空头顺势 ✓`, detail: `板块参照锚偏弱 · ${summary}` };
     }
     return {
       kind: "divergent",
-      label: "锚点背离 · 需L2甄别",
-      detail: `参照锚仍在上涨 (+${avg20.toFixed(1)}%)，严禁左侧摸顶，等 L2 日线跌破结构 · ${summary}`,
+      label: `${leadTag} · 仍在涨禁摸顶`,
+      detail: `参照锚仍在上涨，严禁左侧摸顶，等 L2 日线跌破结构 · ${summary}`,
     };
   }
-  return { kind: "neutral", label: "配对锚温对照", detail: summary };
+  return { kind: "neutral", label: `配对锚 ${leadTag}`, detail: summary };
 }
 
 export interface Layer1CompassPanelProps {
@@ -963,23 +976,35 @@ export function Layer1CompassPanel({
               })}
             </div>
 
-            {result ? (
+            {result && !result.regime_summary ? (
               <button
                 type="button"
                 onClick={() => setDrawer({ kind: "macro_pillars" })}
                 className="inline-flex items-center gap-1 text-[11px] font-medium text-accent hover:underline"
               >
                 <Layers className="h-3.5 w-3.5" aria-hidden="true" />
-                <span>查看四维全文与风险提示</span>
+                <span>四维全文</span>
+                <ChevronRight className="h-3 w-3" aria-hidden="true" />
               </button>
             ) : null}
           </div>
 
           {result?.regime_summary ? (
-            <p className="line-clamp-1 text-[12px] text-ink-2" title={result.regime_summary}>
-              <span className="mr-1.5 font-semibold text-ink">本轮定调：</span>
-              {result.regime_summary}
-            </p>
+            <button
+              type="button"
+              onClick={() => setDrawer({ kind: "macro_pillars" })}
+              className="group flex w-full items-center justify-between gap-2 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-surface/80"
+              title={`${result.regime_summary} · 点击展开四维全文与风险提示`}
+            >
+              <span className="line-clamp-1 min-w-0 flex-1 text-[12px] text-ink-2">
+                <span className="mr-1.5 font-semibold text-ink">本轮定调：</span>
+                {result.regime_summary}
+              </span>
+              <span className="inline-flex shrink-0 items-center gap-0.5 text-[11px] font-medium text-accent group-hover:underline">
+                <span>四维全文</span>
+                <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+              </span>
+            </button>
           ) : null}
 
           {/* Compact Avoid Sectors Chip Bar */}
@@ -1005,6 +1030,7 @@ export function Layer1CompassPanel({
                         可空
                       </span>
                     ) : null}
+                    <ChevronRight className="h-3 w-3 text-muted" aria-hidden="true" />
                   </button>
                 );
               })}
@@ -1165,11 +1191,12 @@ export function Layer1CompassPanel({
 
             const anchorTemp = computeAnchorTemperature(card, anchorBySym);
             const l2Summary = l2ScanSummaries?.[card.id];
+            const isDrawerOpenForCard = drawer?.kind === "card" && drawer.card.id === card.id;
 
             return (
               <article
                 key={card.id}
-                className={`relative flex min-h-[218px] flex-col justify-between overflow-hidden rounded-lg border bg-surface p-3 transition-all ${
+                className={`relative flex min-h-[244px] flex-col justify-between overflow-hidden rounded-lg border bg-surface p-3 transition-all ${
                   isActiveL2
                     ? "border-accent ring-1 ring-accent/40"
                     : isFactorHighlighted
@@ -1186,8 +1213,26 @@ export function Layer1CompassPanel({
                   />
                 ) : null}
 
-                {/* Top Content Block */}
-                <div className="flex flex-col gap-2">
+                {/* Clickable Card Body opens/closes progressive detail drawer */}
+                <div
+                  role="button"
+                  tabIndex={0}
+                  onClick={() =>
+                    setDrawer((prev) =>
+                      prev?.kind === "card" && prev.card.id === card.id ? null : { kind: "card", card },
+                    )
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setDrawer((prev) =>
+                        prev?.kind === "card" && prev.card.id === card.id ? null : { kind: "card", card },
+                      );
+                    }
+                  }}
+                  aria-expanded={isDrawerOpenForCard}
+                  className="group flex cursor-pointer flex-col gap-2 text-left outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                >
                   {/* Row 1: Badges + Conviction (with explicit cap strikethrough) + Persistent Track C */}
                   <div className="flex flex-wrap items-center justify-between gap-1.5">
                     <div className="flex flex-wrap items-center gap-1">
@@ -1233,7 +1278,7 @@ export function Layer1CompassPanel({
                   {/* Row 2: Title & Dual-Driver Tag */}
                   <div>
                     <h3
-                      className="line-clamp-1 text-[13.5px] font-semibold text-ink"
+                      className="line-clamp-1 text-[13.5px] font-semibold text-ink transition-colors group-hover:text-accent"
                       title={card.title}
                     >
                       {card.title}
@@ -1257,19 +1302,19 @@ export function Layer1CompassPanel({
                     </div>
                   ) : null}
 
-                  {/* Row 4: Strict 1 Positive + 1 Negative 2-Line Summary (Redline #3) */}
-                  <div className="space-y-1 text-[11.5px]">
-                    <p className="line-clamp-1 text-ink" title={headlinePositive}>
+                  {/* Row 4: Strict 1 Positive + 1 Negative 2-Line Clamped Summary (Redline #3) */}
+                  <div className="space-y-1.5 text-[11.5px] leading-snug">
+                    <p className="line-clamp-2 text-ink" title={headlinePositive}>
                       <span className="mr-1 font-semibold text-bull">差:</span>
                       {headlinePositive}
                     </p>
-                    <p className="line-clamp-1 text-bear" title={headlineNegative}>
+                    <p className="line-clamp-2 text-bear" title={headlineNegative}>
                       <span className="mr-1 font-semibold">线:</span>
                       {headlineNegative}
                     </p>
                   </div>
 
-                  {/* Row 5: Anchor Temperature (Anti-Anchoring) + Bidirectional L2 Scan Badge */}
+                  {/* Row 5: Anchor Temperature (with real 20D% + chase warning) + Bidirectional L2 Scan Badge */}
                   <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
                     {anchorTemp ? (
                       <span
@@ -1277,13 +1322,15 @@ export function Layer1CompassPanel({
                         className={`inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-medium ${
                           anchorTemp.kind === "aligned"
                             ? "bg-bull/10 text-bull"
-                            : anchorTemp.kind === "divergent"
-                              ? "bg-warning/14 text-warning"
-                              : "bg-subtle text-muted"
+                            : anchorTemp.kind === "chase_warn"
+                              ? "border border-warning/45 bg-warning/14 text-warning"
+                              : anchorTemp.kind === "divergent"
+                                ? "bg-warning/14 text-warning"
+                                : "bg-subtle text-muted"
                         }`}
                       >
                         <Crosshair className="h-2.5 w-2.5" aria-hidden="true" />
-                        {anchorTemp.label}
+                        <span className="font-mono">{anchorTemp.label}</span>
                       </span>
                     ) : null}
                     {l2Summary ? (
@@ -1311,11 +1358,11 @@ export function Layer1CompassPanel({
                     <button
                       type="button"
                       className={`btn btn-sm !min-h-[26px] !px-2 !text-[11px] ${
-                        drawer?.kind === "card" && drawer.card.id === card.id
+                        isDrawerOpenForCard
                           ? "border-accent/45 bg-accent/12 font-medium text-accent"
                           : "btn-ghost"
                       }`}
-                      aria-expanded={drawer?.kind === "card" && drawer.card.id === card.id}
+                      aria-expanded={isDrawerOpenForCard}
                       onClick={() =>
                         setDrawer((prev) =>
                           prev?.kind === "card" && prev.card.id === card.id
@@ -1325,7 +1372,7 @@ export function Layer1CompassPanel({
                       }
                     >
                       <BookOpen className="h-3 w-3" aria-hidden="true" />
-                      <span>{drawer?.kind === "card" && drawer.card.id === card.id ? "收起详情" : "详情"}</span>
+                      <span>{isDrawerOpenForCard ? "收起" : "详情"}</span>
                     </button>
                     <button
                       type="button"
@@ -1339,7 +1386,7 @@ export function Layer1CompassPanel({
                       ) : (
                         <BookmarkPlus className="h-3.5 w-3.5" aria-hidden="true" />
                       )}
-                      <span className="hidden sm:inline">{logged ? "已记" : "影子"}</span>
+                      <span>{logged ? "已记" : "记影子"}</span>
                     </button>
                   </div>
 
@@ -1373,6 +1420,7 @@ export function Layer1CompassPanel({
         drawer={drawer}
         result={result}
         runId={currentRun?.run_id}
+        isActiveL2={drawer?.kind === "card" ? activeL2CardId === drawer.card.id : false}
         onClose={() => setDrawer(null)}
         onActivateL2Card={(card) => onSelectCardForL2(card, currentRun?.run_id)}
         onLaunchAvoidShort={(item, idx) => {

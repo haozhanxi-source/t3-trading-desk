@@ -74,7 +74,12 @@ export type AttributionTag =
   | "premature_profit_taking"
   | "discipline_rule_breach"
   | string;
-export type ShadowOpportunityKind = "missed_entry" | "shaken_out" | "premature_exit";
+export type ShadowOpportunityKind =
+  | "missed_entry"
+  | "shaken_out"
+  | "premature_exit"
+  | "l1_direction_call"
+  | "l1_abstention";
 export type ShadowOpportunityStatus = "tracking" | "reviewed";
 
 export interface Position {
@@ -397,6 +402,8 @@ export interface PortfolioAttributionAnalytics {
     missed_entry_count: number;
     shaken_out_count: number;
     premature_exit_count: number;
+    l1_direction_call_count?: number;
+    l1_abstention_count?: number;
     total_missed_r: number;
     max_missed_r: number;
     top_missed: ShadowOpportunity[];
@@ -1398,6 +1405,44 @@ export interface PolymarketMacroOdds {
   error?: string;
 }
 
+export interface CftcCrowdingBenchmarkItem {
+  symbol: string;
+  label: string;
+  report_type?: string;
+  cohort?: string;
+  latest_date?: string | null;
+  age_days?: number | null;
+  is_stale?: boolean;
+  weeks_observed?: number;
+  net_contracts?: number | null;
+  net_pct_oi?: number | null;
+  percentile_52w?: number | null;
+  crowding_state?:
+    | "crowded_long"
+    | "crowded_short"
+    | "short_covering_extreme"
+    | "long_washout_extreme"
+    | "neutral"
+    | "insufficient_history"
+    | string;
+  pair_inverted?: boolean;
+}
+
+export interface CftcCrowdingOverview {
+  status: string;
+  source?: string;
+  latest_report_date?: string | null;
+  window_weeks?: number;
+  benchmarks_ok?: number;
+  benchmarks_total?: number;
+  stale_fallback?: boolean;
+  crowded_long?: CftcCrowdingBenchmarkItem[];
+  crowded_short?: CftcCrowdingBenchmarkItem[];
+  stale_symbols?: string[];
+  items?: CftcCrowdingBenchmarkItem[];
+  error?: string;
+}
+
 export interface CompassMacroOverview {
   fetched_at_utc: string;
   cache_hit?: boolean;
@@ -1413,6 +1458,7 @@ export interface CompassMacroOverview {
   };
   tape_movers?: CompassTapeMovers;
   polymarket_odds?: PolymarketMacroOdds;
+  cftc_crowding?: CftcCrowdingOverview;
 }
 
 export interface CompassDriverItem {
@@ -1436,6 +1482,41 @@ export interface CompassEvidenceItem {
   source?: string;
   url?: string;
   verification_status?: string;
+}
+
+export interface CompassConstitutionalFlag {
+  code: string;
+  article: string;
+  severity: "warning" | "reject" | string;
+  action?: string;
+  message: string;
+}
+
+export interface CompassConstitutionalAudit {
+  enforced: boolean;
+  diagnostics_attached: boolean;
+  rejected_count: number;
+  rejected_reasons?: string[];
+  flagged_cards_count: number;
+  conviction_caps_applied: number;
+}
+
+export interface CompassFactorConcentrationItem {
+  factor_id: string;
+  label: string;
+  direction: string;
+  count: number;
+  share_pct?: number;
+  card_ids: string[];
+  card_titles: string[];
+}
+
+export interface CompassFactorConcentration {
+  concentrated: boolean;
+  directional_cards_count: number;
+  hedged_pair_count?: number;
+  dominant_factors: CompassFactorConcentrationItem[];
+  warnings: string[];
 }
 
 export interface CompassDirectionCard {
@@ -1465,6 +1546,7 @@ export interface CompassDirectionCard {
   portfolio_overlap?: string[];
   leaders: CompassLeaderItem[];
   evidence: CompassEvidenceItem[];
+  constitutional_flags?: CompassConstitutionalFlag[];
 }
 
 export interface CompassAvoidSectorItem {
@@ -1489,10 +1571,30 @@ export interface CompassResultPayload {
   abstained?: boolean;
   abstain_reason?: string;
   risk_warnings?: string[];
+  factor_concentration?: CompassFactorConcentration;
+  constitutional_audit?: CompassConstitutionalAudit;
   generated_at_utc?: string;
   engine?: string;
   effort?: string;
   focus_prompt?: string;
+}
+
+export interface CompassLogOpportunityBody {
+  kind: "l1_direction_call" | "l1_abstention";
+  card_id?: string | null;
+  symbol?: string | null;
+  direction?: "long" | "short" | null;
+  anchor_price?: number | null;
+  planned_stop_price?: number | null;
+  note?: string;
+}
+
+export interface CompassLogOpportunityResponse {
+  opportunity: ShadowOpportunity;
+  idempotent_replay?: boolean;
+  run_id: string;
+  card_id?: string | null;
+  stop_is_proxy?: boolean;
 }
 
 export interface CompassRunSummary {

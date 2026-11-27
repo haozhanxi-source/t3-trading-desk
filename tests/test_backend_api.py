@@ -1623,6 +1623,165 @@ def test_fx_reference_daily_usd_cny_and_cross_rates(client: TestClient, monkeypa
     assert b5["usd_cny"] == 7.2
 
 
+def test_compass_log_opportunity_l1_direction_call_and_abstention_idempotent(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    from backend import macro_compass
+
+    client.post(
+        "/api/portfolio/init",
+        json={"equity": 100_000.0, "base_currency": "USD", "default_risk_per_trade_pct": 1.0},
+    )
+
+    dir_run = {
+        "run_id": "compass-test-dir-001",
+        "status": "completed",
+        "engine": "claude",
+        "result": {
+            "regime_title": "铜供需缺口多头主线",
+            "regime_summary": "矿端干扰叠加库存低位。",
+            "abstained": False,
+            "focus_scopes": ["commodities"],
+            "macro_snapshot_summary": {
+                "anchors_items": [
+                    {
+                        "symbol": "HG=F",
+                        "name": "COMEX铜",
+                        "last": 4.50,
+                        "chanlun_hint": {"latest_zd": 4.10, "latest_zg": 4.65},
+                    }
+                ]
+            },
+            "directions": [
+                {
+                    "id": "copper_deficit",
+                    "rank": 1,
+                    "title": "铜供给缺口多头",
+                    "direction": "long",
+                    "horizon": "1Q~2Q",
+                    "conviction": "high",
+                    "asset_scope": "commodities",
+                    "reference_anchors": ["HG=F"],
+                    "primary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "矿端扰动"},
+                    "secondary_driver": {"dimension": "技术与产业迭代", "summary": "电网需求"},
+                    "unpriced_gap": "低库存与扩产滞后尚未充分定价",
+                    "thesis": "供需缺口扩大",
+                    "leaders": [],
+                    "evidence": [],
+                }
+            ],
+        },
+    }
+    abstain_run = {
+        "run_id": "compass-test-abs-002",
+        "status": "completed",
+        "engine": "claude",
+        "result": {
+            "regime_title": "全局高波动混沌期：战略留白",
+            "regime_summary": "多空无清晰预期差，按宪法第4条留白。",
+            "abstained": True,
+            "abstain_reason": "信用利差走阔且全市场无通过两维共振与护盾检验的清晰方向，宁缺毋滥。",
+            "focus_scopes": [],
+            "macro_snapshot_summary": {
+                "anchors_items": [
+                    {"symbol": "SPY", "name": "标普500", "last": 580.0, "chanlun_hint": {}}
+                ]
+            },
+            "directions": [],
+        },
+    }
+
+    runs = {dir_run["run_id"]: dir_run, abstain_run["run_id"]: abstain_run}
+    monkeypatch.setattr(macro_compass, "get_compass_run", lambda rid: runs.get(rid))
+
+    # 1. Log l1_direction_call -> uses snapshot anchor price (4.50) & Chanlun ZD (4.10)
+    r1 = client.post(
+        "/api/compass/history/compass-test-dir-001/log-opportunity",
+        json={"kind": "l1_direction_call", "card_id": "copper_deficit"},
+    )
+    assert r1.status_code == 200
+    b1 = r1.json()
+    assert b1["idempotent_replay"] is False
+    assert b1["stop_is_proxy"] is False
+    assert b1["opportunity"]["kind"] == "l1_direction_call"
+    assert b1["opportunity"]["symbol"] == "HG=F"
+    assert b1["opportunity"]["market"] == "US_FUTURES"
+    assert b1["opportunity"]["anchor_price"] == 4.5
+    assert b1["opportunity"]["planned_stop_price"] == 4.1
+
+    # 2. Repeat call with lowercase/alias symbol hits idempotency (no duplicate row)
+    r2 = client.post(
+        "/api/compass/history/compass-test-dir-001/log-opportunity",
+        json={"kind": "l1_direction_call", "card_id": "copper_deficit", "symbol": "铜"},
+    )
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["idempotent_replay"] is True
+    assert b2["opportunity"]["opportunity_id"] == b1["opportunity"]["opportunity_id"]
+
+    # 2b. Non-anchor symbol falls back to market_snapshot.get_snapshot (real signature + technicals.last_close)
+    #     and subsequent repeat click after live price drift still replays idempotently (no HTTP 409)
+    import market_snapshot
+
+    live_prices = iter([120.5, 128.0])
+
+    def _fake_get_snapshot(raw_symbol: str, *, period: str = "3y", include_macro: bool = True, include_fundamentals: bool = True):
+        assert period == "3mo"
+        assert include_macro is False
+        assert include_fundamentals is False
+        return {"symbol": raw_symbol, "technicals": {"last_close": next(live_prices)}}
+
+    monkeypatch.setattr(market_snapshot, "get_snapshot", _fake_get_snapshot)
+    r_nvda1 = client.post(
+        "/api/compass/history/compass-test-dir-001/log-opportunity",
+        json={"kind": "l1_direction_call", "card_id": "copper_deficit", "symbol": "CU0"},
+    )
+    assert r_nvda1.status_code == 200
+    bn1 = r_nvda1.json()
+    assert bn1["idempotent_replay"] is False
+    assert bn1["opportunity"]["symbol"] == "CU0"
+    assert bn1["opportunity"]["market"] == "CN_FUTURES"
+    assert bn1["opportunity"]["anchor_price"] == 120.5
+
+    r_nvda2 = client.post(
+        "/api/compass/history/compass-test-dir-001/log-opportunity",
+        json={"kind": "l1_direction_call", "card_id": "copper_deficit", "symbol": "CU0"},
+    )
+    assert r_nvda2.status_code == 200
+    bn2 = r_nvda2.json()
+    assert bn2["idempotent_replay"] is True
+    assert bn2["opportunity"]["opportunity_id"] == bn1["opportunity"]["opportunity_id"]
+    assert bn2["opportunity"]["anchor_price"] == 120.5
+
+    # 3. Attempting l1_abstention on non-abstained run -> HTTP 422
+    r_bad_abs = client.post(
+        "/api/compass/history/compass-test-dir-001/log-opportunity",
+        json={"kind": "l1_abstention"},
+    )
+    assert r_bad_abs.status_code == 422
+
+    # 4. Log l1_abstention on abstained run -> uses SPY snapshot (580.0) and 8% proxy stop
+    r3 = client.post(
+        "/api/compass/history/compass-test-abs-002/log-opportunity",
+        json={"kind": "l1_abstention"},
+    )
+    assert r3.status_code == 200
+    b3 = r3.json()
+    assert b3["stop_is_proxy"] is True
+    assert b3["opportunity"]["kind"] == "l1_abstention"
+    assert b3["opportunity"]["symbol"] == "SPY"
+    assert b3["opportunity"]["anchor_price"] == 580.0
+    assert b3["opportunity"]["planned_stop_price"] == pytest.approx(580.0 * 0.92, abs=1e-4)
+
+    # 5. Attribution analytics reflects both L1 shadow ledger counts
+    r_attr = client.get("/api/portfolio/attribution")
+    assert r_attr.status_code == 200
+    ss = r_attr.json()["shadow_summary"]
+    assert ss["l1_direction_call_count"] == 2
+    assert ss["l1_abstention_count"] == 1
+
+
+
 def test_portfolio_void_mistaken_entry_preserves_equity_and_rejects_trimmed(client: TestClient):
     client.post(
         "/api/portfolio/init",

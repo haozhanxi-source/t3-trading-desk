@@ -96,7 +96,13 @@ ATTRIBUTION_TAGS: dict[str, dict[str, str]] = {
     "discipline_rule_breach": {"label": "违背纪律硬扛/乱动", "category": "mistake"},
 }
 
-VALID_OPPORTUNITY_KINDS = ("missed_entry", "shaken_out", "premature_exit")
+VALID_OPPORTUNITY_KINDS = (
+    "missed_entry",
+    "shaken_out",
+    "premature_exit",
+    "l1_direction_call",
+    "l1_abstention",
+)
 VALID_OPPORTUNITY_STATUSES = ("tracking", "reviewed")
 
 _UNSET: Any = object()
@@ -586,6 +592,41 @@ def _db_store_idempotency(
             now,
         ),
     )
+
+
+def lookup_idempotent_result(
+    *,
+    idempotency_key: str,
+    expected_operation: str | None = None,
+    portfolio_dir: str | None = None,
+    db_path: str | None = None,
+) -> dict[str, Any] | None:
+    """Read-only lookup of a previously committed idempotency record without mutating DB state."""
+    idem_key = _normalize_idempotency_key(idempotency_key)
+    if idem_key is None:
+        return None
+    pdir, db_file = _resolve_storage(portfolio_dir=portfolio_dir, db_path=db_path)
+    target_db = Path(db_file) if db_file is not None else (Path(pdir) / "portfolio.db")
+    if not target_db.exists():
+        return None
+    with _portfolio_lock(pdir):
+        conn = _connect_db(pdir, db_file=db_file)
+        try:
+            row = conn.execute(
+                "SELECT operation, result_json FROM idempotency_keys WHERE key = ?",
+                (idem_key,),
+            ).fetchone()
+            if row is None:
+                return None
+            stored_op, stored_json = row
+            if expected_operation and stored_op != expected_operation:
+                return None
+            parsed = json.loads(stored_json)
+            return parsed if isinstance(parsed, dict) else None
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            conn.close()
 
 
 def _export_json_mirrors_unlocked(pdir: str, db_file: str | None = None) -> None:
@@ -4823,6 +4864,8 @@ def compute_attribution_analytics(
         "missed_entry_count": sum(1 for o in all_opps if o.get("kind") == "missed_entry"),
         "shaken_out_count": sum(1 for o in all_opps if o.get("kind") == "shaken_out"),
         "premature_exit_count": sum(1 for o in all_opps if o.get("kind") == "premature_exit"),
+        "l1_direction_call_count": sum(1 for o in all_opps if o.get("kind") == "l1_direction_call"),
+        "l1_abstention_count": sum(1 for o in all_opps if o.get("kind") == "l1_abstention"),
         "total_missed_r": round(sum(opp_missed_r_vals), 4) + 0.0 if opp_missed_r_vals else 0.0,
         "max_missed_r": round(max(opp_missed_r_vals), 4) + 0.0 if opp_missed_r_vals else 0.0,
         "top_missed": top_missed,

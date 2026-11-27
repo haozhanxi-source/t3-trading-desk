@@ -158,6 +158,7 @@ FRED_SERIES: list[tuple[str, str]] = [
     ("DFII10", "US 10Y Real Yield (%)"),
     ("T10YIE", "US 10Y Breakeven Inflation (%)"),
     ("DGS10", "US 10Y Nominal Treasury Yield (%)"),
+    ("BAMLH0A0HYM2", "US High Yield OAS Credit Spread (%)"),
     ("FEDFUNDS", "Effective Federal Funds Rate (%)"),
     ("M2SL", "US M2 Money Stock (Bil. USD)"),
     ("PCOPPUSDM", "Global Price of Copper (USD/MT)"),

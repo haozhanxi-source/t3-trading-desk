@@ -472,7 +472,7 @@
         "direction": { "type": "string", "enum": ["long", "short"] },
         "kind": {
           "type": "string",
-          "enum": ["missed_entry", "shaken_out", "premature_exit"]
+          "enum": ["missed_entry", "shaken_out", "premature_exit", "l1_direction_call", "l1_abstention"]
         },
         "status": {
           "type": "string",

@@ -2032,7 +2032,7 @@ def test_l1_constitutional_diagnostics_prompt_and_dynamic_abstention_quota():
     cd_dxy = macro_compass.build_compass_brief(macro_overview=dxy_only_fresh)["constitutional_diagnostics"]
     assert [x["symbol"] for x in cd_dxy["subordinate_evidentiary_clues"]["resilient_under_tightening"]] == ["GC=F"]
 
-    # 4. Prompt embeds all 4 Constitutional Articles + Option A US short prerequisite + A-share pair-short ban + 1~5 quota
+    # 4. Prompt embeds all 4 Constitutional Articles + Option A US short prerequisite + A-share pair-short ban + 0~5 quota
     prompt = macro_compass.build_compass_prompt(brief_path="/tmp/brief.json", focus_scopes=["a_shares"])
     for token in (
         "宪法第 1 条",
@@ -2041,9 +2041,10 @@ def test_l1_constitutional_diagnostics_prompt_and_dynamic_abstention_quota():
         "宪法第 4 条",
         "戴维斯双杀基本面前提",
         "充当 `pair` 配对空头腿",
-        "1~5 个",
-        "1~5 张",
+        "0~5 个",
+        "`0~5` 张",
         "abstain_reason",
+        "article2_credit_and_crowding",
     ):
         assert token in prompt
     assert "输出 **4~6 个**" not in prompt
@@ -2104,33 +2105,32 @@ def test_l1_constitutional_diagnostics_prompt_and_dynamic_abstention_quota():
         "abstain_reason": "锁定战场为严格禁空的A股，当下无任何板块满足两维多头共振与龙头护盾完好条件，宁缺毋滥持币观望。",
         "risk_warnings": ["切勿在破ZD自由落体段左侧接飞刀"],
     }
-    # Passes ONLY when focus_scopes == ["a_shares"]!
-    norm_abstain = macro_compass.normalize_compass_output(
-        abstain_payload,
-        valid_universes=set(),
-        focus_scopes=["a_shares"],
-    )
-    assert norm_abstain["abstained"] is True
-    assert norm_abstain["directions"] == []
-    assert "宁缺毋滥" in norm_abstain["abstain_reason"]
+    # Full-market Article 4 strategic abstention works across ANY focus_scopes when anti-laziness guards are satisfied!
+    for valid_scopes in (None, [], ["a_shares"], ["us_equities"], ["a_shares", "commodities_metals"]):
+        norm_abstain = macro_compass.normalize_compass_output(
+            abstain_payload,
+            valid_universes=set(),
+            focus_scopes=valid_scopes,
+        )
+        assert norm_abstain["abstained"] is True
+        assert norm_abstain["directions"] == []
+        assert "宁缺毋滥" in norm_abstain["abstain_reason"]
 
-    # Unscoped, US-equity scoped, multi-scoped, non-list avoid_sectors, non-string abstain_reason, or missing reason MUST all raise ValueError
-    for bad_scopes in (None, [], ["us_equities"], ["a_shares", "commodities_metals"]):
-        with pytest.raises(ValueError, match="directions 为空"):
-            macro_compass.normalize_compass_output(abstain_payload, valid_universes=set(), focus_scopes=bad_scopes)
+    # Anti-laziness guards: empty/non-list avoid_sectors, non-string or too-short (<15 chars) abstain_reason MUST still raise ValueError
     for bad_avoid in ("地产", {"sector": "地产"}, None, []):
         with pytest.raises(ValueError, match="directions 为空"):
             macro_compass.normalize_compass_output(
                 {**abstain_payload, "avoid_sectors": bad_avoid},
                 valid_universes=set(),
-                focus_scopes=["a_shares"],
+                focus_scopes=None,
             )
-    with pytest.raises(ValueError, match="directions 为空"):
-        macro_compass.normalize_compass_output(
-            {**abstain_payload, "abstain_reason": True},
-            valid_universes=set(),
-            focus_scopes=["a_shares"],
-        )
+    for bad_reason in (True, "", "太短了没机会"):
+        with pytest.raises(ValueError, match="directions 为空"):
+            macro_compass.normalize_compass_output(
+                {**abstain_payload, "abstain_reason": bad_reason},
+                valid_universes=set(),
+                focus_scopes=None,
+            )
     with pytest.raises(ValueError, match="directions 为空"):
         macro_compass.normalize_compass_output(
             {
@@ -2140,8 +2140,370 @@ def test_l1_constitutional_diagnostics_prompt_and_dynamic_abstention_quota():
                 "directions": [],
             },
             valid_universes=set(),
-            focus_scopes=["a_shares"],
+            focus_scopes=None,
         )
+
+
+def test_cftc_crowding_sign_aware_parser_hy_oas_and_isolated_cache(monkeypatch: pytest.MonkeyPatch):
+    # 1. Sign-aware CFTC 52w crowding percentile parser (real CSV format)
+    today_dt = pd.Timestamp.utcnow().normalize()
+
+    def _make_csv_lines(
+        market_name: str,
+        code: str,
+        net_pcts: list[float],
+        *,
+        report_type: str,
+    ) -> list[str]:
+        lines: list[str] = []
+        n = len(net_pcts)
+        for idx, pct in enumerate(net_pcts):
+            oi = 100_000.0
+            net = oi * pct / 100.0
+            long_v = max(net, 0.0) + 10_000.0
+            short_v = max(-net, 0.0) + 10_000.0
+            dt_str = (today_dt - pd.Timedelta(days=7 * (n - 1 - idx) + 2)).strftime("%Y-%m-%d")
+            cols = ["0"] * 17
+            cols[0] = f'"{market_name}"'
+            cols[2] = dt_str
+            cols[3] = code
+            cols[7] = str(int(oi))
+            if report_type == "disagg":
+                cols[13] = str(int(round(long_v)))
+                cols[14] = str(int(round(short_v)))
+            else:
+                cols[14] = str(int(round(long_v)))
+                cols[15] = str(int(round(short_v)))
+            lines.append(",".join(cols))
+        return lines
+
+    # CL=F: positive net at 52w high -> crowded_long
+    # HG=F: still net long (+9.6%) even at 52w low -> long_washout_extreme (NOT crowded_short!)
+    # NG=F: net short (-23.5%) at 52w low -> crowded_short
+    disagg_csv = "\n".join(
+        _make_csv_lines("WTI-PHYSICAL - NEW YORK MERCANTILE EXCHANGE", "067651", [5.0 + i * 0.4 for i in range(52)], report_type="disagg")
+        + _make_csv_lines("COPPER- #1 - COMMODITY EXCHANGE INC.", "085692", [30.0 - i * 0.4 for i in range(52)], report_type="disagg")
+        + _make_csv_lines("NAT GAS NYME - NEW YORK MERCANTILE EXCHANGE", "023651", [2.0 - i * 0.5 for i in range(52)], report_type="disagg")
+    )
+    # SPY: structurally net short (-4.6%) at 52w high -> short_covering_extreme (NOT crowded_long!)
+    # USDJPY=X: pair_inverted=True, JPY futures net long (+15.5% at 52w high) => USDJPY pair net short (-15.5% at 52w low) -> crowded_short
+    tff_csv = "\n".join(
+        _make_csv_lines("E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE", "13874A", [-25.0 + i * 0.4 for i in range(52)], report_type="tff")
+        + _make_csv_lines("JAPANESE YEN - CHICAGO MERCANTILE EXCHANGE", "097741", [-10.0 + i * 0.5 for i in range(52)], report_type="tff")
+    )
+
+    parsed = research_extensions.parse_cftc_crowding_history([disagg_csv], [tff_csv])
+    by_sym = {it["symbol"]: it for it in parsed["items"]}
+    assert by_sym["CL=F"]["crowding_state"] == "crowded_long"
+    assert by_sym["CL=F"]["percentile_52w"] >= 90.0
+    assert by_sym["HG=F"]["net_pct_oi"] > 0
+    assert by_sym["HG=F"]["crowding_state"] == "long_washout_extreme"
+    assert by_sym["NG=F"]["crowding_state"] == "crowded_short"
+    assert by_sym["SPY"]["net_pct_oi"] < 0
+    assert by_sym["SPY"]["crowding_state"] == "short_covering_extreme"
+    assert by_sym["USDJPY=X"]["pair_inverted"] is True
+    assert by_sym["USDJPY=X"]["net_pct_oi"] < 0
+    assert by_sym["USDJPY=X"]["crowding_state"] == "crowded_short"
+    assert [x["symbol"] for x in parsed["crowded_long"]] == ["CL=F"]
+    assert {x["symbol"] for x in parsed["crowded_short"]} == {"NG=F", "USDJPY=X"}
+
+    # 2. HY OAS (BAMLH0A0HYM2) flows into headline_metrics, regime_tags, and article2_credit_and_crowding (with stale masking)
+    today_iso = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    stale_iso = (pd.Timestamp.utcnow() - pd.Timedelta(days=15)).strftime("%Y-%m-%d")
+    fresh_ov = {
+        "fetched_at_utc": f"{today_iso}T08:00:00+00:00",
+        "sources_status": {"us_fred": "ok", "cftc_crowding": "ok"},
+        "stale_sources": {},
+        "live_macro": {},
+        "us_fred": {
+            "series": {
+                "DFII10": {"status": "ok", "latest_value": 2.25, "change": 0.05, "latest_date": today_iso},
+                "BAMLH0A0HYM2": {"status": "ok", "latest_value": 5.35, "change": 0.42, "latest_date": today_iso},
+            }
+        },
+        "cftc_crowding": parsed,
+        "anchors": {"items": []},
+    }
+    metrics, tags = macro_compass._build_headline_metrics_and_tags(
+        fresh_ov["live_macro"],
+        fresh_ov["us_fred"],
+        {},
+        cftc_crowding=parsed,
+    )
+    hy_metric = next((m for m in metrics if m["key"] == "HY_OAS"), None)
+    assert hy_metric is not None
+    assert hy_metric["value"] == 5.35
+    assert hy_metric["unit"] == "%"
+    assert any("信用" in t["label"] and t["tone"] == "critical" for t in tags)
+    assert any("CFTC" in t["label"] for t in tags)
+
+    diag = macro_compass.compute_constitutional_diagnostics(macro_overview=fresh_ov, anchor_items=[])
+    a2 = diag["article2_credit_and_crowding"]
+    assert a2["hy_oas_pct"] == 5.35
+    assert a2["credit_stress_level"] == "stress_crisis"
+    assert [x["symbol"] for x in a2["crowded_long_90pct"]] == ["CL=F"]
+    assert {x["symbol"] for x in a2["crowded_short_10pct"]} == {"NG=F", "USDJPY=X"}
+
+    # Stale HY OAS (>10 days old) MUST be masked in diagnostics
+    stale_ov = {
+        **fresh_ov,
+        "us_fred": {
+            "series": {
+                "DFII10": {"status": "ok", "latest_value": 2.25, "change": 0.05, "latest_date": today_iso},
+                "BAMLH0A0HYM2": {"status": "ok", "latest_value": 5.35, "change": 0.42, "latest_date": stale_iso},
+            }
+        },
+    }
+    diag_stale = macro_compass.compute_constitutional_diagnostics(macro_overview=stale_ov, anchor_items=[])
+    assert diag_stale["article2_credit_and_crowding"]["hy_oas_pct"] is None
+    assert diag_stale["article2_credit_and_crowding"]["credit_stress_level"] == "stale"
+
+    # 3. CFTC isolated optional cache: single-flight retry caches degraded status independently
+    macro_compass.CACHE.invalidate(("compass_cftc_crowding",))
+    macro_compass._LAST_GOOD_MACRO_SOURCES.pop("cftc_crowding", None)
+    monkeypatch.setattr(
+        macro_compass,
+        "fetch_cftc_crowding_overview",
+        lambda *, timeout_seconds=8.0: {"status": "error", "items": [], "error": "net down"},
+    )
+    cftc_data, cftc_status, cftc_stale = macro_compass._refresh_cftc_crowding_singleflight(timeout_seconds=1.0)
+    assert cftc_status == "error"
+    assert cftc_data["status"] == "error"
+    assert cftc_stale is not None
+    hit_cftc, cached_cftc = macro_compass.CACHE.get(("compass_cftc_crowding",))
+    assert hit_cftc is True
+    assert isinstance(cached_cftc, tuple) and cached_cftc[1] == "error"
+
+
+def test_programmatic_constitutional_guardrails_and_factor_concentration():
+    diagnostics = {
+        "article1_denominator_truth": {
+            "data_status": "ok",
+            "state": "unanchored_inflation_nominal_pressure",
+            "real_yield_10y_pct": 2.25,
+        },
+        "article2_credit_and_crowding": {
+            "hy_oas_pct": 5.35,
+            "credit_stress_level": "stress_crisis",
+            "cftc_status": "ok",
+            "crowded_long_90pct": [{"symbol": "CL=F", "label": "WTI原油", "percentile_52w": 95.0}],
+            "crowded_short_10pct": [],
+        },
+        "article2_bellwether_shields": [
+            {
+                "symbol": "LC0",
+                "name": "碳酸锂",
+                "shield_posture": "broken_below_zd_breakdown",
+                "chanlun_hint": {"shield_state": "broken_below_zd_breakdown"},
+            }
+        ],
+        "article3_panic_pendulum_gate": {
+            "systemic_panic_active": True,
+            "vix": 32.5,
+            "deep_hole_short_chase_ban": [{"symbol": "LC0", "name": "碳酸锂", "ret_60d_pct": -28.0}],
+        },
+    }
+
+    def _ev_l1():
+        return [
+            {"fact": "官方数据确认供需变化", "level": "L1", "date": "2026-11-20", "source": "官方统计"},
+            {"fact": "行业周报交叉验证", "level": "L2", "date": "2026-11-22", "source": "行业协会"},
+        ]
+
+    payload = {
+        "regime_title": "紧缩信用压力期测试",
+        "regime_summary": "测试程序化宪法护栏与跨卡片因子集中度检测。",
+        "avoid_sectors": [{"sector": "弱势高估值", "reason": "利率压制"}],
+        "directions": [
+            # Card 1: ONLY L3/L4 evidence -> HARD REJECTED by L1/L2 floor
+            {
+                "id": "no_hard_ev",
+                "rank": 1,
+                "title": "纯消息面题材",
+                "direction": "long",
+                "horizon": "1Q~2Q",
+                "conviction": "high",
+                "asset_scope": "us_equities",
+                "primary_driver": {"dimension": "技术与产业迭代", "summary": "AI传闻"},
+                "secondary_driver": {"dimension": "资金流与市场结构", "summary": "资金流入"},
+                "thesis": "仅凭传闻看多。",
+                "evidence": [
+                    {"fact": "某研报看好", "level": "L3", "date": "2026-11-20", "source": "卖方"},
+                    {"fact": "社媒热议", "level": "L4", "date": "2026-11-21", "source": "社媒"},
+                ],
+            },
+            # Card 2: Short on deep-hole LC0 WITHOUT pullback discipline -> HARD REJECTED by Article 3
+            {
+                "id": "chase_short_hole",
+                "rank": 2,
+                "title": "碳酸锂追空",
+                "direction": "short",
+                "horizon": "1Q~2Q",
+                "conviction": "high",
+                "asset_scope": "commodities",
+                "reference_anchors": ["LC0"],
+                "primary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "过剩"},
+                "secondary_driver": {"dimension": "宏观双核", "summary": "需求弱"},
+                "thesis": "立刻市价直接追空碳酸锂。",
+                "value_chain_focus": "顺势继续砸盘。",
+                "evidence": _ev_l1(),
+            },
+            # Card 3: Long on <ZD breakdown anchor LC0 WITHOUT bottom-divergence confirmation -> HARD REJECTED by Article 2
+            {
+                "id": "knife_catch_long",
+                "rank": 3,
+                "title": "碳酸锂左侧抄底",
+                "direction": "long",
+                "horizon": "1Q~2Q",
+                "conviction": "high",
+                "asset_scope": "commodities",
+                "reference_anchors": ["LC0"],
+                "primary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "跌多了"},
+                "secondary_driver": {"dimension": "产业政策与监管", "summary": "环保"},
+                "thesis": "跌幅大所以便宜直接抄底。",
+                "evidence": _ev_l1(),
+            },
+            # Card 4: Valid long on CL=F (crowded_long) -> KEPT, conviction capped high->medium + cftc flag
+            {
+                "id": "crude_supply_long",
+                "rank": 4,
+                "title": "原油供给收紧与能源地缘溢价",
+                "direction": "long",
+                "horizon": "1Q~2Q",
+                "conviction": "high",
+                "asset_scope": "commodities",
+                "reference_anchors": ["CL=F"],
+                "primary_driver": {"dimension": "地缘与资源国政策", "summary": "OPEC+减产执行与霍尔木兹海峡风险"},
+                "secondary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "原油库存持续去化"},
+                "thesis": "原油供给受限与地缘风险驱动能源价格走高。",
+                "evidence": _ev_l1(),
+            },
+            # Card 5: Valid long on US utilities/SaaS during unanchored inflation + HY credit crisis -> capped high->medium + Art1 & Art2 flags
+            {
+                "id": "us_grid_long",
+                "rank": 5,
+                "title": "北美电力公用事业与数据中心能源",
+                "direction": "long",
+                "horizon": "2Q~1Y",
+                "conviction": "high",
+                "asset_scope": "us_equities",
+                "reference_anchors": ["XLU", "XLE"],
+                "primary_driver": {"dimension": "技术与产业迭代", "summary": "AI数据中心用电与原油天然气发电需求"},
+                "secondary_driver": {"dimension": "地缘与资源国政策", "summary": "能源供给安全与公用事业电网扩建"},
+                "thesis": "公用事业电网与能源设施需求扩张。",
+                "evidence": _ev_l1(),
+            },
+            # Card 6: Hedged pair card -> MUST NOT inflate directional macro beta concentration
+            {
+                "id": "energy_pair",
+                "rank": 6,
+                "title": "多油运空炼化能源配对",
+                "direction": "pair",
+                "long_leg_sector": "原油油运与VLCC航运",
+                "short_leg_sector": "成品油裂解与高成本炼厂",
+                "horizon": "1Q~2Q",
+                "conviction": "medium",
+                "asset_scope": "commodities",
+                "reference_anchors": ["CL=F"],
+                "primary_driver": {"dimension": "地缘与资源国政策", "summary": "红海油运扰动"},
+                "secondary_driver": {"dimension": "商品供需平衡与库存周期", "summary": "炼厂裂解走弱"},
+                "thesis": "对冲原油方向性Beta仅赚运价剪刀差。",
+                "evidence": _ev_l1(),
+            },
+        ],
+    }
+
+    out = macro_compass.normalize_compass_output(
+        payload,
+        valid_universes=set(),
+        constitutional_diagnostics=diagnostics,
+    )
+    kept_ids = [d["id"] for d in out["directions"]]
+    assert kept_ids == [
+        "crude_supply_long",
+        "us_grid_long",
+        "energy_pair",
+    ]
+    audit = out["constitutional_audit"]
+    assert audit["enforced"] is True
+    assert audit["diagnostics_attached"] is True
+    assert audit["rejected_count"] == 3
+    assert audit["conviction_caps_applied"] == 2
+    assert audit["flagged_cards_count"] == 2
+
+    crude_card = out["directions"][0]
+    assert crude_card["conviction"] == "medium"
+    assert {fl["code"] for fl in crude_card["constitutional_flags"]} == {"cftc_crowded_long_90pct"}
+    assert crude_card["constitutional_flags"][0]["action"] == "cap_conviction_to_medium"
+
+    grid_card = out["directions"][1]
+    assert grid_card["conviction"] == "medium"
+    grid_codes = {fl["code"] for fl in grid_card["constitutional_flags"]}
+    assert "unanchored_inflation_duration_risk" in grid_codes
+    assert "hy_credit_stress_warning" in grid_codes
+
+    fc = out["factor_concentration"]
+    assert fc["concentrated"] is True
+    assert fc["directional_cards_count"] == 2  # pair card excluded!
+    assert fc["hedged_pair_count"] == 1
+    assert any(f["factor_id"] == "energy_geopolitics:long" and f["count"] == 2 for f in fc["dominant_factors"])
+    assert any("跨卡宏观因子重叠警戒" in w for w in out["risk_warnings"])
+
+    # Opposite USD/Fed stance cards MUST NOT falsely collide into usd_rates_tightening:long
+    fc_opposite_usd = macro_compass.analyze_macro_factor_concentration(
+        [
+            {
+                "id": "long_usdjpy",
+                "title": "做多美元兑日元",
+                "direction": "long",
+                "reference_anchors": ["USDJPY=X"],
+                "primary_driver": {"dimension": "宏观双核", "summary": "强美元鹰派利率上行"},
+                "secondary_driver": {"dimension": "资金流", "summary": "美日利差扩大"},
+                "thesis": "强美元紧缩顺风。",
+            },
+            {
+                "id": "long_eurusd",
+                "title": "做多欧元兑美元",
+                "direction": "long",
+                "reference_anchors": ["EURUSD=X"],
+                "primary_driver": {"dimension": "宏观双核", "summary": "美联储降息美债下行美元走弱"},
+                "secondary_driver": {"dimension": "资金流", "summary": "欧债资金回流"},
+                "thesis": "美联储转向宽松导致美元走弱、实际利率回落。",
+            },
+        ]
+    )
+    assert fc_opposite_usd["concentrated"] is False
+
+    # Partial CFTC overview with stale_sources entry MUST still keep fresh crowded benchmarks active
+    from datetime import datetime, timezone
+
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    partial_ov = {
+        "sources_status": {"us_fred": "ok", "cftc_crowding": "partial"},
+        "stale_sources": {"cftc_crowding": {"last_good_at_utc": today_iso, "error": "tff timeout"}},
+        "us_fred": {"series": {"BAMLH0A0HYM2": {"status": "ok", "latest_value": 3.5, "change": 0.0, "latest_date": today_iso}}},
+        "cftc_crowding": {
+            "status": "partial",
+            "latest_report_date": today_iso,
+            "stale_fallback": False,
+            "items": [
+                {
+                    "symbol": "CL=F",
+                    "label": "WTI原油",
+                    "cohort": "managed_money",
+                    "latest_date": today_iso,
+                    "is_stale": False,
+                    "net_pct_oi": 14.2,
+                    "percentile_52w": 96.0,
+                    "crowding_state": "crowded_long",
+                }
+            ],
+        },
+    }
+    diag_partial = macro_compass.compute_constitutional_diagnostics(macro_overview=partial_ov, anchor_items=[])
+    assert diag_partial["article2_credit_and_crowding"]["cftc_status"] == "partial"
+    assert [x["symbol"] for x in diag_partial["article2_credit_and_crowding"]["crowded_long_90pct"]] == ["CL=F"]
+
 
 
 

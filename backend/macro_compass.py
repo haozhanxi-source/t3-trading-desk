@@ -276,7 +276,9 @@ def _anchor_item_from_close_series(
             "ret_5d_pct": None,
             "ret_20d_pct": None,
             "ret_60d_pct": None,
+            "ret_2y_pct": None,
             "range_pos_6m_pct": None,
+            "range_pos_1y_pct": None,
             "as_of": None,
         }
     n_bars = len(close_series)
@@ -285,12 +287,25 @@ def _anchor_item_from_close_series(
     p5 = _to_float(close_series.iloc[-6]) if n_bars >= 6 else None
     p20 = _to_float(close_series.iloc[-21]) if n_bars >= 21 else None
     p60 = _to_float(close_series.iloc[-61]) if n_bars >= 61 else None
+    p2y = (
+        _to_float(close_series.iloc[-505] if n_bars >= 505 else close_series.iloc[0])
+        if n_bars >= 480
+        else None
+    )
     range_pos_6m: float | None = None
     if last is not None and n_bars >= 20:
-        hi_6m = _to_float(close_series.max())
-        lo_6m = _to_float(close_series.min())
+        tail_6m = close_series.iloc[-126:]
+        hi_6m = _to_float(tail_6m.max())
+        lo_6m = _to_float(tail_6m.min())
         if hi_6m is not None and lo_6m is not None and hi_6m > lo_6m:
             range_pos_6m = round(max(0.0, min(100.0, (last - lo_6m) / (hi_6m - lo_6m) * 100.0)), 1)
+    range_pos_1y: float | None = None
+    if last is not None and n_bars >= 180:
+        tail_1y = close_series.iloc[-252:]
+        hi_1y = _to_float(tail_1y.max())
+        lo_1y = _to_float(tail_1y.min())
+        if hi_1y is not None and lo_1y is not None and hi_1y > lo_1y:
+            range_pos_1y = round(max(0.0, min(100.0, (last - lo_1y) / (hi_1y - lo_1y) * 100.0)), 1)
     as_of_raw = close_series.index[-1]
     as_of = as_of_raw.strftime("%Y-%m-%d") if hasattr(as_of_raw, "strftime") else str(as_of_raw)[:10]
     is_stale = bool(stale_fallback) or _is_bar_stale(as_of)
@@ -301,7 +316,9 @@ def _anchor_item_from_close_series(
         "ret_5d_pct": _safe_pct_change(last, p5),
         "ret_20d_pct": _safe_pct_change(last, p20),
         "ret_60d_pct": _safe_pct_change(last, p60),
+        "ret_2y_pct": _safe_pct_change(last, p2y),
         "range_pos_6m_pct": range_pos_6m,
+        "range_pos_1y_pct": range_pos_1y,
         "as_of": as_of,
     }
     if is_stale:
@@ -310,7 +327,7 @@ def _anchor_item_from_close_series(
 
 
 def fetch_cross_asset_anchors() -> dict[str, Any]:
-    """Batch-fetch strict 5D / 20D / 60D relative returns for 19 global pricing anchors via yfinance."""
+    """Batch-fetch strict 5D/20D/60D/2Y returns and 6M/1Y range positions for 19 global pricing anchors via yfinance."""
     if yf is None:
         return {"status": "error", "error": "yfinance is not installed", "items": []}
 
@@ -319,7 +336,7 @@ def fetch_cross_asset_anchors() -> dict[str, Any]:
         with data_store.scoped_http_timeout((4.0, 12.0)):
             df = yf.download(
                 tickers,
-                period="6mo",
+                period="2y",
                 interval="1d",
                 auto_adjust=True,
                 progress=False,
@@ -443,7 +460,9 @@ def _fetch_single_cn_future_anchor(
                     "ret_5d_pct": _to_float(tech.get("return_5d_pct")),
                     "ret_20d_pct": _to_float(tech.get("return_20d_pct")),
                     "ret_60d_pct": _to_float(tech.get("return_60d_pct")),
+                    "ret_2y_pct": None,
                     "range_pos_6m_pct": None,
+                    "range_pos_1y_pct": None,
                     "as_of": as_of,
                 }
                 if chanlun_hint is not None:
@@ -1799,15 +1818,27 @@ def compute_constitutional_diagnostics(
         dt = str(row.get("latest_date") or "").strip()[:10] or None
         return v, _to_float(row.get("change")), dt
 
+    def _fchg(sid: str, key: str) -> float | None:
+        row = fred_series.get(sid)
+        if not isinstance(row, dict) or row.get("status") != "ok":
+            return None
+        return _to_float(row.get(key))
+
     dfii10, dfii10_chg, dfii10_dt = _fval("DFII10")
     t10yie, _, t10yie_dt = _fval("T10YIE")
     dgs10, dgs10_chg, dgs10_dt = _fval("DGS10")
+    dgs2, _, dgs2_dt = _fval("DGS2")
+    dgs2_1m, dgs2_3m = _fchg("DGS2", "change_1m"), _fchg("DGS2", "change_3m")
+    t10y2y, _, t10y2y_dt = _fval("T10Y2Y")
+    t10y2y_1m, t10y2y_3m = _fchg("T10Y2Y", "change_1m"), _fchg("T10Y2Y", "change_3m")
     hy_oas, hy_oas_chg, hy_oas_dt = _fval("BAMLH0A0HYM2")
     fedfunds, _, fedfunds_dt = _fval("FEDFUNDS")
 
     dfii10_fresh = (dfii10 is not None) and (not fred_is_stale) and _is_obs_fresh(dfii10_dt, max_age_days=10)
     t10yie_fresh = (t10yie is not None) and (not fred_is_stale) and _is_obs_fresh(t10yie_dt, max_age_days=10)
     dgs10_fresh = (dgs10 is not None) and (not fred_is_stale) and _is_obs_fresh(dgs10_dt, max_age_days=10)
+    dgs2_fresh = (dgs2 is not None) and (not fred_is_stale) and _is_obs_fresh(dgs2_dt, max_age_days=10)
+    t10y2y_fresh = (t10y2y is not None) and (not fred_is_stale) and _is_obs_fresh(t10y2y_dt, max_age_days=10)
     hy_oas_fresh = (hy_oas is not None) and (not fred_is_stale) and _is_obs_fresh(hy_oas_dt, max_age_days=10)
     fedfunds_fresh = (fedfunds is not None) and (not fred_is_stale) and _is_obs_fresh(fedfunds_dt, max_age_days=45)
     dfii10_status = "ok" if dfii10_fresh else ("stale" if dfii10 is not None else "missing")
@@ -1906,6 +1937,8 @@ def compute_constitutional_diagnostics(
     bellwether_shields: list[dict[str, Any]] = []
     deep_hole_ban_symbols: list[dict[str, Any]] = []
     resilient_divergence_clues: list[dict[str, Any]] = []
+    high_breakout_intact_leaders: list[dict[str, Any]] = []
+    post_boom_zd_breakdown_alerts: list[dict[str, Any]] = []
 
     tightening_backdrop = bool(
         (dfii10_fresh and dfii10 is not None and dfii10 >= 1.80)
@@ -1918,7 +1951,9 @@ def compute_constitutional_diagnostics(
         name = str(it.get("name") or sym)
         r20 = _to_float(it.get("ret_20d_pct"))
         r60 = _to_float(it.get("ret_60d_pct"))
+        r2y = _to_float(it.get("ret_2y_pct"))
         pos6m = _to_float(it.get("range_pos_6m_pct"))
+        pos1y = _to_float(it.get("range_pos_1y_pct"))
         cl_hint = it.get("chanlun_hint") if isinstance(it.get("chanlun_hint"), dict) else None
         cl_shield = str(cl_hint.get("shield_state") or "") if cl_hint else ""
 
@@ -1941,19 +1976,49 @@ def compute_constitutional_diagnostics(
                 "name": name,
                 "ret_20d_pct": r20,
                 "ret_60d_pct": r60,
+                "ret_2y_pct": r2y,
                 "range_pos_6m_pct": pos6m,
+                "range_pos_1y_pct": pos1y,
                 "shield_posture": posture,
                 **({"chanlun_hint": cl_hint} if cl_hint else {}),
             }
         )
 
-        if (r60 is not None and r60 <= -15.0) or (r20 is not None and r20 <= -12.0):
+        is_deep_hole = bool((r60 is not None and r60 <= -15.0) or (r20 is not None and r20 <= -12.0))
+        if is_deep_hole:
             deep_hole_ban_symbols.append(
                 {
                     "symbol": sym,
                     "name": name,
                     "ret_20d_pct": r20,
                     "ret_60d_pct": r60,
+                }
+            )
+
+        pos_ref = pos1y if pos1y is not None else pos6m
+        pos_win = "1y" if pos1y is not None else ("6m" if pos6m is not None else None)
+        if posture in {"bullish_shield_intact", "shield_intact_uptrend"} and pos_ref is not None and pos_ref >= 85.0:
+            high_breakout_intact_leaders.append(
+                {
+                    "symbol": sym,
+                    "name": name,
+                    "range_pos_pct": pos_ref,
+                    "range_window": pos_win,
+                    "ret_60d_pct": r60,
+                    "shield_posture": posture,
+                    "audit_note": "右侧强势突破离开段且护盾完好：严禁仅因高位恐高否决做多或左侧摸顶",
+                }
+            )
+
+        if posture == "below_zd_breakdown" and r2y is not None and r2y >= 45.0 and not is_deep_hole:
+            post_boom_zd_breakdown_alerts.append(
+                {
+                    "symbol": sym,
+                    "name": name,
+                    "ret_2y_pct": r2y,
+                    "ret_60d_pct": r60,
+                    "shield_posture": posture,
+                    "audit_note": "两年大涨透支后实质跌破ZD且未落深坑：叠加宏观/基本面逆风可按跨资产权限评估空头(A股严禁做空)",
                 }
             )
 
@@ -2039,6 +2104,53 @@ def compute_constitutional_diagnostics(
     if not credit_crowding_notes:
         credit_crowding_notes.append("信贷利差与CFTC衍生品拥挤度暂未触发极端红线")
 
+    # Macro 2nd-derivative Inflection Radar (54-year Bootstrap verified: non-stagflation easing/steepening + intact shield)
+    if dgs2_fresh or t10y2y_fresh:
+        radar_data_status = (
+            "ok"
+            if ((dgs2_fresh and dgs2_3m is not None) or (t10y2y_fresh and t10y2y_3m is not None))
+            else "partial"
+        )
+    elif dgs2 is not None or t10y2y is not None:
+        radar_data_status = "stale"
+    else:
+        radar_data_status = "missing"
+
+    inflation_anchored_ok = bool(
+        art1_state in {"anchored_inflation_regime", "anchored_inflation_real_yield_unavailable"}
+    )
+    easing_2y_active = bool(dgs2_fresh and dgs2_3m is not None and dgs2_3m <= -0.25)
+    steepening_active = bool(t10y2y_fresh and t10y2y_3m is not None and t10y2y_3m >= 0.25)
+    tightening_2y_shock = bool(dgs2_fresh and dgs2_3m is not None and dgs2_3m >= 0.35)
+    credit_calm = credit_stress_level not in {"stress_crisis"}
+    easing_or_steepening_active = bool(
+        inflation_anchored_ok and credit_calm and (easing_2y_active or steepening_active)
+    )
+
+    inflection_signals: list[str] = []
+    if easing_2y_active and dgs2_3m is not None:
+        inflection_signals.append(f"美债2Y短端利率近3M下行{dgs2_3m:+.2f}pp(宽松拐点)")
+    if steepening_active and t10y2y_3m is not None:
+        inflection_signals.append(f"10Y-2Y利差近3M陡峭化{t10y2y_3m:+.2f}pp")
+    if tightening_2y_shock and dgs2_3m is not None:
+        inflection_signals.append(f"美债2Y短端利率近3M急升{dgs2_3m:+.2f}pp(鹰派紧缩冲击)")
+
+    if radar_data_status in ("missing", "stale"):
+        radar_guidance = "2Y短端利率或10Y-2Y曲线3M变动观测缺失或陈旧，已置空不触发拐点进攻授权，请联网核验"
+    elif easing_or_steepening_active:
+        radar_guidance = "通胀未失锚且信贷未处危机下触发宽松/陡峭化拐点：授权对护盾完好且基本面共振主线输出高确信度做多卡"
+    elif (easing_2y_active or steepening_active) and not inflation_anchored_ok:
+        radar_guidance = "虽见利率/曲线变动，但通胀锚失控或数据陈旧缺失：拒绝激活宽松进攻授权，严防滞胀假象"
+    elif (easing_2y_active or steepening_active) and not credit_calm:
+        radar_guidance = "虽见利率下行/曲线陡峭化，但高收益信贷利差处于高压危机区：暂缓进攻授权，严防衰退型牛陡陷阱"
+    elif tightening_2y_shock:
+        radar_guidance = "短端利率3M显著上行形成紧缩逆风：严审估值与分子护盾，警惕高估值久期与大涨透支破位品种"
+    else:
+        radar_guidance = "短端利率与期限利差近3M未触及显著二阶拐点阈值，按常规宪法第1~4条正常推演"
+
+    high_breakout_intact_leaders.sort(key=lambda x: float(x.get("range_pos_pct") or 0.0), reverse=True)
+    post_boom_zd_breakdown_alerts.sort(key=lambda x: float(x.get("ret_2y_pct") or 0.0), reverse=True)
+
     return {
         "article1_denominator_truth": {
             "data_status": art1_data_status,
@@ -2072,6 +2184,26 @@ def compute_constitutional_diagnostics(
             "systemic_panic_active": systemic_panic,
             "deep_hole_short_chase_ban": deep_hole_ban_symbols,
             "put_long_unlock_rule": "深坑区无条件禁直接追空；反手做多流动性兜底必须同时满足：①央行未被高通胀绑手(短端利率停止上行/转向降息) + ②标的未处实质破ZD自由落体",
+        },
+        "macro_inflection_radar": {
+            "data_status": radar_data_status,
+            "dgs2_pct": dgs2 if dgs2_fresh else None,
+            "dgs2_chg_1m_pp": dgs2_1m if dgs2_fresh else None,
+            "dgs2_chg_3m_pp": dgs2_3m if dgs2_fresh else None,
+            "dgs2_as_of": dgs2_dt,
+            "t10y2y_pct": t10y2y if t10y2y_fresh else None,
+            "t10y2y_chg_1m_pp": t10y2y_1m if t10y2y_fresh else None,
+            "t10y2y_chg_3m_pp": t10y2y_3m if t10y2y_fresh else None,
+            "t10y2y_as_of": t10y2y_dt,
+            "easing_or_steepening_active": easing_or_steepening_active,
+            "tightening_2y_shock": tightening_2y_shock,
+            "inflection_signals": inflection_signals,
+            "guidance": radar_guidance,
+        },
+        "offensive_structure_signals": {
+            "high_breakout_intact_leaders": high_breakout_intact_leaders[:8],
+            "post_boom_zd_breakdown_alerts": post_boom_zd_breakdown_alerts[:6],
+            "anti_acrophobia_rule": "6M/1Y区间高位突破(≥85%分位)且护盾完好属于强势离开段：严禁仅因恐高否决做多或左侧摸顶",
         },
         "subordinate_evidentiary_clues": {
             "resilient_under_tightening": resilient_divergence_clues[:6],
@@ -2336,7 +2468,8 @@ def build_compass_prompt(
         "【最高准则：Layer 1 思考宪法（跨半世纪正反周期违宪审查核准 · 享有最高裁决权）】\n"
         "请结合 `brief.json` 中的 `constitutional_diagnostics` 诊断字段，严格按以下 4 条最高宪法与 2 条取证规程推演，拒绝死背静态教科书口诀：\n"
         "- **宪法第 1 条（分母真伪辨识律 · 剥离恶性通胀与温和宽松）**：评判实际利率前先核查通胀锚是否失控——温和通胀下的低/负实际利率利好权益久期；但**因恶性高通胀失锚叠加名义长债飙升压缩算出的低/负实际利率，通杀股票与类债防御板块，此时唯独实物能源与贵金属受益**。\n"
-        "- **宪法第 2 条（统治权归属与真龙头两段式护盾律）**：先比分子与分母量级——当板块具备非线性分子爆发（如资本开支与盈利二阶加速）或主权外储刚性买盘、信贷利差平稳且**板块基准定价锚护盾完好（未出日线确认卖点，实物储备须同时处于跨年正趋势）**时，分子统治分母，豁免高利率利空；**一段护盾（高位分歧退观望）**：若基准定价锚在大中枢 `ZD` 上方首现日线确认卖点或衍生品持仓极端拥挤（>90%分位），**立即收回做多豁免权退居观望（列入 `avoid_sectors` 或留白，绝不硬推做多，也绝不在 `ZD` 上方左侧摸顶做空）**；**二段破位警报与分层空头权限**：一旦基准定价锚实质跌破大中枢 `ZD`，哪怕央行正在降息也无条件严禁凭降息惯性抄底（列入回避观察）；至于能否反手输出 `short` 或充当 `pair` 空头腿，必须严守跨资产权限与分层边界——**大宗商品/外汇/加密**在供需过剩或利差逻辑共振下可顺势做空，**美股/美股行业 ETF** 唯有同时具备“高实际利率/金融条件紧缩压制估值 + 未来 1~3 年盈利/CapEx 增长故事证伪或强周期景气见顶反转”的戴维斯双杀基本面前提方可输出空头（具体真龙头日线与 30min 缠论结构交由 Layer 2/4 独立验证），**A 股在任何情形下均严格禁止直接做空及充当 `pair` 配对空头腿**。\n"
+        "- **宪法第 2 条（统治权归属与真龙头两段式护盾律）**：先比分子与分母量级——当板块具备非线性分子爆发（如资本开支与盈利二阶加速）或主权外储刚性买盘、信贷利差平稳且**板块基准定价锚护盾完好（未出日线确认卖点，实物储备须同时处于跨年正趋势）**时，分子统治分母，豁免高利率利空；**一段护盾（高位分歧退观望）**：若基准定价锚在大中枢 `ZD` 上方首现日线确认卖点或衍生品持仓极端拥挤（>90%分位），**立即收回做多豁免权退居观望（列入 `avoid_sectors` 或留白，绝不硬推做多，也绝不在 `ZD` 上方左侧摸顶做空）**；**二段破位警报与分层空头权限**：一旦基准定价锚实质跌破大中枢 `ZD`，哪怕央行正在降息也无条件严禁凭降息惯性抄底（列入回避观察）；尤其当 `offensive_structure_signals.post_boom_zd_breakdown_alerts` 提示标的经历 2 年大涨透支（`≥45%`）后首次实质跌破 `ZD` 且未落深坑禁追空区时，若叠加宏观/信贷逆风或基本面供需/盈利证伪，应按跨资产分层权限主动评估将其升格为空头方向——**大宗商品/外汇/加密**在供需过剩或利差逻辑共振下可直接顺势做空，**美股/美股行业 ETF** 唯有同时具备“高实际利率/金融条件紧缩压制估值 + 未来 1~3 年盈利/CapEx 增长故事证伪或强周期景气见顶反转”的戴维斯双杀基本面前提方可输出空头（具体真龙头日线与 30min 缠论结构交由 Layer 2/4 独立验证），**A 股在任何情形下均严格禁止直接做空及充当 `pair` 配对空头腿**。\n"
+        "- **大行情进攻增补律（跨 54 年三时代检验核准 · 配合 `macro_inflection_radar` 与 `offensive_structure_signals`）**：① **非滞胀宽松/陡峭化拐点进攻授权**：当 `macro_inflection_radar.easing_or_steepening_active` 为 `true`（通胀锚稳固、信贷未处危机，且 2Y 短端利率 3M 显著下行或 10Y-2Y 曲线陡峭化）时，对基准定价锚护盾完好（`bullish_shield_intact` / `shield_intact_uptrend`）且具基本面共振的主线，**积极输出高确信度做多方向卡**，避免过度保守踏空主升浪；② **反恐高铁律（右侧突破离开段禁因高位否决）**：对 `offensive_structure_signals.high_breakout_intact_leaders`（6M/1Y 区间分位 `≥85%` 且护盾完好），**严禁仅因“位置高/涨多了”的恐高均值回归思维否决做多或左侧摸顶**——高位突破且护盾完好正是资金高度一致的主升离开段，除非出现基本面证伪、高位确认卖点或 CFTC ≥90% 极端拥挤，否则应放行主升或交由 Layer 2/4 跟踪。\n"
         "- **宪法第 3 条（恐慌反应函数二分律 · 禁空绝对化、抄底条件化）**：**上半句（无条件铁律）**：在 `VIX ≥ 30` 恐慌极值或标的已落入深坑暴跌区（见 `deep_hole_short_chase_ban`），**无条件禁止直接市价追空**（若中期仍过剩，必须在 `value_chain_focus` 注明等反抽二卖/三卖）；**下半句（双前提解锁）**：唯有同时满足“① 央行未被高通胀绑手（短端利率停止上行/转向降息）+ ② 标的未处实质破 `ZD` 自由落体”双前提时，才解锁流动性兜底做多，缺一则持币观望。\n"
         "- **宪法第 4 条（认知谦逊与全市场战略留白权 · 废除强凑满额方向卡）**：真正高赔率的主矛盾方向在多数时期只有 **1~4 个**（上限 5 个）。只输出确信度真正过硬的方向卡（`0~5` 张）；在全面紧缩或无主线震荡期宁可只出 **1~2 张** 狙击卡，**严禁为凑满名额塞入二流凑数多头或左侧摸顶空头**！当全市场或所选战场均处于宏观信号剧烈撕裂、共识高度拥挤（如 `article2_credit_and_crowding` 显示信贷高压/CFTC 极端拥挤）或缺乏清晰 1Q~1Y 非对称预期差时，**任何市场范围均可主动行使战略留白权**，输出 `\"directions\": []` 并必填充分的 `\"abstain_reason\"`（≥15字讲清为何持币优于硬开仓）与至少 1 条 `\"avoid_sectors\"`（禁止无理由偷懒留白）。\n"
         "- **二级溯源与取证规程（严禁走捷径）**：① **反常劈叉仅作侦探警报**：对“逆古典宏观走强”的品种，必须先核查全市场顺周期权益与信贷地基——信贷与顺周期企稳才是真新主线；若顺周期权益与信贷已崩盘、仅剩下游高烧商品独强，必须警惕晚周期需求坍塌补跌诱多（Catch-down），严禁免检追涨；② **物理供给严禁靠 K 线臆测**：绝不凭过去涨跌幅猜“稀缺”或“过剩”，商品多空必须联网查实未来 `1Q~1Y` 真实物理新增产能投产表与成本曲线；③ **定价主权归属**：中国内需定价品种（A股/黑色建材/内盘化工）锚定国内信用与产业政策，不机械外推美联储。\n\n"

@@ -135,7 +135,25 @@ class TestPureParsers(unittest.TestCase):
         self.assertEqual(res["previous_date"], "2026-11-13")
         self.assertEqual(res["previous_value"], 2.91)
         self.assertAlmostEqual(res["change"], -0.02, places=6)
+        self.assertIsNone(res["change_1m"])
+        self.assertIsNone(res["change_3m"])
         self.assertEqual(res["observations_count"], 3)
+
+    def test_parse_fred_csv_computes_1m_and_3m_window_changes_and_series_registry(self):
+        csv_text = (
+            "observation_date,DGS2\n"
+            "2026-07-01,4.80\n"
+            "2026-08-19,4.55\n"
+            "2026-10-18,4.20\n"
+            "2026-11-16,3.95\n"
+            "2026-11-17,3.90\n"
+        )
+        res = rd.parse_fred_csv(csv_text, series_id="DGS2")
+        self.assertAlmostEqual(res["change_1m"], -0.30, places=6)
+        self.assertAlmostEqual(res["change_3m"], -0.65, places=6)
+        series_ids = {sid for sid, _ in rd.FRED_SERIES}
+        self.assertIn("DGS2", series_ids)
+        self.assertIn("T10Y2Y", series_ids)
 
     def test_parse_cftc_disagg_handles_quoted_comma(self):
         wti = rd.parse_cftc_disagg(SAMPLE_CFTC_CSV, ["CRUDE OIL, LIGHT SWEET"])

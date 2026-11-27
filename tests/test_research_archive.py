@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """Offline unit tests for Layer 3 incremental research archive manager."""
+# ruff: noqa: EXE001
 import json
 import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-from research_archive import (  # noqa: E402
+from research_archive import (
+    VALID_CROWDING_ASSESSMENTS,
     append_evidence,
     append_log,
     evaluate_triggers,
     init_archive,
     list_archives,
     load_archive,
-    main as archive_main,
+    normalize_expectation_gap,
+    record_trigger_verifications,
     resolve_archive_dir,
     update_state,
 )
+from research_archive import main as archive_main
 
 
 class TestResearchArchive(unittest.TestCase):
@@ -243,11 +248,11 @@ class TestResearchArchive(unittest.TestCase):
 
             # 6) init --overwrite rolls back thesis.md & evidence.jsonl if final state write fails
             from unittest.mock import patch
+
             import research_archive as ra
             append_log("PWR", "preserved-note", research_root=tmpdir)
-            with patch.object(ra, "_atomic_write_json", side_effect=OSError("disk full")):
-                with self.assertRaises(OSError):
-                    init_archive("PWR", thesis_summary="broken overwrite", research_root=tmpdir, overwrite=True)
+            with patch.object(ra, "_atomic_write_json", side_effect=OSError("disk full")), self.assertRaises(OSError):
+                init_archive("PWR", thesis_summary="broken overwrite", research_root=tmpdir, overwrite=True)
             after_fail = load_archive("PWR", research_root=tmpdir)
             self.assertIn("preserved-note", after_fail["thesis_md"])
             self.assertEqual(after_fail["evidence_count"], 2)
@@ -443,6 +448,287 @@ class TestResearchArchive(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx_rev:
                 update_state("PWR", {"confidence": "low"}, expected_revision=1, research_root=tmpdir)
             self.assertIn("Revision conflict", str(ctx_rev.exception))
+
+    def test_expectation_gap_init_update_partial_reset_validation_and_legacy_compat(self):
+        self.assertEqual(VALID_CROWDING_ASSESSMENTS, {"underpriced", "fair", "crowded", "unknown"})
+        default_eg = {
+            "priced_in_consensus": "",
+            "our_variant_view": "",
+            "crowding_assessment": "unknown",
+            "leading_kpis": [],
+        }
+        self.assertEqual(normalize_expectation_gap(None), default_eg)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # 1) init_archive sets clean default expectation_gap across asset classes
+            for sym in ("NVDA", "NI0", "USDJPY=X"):
+                res = init_archive(sym, research_root=tmpdir)
+                self.assertEqual(res["state"]["expectation_gap"], default_eg)
+                loaded = load_archive(sym, research_root=tmpdir)
+                self.assertEqual(loaded["state"]["expectation_gap"], default_eg)
+
+            # 2) Full update_state with leading_kpis (up to 6) and whitespace/case normalization
+            st2 = update_state(
+                "NI0",
+                {
+                    "expectation_gap": {
+                        "priced_in_consensus": "  市场一致预期 Q1 印尼配额充裕  ",
+                        "our_variant_view": "  雨季发运受阻叠加 RKAB 审批延迟带来阶段性错配  ",
+                        "crowding_assessment": "  UNDERPRICED  ",
+                        "leading_kpis": [
+                            {
+                                "name": " 菲律宾红土镍矿周度发运量 ",
+                                "current_baseline": " 85 万湿吨/周 ",
+                                "expected_trajectory": " 12 月降至 45 万湿吨以下 ",
+                                "falsification_threshold": " 连续两周 > 90 万湿吨 ",
+                                "cadence": " weekly ",
+                            },
+                            {
+                                "name": "印尼镍铁冶炼厂矿石库存天数",
+                            },
+                        ],
+                    }
+                },
+                expected_revision=1,
+                research_root=tmpdir,
+            )
+            self.assertEqual(st2["revision"], 2)
+            self.assertEqual(
+                st2["expectation_gap"],
+                {
+                    "priced_in_consensus": "市场一致预期 Q1 印尼配额充裕",
+                    "our_variant_view": "雨季发运受阻叠加 RKAB 审批延迟带来阶段性错配",
+                    "crowding_assessment": "underpriced",
+                    "leading_kpis": [
+                        {
+                            "name": "菲律宾红土镍矿周度发运量",
+                            "current_baseline": "85 万湿吨/周",
+                            "expected_trajectory": "12 月降至 45 万湿吨以下",
+                            "falsification_threshold": "连续两周 > 90 万湿吨",
+                            "cadence": "weekly",
+                        },
+                        {
+                            "name": "印尼镍铁冶炼厂矿石库存天数",
+                            "current_baseline": "",
+                            "expected_trajectory": "",
+                            "falsification_threshold": "",
+                            "cadence": "",
+                        },
+                    ],
+                },
+            )
+
+            # 3) Partial update preserves omitted canonical fields (e.g. leading_kpis) & strips stale keys
+            folder, _, _, _ = resolve_archive_dir("NI0", research_root=tmpdir)
+            state_path = os.path.join(folder, "state.json")
+            with open(state_path, "r", encoding="utf-8") as f:
+                raw_disk = json.load(f)
+            raw_disk["expectation_gap"]["stale_legacy_field"] = "must_be_removed"
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(raw_disk, f)
+
+            st3 = update_state(
+                "NI0",
+                {
+                    "expectation_gap": {
+                        "crowding_assessment": "fair",
+                        "our_variant_view": "更新后的二阶预期差",
+                    }
+                },
+                expected_revision=2,
+                research_root=tmpdir,
+            )
+            self.assertEqual(st3["revision"], 3)
+            self.assertNotIn("stale_legacy_field", st3["expectation_gap"])
+            self.assertEqual(st3["expectation_gap"]["priced_in_consensus"], "市场一致预期 Q1 印尼配额充裕")
+            self.assertEqual(st3["expectation_gap"]["our_variant_view"], "更新后的二阶预期差")
+            self.assertEqual(st3["expectation_gap"]["crowding_assessment"], "fair")
+            self.assertEqual(len(st3["expectation_gap"]["leading_kpis"]), 2)
+
+            # Partial update of leading_kpis only preserves text fields and crowding_assessment
+            six_kpis = [{"name": f"KPI_{i}", "cadence": "monthly"} for i in range(6)]
+            st4 = update_state(
+                "NI0",
+                {"expectation_gap": {"leading_kpis": six_kpis}},
+                expected_revision=3,
+                research_root=tmpdir,
+            )
+            self.assertEqual(st4["expectation_gap"]["our_variant_view"], "更新后的二阶预期差")
+            self.assertEqual(st4["expectation_gap"]["crowding_assessment"], "fair")
+            self.assertEqual(len(st4["expectation_gap"]["leading_kpis"]), 6)
+
+            # 4) Invalid patches rejected atomically without bumping revision
+            for bad_eg in (
+                "not-a-dict",
+                [],
+                123,
+                {"priced_in_consensus": 123},
+                {"priced_in_consensus": None},
+                {"our_variant_view": ["bad"]},
+                {"crowding_assessment": "bubble"},
+                {"crowding_assessment": ""},
+                {"crowding_assessment": None},
+                {"crowding_assessment": 1},
+                {"leading_kpis": "not-a-list"},
+                {"leading_kpis": None},
+                {"leading_kpis": ["not-a-dict"]},
+                {"leading_kpis": [{}]},
+                {"leading_kpis": [{"name": "   "}]},
+                {"leading_kpis": [{"name": 123}]},
+                {"leading_kpis": [{"name": "ok", "current_baseline": 999}]},
+                {"leading_kpis": [{"name": f"k{i}"} for i in range(7)]},
+            ):
+                with self.assertRaises(ValueError, msg=f"Should reject expectation_gap={bad_eg!r}"):
+                    update_state("NI0", {"expectation_gap": bad_eg}, research_root=tmpdir)
+            self.assertEqual(load_archive("NI0", research_root=tmpdir)["state"]["revision"], 4)
+
+            # 5) None resets expectation_gap cleanly to default empty structure
+            st5 = update_state("NI0", {"expectation_gap": None}, expected_revision=4, research_root=tmpdir)
+            self.assertEqual(st5["revision"], 5)
+            self.assertEqual(st5["expectation_gap"], default_eg)
+
+            # 6) Backward compatibility with legacy state.json lacking expectation_gap
+            nvda_folder, _, _, _ = resolve_archive_dir("NVDA", research_root=tmpdir)
+            nvda_state_path = os.path.join(nvda_folder, "state.json")
+            with open(nvda_state_path, "r", encoding="utf-8") as f:
+                legacy_state = json.load(f)
+            legacy_state.pop("expectation_gap", None)
+            with open(nvda_state_path, "w", encoding="utf-8") as f:
+                json.dump(legacy_state, f)
+
+            legacy_loaded = load_archive("NVDA", research_root=tmpdir)
+            self.assertEqual(legacy_loaded["state"]["expectation_gap"], default_eg)
+            exists_res = init_archive("NVDA", research_root=tmpdir)
+            self.assertEqual(exists_res["status"], "exists")
+            self.assertEqual(exists_res["state"]["expectation_gap"], default_eg)
+
+            legacy_patched = update_state(
+                "NVDA",
+                {"expectation_gap": {"our_variant_view": "Blackwell 机柜交付超预期"}},
+                expected_revision=1,
+                research_root=tmpdir,
+            )
+            self.assertEqual(legacy_patched["expectation_gap"]["our_variant_view"], "Blackwell 机柜交付超预期")
+            self.assertEqual(legacy_patched["expectation_gap"]["crowding_assessment"], "unknown")
+            self.assertEqual(legacy_patched["expectation_gap"]["leading_kpis"], [])
+
+            # 7) Strict write-path validation rejects misspelled/unknown keys without bumping revision
+            rev_before = load_archive("NVDA", research_root=tmpdir)["state"]["revision"]
+            for bad_unknown in (
+                {"crowding_assesment": "underpriced"},
+                {"our_variant_view": "valid", "unknown_top_key": "nope"},
+                {"leading_kpis": [{"name": "KPI_1", "cadnce": "weekly"}]},
+                {"leading_kpis": [{"name": "KPI_1", "extra_field": "bad"}]},
+            ):
+                with self.assertRaises(ValueError, msg=f"Should reject unknown key in {bad_unknown!r}"):
+                    update_state("NVDA", {"expectation_gap": bad_unknown}, research_root=tmpdir)
+            self.assertEqual(load_archive("NVDA", research_root=tmpdir)["state"]["revision"], rev_before)
+
+            # strict=False remains tolerant for legacy disk reads, while strict=True rejects unknown keys
+            self.assertEqual(
+                normalize_expectation_gap({"crowding_assesment": "underpriced"}, strict=False)["crowding_assessment"],
+                "unknown",
+            )
+            with self.assertRaises(ValueError):
+                normalize_expectation_gap({"crowding_assesment": "underpriced"}, strict=True)
+            with self.assertRaises(ValueError):
+                normalize_expectation_gap({"leading_kpis": [{"name": "x", "typo": "y"}]}, strict=True)
+
+    def test_trigger_verification_ttl_enforces_stricter_of_trigger_and_verification(self):
+        ver_2d_ago = {
+            "method": "ai_web",
+            "status": "clear",
+            "verified_at_utc": "2026-11-25T08:00:00Z",
+            "ttl_days": 7,
+            "summary": "核验未触发",
+            "source_url": "https://www.esdm.go.id/en",
+            "evidence_tier": "L1",
+        }
+        now_dt = datetime.fromisoformat("2026-11-27T09:00:00+00:00")
+
+        # Shortening trigger verification_ttl_days or ttl_days to 1 MUST expire 2-day-old ver with ttl_days=7
+        state = {
+            "triggers": [
+                {
+                    "id": "trig_short_ver_ttl",
+                    "kind": "policy",
+                    "evaluation_mode": "ai_web",
+                    "metric": "export_ban",
+                    "operator": "event",
+                    "threshold": True,
+                    "action": "exit_review",
+                    "verification_ttl_days": 1,
+                    "verification": ver_2d_ago,
+                },
+                {
+                    "id": "trig_short_alias_ttl",
+                    "kind": "policy",
+                    "evaluation_mode": "ai_web",
+                    "metric": "export_ban_2",
+                    "operator": "event",
+                    "threshold": True,
+                    "action": "exit_review",
+                    "ttl_days": 1,
+                    "verification": ver_2d_ago,
+                },
+                {
+                    "id": "trig_ver_stricter",
+                    "kind": "policy",
+                    "evaluation_mode": "ai_web",
+                    "metric": "export_ban_3",
+                    "operator": "event",
+                    "threshold": True,
+                    "action": "exit_review",
+                    "verification_ttl_days": 7,
+                    "verification": {**ver_2d_ago, "ttl_days": 1},
+                },
+                {
+                    "id": "trig_still_fresh",
+                    "kind": "policy",
+                    "evaluation_mode": "ai_web",
+                    "metric": "export_ban_4",
+                    "operator": "event",
+                    "threshold": True,
+                    "action": "exit_review",
+                    "verification_ttl_days": 7,
+                    "verification": ver_2d_ago,
+                },
+            ]
+        }
+        eval_by_id = {t["id"]: t for t in evaluate_triggers(state, {}, now_utc=now_dt)}
+        for stale_id in ("trig_short_ver_ttl", "trig_short_alias_ttl", "trig_ver_stricter"):
+            self.assertFalse(eval_by_id[stale_id]["evaluated"], msg=f"{stale_id} should be expired")
+            self.assertTrue(eval_by_id[stale_id].get("verification_stale"), msg=f"{stale_id} should be marked stale")
+        self.assertTrue(eval_by_id["trig_still_fresh"]["evaluated"])
+        self.assertFalse(eval_by_id["trig_still_fresh"]["fired"])
+
+        # Recording a verification with larger ttl_days=7 on a trigger declaring verification_ttl_days=1 caps to 1
+        with tempfile.TemporaryDirectory() as tmpdir:
+            init_archive("NI0", research_root=tmpdir)
+            update_state(
+                "NI0",
+                {
+                    "triggers": [
+                        {
+                            "id": "trig_cap",
+                            "kind": "policy",
+                            "evaluation_mode": "ai_web",
+                            "metric": "quota_cap",
+                            "operator": "event",
+                            "threshold": True,
+                            "action": "alert",
+                            "verification_ttl_days": 1,
+                        }
+                    ]
+                },
+                research_root=tmpdir,
+            )
+            rec = record_trigger_verifications(
+                "NI0",
+                {"trig_cap": ver_2d_ago},
+                research_root=tmpdir,
+            )
+            self.assertEqual(rec["state"]["triggers"][0]["verification"]["ttl_days"], 1)
 
 
 if __name__ == "__main__":

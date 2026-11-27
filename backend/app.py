@@ -110,6 +110,7 @@ class OpenPositionReq(_Strict):
     reason: str = "initial_entry"
     enforce_macro_cap: bool = True
     allow_equity_margin: bool = False
+    campaign_1r_amount: float | None = Field(default=None, gt=0)
     idempotency_key: str | None = None
 
 
@@ -125,6 +126,8 @@ class TrimReq(_Strict):
     trim_price: float
     trim_quantity: float
     reason: str = "partial_take_profit"
+    attribution_tag: str | None = None
+    lesson_note: str = ""
     idempotency_key: str | None = None
 
 
@@ -139,6 +142,19 @@ class ScaleInPositionRequest(_Strict):
     )
     note: str = ""
     enforce_macro_cap: bool = True
+    require_breakeven_lock: bool = False
+    max_profit_cushion_ratio: float = Field(default=0.65, gt=0, le=1.0)
+    new_daily_stop: float | None = Field(default=None, gt=0)
+    max_leverage: float | None = Field(default=None, gt=0)
+    idempotency_key: str | None = None
+
+
+class SetStopRegimeReq(_Strict):
+    regime: Literal["daily_structure", "tactical_30m"]
+    new_daily_stop: float | None = Field(default=None, gt=0)
+    new_stop_30m: float | None = Field(default=None, gt=0)
+    current_price: float | None = Field(default=None, gt=0)
+    reason: str = ""
     idempotency_key: str | None = None
 
 
@@ -147,6 +163,8 @@ class CloseReq(_Strict):
     exit_reason: str
     exit_category: str = "manual"
     update_account_equity: bool = True
+    attribution_tag: str | None = None
+    lesson_note: str = ""
     idempotency_key: str | None = None
 
 
@@ -176,6 +194,7 @@ class RotateNewPositionReq(_Strict):
     notes: str = ""
     reason: str = "leader_rotation_entry"
     allow_equity_margin: bool = False
+    campaign_1r_amount: float | None = Field(default=None, gt=0)
 
 
 class RotateReq(_Strict):
@@ -184,6 +203,32 @@ class RotateReq(_Strict):
     new_position: RotateNewPositionReq
     exit_category: str = "leader_rotation"
     enforce_macro_cap: bool = True
+    attribution_tag: str | None = None
+    lesson_note: str = ""
+    idempotency_key: str | None = None
+
+
+class LogOpportunityReq(_Strict):
+    symbol: str
+    market: str
+    sector_theme: str
+    direction: Direction
+    kind: Literal["missed_entry", "shaken_out", "premature_exit"]
+    anchor_price: float = Field(gt=0)
+    planned_stop_price: float = Field(gt=0)
+    subsequent_extreme_price: float | None = Field(default=None, gt=0)
+    root_cause_tag: str | None = None
+    lesson_note: str = ""
+    linked_position_id: str | None = None
+    status: Literal["tracking", "reviewed"] = "tracking"
+    idempotency_key: str | None = None
+
+
+class UpdateOpportunityReq(_Strict):
+    subsequent_extreme_price: float | None = Field(default=None, gt=0)
+    status: Literal["tracking", "reviewed"] | None = None
+    root_cause_tag: str | None = None
+    lesson_note: str | None = None
     idempotency_key: str | None = None
 
 
@@ -276,6 +321,7 @@ class ArchiveStateReq(_ArchiveMarketReq):
     layer1_primary: str | None = None
     layer1_secondary: str | None = None
     layer1_drivers: dict[str, Any] | None = None
+    expectation_gap: dict[str, Any] | None = None
     status: str | None = None
     confidence: str | float | None = None
 
@@ -528,19 +574,51 @@ def portfolio_initialized() -> bool:
         return False
 
 
+def _is_idempotency_conflict(msg: str) -> bool:
+    low = msg.lower()
+    return "idempotency_key_conflict" in low or (
+        "idempotency" in low and ("conflict" in low or "different" in low or "already used" in low)
+    )
+
+
 def portfolio_call(fn: Callable[..., Any], **kwargs: Any) -> SafeJSONResponse:
     """Run a portfolio_manager mutation and map its domain errors onto HTTP status codes."""
     try:
         result = fn(**kwargs)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
+    except (pm.PortfolioError, ValueError) as exc:
         msg = str(exc)
+        if _is_idempotency_conflict(msg):
+            raise HTTPException(status_code=409, detail=msg) from exc
         raise HTTPException(status_code=404 if "not found" in msg.lower() else 422, detail=msg) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     CACHE.invalidate_prefix("sentinel")
     return ok(result)
+
+
+def _portfolio_op(fn: Callable[..., Any], **kwargs: Any) -> Any:
+    """Run a portfolio_manager operation, mapping ValueError/PortfolioError to 400/404/409 and IO/Runtime to 409."""
+    try:
+        return fn(**kwargs)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (pm.PortfolioError, ValueError) as exc:
+        msg = str(exc)
+        if _is_idempotency_conflict(msg):
+            raise HTTPException(status_code=409, detail=msg) from exc
+        raise HTTPException(status_code=404 if "not found" in msg.lower() else 400, detail=msg) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+def _safe_attribution_refresh() -> dict[str, Any]:
+    """Refresh attribution analytics after a committed write without failing the response."""
+    try:
+        return {"attribution": pm.compute_attribution_analytics()}
+    except Exception as exc:  # noqa: BLE001
+        return {"attribution": None, "attribution_warning": str(exc)}
 
 
 def archive_call(fn: Callable[..., Any], *, invalidate_sentinel: bool = False, **kwargs: Any) -> Any:
@@ -653,8 +731,10 @@ def _plan_args(req: TradePlanReq) -> tuple[Any, str, dict[str, Any]]:
         "status": None,
         "direction_bias": req.research_direction_bias,
         "layer1_drivers": None,
+        "expectation_gap": None,
         "has_l1_l2": False,
     }
+    arch_state_for_plan: dict[str, Any] | None = None
     try:
         arch = ra.load_archive(req.symbol, market_override=req.archive_market, evidence_limit=0)
         has_l1_l2 = any(
@@ -663,6 +743,8 @@ def _plan_args(req: TradePlanReq) -> tuple[Any, str, dict[str, Any]]:
         )
         args.has_l1_l2 = has_l1_l2
         arch_state = arch.get("state") if isinstance(arch, dict) else None
+        if isinstance(arch_state, dict):
+            arch_state_for_plan = arch_state
         raw_bias = (
             str(arch_state.get("direction_bias") or "").strip().lower()
             if isinstance(arch_state, dict)
@@ -676,6 +758,7 @@ def _plan_args(req: TradePlanReq) -> tuple[Any, str, dict[str, Any]]:
             "status": arch_state.get("status") if isinstance(arch_state, dict) else None,
             "direction_bias": eff_bias,
             "layer1_drivers": arch_state.get("layer1_drivers") if isinstance(arch_state, dict) else None,
+            "expectation_gap": arch_state.get("expectation_gap") if isinstance(arch_state, dict) else None,
             "has_l1_l2": has_l1_l2,
         }
     except (FileNotFoundError, ValueError, OSError):
@@ -685,6 +768,7 @@ def _plan_args(req: TradePlanReq) -> tuple[Any, str, dict[str, Any]]:
     eff_direction_bias = archive_ctx["direction_bias"]
     args.research_direction = eff_direction_bias
     args.research_root = ra.DEFAULT_RESEARCH_DIR
+    args.archive_state = arch_state_for_plan
     for attr in ("research_direction_bias", "direction_bias", "archive_direction_bias", "thesis_direction_bias"):
         if hasattr(args, attr) or attr in ("research_direction_bias", "direction_bias"):
             setattr(args, attr, eff_direction_bias)
@@ -878,26 +962,39 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
 
     @app.post("/api/portfolio/positions/{position_id}/scale-in")
     def portfolio_scale_in(position_id: str, req: ScaleInPositionRequest):
-        try:
-            result = pm.scale_in_position(
-                position_id=position_id,
-                add_quantity=req.add_quantity,
-                add_price=req.add_price,
-                new_stop_loss=req.new_stop_loss,
-                fx_rate_to_base=req.fx_rate_to_base,
-                note=req.note,
-                enforce_macro_cap=req.enforce_macro_cap,
-                idempotency_key=req.idempotency_key,
-            )
-        except FileNotFoundError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ValueError as exc:
-            msg = str(exc)
-            raise HTTPException(status_code=404 if "not found" in msg.lower() else 400, detail=msg) from exc
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        result = _portfolio_op(
+            pm.scale_in_position,
+            position_id=position_id,
+            add_quantity=req.add_quantity,
+            add_price=req.add_price,
+            new_stop_loss=req.new_stop_loss,
+            fx_rate_to_base=req.fx_rate_to_base,
+            note=req.note,
+            enforce_macro_cap=req.enforce_macro_cap,
+            idempotency_key=req.idempotency_key,
+            require_breakeven_lock=req.require_breakeven_lock,
+            max_profit_cushion_ratio=req.max_profit_cushion_ratio,
+            new_daily_stop=req.new_daily_stop,
+            max_leverage=req.max_leverage,
+        )
         CACHE.invalidate_prefix("sentinel")
-        summary = pm.summarize_portfolio()
+        summary = _portfolio_op(pm.summarize_portfolio)
+        return ok({**result, "summary": summary})
+
+    @app.post("/api/portfolio/positions/{position_id}/stop-regime")
+    def portfolio_set_stop_regime(position_id: str, req: SetStopRegimeReq):
+        result = _portfolio_op(
+            pm.set_stop_regime,
+            position_id=position_id,
+            regime=req.regime,
+            new_daily_stop=req.new_daily_stop,
+            new_stop_30m=req.new_stop_30m,
+            current_price=req.current_price,
+            reason=req.reason,
+            idempotency_key=req.idempotency_key,
+        )
+        CACHE.invalidate_prefix("sentinel")
+        summary = _portfolio_op(pm.summarize_portfolio)
         return ok({**result, "summary": summary})
 
     @app.post("/api/portfolio/positions/{position_id}/trail-stop")
@@ -938,7 +1035,45 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
             enforce_macro_cap=req.enforce_macro_cap,
             idempotency_key=req.idempotency_key,
             research_dir=ra.DEFAULT_RESEARCH_DIR,
+            attribution_tag=req.attribution_tag,
+            lesson_note=req.lesson_note,
         )
+
+    @app.get("/api/portfolio/attribution")
+    def portfolio_attribution():
+        return ok(_portfolio_op(pm.compute_attribution_analytics))
+
+    @app.get("/api/portfolio/opportunities")
+    def portfolio_opportunities_list(
+        status: str | None = None,
+        kind: str | None = None,
+        limit: int = Query(default=200, ge=1, le=500),
+    ):
+        items = _portfolio_op(pm.load_opportunities, status=status, kind=kind, limit=limit)
+        return ok({"opportunities": items})
+
+    @app.post("/api/portfolio/opportunities")
+    def portfolio_opportunities_log(req: LogOpportunityReq):
+        result = _portfolio_op(pm.log_opportunity, **req.model_dump())
+        return ok({**result, **_safe_attribution_refresh()})
+
+    @app.patch("/api/portfolio/opportunities/{opportunity_id}")
+    def portfolio_opportunity_update(opportunity_id: str, req: UpdateOpportunityReq):
+        update_kwargs: dict[str, Any] = {}
+        if "subsequent_extreme_price" in req.model_fields_set:
+            update_kwargs["subsequent_extreme_price"] = req.subsequent_extreme_price
+        if "status" in req.model_fields_set:
+            if req.status is None:
+                raise HTTPException(status_code=422, detail="status cannot be null")
+            update_kwargs["status"] = req.status
+        if "root_cause_tag" in req.model_fields_set:
+            update_kwargs["root_cause_tag"] = req.root_cause_tag
+        if "lesson_note" in req.model_fields_set:
+            update_kwargs["lesson_note"] = req.lesson_note
+        if "idempotency_key" in req.model_fields_set:
+            update_kwargs["idempotency_key"] = req.idempotency_key
+        result = _portfolio_op(pm.update_opportunity, opportunity_id=opportunity_id, **update_kwargs)
+        return ok({**result, **_safe_attribution_refresh()})
 
     @app.get("/api/sentinel/run")
     def sentinel_run(
@@ -1182,6 +1317,17 @@ def create_app(task_manager: TaskManager | None = None, frontend_dist: str | Non
         _merge_scalar("thesis_summary", req.thesis_summary)
         _merge_scalar("status", req.status)
         _merge_scalar("confidence", req.confidence)
+
+        if "expectation_gap" in req.model_fields_set:
+            if (
+                "expectation_gap" in merged_patch
+                and merged_patch["expectation_gap"] != req.expectation_gap
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Conflicting top-level expectation_gap and patch.expectation_gap",
+                )
+            merged_patch["expectation_gap"] = req.expectation_gap
 
         # Reconcile layer1_primary / layer1_secondary / layer1_drivers into canonical state.layer1_drivers
         patch_l1_primary = merged_patch.pop("layer1_primary", None)

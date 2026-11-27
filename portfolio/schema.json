@@ -2,17 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://t3-trading-desk.local/portfolio/schema.json",
   "title": "Layer-4 Portfolio Storage Schemas",
-  "description": "JSON Schema definitions for local Layer-4 portfolio state managed by scripts/portfolio_manager.py. Canonical transactional storage is portfolio.db (SQLite WAL + synchronous=FULL, single BEGIN IMMEDIATE...COMMIT boundary covering account, positions, meta, and journal); account.json, positions.json, and journal.jsonl are atomically exported read-only JSON mirrors. Live portfolio state files are intentionally excluded from git.",
+  "description": "JSON Schema definitions for local Layer-4 portfolio state managed by scripts/portfolio_manager.py. Canonical transactional storage is portfolio.db (SQLite WAL + synchronous=FULL, single BEGIN IMMEDIATE...COMMIT boundary covering account, positions, meta, journal, and opportunities); account.json, positions.json, journal.jsonl, and opportunities.jsonl are atomically exported read-only JSON mirrors. Live portfolio state files are intentionally excluded from git.",
   "type": "object",
   "properties": {
     "storage_engine": {
       "type": "string",
       "const": "sqlite_wal_with_json_mirrors",
-      "description": "portfolio.db is canonical transactional truth; account.json, positions.json, and journal.jsonl are read-only mirrors."
+      "description": "portfolio.db is canonical transactional truth; account.json, positions.json, journal.jsonl, and opportunities.jsonl are read-only mirrors."
     },
     "account": { "$ref": "#/$defs/account" },
     "positions_document": { "$ref": "#/$defs/positions_document" },
-    "journal_entry": { "$ref": "#/$defs/journal_entry" }
+    "journal_entry": { "$ref": "#/$defs/journal_entry" },
+    "opportunity_entry": { "$ref": "#/$defs/opportunity_entry" }
   },
   "$defs": {
     "drawdown_step": {
@@ -36,7 +37,7 @@
     },
     "account": {
       "type": "object",
-      "description": "Schema for portfolio/account.json mirror (canonical row stored in portfolio.db table account). Bounds enforced identically by init_portfolio and update_account: equity > 0, peak_equity >= equity > 0, 0 < default_risk_per_trade_pct <= 10.0, 0 < max_total_open_risk_pct <= 50.0, 0 < max_macro_factor_risk_pct <= 50.0.",
+      "description": "Schema for portfolio/account.json mirror (canonical row stored in portfolio.db table account). Bounds enforced identically by init_portfolio and update_account: equity > 0 (unless insolvent=true after a realized gap loss), peak_equity > 0, 0 < default_risk_per_trade_pct <= 10.0, 0 < max_total_open_risk_pct <= 50.0, 0 < max_macro_factor_risk_pct <= 50.0.",
       "required": [
         "schema_version",
         "base_currency",
@@ -52,15 +53,18 @@
       "properties": {
         "schema_version": { "type": "integer", "const": 1 },
         "base_currency": { "type": "string", "minLength": 1, "examples": ["USD", "CNY"] },
+        "insolvent": {
+          "type": "boolean",
+          "description": "True when realized losses have reduced equity <= 0; blocks opening or scaling positions until recapitalized."
+        },
         "equity": {
           "type": "number",
-          "exclusiveMinimum": 0,
-          "description": "Current ledger equity in base_currency (> 0); updated atomically on trim, close, and rotate_leader."
+          "description": "Current ledger equity in base_currency (> 0 when solvent; <= 0 when insolvent=true); updated atomically on trim, close, and rotate_leader."
         },
         "peak_equity": {
           "type": "number",
           "exclusiveMinimum": 0,
-          "description": "High-water mark equity (>= equity > 0) used for drawdown step-down scaling."
+          "description": "High-water mark equity (>= equity when solvent, > 0) used for drawdown step-down scaling."
         },
         "default_risk_per_trade_pct": {
           "type": "number",
@@ -85,6 +89,22 @@
           "items": { "$ref": "#/$defs/drawdown_step" }
         },
         "updated_at_utc": { "type": "string" }
+      },
+      "if": {
+        "properties": {
+          "insolvent": { "const": true }
+        },
+        "required": ["insolvent"]
+      },
+      "then": {
+        "properties": {
+          "equity": { "maximum": 0 }
+        }
+      },
+      "else": {
+        "properties": {
+          "equity": { "exclusiveMinimum": 0 }
+        }
       }
     },
     "tranche": {
@@ -97,6 +117,47 @@
         "price": { "type": "number", "exclusiveMinimum": 0 },
         "quantity": { "type": "number", "exclusiveMinimum": 0 },
         "reason": { "type": "string" }
+      }
+    },
+    "trim_record": {
+      "type": "object",
+      "required": [
+        "trim_index",
+        "timestamp_utc",
+        "price",
+        "quantity",
+        "remaining_quantity",
+        "realized_pnl",
+        "reason"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "trim_index": { "type": "integer", "minimum": 1 },
+        "timestamp_utc": { "type": "string" },
+        "price": { "type": "number", "exclusiveMinimum": 0 },
+        "quantity": { "type": "number", "exclusiveMinimum": 0 },
+        "remaining_quantity": { "type": "number", "exclusiveMinimum": 0 },
+        "realized_pnl": { "type": "number" },
+        "reason": { "type": "string" },
+        "attribution_tag": {
+          "type": ["string", "null"],
+          "enum": [
+            "full_main_wave_ride",
+            "clean_pyramid_win",
+            "disciplined_trailing_exit",
+            "thesis_target_reached",
+            "leader_rotation_upgrade",
+            "normal_pilot_cost",
+            "l1_regime_headwind",
+            "l3_thesis_falsified",
+            "l4_chased_extended",
+            "shaken_out_30m_noise",
+            "premature_profit_taking",
+            "discipline_rule_breach",
+            null
+          ]
+        },
+        "lesson_note": { "type": ["string", "null"] }
       }
     },
     "position": {
@@ -178,13 +239,47 @@
         "initial_entry_price": { "type": "number", "exclusiveMinimum": 0 },
         "tactical_stop_30m": { "type": "number", "exclusiveMinimum": 0 },
         "initial_stop_30m": { "type": "number", "exclusiveMinimum": 0 },
+        "stop_updated_at_utc": { "type": ["string", "null"] },
+        "tactical_stop_active_since_utc": {
+          "type": ["string", "null"],
+          "description": "UTC timestamp from which tactical_stop_30m became active (updated on tactical stop change AND unconditionally when set_stop_regime switches back to tactical_30m)."
+        },
         "structural_stop_daily": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+        "structural_stop_updated_at_utc": { "type": ["string", "null"] },
+        "regime_updated_at_utc": { "type": ["string", "null"] },
         "target_price": { "type": ["number", "null"], "exclusiveMinimum": 0 },
         "initial_risk_amount": { "type": "number", "minimum": 0 },
+        "campaign_1r_amount": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Full-campaign 1R denominator in account currency so 0.4R pilot entries do not inflate closed R-multiples."
+        },
+        "lifecycle_stage": {
+          "type": "string",
+          "enum": ["pilot", "breakeven_locked", "pyramided", "main_wave"]
+        },
+        "active_stop_regime": {
+          "type": "string",
+          "enum": ["tactical_30m", "daily_structure"]
+        },
         "current_open_risk_amount": {
           "type": "number",
           "minimum": 0,
-          "description": "Recomputed whenever stops tighten or tranches are added; reaches 0.0 at breakeven or profit."
+          "description": "Recomputed whenever stops tighten, regime changes, or tranches are added; reaches 0.0 at breakeven or profit."
+        },
+        "remaining_open_risk_amount": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Open risk on the remaining live quantity relative to avg_entry_price at the active effective stop."
+        },
+        "campaign_open_risk_amount": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Whole-campaign open risk accounting for prior partial_realized_pnl plus remaining PnL at active effective stop."
+        },
+        "campaign_net_pnl_at_stop": {
+          "type": "number",
+          "description": "Whole-campaign net PnL (partial_realized_pnl + remaining PnL at active effective stop) in account currency."
         },
         "locked_profit_amount": { "type": "number", "minimum": 0 },
         "slot_risk_share": { "type": "number", "minimum": 0, "maximum": 1 },
@@ -198,6 +293,10 @@
           "minItems": 1,
           "items": { "$ref": "#/$defs/tranche" }
         },
+        "trims": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/trim_record" }
+        },
         "partial_realized_pnl": { "type": "number" },
         "notes": { "type": "string" },
         "opened_at_utc": { "type": "string" },
@@ -208,6 +307,26 @@
         "exit_category": { "type": ["string", "null"] },
         "realized_pnl": { "type": ["number", "null"] },
         "r_multiple": { "type": ["number", "null"] },
+        "campaign_r_multiple": { "type": ["number", "null"] },
+        "attribution_tag": {
+          "type": ["string", "null"],
+          "enum": [
+            "full_main_wave_ride",
+            "clean_pyramid_win",
+            "disciplined_trailing_exit",
+            "thesis_target_reached",
+            "leader_rotation_upgrade",
+            "normal_pilot_cost",
+            "l1_regime_headwind",
+            "l3_thesis_falsified",
+            "l4_chased_extended",
+            "shaken_out_30m_noise",
+            "premature_profit_taking",
+            "discipline_rule_breach",
+            null
+          ]
+        },
+        "lesson_note": { "type": ["string", "null"] },
         "rotated_from_position_id": { "type": "string" },
         "rotated_to_position_id": { "type": "string" }
       }
@@ -244,29 +363,132 @@
         "timestamp_utc": { "type": "string" },
         "action": {
           "type": "string",
-          "enum": ["open", "add_on_profit", "trail_stop", "rotate_leader", "trim", "close", "void"]
+          "enum": [
+            "open",
+            "add_on_profit",
+            "trail_stop",
+            "set_stop_regime",
+            "rotate_leader",
+            "trim",
+            "close",
+            "void"
+          ]
         },
         "leg": { "type": "string", "enum": ["close_old_leader", "open_new_leader"] },
+        "event": { "type": "string" },
         "rotation_id": { "type": "string" },
         "position_id": { "type": "string" },
         "symbol": { "type": "string" },
         "sector_theme": { "type": "string" },
         "direction": { "type": "string", "enum": ["long", "short"] },
+        "leader_role": { "type": "string", "enum": ["sole_leader", "co_leader"] },
         "price": { "type": "number" },
+        "add_price": { "type": "number" },
+        "avg_entry_price": { "type": "number" },
+        "old_entry_price": { "type": "number" },
+        "new_avg_entry_price": { "type": "number" },
+        "new_entry_price": { "type": "number" },
         "stop_30m": { "type": "number" },
         "old_stop_30m": { "type": "number" },
         "new_stop_30m": { "type": "number" },
+        "old_stop_loss": { "type": "number" },
+        "new_stop_loss": { "type": "number" },
+        "structural_stop_daily": { "type": ["number", "null"] },
+        "new_structural_stop_daily": { "type": ["number", "null"] },
+        "effective_stop": { "type": "number" },
+        "old_stop_regime": { "type": "string", "enum": ["tactical_30m", "daily_structure"] },
+        "new_stop_regime": { "type": "string", "enum": ["tactical_30m", "daily_structure"] },
+        "lifecycle_stage": {
+          "type": "string",
+          "enum": ["pilot", "breakeven_locked", "pyramided", "main_wave"]
+        },
         "quantity": { "type": "number" },
+        "old_quantity": { "type": "number" },
         "add_quantity": { "type": "number" },
+        "new_quantity": { "type": "number" },
+        "total_quantity": { "type": "number" },
         "trim_quantity": { "type": "number" },
+        "remaining_quantity": { "type": "number" },
         "risk_delta": { "type": "number" },
+        "old_risk_amount": { "type": "number", "minimum": 0 },
+        "new_risk_amount": { "type": "number", "minimum": 0 },
+        "old_risk_pct": { "type": "number", "minimum": 0 },
+        "new_risk_pct": { "type": "number", "minimum": 0 },
         "added_tranche_risk_amount": { "type": "number", "minimum": 0 },
+        "current_open_risk_amount": { "type": "number", "minimum": 0 },
+        "remaining_open_risk_amount": { "type": "number", "minimum": 0 },
+        "campaign_open_risk_amount": { "type": "number", "minimum": 0 },
+        "campaign_net_pnl_at_stop": { "type": "number" },
+        "locked_profit_amount": { "type": "number", "minimum": 0 },
+        "margin_basis": { "type": "string" },
+        "conservative_margin_account": { "type": "number", "minimum": 0 },
+        "conservative_notional_account": { "type": "number", "minimum": 0 },
+        "giveback_cap_mode": {
+          "type": "string",
+          "enum": ["strict_profit_cushion_ceiling", "principal_risk_budget"]
+        },
         "realized_pnl": { "type": "number" },
         "partial_realized_pnl": { "type": "number" },
-        "equity_after": { "type": "number", "exclusiveMinimum": 0 },
+        "equity_after": { "type": "number" },
+        "account_insolvent": { "type": "boolean" },
         "r_multiple": { "type": ["number", "null"] },
+        "campaign_r_multiple": { "type": ["number", "null"] },
         "exit_category": { "type": "string" },
+        "attribution_tag": { "type": ["string", "null"] },
+        "lesson_note": { "type": ["string", "null"] },
+        "note": { "type": "string" },
         "reason": { "type": "string" }
+      }
+    },
+    "opportunity_entry": {
+      "type": "object",
+      "description": "Schema for each newline-delimited JSON record in portfolio/opportunities.jsonl (shadow opportunity ledger).",
+      "required": [
+        "opportunity_id",
+        "symbol",
+        "market",
+        "sector_theme",
+        "direction",
+        "kind",
+        "status",
+        "anchor_price",
+        "planned_stop_price",
+        "unit_1r_distance",
+        "subsequent_extreme_price",
+        "missed_move_pct",
+        "missed_r_multiple",
+        "root_cause_tag",
+        "lesson_note",
+        "linked_position_id",
+        "created_at_utc",
+        "updated_at_utc"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "opportunity_id": { "type": "string", "minLength": 1 },
+        "symbol": { "type": "string", "minLength": 1 },
+        "market": { "type": "string", "minLength": 1 },
+        "sector_theme": { "type": "string", "minLength": 1 },
+        "direction": { "type": "string", "enum": ["long", "short"] },
+        "kind": {
+          "type": "string",
+          "enum": ["missed_entry", "shaken_out", "premature_exit"]
+        },
+        "status": {
+          "type": "string",
+          "enum": ["tracking", "reviewed"]
+        },
+        "anchor_price": { "type": "number", "exclusiveMinimum": 0 },
+        "planned_stop_price": { "type": "number", "exclusiveMinimum": 0 },
+        "unit_1r_distance": { "type": "number", "exclusiveMinimum": 0 },
+        "subsequent_extreme_price": { "type": ["number", "null"], "exclusiveMinimum": 0 },
+        "missed_move_pct": { "type": ["number", "null"], "minimum": 0 },
+        "missed_r_multiple": { "type": ["number", "null"], "minimum": 0 },
+        "root_cause_tag": { "type": ["string", "null"] },
+        "lesson_note": { "type": "string" },
+        "linked_position_id": { "type": ["string", "null"] },
+        "created_at_utc": { "type": "string" },
+        "updated_at_utc": { "type": "string" }
       }
     }
   }

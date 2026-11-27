@@ -1,4 +1,4 @@
-.venv/
+.venv
 __pycache__/
 *.pyc
 .pytest_cache/
@@ -10,6 +10,7 @@ portfolio/portfolio.db-shm
 portfolio/account.json
 portfolio/positions.json
 portfolio/journal.jsonl
+portfolio/opportunities.jsonl
 portfolio/scan_history.json
 portfolio/.portfolio.lock
 data/desk.db

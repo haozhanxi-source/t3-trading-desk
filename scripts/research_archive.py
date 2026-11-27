@@ -7,6 +7,7 @@ Stores persistent, append-friendly research files under:
         - state.json      (structured triggers, Chanlun anchors, watermarks, optimistic revision)
         - evidence.jsonl  (append-only L1-L4 graded facts with deduplication & supersedes)
 """
+# ruff: noqa: EXE001, TRY004, UP017
 from __future__ import annotations
 
 import argparse
@@ -54,6 +55,21 @@ VALID_STATUSES = {
 }
 VALID_DIRECTIONS = {"long", "short", "neutral", "pair"}
 VALID_CONFIDENCE_LEVELS = {"low", "medium", "high"}
+VALID_CROWDING_ASSESSMENTS = {"underpriced", "fair", "crowded", "unknown"}
+MAX_EXPECTATION_GAP_KPIS = 6
+EXPECTATION_GAP_CANONICAL_KEYS = (
+    "priced_in_consensus",
+    "our_variant_view",
+    "crowding_assessment",
+    "leading_kpis",
+)
+EXPECTATION_GAP_KPI_OPTIONAL_KEYS = (
+    "current_baseline",
+    "expected_trajectory",
+    "falsification_threshold",
+    "cadence",
+)
+EXPECTATION_GAP_KPI_ALLOWED_KEYS = ("name",) + EXPECTATION_GAP_KPI_OPTIONAL_KEYS
 VALID_OPERATORS = {">", ">=", "<", "<=", "==", "contains", "event"}
 VALID_TRIGGER_KINDS = {
     "fundamental",
@@ -148,9 +164,7 @@ def is_known_auto_metric(metric: Any) -> bool:
         return False
     if key in KNOWN_AUTO_METRICS:
         return True
-    if "_vs_" in key or key.endswith(("_spread", "_spread_pct", "_ratio", "_import_margin")):
-        return True
-    return False
+    return "_vs_" in key or key.endswith(("_spread", "_spread_pct", "_ratio", "_import_margin"))
 
 
 def is_trigger_auto_metric(trig: dict[str, Any]) -> bool:
@@ -182,9 +196,7 @@ def is_valid_http_url(url: Any) -> bool:
     if parsed.username is not None or parsed.password is not None or "@" in parsed.netloc:
         return False
     host = parsed.hostname
-    if not host or host.startswith(".") or host.endswith("."):
-        return False
-    return True
+    return bool(host and not host.startswith(".") and not host.endswith("."))
 
 
 def parse_strict_utc_timestamp(ts: Any) -> datetime | None:
@@ -216,6 +228,78 @@ def parse_strict_utc_timestamp(ts: Any) -> datetime | None:
     return None
 
 
+def _parse_positive_ttl_days(value: Any) -> int | None:
+    """Parse a positive integer TTL in days; return None for missing/bool/non-positive/invalid values."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 1 else None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            parsed = int(s)
+        except ValueError:
+            return None
+        return parsed if parsed >= 1 else None
+    return None
+
+
+def get_trigger_declared_ttl_days(trig: dict[str, Any]) -> int | None:
+    """Return the strictest positive TTL declared on a trigger definition (supports verification_ttl_days & ttl_days)."""
+    if not isinstance(trig, dict):
+        return None
+    candidates = [
+        parsed
+        for parsed in (
+            _parse_positive_ttl_days(trig.get("verification_ttl_days")),
+            _parse_positive_ttl_days(trig.get("ttl_days")),
+        )
+        if parsed is not None
+    ]
+    return min(candidates) if candidates else None
+
+
+def resolve_effective_verification_ttl_days(
+    trig: dict[str, Any],
+    ver: dict[str, Any] | None = None,
+) -> int:
+    """Enforce the stricter (smaller) positive TTL between trigger definition and verification record."""
+    trig_ttl = get_trigger_declared_ttl_days(trig)
+    ver_ttl = _parse_positive_ttl_days(ver.get("ttl_days")) if isinstance(ver, dict) else None
+    if trig_ttl is not None and ver_ttl is not None:
+        return min(trig_ttl, ver_ttl)
+    if trig_ttl is not None:
+        return trig_ttl
+    if ver_ttl is not None:
+        return ver_ttl
+    return DEFAULT_VERIFICATION_TTL_DAYS
+
+
+def exact_threshold_key(val: Any) -> Any:
+    """Build a strict, type- and insertion-order-preserving canonical key for trigger value identity."""
+    if val is None:
+        return ("none", None)
+    if isinstance(val, bool):
+        return ("bool", val)
+    if isinstance(val, int):
+        return ("int", val)
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            return ("nonfinite", str(val))
+        return ("float", repr(val))
+    if isinstance(val, str):
+        return ("str", val)
+    if isinstance(val, list):
+        return ("list", tuple(exact_threshold_key(item) for item in val))
+    if isinstance(val, tuple):
+        return ("tuple", tuple(exact_threshold_key(item) for item in val))
+    if isinstance(val, dict):
+        return ("dict", tuple((exact_threshold_key(k), exact_threshold_key(v)) for k, v in val.items()))
+    return (type(val).__qualname__, repr(val), str(val))
+
+
 def trigger_definition_fingerprint(trig: dict[str, Any]) -> dict[str, Any]:
     """Return canonical definition snapshot used for optimistic conflict detection during async verification."""
     return {
@@ -223,10 +307,10 @@ def trigger_definition_fingerprint(trig: dict[str, Any]) -> dict[str, Any]:
         "evaluation_mode": str(trig.get("evaluation_mode") or "").strip().lower(),
         "metric": str(trig.get("metric") or "").strip(),
         "operator": str(trig.get("operator") or "").strip(),
-        "threshold": trig.get("threshold"),
+        "threshold": exact_threshold_key(trig.get("threshold")),
         "action": str(trig.get("action") or "").strip(),
         "status": str(trig.get("status") or "armed").strip().lower(),
-        "verification_ttl_days": trig.get("verification_ttl_days"),
+        "verification_ttl_days": get_trigger_declared_ttl_days(trig),
         "description": str(trig.get("description") or "").strip(),
     }
 
@@ -254,13 +338,12 @@ def _archive_lock(folder: str):
     os.makedirs(folder, exist_ok=True)
     lock_path = os.path.join(os.path.realpath(folder), ".archive.lock")
     tlock = _get_inproc_lock(lock_path)
-    with tlock:
-        with open(lock_path, "a+", encoding="utf-8") as lock_file:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    with tlock, open(lock_path, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def utc_now_str() -> str:
@@ -410,6 +493,110 @@ def _normalize_confidence(value: Any) -> str | float | None:
     raise ValueError(
         f"Invalid confidence {value!r}; expected one of {sorted(VALID_CONFIDENCE_LEVELS)} or a number in [0.0, 1.0]"
     )
+
+
+def _default_expectation_gap() -> dict[str, Any]:
+    return {
+        "priced_in_consensus": "",
+        "our_variant_view": "",
+        "crowding_assessment": "unknown",
+        "leading_kpis": [],
+    }
+
+
+def normalize_expectation_gap(raw: Any, *, strict: bool = False) -> dict[str, Any]:
+    """Validate and normalize cross-asset structured second-order expectation gap."""
+    if raw is None:
+        return _default_expectation_gap()
+    if not isinstance(raw, dict):
+        raise ValueError(f"Field 'expectation_gap' must be a JSON object or null, got {raw!r}")
+
+    if strict:
+        unknown_top = sorted(str(k) for k in raw if k not in EXPECTATION_GAP_CANONICAL_KEYS)
+        if unknown_top:
+            raise ValueError(
+                f"expectation_gap contains unknown keys: {unknown_top}; "
+                f"expected subset of {list(EXPECTATION_GAP_CANONICAL_KEYS)}"
+            )
+
+    if "priced_in_consensus" in raw:
+        raw_consensus = raw["priced_in_consensus"]
+        if not isinstance(raw_consensus, str):
+            raise ValueError(
+                f"Field 'expectation_gap.priced_in_consensus' must be a string, got {raw_consensus!r}"
+            )
+        priced_in_consensus = raw_consensus.strip()
+    else:
+        priced_in_consensus = ""
+
+    if "our_variant_view" in raw:
+        raw_variant = raw["our_variant_view"]
+        if not isinstance(raw_variant, str):
+            raise ValueError(
+                f"Field 'expectation_gap.our_variant_view' must be a string, got {raw_variant!r}"
+            )
+        our_variant_view = raw_variant.strip()
+    else:
+        our_variant_view = ""
+
+    if "crowding_assessment" in raw:
+        raw_crowding = raw["crowding_assessment"]
+        if not isinstance(raw_crowding, str):
+            raise ValueError(
+                f"Invalid expectation_gap.crowding_assessment {raw_crowding!r}; "
+                f"expected one of {sorted(VALID_CROWDING_ASSESSMENTS)}"
+            )
+        crowding_assessment = raw_crowding.strip().lower()
+        if crowding_assessment not in VALID_CROWDING_ASSESSMENTS:
+            raise ValueError(
+                f"Invalid expectation_gap.crowding_assessment {raw_crowding!r}; "
+                f"expected one of {sorted(VALID_CROWDING_ASSESSMENTS)}"
+            )
+    else:
+        crowding_assessment = "unknown"
+
+    leading_kpis: list[dict[str, str]] = []
+    if "leading_kpis" in raw:
+        raw_kpis = raw["leading_kpis"]
+        if not isinstance(raw_kpis, list):
+            raise ValueError("Field 'expectation_gap.leading_kpis' must be a JSON array")
+        if len(raw_kpis) > MAX_EXPECTATION_GAP_KPIS:
+            raise ValueError(
+                f"Field 'expectation_gap.leading_kpis' allows at most {MAX_EXPECTATION_GAP_KPIS} items, "
+                f"got {len(raw_kpis)}"
+            )
+        for idx, item in enumerate(raw_kpis):
+            if not isinstance(item, dict):
+                raise ValueError(f"expectation_gap.leading_kpis[{idx}] must be a JSON object")
+            if strict:
+                unknown_kpi = sorted(str(k) for k in item if k not in EXPECTATION_GAP_KPI_ALLOWED_KEYS)
+                if unknown_kpi:
+                    raise ValueError(
+                        f"expectation_gap.leading_kpis[{idx}] contains unknown keys: {unknown_kpi}; "
+                        f"expected subset of {list(EXPECTATION_GAP_KPI_ALLOWED_KEYS)}"
+                    )
+            raw_name = item.get("name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                raise ValueError(f"expectation_gap.leading_kpis[{idx}].name must be a non-empty string")
+            clean_kpi: dict[str, str] = {"name": raw_name.strip()}
+            for opt_key in EXPECTATION_GAP_KPI_OPTIONAL_KEYS:
+                if opt_key in item and item[opt_key] is not None:
+                    opt_val = item[opt_key]
+                    if not isinstance(opt_val, str):
+                        raise ValueError(
+                            f"expectation_gap.leading_kpis[{idx}].{opt_key} must be a string, got {opt_val!r}"
+                        )
+                    clean_kpi[opt_key] = opt_val.strip()
+                else:
+                    clean_kpi[opt_key] = ""
+            leading_kpis.append(clean_kpi)
+
+    return {
+        "priced_in_consensus": priced_in_consensus,
+        "our_variant_view": our_variant_view,
+        "crowding_assessment": crowding_assessment,
+        "leading_kpis": leading_kpis,
+    }
 
 
 def _format_header_meta_lines(
@@ -742,6 +929,61 @@ def render_thesis_template(
     )
 
 
+def _default_state(
+    *,
+    next_revision: int,
+    market: str,
+    norm_sym: str,
+    name: str,
+    asset_class: str,
+    subtype: str,
+    cik: str | None,
+    norm_dir: str,
+    norm_conf: str | float | None,
+    eff_primary: str,
+    eff_secondary: str,
+    clean_summary: str,
+    now: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "revision": next_revision,
+        "instrument": {
+            "market": market,
+            "symbol": norm_sym,
+            "name": name,
+            "asset_class": asset_class,
+            "subtype": subtype,
+            "cik": cik,
+        },
+        "status": "watchlist",
+        "direction_bias": norm_dir,
+        "confidence": norm_conf,
+        "layer1_drivers": {
+            "primary": eff_primary,
+            "secondary": eff_secondary,
+        },
+        "thesis_summary": clean_summary or "待补充核心论点",
+        "expectation_gap": _default_expectation_gap(),
+        "chanlun_anchors": {
+            "as_of_bar": None,
+            "zhongshu_level": None,
+            "zd": None,
+            "zg": None,
+            "tactical_stop": None,
+            "structural_invalidation": None,
+            "target_zone": None,
+        },
+        "valuation_or_balance": {},
+        "triggers": [],
+        "pending_verifications": [],
+        "events": [],
+        "source_watermarks": {},
+        "created_at_utc": now,
+        "updated_at_utc": now,
+    }
+
+
 def init_archive(
     raw_symbol: str,
     name: str = "",
@@ -756,7 +998,7 @@ def init_archive(
     direction_bias: str = "neutral",
     layer1_primary: str | None = None,
     layer1_secondary: str | None = None,
-    confidence: str | int | float | None = None,
+    confidence: str | float | None = None,
 ) -> dict:
     """Create research/<MARKET>/<SYMBOL>/{thesis.md, evidence.jsonl, state.json} atomically under lock."""
     norm_dir = _normalize_direction_bias(direction_bias)
@@ -791,6 +1033,13 @@ def init_archive(
         if os.path.exists(state_path) and os.path.exists(thesis_path) and os.path.exists(evidence_path) and not overwrite:
             with open(state_path, "r", encoding="utf-8") as f:
                 existing_state = json.load(f)
+            if isinstance(existing_state, dict):
+                try:
+                    existing_state["expectation_gap"] = normalize_expectation_gap(
+                        existing_state.get("expectation_gap")
+                    )
+                except ValueError:
+                    existing_state["expectation_gap"] = _default_expectation_gap()
             return {"status": "exists", "archive_dir": folder, "state": existing_state}
 
         next_revision = 1
@@ -806,42 +1055,21 @@ def init_archive(
                 next_revision = 1
 
         now = utc_now_str()
-        state = {
-            "schema_version": 1,
-            "revision": next_revision,
-            "instrument": {
-                "market": market,
-                "symbol": norm_sym,
-                "name": name,
-                "asset_class": asset_class,
-                "subtype": subtype,
-                "cik": cik,
-            },
-            "status": "watchlist",
-            "direction_bias": norm_dir,
-            "confidence": norm_conf,
-            "layer1_drivers": {
-                "primary": eff_primary,
-                "secondary": eff_secondary,
-            },
-            "thesis_summary": clean_summary or "待补充核心论点",
-            "chanlun_anchors": {
-                "as_of_bar": None,
-                "zhongshu_level": None,
-                "zd": None,
-                "zg": None,
-                "tactical_stop": None,
-                "structural_invalidation": None,
-                "target_zone": None,
-            },
-            "valuation_or_balance": {},
-            "triggers": [],
-            "pending_verifications": [],
-            "events": [],
-            "source_watermarks": {},
-            "created_at_utc": now,
-            "updated_at_utc": now,
-        }
+        state = _default_state(
+            next_revision=next_revision,
+            market=market,
+            norm_sym=norm_sym,
+            name=name,
+            asset_class=asset_class,
+            subtype=subtype,
+            cik=cik,
+            norm_dir=norm_dir,
+            norm_conf=norm_conf,
+            eff_primary=eff_primary,
+            eff_secondary=eff_secondary,
+            clean_summary=clean_summary,
+            now=now,
+        )
         # Backup raw bytes (preserves CRLF/exact bytes) and attempt every file rollback independently
         backups: dict[str, bytes | None] = {}
         for p in (thesis_path, evidence_path, state_path):
@@ -878,7 +1106,7 @@ def init_archive(
                             os.unlink(p)
                     else:
                         _atomic_write_bytes(p, old_bytes)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             raise
 
@@ -906,6 +1134,11 @@ def load_archive(
         _apply_wal_unlocked(folder)
         with open(state_path, "r", encoding="utf-8") as f:
             state = json.load(f)
+        if isinstance(state, dict):
+            try:
+                state["expectation_gap"] = normalize_expectation_gap(state.get("expectation_gap"))
+            except ValueError:
+                state["expectation_gap"] = _default_expectation_gap()
 
         evidence: list[dict] = []
         if os.path.exists(evidence_path):
@@ -1050,6 +1283,8 @@ def _validate_state_patch(patch: dict[str, Any]) -> None:
         _normalize_confidence(patch["confidence"])
     if "thesis_summary" in patch and not isinstance(patch["thesis_summary"], str):
         raise ValueError(f"Field 'thesis_summary' must be a string, got {patch['thesis_summary']!r}")
+    if "expectation_gap" in patch:
+        normalize_expectation_gap(patch["expectation_gap"], strict=True)
     for shorthand_key in ("layer1_primary", "layer1_secondary"):
         if shorthand_key in patch and not isinstance(patch[shorthand_key], str):
             raise ValueError(f"Field {shorthand_key!r} must be a string, got {patch[shorthand_key]!r}")
@@ -1080,27 +1315,34 @@ def _validate_state_patch(patch: dict[str, Any]) -> None:
             seen_trig_ids.add(tid_clean)
             if trig["operator"] not in VALID_OPERATORS:
                 raise ValueError(f"Invalid trigger operator {trig['operator']!r}; expected one of {sorted(VALID_OPERATORS)}")
-            if "kind" in trig:
-                if not isinstance(trig["kind"], str) or trig["kind"] not in VALID_TRIGGER_KINDS:
-                    raise ValueError(
-                        f"Invalid trigger kind {trig['kind']!r}; expected one of {sorted(VALID_TRIGGER_KINDS)}"
-                    )
+            if "kind" in trig and (not isinstance(trig["kind"], str) or trig["kind"] not in VALID_TRIGGER_KINDS):
+                raise ValueError(
+                    f"Invalid trigger kind {trig['kind']!r}; expected one of {sorted(VALID_TRIGGER_KINDS)}"
+                )
             if "threshold" not in trig:
                 raise ValueError("Trigger missing required field 'threshold'")
-            if "evaluation_mode" in trig and trig["evaluation_mode"] is not None:
-                if trig["evaluation_mode"] not in VALID_EVALUATION_MODES:
-                    raise ValueError(
-                        f"Invalid trigger evaluation_mode {trig['evaluation_mode']!r}; "
-                        f"expected one of {sorted(VALID_EVALUATION_MODES)}"
-                    )
-            if "verification_ttl_days" in trig and trig["verification_ttl_days"] is not None:
-                ttl = trig["verification_ttl_days"]
-                if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 1:
-                    raise ValueError("Trigger field 'verification_ttl_days' must be a positive integer")
+            if (
+                "evaluation_mode" in trig
+                and trig["evaluation_mode"] is not None
+                and trig["evaluation_mode"] not in VALID_EVALUATION_MODES
+            ):
+                raise ValueError(
+                    f"Invalid trigger evaluation_mode {trig['evaluation_mode']!r}; "
+                    f"expected one of {sorted(VALID_EVALUATION_MODES)}"
+                )
+            for ttl_field in ("verification_ttl_days", "ttl_days"):
+                if ttl_field in trig and trig[ttl_field] is not None:
+                    ttl = trig[ttl_field]
+                    if isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 1:
+                        raise ValueError(f"Trigger field {ttl_field!r} must be a positive integer")
             if "verification" in trig and trig["verification"] is not None:
                 ver = trig["verification"]
                 if not isinstance(ver, dict):
                     raise ValueError("Trigger field 'verification' must be a JSON object or null")
+                if "ttl_days" in ver and ver["ttl_days"] is not None:
+                    ver_ttl = ver["ttl_days"]
+                    if isinstance(ver_ttl, bool) or not isinstance(ver_ttl, int) or ver_ttl < 1:
+                        raise ValueError("Trigger verification field 'ttl_days' must be a positive integer")
                 if ver.get("method") not in VALID_VERIFICATION_METHODS:
                     raise ValueError(
                         f"Invalid verification.method {ver.get('method')!r}; "
@@ -1116,12 +1358,18 @@ def _validate_state_patch(patch: dict[str, Any]) -> None:
                         "Trigger verification requires valid timezone-aware UTC 'verified_at_utc' "
                         "(e.g. 'YYYY-MM-DD HH:MM UTC' or ISO-8601 with timezone)"
                     )
-                if "evidence_tier" in ver and ver["evidence_tier"] not in (None, ""):
-                    if ver["evidence_tier"] not in VALID_EVIDENCE_LEVELS:
-                        raise ValueError(f"Invalid verification.evidence_tier {ver['evidence_tier']!r}")
-                if "source_url" in ver and ver["source_url"] not in (None, ""):
-                    if not is_valid_http_url(ver["source_url"]):
-                        raise ValueError(f"Invalid verification.source_url {ver['source_url']!r}")
+                if (
+                    "evidence_tier" in ver
+                    and ver["evidence_tier"] not in (None, "")
+                    and ver["evidence_tier"] not in VALID_EVIDENCE_LEVELS
+                ):
+                    raise ValueError(f"Invalid verification.evidence_tier {ver['evidence_tier']!r}")
+                if (
+                    "source_url" in ver
+                    and ver["source_url"] not in (None, "")
+                    and not is_valid_http_url(ver["source_url"])
+                ):
+                    raise ValueError(f"Invalid verification.source_url {ver['source_url']!r}")
     if "events" in patch:
         for ev in patch["events"]:
             if not isinstance(ev, dict) or not ev.get("date") or not ev.get("title"):
@@ -1188,7 +1436,21 @@ def update_state(
             normalized_patch["layer1_drivers"] = merged_drv
 
         for k, v in normalized_patch.items():
-            if k in dict_merge_keys and isinstance(v, dict) and isinstance(state.get(k), dict):
+            if k == "expectation_gap":
+                if v is None:
+                    state["expectation_gap"] = normalize_expectation_gap(None, strict=True)
+                else:
+                    normalize_expectation_gap(v, strict=True)
+                    try:
+                        base_eg = normalize_expectation_gap(state.get("expectation_gap"))
+                    except ValueError:
+                        base_eg = _default_expectation_gap()
+                    merged_eg = dict(base_eg)
+                    for eg_k in EXPECTATION_GAP_CANONICAL_KEYS:
+                        if eg_k in v:
+                            merged_eg[eg_k] = v[eg_k]
+                    state["expectation_gap"] = normalize_expectation_gap(merged_eg, strict=True)
+            elif k in dict_merge_keys and isinstance(v, dict) and isinstance(state.get(k), dict):
                 state[k] = {**state[k], **v}
             else:
                 state[k] = v
@@ -1374,9 +1636,7 @@ def is_numeric_trigger(op: Any, thresh: Any) -> bool:
     """Return True if trigger performs numeric threshold comparison (including numeric '==')."""
     if op in (">", ">=", "<", "<="):
         return True
-    if op == "==" and isinstance(thresh, (int, float)) and not isinstance(thresh, bool):
-        return True
-    return False
+    return bool(op == "==" and isinstance(thresh, (int, float)) and not isinstance(thresh, bool))
 
 
 def _compare_trigger_value(op: Any, obs: Any, thresh: Any) -> tuple[bool, bool, str | None]:
@@ -1403,11 +1663,11 @@ def _compare_trigger_value(op: Any, obs: Any, thresh: Any) -> tuple[bool, bool, 
         def _is_nonfinite_token(v: Any) -> bool:
             if isinstance(v, float):
                 return not math.isfinite(v)
-            if isinstance(v, str) and v.strip().lower() in {
-                "nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity",
-            }:
-                return True
-            return False
+            return bool(
+                isinstance(v, str)
+                and v.strip().lower()
+                in {"nan", "inf", "+inf", "-inf", "infinity", "+infinity", "-infinity"}
+            )
 
         if _is_nonfinite_token(obs) or _is_nonfinite_token(thresh):
             return False, False, "Non-finite value rejected for '==' trigger"
@@ -1495,11 +1755,7 @@ def evaluate_triggers(
             v_status = str(ver.get("status") or "uncertain").strip().lower()
             v_ts = ver.get("verified_at_utc")
             ver_dt = parse_strict_utc_timestamp(v_ts)
-            raw_ttl = ver.get("ttl_days") or trig.get("verification_ttl_days") or DEFAULT_VERIFICATION_TTL_DAYS
-            try:
-                ttl_days = max(1, int(raw_ttl))
-            except (TypeError, ValueError):
-                ttl_days = DEFAULT_VERIFICATION_TTL_DAYS
+            ttl_days = resolve_effective_verification_ttl_days(trig, ver)
 
             if ver_dt is None:
                 results.append({
@@ -1703,14 +1959,17 @@ def record_trigger_verifications(
                         new_triggers.append(trig)
                         continue
                 cur_ver = trig.get("verification") if isinstance(trig.get("verification"), dict) else None
-                if expected_prev_verifications is not None and tid in expected_prev_verifications:
-                    if cur_ver != expected_prev_verifications[tid]:
-                        skipped_conflicts.append({
-                            "id": tid,
-                            "reason": "核验期间已有更新的人工/AI 核验记录写入，已拒绝覆盖",
-                        })
-                        new_triggers.append(trig)
-                        continue
+                if (
+                    expected_prev_verifications is not None
+                    and tid in expected_prev_verifications
+                    and exact_threshold_key(cur_ver) != exact_threshold_key(expected_prev_verifications[tid])
+                ):
+                    skipped_conflicts.append({
+                        "id": tid,
+                        "reason": "核验期间已有更新的人工/AI 核验记录写入，已拒绝覆盖",
+                    })
+                    new_triggers.append(trig)
+                    continue
                 if expected_prev_verified_at and tid in expected_prev_verified_at:
                     cur_ts = cur_ver.get("verified_at_utc") if isinstance(cur_ver, dict) else None
                     if cur_ts != expected_prev_verified_at[tid]:
@@ -1729,11 +1988,7 @@ def record_trigger_verifications(
                 verified_at = str(raw_v.get("verified_at_utc") or utc_now_iso_seconds()).strip()
                 if parse_strict_utc_timestamp(verified_at) is None:
                     raise ValueError(f"Invalid verified_at_utc for trigger {tid!r}: {verified_at!r}")
-                ttl_days = raw_v.get("ttl_days") or trig.get("verification_ttl_days") or DEFAULT_VERIFICATION_TTL_DAYS
-                try:
-                    ttl_days = max(1, int(ttl_days))
-                except (TypeError, ValueError):
-                    ttl_days = DEFAULT_VERIFICATION_TTL_DAYS
+                ttl_days = resolve_effective_verification_ttl_days(trig, raw_v)
                 clean_v: dict[str, Any] = {
                     "method": method,
                     "status": status,
@@ -1833,7 +2088,7 @@ def list_archives(research_root: str | None = None) -> list[dict]:
                 "updated_at_utc": st.get("updated_at_utc"),
                 "archive_dir": dirpath,
             })
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             out.append({"archive_dir": dirpath, "error": str(exc)})
     out.sort(key=lambda r: (r.get("market") or "", r.get("symbol") or ""))
     return out
@@ -1934,7 +2189,7 @@ def main(argv: list[str] | None = None):
             res = list_archives(research_root=args.root)
         else:
             raise ValueError(f"Unknown command: {args.cmd}")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(2)
 

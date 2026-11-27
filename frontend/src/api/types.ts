@@ -58,6 +58,25 @@ export interface MacroFactorSlot {
   overexposed: boolean;
 }
 
+export type PositionLifecycleStage = "pilot" | "breakeven_locked" | "pyramided" | "main_wave";
+export type StopRegime = "tactical_30m" | "daily_structure";
+export type AttributionTag =
+  | "full_main_wave_ride"
+  | "clean_pyramid_win"
+  | "disciplined_trailing_exit"
+  | "thesis_target_reached"
+  | "leader_rotation_upgrade"
+  | "normal_pilot_cost"
+  | "l1_regime_headwind"
+  | "l3_thesis_falsified"
+  | "l4_chased_extended"
+  | "shaken_out_30m_noise"
+  | "premature_profit_taking"
+  | "discipline_rule_breach"
+  | string;
+export type ShadowOpportunityKind = "missed_entry" | "shaken_out" | "premature_exit";
+export type ShadowOpportunityStatus = "tracking" | "reviewed";
+
 export interface Position {
   position_id: string;
   symbol: string;
@@ -70,6 +89,9 @@ export interface Position {
   co_leader_reason?: string | null;
   entry_price?: number;
   avg_entry_price?: number;
+  initial_entry_price?: number | null;
+  initial_stop_30m?: number | null;
+  multiplier?: number | null;
   quantity: number;
   initial_quantity?: number;
   fx_to_account?: number;
@@ -81,7 +103,20 @@ export interface Position {
   macro_factors?: string[];
   exit_red_lines?: unknown[];
   current_open_risk_amount?: number;
+  remaining_open_risk_amount?: number;
+  campaign_open_risk_amount?: number;
+  campaign_net_pnl_at_stop?: number;
   initial_risk_amount?: number;
+  campaign_1r_amount?: number;
+  lifecycle_stage?: PositionLifecycleStage;
+  active_stop_regime?: StopRegime;
+  tactical_stop_active_since_utc?: string | null;
+  r_multiple?: number | null;
+  campaign_r_multiple?: number | null;
+  attribution_tag?: AttributionTag | null;
+  lesson_note?: string;
+  stop_updated_at_utc?: string | null;
+  structural_stop_updated_at_utc?: string | null;
   status?: string;
   opened_at_utc?: string;
   notes?: string | null;
@@ -122,6 +157,10 @@ export interface JournalEntry {
   symbol?: string;
   position_id?: string;
   detail?: unknown;
+  r_multiple?: number | null;
+  campaign_r_multiple?: number | null;
+  attribution_tag?: AttributionTag | null;
+  lesson_note?: string;
   [k: string]: unknown;
 }
 
@@ -157,6 +196,7 @@ export interface OpenPositionBody {
   exit_red_lines?: string[];
   notes?: string;
   allow_equity_margin?: boolean;
+  campaign_1r_amount?: number;
 }
 
 export interface TrailStopBody {
@@ -166,10 +206,21 @@ export interface TrailStopBody {
   reason?: string;
 }
 
+export interface SetStopRegimeBody {
+  regime: StopRegime;
+  new_daily_stop?: number;
+  new_stop_30m?: number;
+  current_price?: number;
+  reason?: string;
+  idempotency_key?: string;
+}
+
 export interface TrimBody {
   trim_price: number;
   trim_quantity: number;
   reason?: string;
+  attribution_tag?: string | null;
+  lesson_note?: string;
 }
 
 export interface ScaleInBody {
@@ -180,6 +231,10 @@ export interface ScaleInBody {
   note?: string;
   enforce_macro_cap?: boolean;
   idempotency_key?: string;
+  require_breakeven_lock?: boolean;
+  max_profit_cushion_ratio?: number;
+  new_daily_stop?: number;
+  max_leverage?: number;
 }
 
 export interface ScaleInResponse {
@@ -209,6 +264,8 @@ export interface CloseBody {
   exit_price: number;
   exit_reason: string;
   exit_category?: string;
+  attribution_tag?: string | null;
+  lesson_note?: string;
 }
 
 export interface VoidBody {
@@ -232,6 +289,7 @@ export interface RotateNewPositionBody {
   notes?: string;
   reason?: string;
   allow_equity_margin?: boolean;
+  campaign_1r_amount?: number;
 }
 
 export interface RotatePositionBody {
@@ -240,6 +298,110 @@ export interface RotatePositionBody {
   new_position: RotateNewPositionBody;
   exit_category?: string;
   enforce_macro_cap?: boolean;
+  attribution_tag?: string | null;
+  lesson_note?: string;
+}
+
+export interface ShadowOpportunity {
+  opportunity_id: string;
+  symbol: string;
+  market: string;
+  sector_theme: string;
+  direction: Direction;
+  kind: ShadowOpportunityKind | string;
+  status: ShadowOpportunityStatus | string;
+  anchor_price: number;
+  planned_stop_price: number;
+  unit_1r_distance?: number | null;
+  subsequent_extreme_price?: number | null;
+  missed_move_pct?: number | null;
+  missed_r_multiple?: number | null;
+  root_cause_tag?: string | null;
+  lesson_note?: string;
+  linked_position_id?: string | null;
+  created_at_utc?: string;
+  updated_at_utc?: string;
+}
+
+export interface LogOpportunityBody {
+  symbol: string;
+  market?: string;
+  sector_theme?: string;
+  direction: Direction;
+  kind: ShadowOpportunityKind;
+  anchor_price: number;
+  planned_stop_price: number;
+  subsequent_extreme_price?: number | null;
+  root_cause_tag?: string | null;
+  lesson_note?: string;
+  linked_position_id?: string | null;
+  status?: ShadowOpportunityStatus;
+  idempotency_key?: string;
+}
+
+export interface UpdateOpportunityBody {
+  subsequent_extreme_price?: number | null;
+  status?: ShadowOpportunityStatus;
+  root_cause_tag?: string | null;
+  lesson_note?: string | null;
+  idempotency_key?: string;
+}
+
+export interface AttributionTagMetric {
+  tag: string;
+  label: string;
+  category: "positive" | "pilot_friction" | "mistake" | string;
+  count: number;
+  total_pnl: number;
+  total_r: number;
+  avg_r: number;
+}
+
+export interface AttributionTaxonomyItem {
+  tag: string;
+  label: string;
+  category: "positive" | "pilot_friction" | "mistake" | string;
+}
+
+export interface PortfolioAttributionAnalytics {
+  initialized: boolean;
+  closed_count: number;
+  win_count: number;
+  loss_count: number;
+  flat_count: number;
+  win_rate_pct: number;
+  total_realized_pnl: number;
+  gross_profit: number;
+  gross_loss: number;
+  profit_factor: number | null;
+  total_realized_r: number;
+  avg_win_r: number;
+  avg_loss_r: number;
+  avg_loss_r_abs: number;
+  payoff_ratio_r: number | null;
+  expectancy_r: number;
+  max_win_r: number;
+  max_loss_r: number;
+  skewness: {
+    top_20pct_winner_count: number;
+    top_20pct_profit_share_pct: number;
+    multi_r_winners_count: number;
+    pilot_friction_loss_r: number;
+    preventable_mistake_loss_r: number;
+    untagged_closed_count: number;
+  };
+  by_tag: AttributionTagMetric[];
+  shadow_summary: {
+    total_count: number;
+    tracking_count: number;
+    missed_entry_count: number;
+    shaken_out_count: number;
+    premature_exit_count: number;
+    total_missed_r: number;
+    max_missed_r: number;
+    top_missed: ShadowOpportunity[];
+  };
+  taxonomy?: AttributionTaxonomyItem[];
 }
 
 /* ---------------- Sentinel ---------------- */
@@ -254,6 +416,7 @@ export interface SentinelAlert {
 }
 
 export interface SuggestedTrailStop {
+  stop_field?: "tactical_stop_30m" | "structural_stop_daily";
   current_stop: number | null;
   suggested_stop: number | null;
   improvement_pct?: number | null;
@@ -269,6 +432,25 @@ export interface UpcomingEvent {
   source?: string;
   imminent?: boolean;
   symbol?: string;
+}
+
+export interface SentinelCampaignStatus {
+  lifecycle_stage?: PositionLifecycleStage;
+  active_stop_regime?: StopRegime;
+  configured_stop_regime?: string;
+  effective_stop_price?: number | null;
+  unit_1r_price_dist?: number | null;
+  unrealized_r?: number | null;
+  is_breakeven_locked?: boolean;
+  tactical_30m_reference_crossed?: boolean;
+  main_wave_pullback_watch?: { active: boolean; message: string } | null;
+  suggested_breakeven_stop?: { recommended_stop: number; stop_field: string; reason: string } | null;
+  suggested_regime_handover?: {
+    target_regime: "daily_structure";
+    recommended_daily_stop: number;
+    unrealized_r: number;
+    reason: string;
+  } | null;
 }
 
 export interface SentinelHolding {
@@ -295,6 +477,7 @@ export interface SentinelHolding {
   yellow_alerts: SentinelAlert[];
   info_notes: string[];
   suggested_trail_stop?: SuggestedTrailStop | null;
+  campaign_status?: SentinelCampaignStatus | null;
   trigger_results?: Dict[];
   verifiable_trigger_ids?: string[];
   upcoming_events?: UpcomingEvent[];
@@ -610,6 +793,64 @@ export interface TradePlanBody {
   archive_market?: string;
 }
 
+export type CrowdingAssessment = "underpriced" | "fair" | "crowded" | "unknown";
+
+export interface LeadingKpiItem {
+  name: string;
+  current_baseline: string;
+  expected_trajectory: string;
+  falsification_threshold: string;
+  cadence: string;
+}
+
+export interface ExpectationGap {
+  priced_in_consensus: string;
+  our_variant_view: string;
+  crowding_assessment: CrowdingAssessment;
+  leading_kpis: LeadingKpiItem[];
+}
+
+export interface ExpectationGapSummary {
+  crowding_assessment?: CrowdingAssessment | string;
+  priced_in_consensus?: string;
+  our_variant_view?: string;
+  leading_kpis_count?: number;
+  has_expectation_gap?: boolean;
+  [k: string]: unknown;
+}
+
+export interface OffensiveCampaignStage {
+  stage: "pilot" | "breakeven_pyramid" | "main_wave_handover" | string;
+  actionable?: boolean;
+  title: string;
+  trigger_r: number;
+  trigger_price: number | null;
+  recommended_qty: number;
+  stop_price: number | null;
+  principal_risk_amount: number;
+  rule_summary: string;
+}
+
+export interface OffensiveCampaign {
+  campaign_1r_amount: number;
+  unit_1r_price_distance: number;
+  full_pilot_qty: number;
+  full_pilot_risk_amount: number;
+  split_pilot_qty: number;
+  breakeven_trigger_price: number | null;
+  pyramid_trigger_price: number | null;
+  main_wave_trigger_price: number | null;
+  prior_profit_cushion_at_pyramid: number;
+  added_giveback_cap_amount: number;
+  added_leg_giveback_amount: number;
+  new_open_risk: number;
+  max_zero_risk_add_qty: number;
+  post_add_total_qty: number;
+  post_add_breakeven_stop: number | null;
+  initial_main_wave_stop: number | null;
+  stages: OffensiveCampaignStage[];
+}
+
 export interface FourQuadrantGate {
   decision: string;
   actionable: boolean;
@@ -619,6 +860,8 @@ export interface FourQuadrantGate {
   direction_aligned?: boolean | null;
   reason?: string;
   reasons?: string[];
+  warnings?: string[];
+  expectation_gap_summary?: ExpectationGapSummary | null;
   checks?: Record<string, unknown>;
 }
 
@@ -638,8 +881,11 @@ export interface ExpressionAndCarry {
   near_horizon_carry_pct?: number | null;
   curve_horizon_carry_pct?: number | null;
   carry_adjusted_rr_ratio?: number | null;
+  carry_adjusted_rr_ratio_raw?: number | null;
   curve_carry_adjusted_rr_ratio?: number | null;
+  curve_carry_adjusted_rr_ratio_raw?: number | null;
   near_carry_stress_rr_ratio?: number | null;
+  near_carry_stress_rr_ratio_raw?: number | null;
   expression_recommendation?: string | null;
   contract_guidance?: string | null;
   monitoring_points?: string[];
@@ -692,12 +938,15 @@ export interface PositionPlan {
   max_margin_pct?: number;
   max_leverage?: number | null;
   rr_ratio?: number | null;
+  rr_ratio_raw?: number | null;
   carry_adjusted_rr_ratio?: number | null;
+  carry_adjusted_rr_ratio_raw?: number | null;
   expected_move_pct?: number | null;
   daily_structural_risk_amount?: number | null;
   daily_vs_30m_risk_ratio?: number | null;
   noise_risk_saved_amount?: number | null;
   tranches?: Tranche[];
+  offensive_campaign?: OffensiveCampaign | null;
   warnings?: string[];
 }
 
@@ -710,6 +959,7 @@ export interface TradePlanResponse {
   stop_timeframe?: string | null;
   live_warnings?: string[];
   research_direction_bias?: string | null;
+  expectation_gap_summary?: ExpectationGapSummary | null;
   archive_context?: {
     exists?: boolean;
     market?: string | null;
@@ -780,6 +1030,7 @@ export interface ArchiveState {
   confidence?: "low" | "medium" | "high" | number | null;
   layer1_drivers?: { primary?: string; secondary?: string };
   thesis_summary?: string;
+  expectation_gap?: ExpectationGap | null;
   chanlun_anchors?: Dict;
   valuation_or_balance?: Dict;
   triggers?: ArchiveTrigger[];

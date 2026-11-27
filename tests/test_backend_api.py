@@ -2433,3 +2433,817 @@ def test_p2_4_archive_init_single_write_and_overwrite_increments_revision(client
     )
     assert r_stale.status_code == 409
 
+
+# ---------------------------------------------------------------------------
+# 10. Asymmetric Alpha Engine API Integration Tests
+# ---------------------------------------------------------------------------
+def test_asymmetric_alpha_archive_expectation_gap_patch_and_trade_plan(client: TestClient):
+    """Verify PATCH /api/research/archive/state expectation_gap semantics and /api/trade/plan propagation."""
+    r_init = client.post(
+        "/api/research/archive/init",
+        json={
+            "symbol": "PWR",
+            "name": "Quanta Services",
+            "direction_bias": "long",
+            "layer1_primary": "电力与电网设备瓶颈",
+            "layer1_secondary": "AI算力资本开支周期",
+        },
+    )
+    assert r_init.status_code == 200
+    assert r_init.json()["state"]["expectation_gap"] == {
+        "priced_in_consensus": "",
+        "our_variant_view": "",
+        "crowding_assessment": "unknown",
+        "leading_kpis": [],
+    }
+
+    # 1) Full expectation_gap dict patch
+    full_eg = {
+        "priced_in_consensus": "市场定价 FY27 营收增速回落至 11%",
+        "our_variant_view": "特高压变电站与数据中心并网积压推动 FY27 增速维持 18%+",
+        "crowding_assessment": "underpriced",
+        "leading_kpis": [
+            {
+                "name": "12-Month Remaining Performance Obligations",
+                "current_baseline": "$35.2B",
+                "expected_trajectory": "QoQ 增速转正超过 6%",
+            }
+        ],
+    }
+    r_full = client.patch(
+        "/api/research/archive/state",
+        json={"symbol": "PWR", "expected_revision": 1, "expectation_gap": full_eg},
+    )
+    assert r_full.status_code == 200
+    st2 = r_full.json()
+    assert st2["revision"] == 2
+    assert st2["expectation_gap"]["priced_in_consensus"] == full_eg["priced_in_consensus"]
+    assert st2["expectation_gap"]["our_variant_view"] == full_eg["our_variant_view"]
+    assert st2["expectation_gap"]["crowding_assessment"] == "underpriced"
+    assert len(st2["expectation_gap"]["leading_kpis"]) == 1
+
+    # 2) Omitting expectation_gap when patching another field MUST preserve existing expectation_gap
+    r_omit = client.patch(
+        "/api/research/archive/state",
+        json={"symbol": "PWR", "expected_revision": 2, "thesis_summary": "电网主干网改造超级周期"},
+    )
+    assert r_omit.status_code == 200
+    st3 = r_omit.json()
+    assert st3["thesis_summary"] == "电网主干网改造超级周期"
+    assert st3["expectation_gap"]["crowding_assessment"] == "underpriced"
+    assert st3["expectation_gap"]["priced_in_consensus"] == full_eg["priced_in_consensus"]
+    assert len(st3["expectation_gap"]["leading_kpis"]) == 1
+
+    # 3) Partial merge updates only crowding_assessment while keeping other subfields intact
+    r_partial = client.patch(
+        "/api/research/archive/state",
+        json={
+            "symbol": "PWR",
+            "expected_revision": 3,
+            "expectation_gap": {"crowding_assessment": "crowded"},
+        },
+    )
+    assert r_partial.status_code == 200
+    st4 = r_partial.json()
+    assert st4["expectation_gap"]["crowding_assessment"] == "crowded"
+    assert st4["expectation_gap"]["priced_in_consensus"] == full_eg["priced_in_consensus"]
+    assert st4["expectation_gap"]["our_variant_view"] == full_eg["our_variant_view"]
+    assert len(st4["expectation_gap"]["leading_kpis"]) == 1
+
+    # Verify /api/trade/plan exposes archive expectation_gap_summary and offensive_campaign unstripped
+    ra.append_evidence("PWR", [{"level": "L1", "metric": "backlog", "value": "35.2B"}])
+    r_plan = client.post(
+        "/api/trade/plan",
+        json={
+            "symbol": "PWR",
+            "direction": "long",
+            "live": False,
+            "entry_price": 300.0,
+            "tactical_stop_30m": 288.0,
+            "structural_stop_daily": 270.0,
+            "target_price": 360.0,
+            "account_equity": 200_000.0,
+            "account_currency": "USD",
+            "alignment_status": "aligned_trigger",
+        },
+    )
+    assert r_plan.status_code == 200
+    plan_body = r_plan.json()
+    assert plan_body["expectation_gap_summary"]["crowding_assessment"] == "crowded"
+    assert plan_body["expectation_gap_summary"]["leading_kpis_count"] == 1
+    assert plan_body["archive_context"]["expectation_gap"]["crowding_assessment"] == "crowded"
+    assert isinstance(plan_body["position_plan"].get("offensive_campaign"), dict)
+    assert plan_body["position_plan"]["offensive_campaign"]["campaign_1r_amount"] > 0
+
+    # 4) Invalid crowding_assessment -> clean 4xx validation error (never 500)
+    r_bad = client.patch(
+        "/api/research/archive/state",
+        json={
+            "symbol": "PWR",
+            "expectation_gap": {"crowding_assessment": "mega_overheated"},
+        },
+    )
+    assert r_bad.status_code in (400, 422)
+    assert "crowding_assessment" in r_bad.json()["detail"]
+
+    # Conflicting top-level expectation_gap vs patch.expectation_gap -> 422
+    r_conflict_eg = client.patch(
+        "/api/research/archive/state",
+        json={
+            "symbol": "PWR",
+            "expectation_gap": None,
+            "patch": {"expectation_gap": {"crowding_assessment": "fair"}},
+        },
+    )
+    assert r_conflict_eg.status_code == 422
+
+    # 5) Explicit null resets expectation_gap to clean defaults
+    r_reset = client.patch(
+        "/api/research/archive/state",
+        json={"symbol": "PWR", "expected_revision": 4, "expectation_gap": None},
+    )
+    assert r_reset.status_code == 200
+    st5 = r_reset.json()
+    assert st5["revision"] == 5
+    assert st5["expectation_gap"] == {
+        "priced_in_consensus": "",
+        "our_variant_view": "",
+        "crowding_assessment": "unknown",
+        "leading_kpis": [],
+    }
+
+
+def test_asymmetric_alpha_campaign_scale_in_stop_regime_and_attribution_lifecycle(client: TestClient):
+    """End-to-end API flow: open(campaign_1r) -> scale-in(breakeven lock) -> stop-regime(daily) -> trim -> close -> rotate."""
+    assert (
+        client.post(
+            "/api/portfolio/init",
+            json={
+                "equity": 100_000.0,
+                "base_currency": "USD",
+                "default_risk_per_trade_pct": 1.0,
+                "max_total_open_risk_pct": 6.0,
+                "max_macro_factor_risk_pct": 3.0,
+            },
+        ).status_code
+        == 200
+    )
+
+    # 1) Open pilot position with explicit campaign_1r_amount=1000 (0.5R pilot risk = $500)
+    r_open = client.post(
+        "/api/portfolio/positions/open",
+        json={
+            "symbol": "NVDA",
+            "direction": "long",
+            "sector_theme": "ai_compute",
+            "entry_price": 100.0,
+            "tactical_stop_30m": 95.0,
+            "structural_stop_daily": 92.0,
+            "target_price": 145.0,
+            "quantity": 100,
+            "campaign_1r_amount": 1000.0,
+            "macro_factors": ["us_real_rate"],
+        },
+    )
+    assert r_open.status_code == 200
+    pos = r_open.json()["position"]
+    pid = pos["position_id"]
+    assert pos["campaign_1r_amount"] == 1000.0
+    assert pos["lifecycle_stage"] == "pilot"
+    assert pos["active_stop_regime"] == "tactical_30m"
+
+    # 2) Scale-in with require_breakeven_lock=True rejected when stop is below post-add avg entry -> HTTP 400
+    r_scale_reject = client.post(
+        f"/api/portfolio/positions/{pid}/scale-in",
+        json={
+            "add_quantity": 100,
+            "add_price": 112.0,
+            "new_stop_loss": 102.0,  # avg entry would be 106.0 > 102.0
+            "require_breakeven_lock": True,
+            "max_profit_cushion_ratio": 0.65,
+        },
+    )
+    assert r_scale_reject.status_code == 400
+    assert "breakeven" in r_scale_reject.json()["detail"].lower() or "保本" in r_scale_reject.json()["detail"]
+
+    # 3) Scale-in with require_breakeven_lock=True accepted when locked at breakeven (106.0) -> HTTP 200
+    r_scale_ok = client.post(
+        f"/api/portfolio/positions/{pid}/scale-in",
+        json={
+            "add_quantity": 100,
+            "add_price": 112.0,
+            "new_stop_loss": 106.0,
+            "new_daily_stop": 100.0,
+            "require_breakeven_lock": True,
+            "max_profit_cushion_ratio": 0.65,
+            "note": "T2 保本推仓",
+        },
+    )
+    assert r_scale_ok.status_code == 200
+    scale_body = r_scale_ok.json()
+    assert scale_body["new_quantity"] == 200
+    assert scale_body["new_entry_price"] == pytest.approx(106.0, abs=1e-6)
+    assert scale_body["new_risk_amount"] == 0.0
+    assert scale_body["position"]["lifecycle_stage"] == "pyramided"
+    assert scale_body["summary"]["open_positions_count"] == 1
+
+    # 4) Handover stop-regime to daily_structure rejected when daily stop < avg_entry (106.0) -> HTTP 400
+    r_regime_reject = client.post(
+        f"/api/portfolio/positions/{pid}/stop-regime",
+        json={
+            "regime": "daily_structure",
+            "new_daily_stop": 103.0,
+            "current_price": 122.0,
+            "reason": "attempt_below_breakeven",
+        },
+    )
+    assert r_regime_reject.status_code == 400
+    assert "daily_stop_below_breakeven_floor" in r_regime_reject.json()["detail"]
+
+    # Unknown position_id on stop-regime -> HTTP 404
+    r_regime_404 = client.post(
+        "/api/portfolio/positions/pos_missing/stop-regime",
+        json={"regime": "daily_structure", "new_daily_stop": 110.0},
+    )
+    assert r_regime_404.status_code == 404
+
+    # 5) Handover stop-regime to daily_structure accepted when daily stop >= avg_entry (106.0) -> HTTP 200
+    r_regime_ok = client.post(
+        f"/api/portfolio/positions/{pid}/stop-regime",
+        json={
+            "regime": "daily_structure",
+            "new_daily_stop": 108.0,
+            "current_price": 125.0,
+            "reason": "handover_to_daily_main_wave",
+        },
+    )
+    assert r_regime_ok.status_code == 200
+    reg_body = r_regime_ok.json()
+    assert reg_body["position"]["active_stop_regime"] == "daily_structure"
+    assert reg_body["position"]["structural_stop_daily"] == 108.0
+    assert reg_body["position"]["lifecycle_stage"] == "main_wave"
+    assert reg_body["summary"]["open_positions_count"] == 1
+
+    # 6) Trim with attribution_tag & lesson_note (bogus tag rejected cleanly)
+    r_trim_bad = client.post(
+        f"/api/portfolio/positions/{pid}/trim",
+        json={
+            "trim_price": 130.0,
+            "trim_quantity": 50,
+            "attribution_tag": "nonexistent_tag",
+        },
+    )
+    assert r_trim_bad.status_code in (400, 422)
+
+    r_trim_ok = client.post(
+        f"/api/portfolio/positions/{pid}/trim",
+        json={
+            "trim_price": 130.0,
+            "trim_quantity": 50,
+            "reason": "lock_partial_gain",
+            "attribution_tag": "disciplined_trailing_exit",
+            "lesson_note": "加速段减仓 25% 锁利",
+        },
+    )
+    assert r_trim_ok.status_code == 200
+    assert r_trim_ok.json()["position"]["trims"][0]["attribution_tag"] == "disciplined_trailing_exit"
+
+    # 7) Close with attribution_tag & lesson_note -> verify campaign_r_multiple & attribution_tag
+    # Partial PnL: 50 * (130 - 106) = 1200; Remaining PnL: 150 * (136 - 106) = 4500; Total = 5700 -> 5.7R on 1R=1000
+    r_close = client.post(
+        f"/api/portfolio/positions/{pid}/close",
+        json={
+            "exit_price": 136.0,
+            "exit_reason": "daily_top_divergence",
+            "exit_category": "take_profit",
+            "attribution_tag": "full_main_wave_ride",
+            "lesson_note": "保本推仓后切换日线主升完整吃满",
+        },
+    )
+    assert r_close.status_code == 200
+    closed_pos = r_close.json()["position"]
+    assert closed_pos["status"] == "closed"
+    assert closed_pos["attribution_tag"] == "full_main_wave_ride"
+    assert closed_pos["lesson_note"] == "保本推仓后切换日线主升完整吃满"
+    assert closed_pos["campaign_1r_amount"] == 1000.0
+    assert closed_pos["campaign_r_multiple"] == pytest.approx(5.7, abs=1e-4)
+
+    # 8) Rotate with attribution_tag, lesson_note, and new_position.campaign_1r_amount
+    r_open2 = client.post(
+        "/api/portfolio/positions/open",
+        json={
+            "symbol": "PWR",
+            "direction": "long",
+            "sector_theme": "power_grid",
+            "entry_price": 200.0,
+            "tactical_stop_30m": 195.0,
+            "quantity": 100,
+            "campaign_1r_amount": 1000.0,
+        },
+    )
+    assert r_open2.status_code == 200
+    pwr_pid = r_open2.json()["position"]["position_id"]
+
+    r_rot = client.post(
+        f"/api/portfolio/positions/{pwr_pid}/rotate",
+        json={
+            "exit_price": 215.0,
+            "exit_reason": "switch_to_etn_leader",
+            "attribution_tag": "disciplined_trailing_exit",
+            "lesson_note": "龙头换仓至 ETN",
+            "new_position": {
+                "symbol": "ETN",
+                "direction": "long",
+                "sector_theme": "power_grid",
+                "entry_price": 300.0,
+                "tactical_stop_30m": 295.0,
+                "quantity": 100,
+                "campaign_1r_amount": 1200.0,
+            },
+        },
+    )
+    assert r_rot.status_code == 200
+    rot_body = r_rot.json()
+    assert rot_body["closed_position"]["attribution_tag"] == "disciplined_trailing_exit"
+    assert rot_body["closed_position"]["lesson_note"] == "龙头换仓至 ETN"
+    assert rot_body["opened_position"]["campaign_1r_amount"] == 1200.0
+
+    # Summary preserves all new fields unstripped
+    sum_body = client.get("/api/portfolio/summary").json()
+    assert sum_body["initialized"] is True
+    open_etn = next(p for p in sum_body["positions"] if p["symbol"] == "ETN")
+    assert open_etn["campaign_1r_amount"] == 1200.0
+    assert open_etn["lifecycle_stage"] == "pilot"
+    assert open_etn["active_stop_regime"] == "tactical_30m"
+    closed_nvda = next(p for p in sum_body["positions"] if p["symbol"] == "NVDA")
+    assert closed_nvda["campaign_r_multiple"] == pytest.approx(5.7, abs=1e-4)
+    assert closed_nvda["attribution_tag"] == "full_main_wave_ride"
+
+
+def test_asymmetric_alpha_shadow_opportunities_and_attribution_analytics(client: TestClient):
+    """Verify shadow opportunity CRUD endpoints and post-trade skewness/attribution analytics."""
+    # 1) Uninitialized portfolio returns clean zeroed analytics and empty opportunity list
+    r_attr0 = client.get("/api/portfolio/attribution")
+    assert r_attr0.status_code == 200
+    assert r_attr0.json()["closed_count"] == 0
+    assert r_attr0.json()["shadow_summary"]["total_count"] == 0
+
+    r_opps0 = client.get("/api/portfolio/opportunities")
+    assert r_opps0.status_code == 200
+    assert r_opps0.json() == {"opportunities": []}
+
+    # 2) Seed portfolio with 1 multi-R winner, 1 pilot friction loss, and 1 preventable mistake loss
+    assert (
+        client.post(
+            "/api/portfolio/init",
+            json={"equity": 100_000.0, "base_currency": "USD", "default_risk_per_trade_pct": 1.0},
+        ).status_code
+        == 200
+    )
+
+    trades = [
+        ("NVDA", "ai_compute", 100.0, 95.0, 100, 1000.0, 140.0, "full_main_wave_ride", "主升吃满 4R"),
+        ("PWR", "power_grid", 200.0, 195.0, 100, 1000.0, 195.0, "normal_pilot_cost", "正常试仓止损 -0.5R"),
+        ("AMD", "semis_alt", 150.0, 145.0, 100, 1000.0, 140.0, "l4_chased_extended", "追高远离中枢 -1.0R"),
+    ]
+    for sym, sec, entry, stop, qty, camp_1r, exit_p, tag, note in trades:
+        ro = client.post(
+            "/api/portfolio/positions/open",
+            json={
+                "symbol": sym,
+                "direction": "long",
+                "sector_theme": sec,
+                "entry_price": entry,
+                "tactical_stop_30m": stop,
+                "quantity": qty,
+                "campaign_1r_amount": camp_1r,
+            },
+        )
+        assert ro.status_code == 200
+        pid = ro.json()["position"]["position_id"]
+        rc = client.post(
+            f"/api/portfolio/positions/{pid}/close",
+            json={
+                "exit_price": exit_p,
+                "exit_reason": "test_close",
+                "attribution_tag": tag,
+                "lesson_note": note,
+            },
+        )
+        assert rc.status_code == 200
+
+    # 3) Log shadow opportunities (and validate error mapping)
+    r_opp_bad = client.post(
+        "/api/portfolio/opportunities",
+        json={
+            "symbol": "GC=F",
+            "market": "US_FUTURES",
+            "sector_theme": "precious_metals",
+            "direction": "long",
+            "kind": "missed_entry",
+            "anchor_price": 2600.0,
+            "planned_stop_price": 2650.0,  # invalid: stop above entry for long
+        },
+    )
+    assert r_opp_bad.status_code == 400
+    assert "invalid_planned_stop" in r_opp_bad.json()["detail"]
+
+    r_opp1 = client.post(
+        "/api/portfolio/opportunities",
+        json={
+            "symbol": "GC=F",
+            "market": "US_FUTURES",
+            "sector_theme": "precious_metals",
+            "direction": "long",
+            "kind": "missed_entry",
+            "anchor_price": 2600.0,
+            "planned_stop_price": 2550.0,
+            "subsequent_extreme_price": 2800.0,
+            "root_cause_tag": "hesitated_at_trigger",
+            "lesson_note": "30m二买确认但犹豫未上车",
+            "status": "tracking",
+        },
+    )
+    assert r_opp1.status_code == 200
+    opp1_body = r_opp1.json()
+    opp1_id = opp1_body["opportunity_id"]
+    assert opp1_body["missed_r_multiple"] == pytest.approx(4.0, abs=1e-4)
+    assert opp1_body["attribution"]["shadow_summary"]["total_count"] == 1
+
+    r_opp2 = client.post(
+        "/api/portfolio/opportunities",
+        json={
+            "symbol": "CU0",
+            "market": "CN_FUTURES",
+            "sector_theme": "base_metals",
+            "direction": "short",
+            "kind": "shaken_out",
+            "anchor_price": 76000.0,
+            "planned_stop_price": 77000.0,
+            "subsequent_extreme_price": 73000.0,
+            "root_cause_tag": "30m_noise_shakeout",
+            "lesson_note": "未切日线防线被30m洗出",
+            "status": "reviewed",
+        },
+    )
+    assert r_opp2.status_code == 200
+    assert r_opp2.json()["missed_r_multiple"] == pytest.approx(3.0, abs=1e-4)
+
+    # 4) List & filter opportunities (+ invalid query params -> HTTP 400)
+    assert len(client.get("/api/portfolio/opportunities").json()["opportunities"]) == 2
+    tracking_only = client.get("/api/portfolio/opportunities", params={"status": "tracking"}).json()["opportunities"]
+    assert len(tracking_only) == 1 and tracking_only[0]["opportunity_id"] == opp1_id
+    shaken_only = client.get("/api/portfolio/opportunities", params={"kind": "shaken_out"}).json()["opportunities"]
+    assert len(shaken_only) == 1 and shaken_only[0]["symbol"] == "CU0"
+
+    assert client.get("/api/portfolio/opportunities", params={"status": "bogus"}).status_code == 400
+    assert client.get("/api/portfolio/opportunities", params={"kind": "bogus"}).status_code == 400
+
+    # 5) PATCH opportunity selectively (omitted fields preserved; explicit null clears root_cause_tag; missing id -> 404)
+    r_upd1 = client.patch(
+        f"/api/portfolio/opportunities/{opp1_id}",
+        json={"subsequent_extreme_price": 2900.0},
+    )
+    assert r_upd1.status_code == 200
+    upd1 = r_upd1.json()
+    assert upd1["missed_r_multiple"] == pytest.approx(6.0, abs=1e-4)
+    assert upd1["status"] == "tracking"
+    assert upd1["root_cause_tag"] == "hesitated_at_trigger"
+    assert upd1["lesson_note"] == "30m二买确认但犹豫未上车"
+
+    r_upd2 = client.patch(
+        f"/api/portfolio/opportunities/{opp1_id}",
+        json={"status": "reviewed", "root_cause_tag": None},
+    )
+    assert r_upd2.status_code == 200
+    upd2 = r_upd2.json()
+    assert upd2["status"] == "reviewed"
+    assert upd2["root_cause_tag"] is None
+    assert upd2["subsequent_extreme_price"] == 2900.0
+    assert upd2["missed_r_multiple"] == pytest.approx(6.0, abs=1e-4)
+    assert upd2["attribution"]["shadow_summary"]["total_missed_r"] == pytest.approx(9.0, abs=1e-4)
+
+    assert (
+        client.patch(
+            "/api/portfolio/opportunities/opp_nonexistent",
+            json={"status": "reviewed"},
+        ).status_code
+        == 404
+    )
+
+    # 6) Verify GET /api/portfolio/attribution skewness / payoff / leakage / shadow metrics
+    r_attr = client.get("/api/portfolio/attribution")
+    assert r_attr.status_code == 200
+    attr = r_attr.json()
+    assert attr["closed_count"] == 3
+    assert attr["avg_win_r"] == pytest.approx(4.0, abs=1e-4)
+    assert attr["avg_loss_r"] == pytest.approx(-0.75, abs=1e-4)
+    assert attr["payoff_ratio_r"] == pytest.approx(4.0 / 0.75, abs=1e-3)
+    assert attr["expectancy_r"] == pytest.approx((4.0 - 0.5 - 1.0) / 3.0, abs=1e-4)
+    assert attr["skewness"]["multi_r_winners_count"] == 1
+    assert attr["skewness"]["top_20pct_profit_share_pct"] == pytest.approx(100.0, abs=1e-4)
+    assert attr["skewness"]["pilot_friction_loss_r"] == pytest.approx(-0.5, abs=1e-4)
+    assert attr["skewness"]["preventable_mistake_loss_r"] == pytest.approx(-1.0, abs=1e-4)
+    assert attr["shadow_summary"]["total_count"] == 2
+    assert attr["shadow_summary"]["total_missed_r"] == pytest.approx(9.0, abs=1e-4)
+    assert len(attr["by_tag"]) == 3
+
+
+def test_opportunity_patch_explicit_null_idempotency_conflict_and_attribution_resilience(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression suite for Codex API findings #3 and #4 on shadow opportunity endpoints."""
+    assert (
+        client.post(
+            "/api/portfolio/init",
+            json={"equity": 100_000.0, "base_currency": "USD", "default_risk_per_trade_pct": 1.0},
+        ).status_code
+        == 200
+    )
+
+    base_payload = {
+        "symbol": "GC=F",
+        "market": "US_FUTURES",
+        "sector_theme": "precious_metals",
+        "direction": "long",
+        "kind": "missed_entry",
+        "anchor_price": 2600.0,
+        "planned_stop_price": 2550.0,
+        "subsequent_extreme_price": 2800.0,
+        "root_cause_tag": "hesitated_at_trigger",
+        "lesson_note": "初始记录",
+        "status": "tracking",
+        "idempotency_key": "opp-create-key-1",
+    }
+
+    # 1) POST with idempotency_key -> 200; identical replay -> 200 with no duplicate row
+    r1 = client.post("/api/portfolio/opportunities", json=base_payload)
+    assert r1.status_code == 200
+    opp_id = r1.json()["opportunity_id"]
+    assert r1.json()["missed_r_multiple"] == pytest.approx(4.0, abs=1e-4)
+
+    r1_replay = client.post("/api/portfolio/opportunities", json=base_payload)
+    assert r1_replay.status_code == 200
+    assert r1_replay.json()["opportunity_id"] == opp_id
+    assert r1_replay.json().get("idempotent_replay") is True
+    assert len(client.get("/api/portfolio/opportunities").json()["opportunities"]) == 1
+
+    # 2) Reused idempotency_key with different payload -> HTTP 409 Conflict
+    r1_conflict = client.post(
+        "/api/portfolio/opportunities",
+        json={**base_payload, "subsequent_extreme_price": 2950.0},
+    )
+    assert r1_conflict.status_code == 409
+    assert "idempotency_key_conflict" in r1_conflict.json()["detail"].lower()
+    assert len(client.get("/api/portfolio/opportunities").json()["opportunities"]) == 1
+
+    # 3) PATCH omitting subsequent_extreme_price preserves existing extreme price & metrics
+    r_preserve = client.patch(
+        f"/api/portfolio/opportunities/{opp_id}",
+        json={"lesson_note": "仅补充复盘笔记"},
+    )
+    assert r_preserve.status_code == 200
+    assert r_preserve.json()["subsequent_extreme_price"] == 2800.0
+    assert r_preserve.json()["missed_move_pct"] == pytest.approx(7.6923, abs=1e-3)
+    assert r_preserve.json()["missed_r_multiple"] == pytest.approx(4.0, abs=1e-4)
+    assert r_preserve.json()["lesson_note"] == "仅补充复盘笔记"
+
+    # 4) PATCH with explicit null status -> 422 without mutating
+    r_null_status = client.patch(
+        f"/api/portfolio/opportunities/{opp_id}",
+        json={"status": None},
+    )
+    assert r_null_status.status_code == 422
+
+    # 5) PATCH with explicit null for subsequent_extreme_price and root_cause_tag clears all derived fields
+    r_clear = client.patch(
+        f"/api/portfolio/opportunities/{opp_id}",
+        json={
+            "subsequent_extreme_price": None,
+            "root_cause_tag": None,
+            "idempotency_key": "opp-patch-key-1",
+        },
+    )
+    assert r_clear.status_code == 200
+    cleared = r_clear.json()
+    assert cleared["subsequent_extreme_price"] is None
+    assert cleared["missed_move_pct"] is None
+    assert cleared["missed_r_multiple"] is None
+    assert cleared["root_cause_tag"] is None
+    assert cleared["lesson_note"] == "仅补充复盘笔记"
+    assert cleared["status"] == "tracking"
+
+    # Verify PATCH idempotency replay (200) and conflict (409)
+    r_patch_replay = client.patch(
+        f"/api/portfolio/opportunities/{opp_id}",
+        json={
+            "subsequent_extreme_price": None,
+            "root_cause_tag": None,
+            "idempotency_key": "opp-patch-key-1",
+        },
+    )
+    assert r_patch_replay.status_code == 200
+    assert r_patch_replay.json().get("idempotent_replay") is True
+
+    r_patch_conflict = client.patch(
+        f"/api/portfolio/opportunities/{opp_id}",
+        json={
+            "status": "reviewed",
+            "idempotency_key": "opp-patch-key-1",
+        },
+    )
+    assert r_patch_conflict.status_code == 409
+    assert "idempotency_key_conflict" in r_patch_conflict.json()["detail"].lower()
+
+    # 6) Post-commit attribution analytics failure must NOT turn committed POST/PATCH into 500
+    def boom_attribution(*args, **kwargs):
+        raise RuntimeError("transient analytics read failure")
+
+    monkeypatch.setattr(pm, "compute_attribution_analytics", boom_attribution)
+
+    r_post_resilient = client.post(
+        "/api/portfolio/opportunities",
+        json={
+            **base_payload,
+            "symbol": "SI=F",
+            "anchor_price": 30.0,
+            "planned_stop_price": 28.0,
+            "subsequent_extreme_price": 36.0,
+            "idempotency_key": "opp-create-resilient-1",
+        },
+    )
+    assert r_post_resilient.status_code == 200
+    post_body = r_post_resilient.json()
+    assert post_body["opportunity_id"]
+    assert post_body["attribution"] is None
+    assert "transient analytics read failure" in post_body["attribution_warning"]
+
+    r_patch_resilient = client.patch(
+        f"/api/portfolio/opportunities/{post_body['opportunity_id']}",
+        json={"status": "reviewed"},
+    )
+    assert r_patch_resilient.status_code == 200
+    patch_body = r_patch_resilient.json()
+    assert patch_body["status"] == "reviewed"
+    assert patch_body["attribution"] is None
+    assert "transient analytics read failure" in patch_body["attribution_warning"]
+
+    # Confirm the committed opportunity actually persisted in SQLite
+    all_opps = client.get("/api/portfolio/opportunities").json()["opportunities"]
+    assert any(o["opportunity_id"] == post_body["opportunity_id"] and o["status"] == "reviewed" for o in all_opps)
+
+
+def test_scale_in_max_leverage_and_conservative_margin_cap(client: TestClient):
+    """Regression suite for Codex HIGH #6: expose max_leverage and enforce max(cost, mark_to_add) cap."""
+    assert (
+        client.post(
+            "/api/portfolio/init",
+            json={
+                "equity": 100_000.0,
+                "base_currency": "USD",
+                "default_risk_per_trade_pct": 2.0,
+                "max_total_open_risk_pct": 10.0,
+            },
+        ).status_code
+        == 200
+    )
+
+    # Case A: Margin-enabled equity position testing max_leverage against conservative max(cost, mark_to_add)
+    r_open_a = client.post(
+        "/api/portfolio/positions/open",
+        json={
+            "symbol": "NVDA",
+            "direction": "long",
+            "sector_theme": "ai_compute",
+            "entry_price": 100.0,
+            "tactical_stop_30m": 95.0,
+            "quantity": 200,
+            "allow_equity_margin": True,
+            "margin_rate": 0.25,
+        },
+    )
+    assert r_open_a.status_code == 200
+    pid_a = r_open_a.json()["position"]["position_id"]
+
+    # Adding 400 @ 200 gives qty=600, avg=166.67 => cost_notional=100,000 (1.0x), mark_notional=120,000 (1.2x).
+    # max_leverage=1.1 must reject (400) because conservative max(cost, mark_to_add) = 120,000 > 110,000.
+    r_lev_rej = client.post(
+        f"/api/portfolio/positions/{pid_a}/scale-in",
+        json={
+            "add_quantity": 400,
+            "add_price": 200.0,
+            "new_stop_loss": 180.0,
+            "max_leverage": 1.1,
+            "note": "over-leveraged add",
+        },
+    )
+    assert r_lev_rej.status_code == 400
+    assert "leverage_limit_exceeded" in r_lev_rej.json()["detail"]
+    assert "max(cost,mark_to_add)_vs_booked_equity" in r_lev_rej.json()["detail"]
+
+    # Raising max_leverage to 1.25 (cap 125,000 >= 120,000) allows the exact same add.
+    r_lev_ok = client.post(
+        f"/api/portfolio/positions/{pid_a}/scale-in",
+        json={
+            "add_quantity": 400,
+            "add_price": 200.0,
+            "new_stop_loss": 180.0,
+            "max_leverage": 1.25,
+            "note": "within leverage cap",
+        },
+    )
+    assert r_lev_ok.status_code == 200
+    assert r_lev_ok.json()["position"]["quantity"] == 600.0
+
+    # Close Case A and verify Case B: non-margin equity conservative margin cap max(cost, mark_to_add) <= equity
+    assert (
+        client.post(
+            f"/api/portfolio/positions/{pid_a}/close",
+            json={"exit_price": 200.0, "exit_reason": "reset_for_case_b", "update_account_equity": False},
+        ).status_code
+        == 200
+    )
+
+    r_open_b = client.post(
+        "/api/portfolio/positions/open",
+        json={
+            "symbol": "PWR",
+            "direction": "long",
+            "sector_theme": "power_grid",
+            "entry_price": 100.0,
+            "tactical_stop_30m": 97.5,
+            "quantity": 400,
+            "allow_equity_margin": False,
+        },
+    )
+    assert r_open_b.status_code == 200
+    pid_b = r_open_b.json()["position"]["position_id"]
+
+    # Adding 300 @ 150 gives qty=700, cost_notional=85,000 (<= 100k), but mark_notional=105,000 (> 100k).
+    # Conservative max(cost, mark_to_add) margin cap must reject with HTTP 400.
+    r_cap_rej = client.post(
+        f"/api/portfolio/positions/{pid_b}/scale-in",
+        json={
+            "add_quantity": 300,
+            "add_price": 150.0,
+            "new_stop_loss": 135.0,
+            "note": "exceeds mark-to-add capital cap",
+        },
+    )
+    assert r_cap_rej.status_code == 400
+    assert "portfolio_capital_limit_exceeded" in r_cap_rej.json()["detail"]
+    assert "max(cost,mark_to_add)_vs_booked_equity" in r_cap_rej.json()["detail"]
+
+
+def test_research_archive_state_rejects_misspelled_expectation_gap_key(client: TestClient):
+    """PATCH /api/research/archive/state rejects unknown expectation_gap keys without mutating state."""
+    r_init = client.post(
+        "/api/research/archive/init",
+        json={
+            "symbol": "PWR",
+            "name": "Quanta Services",
+            "thesis_summary": "Grid capex multi-year bottleneck",
+            "layer1_primary": "技术与产业迭代",
+            "layer1_secondary": "产业政策与监管",
+            "direction_bias": "long",
+        },
+    )
+    assert r_init.status_code == 200
+
+    before = client.get("/api/research/archive", params={"symbol": "PWR"}).json()["state"]
+    rev_before = before["revision"]
+    eg_before = dict(before["expectation_gap"])
+
+    # Top-level expectation_gap with typo 'crowding_assesment' -> 422, state unchanged
+    r_bad_top = client.patch(
+        "/api/research/archive/state",
+        json={
+            "symbol": "PWR",
+            "expectation_gap": {
+                "priced_in_consensus": "Grid growth already priced in",
+                "crowding_assesment": "low",
+            },
+        },
+    )
+    assert r_bad_top.status_code in (400, 422)
+    assert "crowding_assesment" in r_bad_top.json()["detail"]
+
+    # Nested patch.expectation_gap with typo 'crowding_assesment' -> 422, state unchanged
+    r_bad_patch = client.patch(
+        "/api/research/archive/state",
+        json={
+            "symbol": "PWR",
+            "patch": {
+                "expectation_gap": {
+                    "crowding_assesment": "high",
+                }
+            },
+        },
+    )
+    assert r_bad_patch.status_code in (400, 422)
+    assert "crowding_assesment" in r_bad_patch.json()["detail"]
+
+    after = client.get("/api/research/archive", params={"symbol": "PWR"}).json()["state"]
+    assert after["revision"] == rev_before
+    assert after["expectation_gap"] == eg_before

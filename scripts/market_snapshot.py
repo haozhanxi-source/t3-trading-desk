@@ -11,6 +11,7 @@ import re
 import sys
 import time
 from datetime import date, datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal
 from zoneinfo import ZoneInfo
 
 try:
@@ -1099,11 +1100,19 @@ def fetch_crypto_funding(base: str) -> dict:
             ticker = ex.fetch_ticker(spot_sym)
             fr = ex.fetch_funding_rate(perp_sym)
             rate = fr.get("fundingRate")
-            ann = round(rate * 3 * 365 * 100, 2) if rate is not None else None
+            rate_f = float(rate) if (rate is not None and not isinstance(rate, bool)) else None
+            if rate_f is not None and not math.isfinite(rate_f):
+                rate_f = None
+            rate_8h_pct_raw = float(Decimal(str(rate_f)) * Decimal(100)) if rate_f is not None else None
+            ann_raw = float(Decimal(str(rate_f)) * Decimal(109500)) if rate_f is not None else None
+            ann = round(ann_raw, 2) if ann_raw is not None else None
             out[eid] = {
                 "spot_last": ticker.get("last"),
-                "funding_rate_8h_pct": round(rate * 100, 5) if rate is not None else None,
+                "funding_rate_raw": rate_f,
+                "funding_rate_8h_pct": round(rate_8h_pct_raw, 5) if rate_8h_pct_raw is not None else None,
+                "funding_rate_8h_pct_raw": rate_8h_pct_raw,
                 "funding_annualized_pct": ann,
+                "funding_annualized_pct_raw": ann_raw,
             }
         except Exception as e:
             out[eid] = {"error": str(e)[:100]}

@@ -16,26 +16,35 @@ import {
   RotateCcw,
   Scissors,
   Shield,
+  ShieldCheck,
   Sparkles,
   TrendingUp,
   XCircle,
 } from "lucide-react";
 import { api, errorMessage, parseTaskEvent } from "../api/client";
 import type {
+  Direction,
   PortfolioSummaryResponse,
   Position,
   ScaleInResponse,
   SentinelHolding,
   SentinelResponse,
+  StopRegime,
   UpcomingEvent,
 } from "../api/types";
 import {
+  OpportunityLedgerPanel,
+  type ShadowOpportunitySeed,
+} from "../components/portfolio/OpportunityLedgerPanel";
+import {
   canVoidMistakenPosition,
   ClosePositionDialog,
+  formatAttributionTagZh,
   InitPortfolioDialog,
   OpenPositionDialog,
   type OpenPositionSeed,
   RotatePositionDialog,
+  StopRegimeDialog,
   TrailStopDialog,
   TrimPositionDialog,
   VoidPositionDialog,
@@ -46,6 +55,7 @@ import {
   SentinelStatusBadge,
   signedToneClass,
   StatusBadge,
+  type Tone,
 } from "../components/ui/StatusBadge";
 import { SymbolLabel } from "../components/ui/SymbolLabel";
 import {
@@ -67,6 +77,7 @@ const JOURNAL_ACTION_ZH: Record<string, string> = {
   open_position: "建仓入账",
   add_on_profit: "浮盈顺势加仓",
   trail_stop: "收紧保护止损",
+  set_stop_regime: "切换防线模式",
   trim: "分批减仓",
   trim_position: "分批减仓",
   close: "清仓了结",
@@ -76,6 +87,18 @@ const JOURNAL_ACTION_ZH: Record<string, string> = {
   rotate_leader: "原子龙头换仓",
   leader_rotation: "原子龙头换仓",
 };
+
+const LIFECYCLE_STAGE_META: Record<string, { label: string; tone: Tone }> = {
+  pilot: { label: "试仓期", tone: "neutral" },
+  breakeven_locked: { label: "保本锁死", tone: "info" },
+  pyramided: { label: "金字塔推仓", tone: "good" },
+  main_wave: { label: "日线主升持有", tone: "good" },
+};
+
+function fmtSignedRValue(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return `${v > 0 ? "+" : ""}${v.toFixed(2)}R`;
+}
 
 interface SentinelViewProps {
   workspaceRev?: number;
@@ -128,6 +151,14 @@ export function SentinelView({
     reason?: string;
   } | null>(null);
   const [voidTarget, setVoidTarget] = useState<Position | null>(null);
+  const [regimeTarget, setRegimeTarget] = useState<{
+    position: Position;
+    currentPrice?: number | null;
+    suggestedRegime?: StopRegime;
+    suggestedDailyStop?: number | null;
+    defaultReason?: string;
+  } | null>(null);
+  const [opportunityPrefill, setOpportunityPrefill] = useState<ShadowOpportunitySeed | null>(null);
 
   const loadAbortRef = useRef<AbortController | null>(null);
   const loadReqIdRef = useRef(0);
@@ -232,12 +263,15 @@ export function SentinelView({
       const addQtyStr = fmtNum(res.add_quantity, 6);
       const newAvgStr = fmtPrice(res.new_entry_price);
       const newQtyStr = fmtNum(res.new_quantity, 6);
+      const isDaily = res.position?.active_stop_regime === "daily_structure";
       const stopPart =
-        res.new_stop_loss != null &&
-        res.old_stop_loss != null &&
-        Math.abs(res.new_stop_loss - res.old_stop_loss) > 1e-9
-          ? ` · 30m 止损收紧至 ${fmtPrice(res.new_stop_loss)}`
-          : "";
+        isDaily && res.position?.structural_stop_daily != null
+          ? ` · 日线主升防线 ${fmtPrice(res.position.structural_stop_daily)}`
+          : res.new_stop_loss != null &&
+              res.old_stop_loss != null &&
+              Math.abs(res.new_stop_loss - res.old_stop_loss) > 1e-9
+            ? ` · 30m 止损收紧至 ${fmtPrice(res.new_stop_loss)}`
+            : "";
       setActionBanner(
         `已执行浮盈加仓：${symLabel} +${addQtyStr}（新总仓位 ${newQtyStr} · 新均价 ${newAvgStr}${stopPart}）`,
       );
@@ -247,6 +281,14 @@ export function SentinelView({
   );
 
   const summary = portfolio?.summary;
+  const allPositionsById = useMemo(() => {
+    const map = new Map<string, Position>();
+    for (const p of portfolio?.positions ?? []) {
+      map.set(p.position_id, p);
+    }
+    return map;
+  }, [portfolio]);
+
   const openPositionsById = useMemo(() => {
     const map = new Map<string, Position>();
     for (const p of portfolio?.positions ?? []) {
@@ -794,6 +836,23 @@ export function SentinelView({
               const cardKey = `${h.symbol}-${h.position_id ?? "arch"}`;
               const pos = findPosition(h);
               const sug = h.suggested_trail_stop;
+              const cs = h.campaign_status ?? null;
+              const stageKey = cs?.lifecycle_stage ?? pos?.lifecycle_stage ?? null;
+              const stageMeta = stageKey ? LIFECYCLE_STAGE_META[stageKey] : null;
+              const activeRegime: StopRegime =
+                cs?.active_stop_regime === "daily_structure" ||
+                pos?.active_stop_regime === "daily_structure"
+                  ? "daily_structure"
+                  : "tactical_30m";
+              const unrealizedR = cs?.unrealized_r ?? null;
+              const sugBe = cs?.suggested_breakeven_stop ?? null;
+              const sugHandover = cs?.suggested_regime_handover ?? null;
+              const mainWavePullback = cs?.main_wave_pullback_watch ?? null;
+              const isDailyTrailSuggestion = Boolean(
+                sug &&
+                  (sug.stop_field === "structural_stop_daily" ||
+                    (activeRegime === "daily_structure" && sug.anchor?.startsWith("daily_zhongshu_"))),
+              );
               const canTrail = Boolean(pos && sug?.suggested_stop != null);
               const isScaleInUnprofitable =
                 typeof h.unrealized_pnl_pct === "number" &&
@@ -839,9 +898,29 @@ export function SentinelView({
                 >
                   <div className="flex flex-wrap items-start justify-between gap-2">
                     <div>
-                      <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-1.5">
                         <SymbolLabel symbol={h.symbol} name={h.name} />
                         <DirectionBadge direction={h.direction} />
+                        {stageMeta ? (
+                          <StatusBadge tone={stageMeta.tone} label={stageMeta.label} />
+                        ) : null}
+                        <span
+                          className={`rounded border px-1.5 py-0.5 text-[10.5px] font-medium ${
+                            activeRegime === "daily_structure"
+                              ? "border-bull/45 bg-bull/10 text-bull"
+                              : "border-hairline-soft bg-sunken text-ink-2"
+                          }`}
+                        >
+                          {activeRegime === "daily_structure" ? "日线主升防线" : "30m 战术防线"}
+                        </span>
+                        {unrealizedR != null && Number.isFinite(unrealizedR) ? (
+                          <span
+                            className={`tnum rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 font-mono text-[11px] font-semibold ${signedToneClass(unrealizedR)}`}
+                            title="相对初始 1R 止损距离的实时浮动 R 倍数"
+                          >
+                            {fmtSignedRValue(unrealizedR)}
+                          </span>
+                        ) : null}
                         {h.sector_theme ? (
                           <span className="rounded border border-hairline-soft bg-sunken px-2 py-0.5 text-[11px] text-ink-2">
                             {h.sector_theme}
@@ -980,11 +1059,95 @@ export function SentinelView({
                     </div>
                   ) : null}
 
+                  {/* Main-Wave 30m Pullback Filter Watch */}
+                  {mainWavePullback?.active ? (
+                    <div className="flex items-start gap-2 rounded border border-bull/35 bg-bull/8 px-3 py-2 text-xs text-ink">
+                      <ShieldCheck className="mt-0.5 h-3.5 w-3.5 shrink-0 text-bull" aria-hidden="true" />
+                      <span>
+                        <strong>日线主升防线过滤中：</strong>
+                        {cleanSentinelText(mainWavePullback.message) ||
+                          "30m 参考位出现正常回踩，当前由日线主升防线接管过滤噪音、避免被过早洗飞。"}
+                      </span>
+                    </div>
+                  ) : null}
+
+                  {/* Suggested Breakeven Lock Banner (+1.0R) */}
+                  {sugBe?.recommended_stop != null ? (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-accent/40 bg-accent/10 px-3 py-2 text-xs text-ink">
+                      <span>
+                        <strong>+1.0R 保本锁死建议：</strong>移损至成本保本位{" "}
+                        <strong className="font-mono">{fmtPrice(sugBe.recommended_stop)}</strong>
+                        {sugBe.reason ? `（${cleanSentinelText(sugBe.reason)}）` : ""}
+                      </span>
+                      {pos ? (
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-primary"
+                          onClick={() => {
+                            if (sugBe.stop_field === "structural_stop_daily") {
+                              setRegimeTarget({
+                                position: pos,
+                                currentPrice: h.last_price,
+                                suggestedRegime: "daily_structure",
+                                suggestedDailyStop: sugBe.recommended_stop,
+                                defaultReason: sugBe.reason || "+1.0R 移至日线成本保本位锁死零本金风险",
+                              });
+                            } else {
+                              setTrailTarget({
+                                positionId: pos.position_id,
+                                symbol: h.symbol,
+                                currentStop: pos.tactical_stop_30m ?? h.tactical_stop_30m,
+                                suggestedStop: sugBe.recommended_stop,
+                                currentPrice: h.last_price,
+                                rationale: sugBe.reason || "+1.0R 移至成本保本位锁死零本金风险",
+                              });
+                            }
+                          }}
+                        >
+                          <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>一键移至保本位</span>
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+
+                  {/* Suggested Main-Wave Daily Regime Handover Banner (+2.0R) */}
+                  {sugHandover?.recommended_daily_stop != null ? (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-bull/45 bg-bull/12 px-3 py-2 text-xs text-ink">
+                      <span>
+                        <strong>+2.0R 主升防线移交建议：</strong>切换为日线主升防线{" "}
+                        <strong className="font-mono">{fmtPrice(sugHandover.recommended_daily_stop)}</strong>
+                        {sugHandover.reason ? `（${cleanSentinelText(sugHandover.reason)}）` : ""}
+                      </span>
+                      {pos ? (
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-primary"
+                          onClick={() =>
+                            setRegimeTarget({
+                              position: pos,
+                              currentPrice: h.last_price,
+                              suggestedRegime: "daily_structure",
+                              suggestedDailyStop: sugHandover.recommended_daily_stop,
+                              defaultReason:
+                                sugHandover.reason ||
+                                `浮盈达 +${sugHandover.unrealized_r.toFixed(2)}R，移交日线主升防线过滤 30m 回踩噪音`,
+                            })
+                          }
+                        >
+                          <Shield className="h-3.5 w-3.5" aria-hidden="true" />
+                          <span>移交日线主升防线</span>
+                        </button>
+                      ) : null}
+                    </div>
+                  ) : null}
+
                   {/* Suggested Trailing Stop Banner */}
                   {sug?.suggested_stop != null ? (
                     <div className="flex flex-wrap items-center justify-between gap-2 rounded border border-bull/35 bg-bull/10 px-3 py-2 text-xs text-ink">
                       <span>
-                        <strong>浮盈推保护建议：</strong>将 30m 止损收紧至{" "}
+                        <strong>浮盈推保护建议：</strong>
+                        {isDailyTrailSuggestion ? "将日线主升防线收紧至 " : "将 30m 止损收紧至 "}
                         <strong className="font-mono">{fmtPrice(sug.suggested_stop)}</strong>
                         {sug.rationale ? `（${cleanSentinelText(sug.rationale)}）` : ""}
                       </span>
@@ -992,19 +1155,30 @@ export function SentinelView({
                         <button
                           type="button"
                           className="btn btn-sm btn-primary"
-                          onClick={() =>
-                            setTrailTarget({
-                              positionId: pos.position_id,
-                              symbol: h.symbol,
-                              currentStop: h.tactical_stop_30m,
-                              suggestedStop: sug.suggested_stop,
-                              currentPrice: h.last_price,
-                              rationale: sug.rationale,
-                            })
-                          }
+                          onClick={() => {
+                            if (isDailyTrailSuggestion) {
+                              setRegimeTarget({
+                                position: pos,
+                                currentPrice: h.last_price,
+                                suggestedRegime: "daily_structure",
+                                suggestedDailyStop: sug.suggested_stop,
+                                defaultReason:
+                                  sug.rationale || "日线主升结构上移，收紧日线结构防线锁定浮盈",
+                              });
+                            } else {
+                              setTrailTarget({
+                                positionId: pos.position_id,
+                                symbol: h.symbol,
+                                currentStop: pos.tactical_stop_30m ?? h.tactical_stop_30m,
+                                suggestedStop: sug.suggested_stop,
+                                currentPrice: h.last_price,
+                                rationale: sug.rationale,
+                              });
+                            }
+                          }}
                         >
                           <TrendingUp className="h-3.5 w-3.5" aria-hidden="true" />
-                          <span>一键上移止损</span>
+                          <span>{isDailyTrailSuggestion ? "一键上移日线防线" : "一键上移止损"}</span>
                         </button>
                       ) : null}
                     </div>
@@ -1033,12 +1207,32 @@ export function SentinelView({
                               positionId: pos.position_id,
                               symbol: h.symbol,
                               currentStop: pos.tactical_stop_30m,
-                              suggestedStop: sug?.suggested_stop ?? null,
+                              suggestedStop: !isDailyTrailSuggestion ? (sug?.suggested_stop ?? null) : null,
                               currentPrice: h.last_price,
                             })
                           }
                         >
                           调止损
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm"
+                          title="在 30m 战术防线与日线主升防线间切换主控止损模式"
+                          onClick={() =>
+                            setRegimeTarget({
+                              position: pos,
+                              currentPrice: h.last_price,
+                              suggestedRegime: isDailyTrailSuggestion ? "daily_structure" : undefined,
+                              suggestedDailyStop:
+                                (isDailyTrailSuggestion ? sug?.suggested_stop : null) ??
+                                sugHandover?.recommended_daily_stop ??
+                                null,
+                              defaultReason: isDailyTrailSuggestion ? sug?.rationale : undefined,
+                            })
+                          }
+                        >
+                          <Shield className="h-3 w-3 text-muted" aria-hidden="true" />
+                          <span>防线模式</span>
                         </button>
                         <button
                           type="button"
@@ -1314,6 +1508,7 @@ export function SentinelView({
                         <th scope="col" className="num">
                           结算盈亏
                         </th>
+                        <th scope="col">R 倍数 / 归因</th>
                         <th scope="col">复盘归因与依据</th>
                       </tr>
                     </thead>
@@ -1329,6 +1524,7 @@ export function SentinelView({
                           <td data-label="结算盈亏" className="num">
                             —
                           </td>
+                          <td data-label="R 倍数 / 归因">—</td>
                           <td data-label="复盘归因与依据">建仓、推保护止损、换龙头与平仓归因将自动按序沉淀于此</td>
                         </tr>
                       ) : (
@@ -1352,11 +1548,18 @@ export function SentinelView({
                           );
                           const stop30 = toNum(j.stop_30m ?? j.new_stop_30m);
                           const pnl = toNum(j.realized_pnl_account ?? j.realized_pnl);
+                          const rMult = toNum(j.campaign_r_multiple ?? j.r_multiple);
+                          const attrTag = typeof j.attribution_tag === "string" ? j.attribution_tag : "";
+                          const attrLabel = attrTag ? formatAttributionTagZh(attrTag) : "";
+                          const isClosedRow = rawAct.includes("close") || leg === "close_old_leader";
+                          const linkedPos =
+                            typeof j.position_id === "string" ? allPositionsById.get(j.position_id) ?? null : null;
                           const noteText = String(
-                            j.exit_reason ??
-                              j.reason ??
-                              j.note ??
-                              j.notes ??
+                            j.lesson_note ||
+                              j.exit_reason ||
+                              j.reason ||
+                              j.note ||
+                              j.notes ||
                               (rawAct === "init_account"
                                 ? `初始净值 ${fmtMoney(j.equity, String(j.base_currency || summary?.base_currency || ""))}`
                                 : "—"),
@@ -1369,11 +1572,13 @@ export function SentinelView({
                               <td data-label="事务动作">
                                 <StatusBadge
                                   tone={
-                                    rawAct.includes("close") || leg === "close_old_leader"
+                                    isClosedRow
                                       ? "serious"
                                       : rawAct.includes("open") || rawAct.includes("rotate")
                                         ? "info"
-                                        : rawAct.includes("trail") || rawAct === "add_on_profit"
+                                        : rawAct.includes("trail") ||
+                                            rawAct === "add_on_profit" ||
+                                            rawAct === "set_stop_regime"
                                           ? "good"
                                           : "neutral"
                                   }
@@ -1401,8 +1606,86 @@ export function SentinelView({
                                   ? `${pnl > 0 ? "+" : ""}${fmtMoney(pnl, summary?.base_currency)}`
                                   : "—"}
                               </td>
+                              <td data-label="R 倍数 / 归因">
+                                <div className="flex flex-wrap items-center gap-1.5">
+                                  {rMult !== null ? (
+                                    <span
+                                      className={`tnum font-mono text-xs font-semibold ${signedToneClass(rMult)}`}
+                                    >
+                                      {fmtSignedRValue(rMult)}
+                                    </span>
+                                  ) : (
+                                    <span className="text-muted">—</span>
+                                  )}
+                                  {attrLabel ? (
+                                    <span className="rounded border border-hairline-soft bg-sunken px-1.5 py-0.5 text-[10.5px] text-ink-2">
+                                      {attrLabel}
+                                    </span>
+                                  ) : null}
+                                </div>
+                              </td>
                               <td data-label="复盘归因与依据" className="text-ink-2">
-                                {cleanSentinelText(noteText)}
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span>{cleanSentinelText(noteText)}</span>
+                                  {isClosedRow && sym && !sym.includes("→") ? (
+                                    <button
+                                      type="button"
+                                      className="chip shrink-0 py-0.5 text-[10.5px]"
+                                      title="将该笔已平仓记录转入踏空/洗飞影子账本持续跟踪后续行情"
+                                      onClick={() => {
+                                        const exitPx = toNum(j.exit_price ?? j.price) ?? px;
+                                        const dirRaw: Direction =
+                                          linkedPos?.direction ??
+                                          (typeof j.direction === "string" && j.direction === "short"
+                                            ? "short"
+                                            : "long");
+                                        const initEntry = toNum(linkedPos?.initial_entry_price);
+                                        const initStop = toNum(linkedPos?.initial_stop_30m);
+                                        const unit1R =
+                                          initEntry !== null && initStop !== null
+                                            ? Math.abs(initEntry - initStop)
+                                            : 0;
+                                        let stopPx: number | null = null;
+                                        if (unit1R > 0 && exitPx !== null && exitPx > 0) {
+                                          const candidateStop =
+                                            dirRaw === "long" ? exitPx - unit1R : exitPx + unit1R;
+                                          const roundTripped = Number(String(candidateStop));
+                                          const isProtectiveSide =
+                                            dirRaw === "long"
+                                              ? roundTripped < exitPx
+                                              : roundTripped > exitPx;
+                                          if (
+                                            Number.isFinite(roundTripped) &&
+                                            roundTripped > 0 &&
+                                            isProtectiveSide
+                                          ) {
+                                            stopPx = roundTripped;
+                                          }
+                                        }
+                                        setOpportunityPrefill({
+                                          nonce: Date.now(),
+                                          symbol: sym,
+                                          market: linkedPos?.market || "US",
+                                          sector_theme: linkedPos?.sector_theme || "",
+                                          direction: dirRaw,
+                                          kind: "shaken_out",
+                                          anchor_price: exitPx,
+                                          planned_stop_price: stopPx,
+                                          stop_hint:
+                                            stopPx === null
+                                              ? "未找到可追溯的初始 1R 止损距，请手动填写当时 1R 止损价"
+                                              : null,
+                                          linked_position_id:
+                                            typeof j.position_id === "string" ? j.position_id : null,
+                                          root_cause_tag: attrTag || "shaken_out_30m_noise",
+                                          lesson_note: cleanSentinelText(noteText),
+                                        });
+                                      }}
+                                    >
+                                      转入洗飞复盘
+                                    </button>
+                                  ) : null}
+                                </div>
                               </td>
                             </tr>
                           );
@@ -1416,6 +1699,15 @@ export function SentinelView({
           })()}
         </section>
       ) : null}
+
+      {/* Asymmetric Payoff Scorecard & Shadow Opportunity Ledger */}
+      <OpportunityLedgerPanel
+        workspaceRev={workspaceRev}
+        baseCurrency={summary?.base_currency ?? "USD"}
+        prefillSeed={opportunityPrefill}
+        onPrefillConsumed={() => setOpportunityPrefill(null)}
+        onJumpWarRoom={onJumpWarRoom}
+      />
 
       {/* Native <dialog> Modals */}
       <InitPortfolioDialog open={initOpen} onClose={() => setInitOpen(false)} onSuccess={handleMutationSuccess} />
@@ -1481,6 +1773,19 @@ export function SentinelView({
           setOpenSeed(seed);
           setOpenPosModal(true);
         }}
+      />
+      <StopRegimeDialog
+        open={regimeTarget !== null}
+        onClose={() => setRegimeTarget(null)}
+        onSuccess={() => {
+          setActionBanner("已更新持仓防线主控模式并同步本地账本。");
+          handleMutationSuccess();
+        }}
+        position={regimeTarget?.position ?? null}
+        currentPrice={regimeTarget?.currentPrice}
+        suggestedRegime={regimeTarget?.suggestedRegime}
+        suggestedDailyStop={regimeTarget?.suggestedDailyStop}
+        defaultReason={regimeTarget?.defaultReason}
       />
     </div>
   );

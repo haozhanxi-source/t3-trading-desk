@@ -15,8 +15,10 @@ Runs a structured 5-stage pipeline inside the backend TaskManager:
 from __future__ import annotations
 
 import codecs
+import copy
 import inspect
 import json
+import math
 import os
 import re
 import selectors
@@ -26,8 +28,9 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 import daily_sentinel
 import market_snapshot
@@ -234,7 +237,7 @@ def build_research_brief(
 
     return sanitize(
         {
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),  # noqa: UP017
             "target": {
                 "symbol": symbol,
                 "market": market,
@@ -249,6 +252,7 @@ def build_research_brief(
                 "direction_bias": state.get("direction_bias"),
                 "thesis_summary": state.get("thesis_summary"),
                 "layer1_drivers": state.get("layer1_drivers"),
+                "expectation_gap": state.get("expectation_gap"),
                 "triggers": state.get("triggers") or [],
                 "events": state.get("events") or [],
                 "recent_evidence": (archive_loaded.get("recent_evidence") or [])[:25],
@@ -309,7 +313,7 @@ def build_research_prompt(
     adversarial_critique: str | None = None,
 ) -> str:
     """Build the master Layer 3 + Layer 4 research prompt requiring strict JSON output."""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")  # noqa: UP017
     focus_block = f"\n【用户指定的本次研究侧重点】\n{focus_prompt.strip()}\n" if focus_prompt.strip() else ""
     critique_block = (
         "\n【独立反方（跨模型魔鬼代言人）质询意见 —— 你必须在研报的红蓝对抗章节逐条正面回应，并据此修正方向、置信度与证伪阈值】\n"
@@ -326,7 +330,8 @@ def build_research_prompt(
         "1. 严禁使用 RSI 超买/超卖、布林带或均线回踩作为买卖依据；极端单边往往是资金方向高度一致（未背驰离开段）。\n"
         "2. 日线定主方向、中枢 `[ZD, ZG]` 与空间；30 分钟（30min）缠论结构诞生精确入场与紧凑战术止损。\n"
         "3. 0-编造红线：所有价格、缠论中枢、库存、基差、期限结构、利差、财报、宏观指标必须优先引用 `brief.json` 中的实测硬数据；联网检索补齐的政策/供需/产业事实必须标明来源与日期并严格分级（L1=官方/交易所/财报原表，L2=权威行业协会/公司指引，L3=卖方研报，L4=媒体/快讯）。未核验项写进 `pending_verifications`，绝不杜撰数字。\n"
-        "4. 第三层（纯研究 + 红蓝对抗）与第四层（日线定方向 + 30min 执行表达 + 撤离红线）职责清晰分离，但在一份完整的 `thesis_md` 中分层呈现。\n\n"
+        "4. 第三层（纯研究 + 红蓝对抗）与第四层（日线定方向 + 30min 执行表达 + 撤离红线）职责清晰分离，但在一份完整的 `thesis_md` 中分层呈现。\n"
+        "5. 二阶预期差（Second-Order Expectation Gap）硬约束：所有资产类别均须明确拆解当前市价已充分计入的一阶主流共识（`priced_in_consensus`，严禁复述滞后新闻）与未来 1Q~1Y 市场尚未充分定价的二阶预期差来源（`our_variant_view`），评估拥挤度（`crowding_assessment`），并绑定 1~4 个比价格更早拐头的领先硬指标（`leading_kpis`）。\n\n"
         f"{_asset_specific_rules(asset_class, market)}"
         f"{focus_block}"
         f"{critique_block}\n"
@@ -340,6 +345,20 @@ def build_research_prompt(
         '  "layer1_drivers": {\n'
         '    "primary": "主驱动维度（如：资源国政策叙事 / 供需平衡预期 / 宏观双核 / 技术产业迭代）+ 一句话要点",\n'
         '    "secondary": "次驱动维度 + 一句话要点"\n'
+        "  },\n"
+        '  "expectation_gap": {\n'
+        '    "priced_in_consensus": "当前市价已充分计入的一阶主流共识与隐含假设（严禁复述滞后新闻）",\n'
+        '    "our_variant_view": "未来 1Q~1Y 市场尚未充分定价的二阶预期差来源",\n'
+        '    "crowding_assessment": "underpriced | fair | crowded | unknown",\n'
+        '    "leading_kpis": [\n'
+        "      {\n"
+        '        "name": "比价格更早拐头的领先硬指标名称",\n'
+        '        "current_baseline": "当前基准读数（带单位与时间点）",\n'
+        '        "expected_trajectory": "未来 1Q~1Y 预期演进方向与节奏",\n'
+        '        "falsification_threshold": "证伪该二阶预期差的量化阈值",\n'
+        '        "cadence": "weekly | monthly | quarterly | event"\n'
+        "      }\n"
+        "    ]\n"
         "  },\n"
         '  "chanlun_anchors": {\n'
         '    "daily_direction": "多头 | 空头 | 震荡中枢",\n'
@@ -391,6 +410,7 @@ def build_research_prompt(
         "}\n"
         "```\n"
         f"提示：哨兵自动支持的标准化 metric 键名包括：{SENTINEL_METRIC_HINTS}。"
+        "其中 `expectation_gap.crowding_assessment` 必须从 `\"underpriced\"`（明显未充分定价）、`\"fair\"`（定价较充分）、`\"crowded\"`（共识高度拥挤，警惕追高）、`\"unknown\"` 四者中择一，`expectation_gap.leading_kpis` 请提供 1~4 个比价格更早拐头的领先硬指标。"
         "请至少提供 5~10 条高质量 L1~L4 证据、3~6 条可执行撤离红线/监控触发器（量化价格/结构/库存/基差/曲线/利差类必须精确选用上述标准键名并标 evaluation_mode=auto；政策或突发事件类非标指标可标 evaluation_mode=ai_web 并写清核验口径）以及 2~5 条未来催化/移仓事件。"
     )
 
@@ -527,10 +547,10 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
         return
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             proc.terminate()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
@@ -541,10 +561,10 @@ def _terminate_process_group(proc: subprocess.Popen[str]) -> None:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             proc.kill()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -785,6 +805,231 @@ def extract_json_payload(raw_text: str) -> dict[str, Any]:
     raise ValueError("无法从研究输出中提取合法的 JSON 结构化结果")
 
 
+def _coerce_optional_str(val: Any) -> str:
+    if isinstance(val, str):
+        return val.strip()
+    if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val)):
+        return str(val)
+    return ""
+
+
+def _coerce_crowding_assessment(val: Any) -> str:
+    if not isinstance(val, str):
+        return "unknown"
+    cleaned = val.strip().lower()
+    if cleaned in research_archive.VALID_CROWDING_ASSESSMENTS:
+        return cleaned
+    if "|" in cleaned:
+        return "unknown"
+    m = re.match(r"^(underpriced|fair|crowded|unknown)(?:[\s(（:：-]|$)", cleaned)
+    if m:
+        return m.group(1)
+    return "unknown"
+
+
+def _coerce_expectation_gap_output(
+    raw_eg: Any,
+    valuation_or_balance: dict[str, Any] | None,
+) -> dict[str, Any]:
+    eg_dict = raw_eg if isinstance(raw_eg, dict) else {}
+    priced_in = _coerce_optional_str(eg_dict.get("priced_in_consensus"))
+    if not priced_in and isinstance(valuation_or_balance, dict):
+        ieb = valuation_or_balance.get("implied_expectation_breakdown")
+        if isinstance(ieb, str) and ieb.strip():
+            priced_in = ieb.strip()
+
+    variant_view = _coerce_optional_str(eg_dict.get("our_variant_view"))
+    crowding = _coerce_crowding_assessment(eg_dict.get("crowding_assessment"))
+
+    clean_kpis: list[dict[str, str]] = []
+    raw_kpis = eg_dict.get("leading_kpis")
+    if isinstance(raw_kpis, list):
+        for raw_item in raw_kpis:
+            if not isinstance(raw_item, dict):
+                continue
+            raw_name = raw_item.get("name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                continue
+            clean_kpis.append(
+                {
+                    "name": raw_name.strip(),
+                    "current_baseline": _coerce_optional_str(raw_item.get("current_baseline")),
+                    "expected_trajectory": _coerce_optional_str(raw_item.get("expected_trajectory")),
+                    "falsification_threshold": _coerce_optional_str(raw_item.get("falsification_threshold")),
+                    "cadence": _coerce_optional_str(raw_item.get("cadence")),
+                }
+            )
+            if len(clean_kpis) >= research_archive.MAX_EXPECTATION_GAP_KPIS:
+                break
+
+    return research_archive.normalize_expectation_gap(
+        {
+            "priced_in_consensus": priced_in,
+            "our_variant_view": variant_view,
+            "crowding_assessment": crowding,
+            "leading_kpis": clean_kpis,
+        }
+    )
+
+
+def _try_parse_finite_float(val: Any) -> tuple[bool, float]:
+    if isinstance(val, bool) or val is None:
+        return False, 0.0
+    if isinstance(val, (int, float)):
+        fval = float(val)
+        return (True, fval) if math.isfinite(fval) else (False, 0.0)
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return False, 0.0
+        try:
+            fval = float(s)
+        except ValueError:
+            return False, 0.0
+        return (True, fval) if math.isfinite(fval) else (False, 0.0)
+    return False, 0.0
+
+
+_NUMERIC_ORDER_OPERATORS = frozenset({">", ">=", "<", "<=", "gt", "gte", "lt", "lte"})
+
+
+def _exact_threshold_key(val: Any) -> Any:
+    """Build a strict, type-preserving canonical key for non-ordering threshold comparisons."""
+    return research_archive.exact_threshold_key(val)
+
+
+def _thresholds_semantically_equal(lhs: Any, rhs: Any, operator: str = "") -> bool:
+    op = str(operator or "").strip().lower()
+    if op in _NUMERIC_ORDER_OPERATORS:
+        if lhs is None or rhs is None:
+            return lhs is None and rhs is None
+        if isinstance(lhs, bool) or isinstance(rhs, bool):
+            return isinstance(lhs, bool) and isinstance(rhs, bool) and lhs == rhs
+        ok_l, fl = _try_parse_finite_float(lhs)
+        ok_r, fr = _try_parse_finite_float(rhs)
+        if ok_l and ok_r:
+            return abs(fl - fr) <= 1e-9
+        if ok_l != ok_r:
+            return False
+        return _exact_threshold_key(lhs) == _exact_threshold_key(rhs)
+    return _exact_threshold_key(lhs) == _exact_threshold_key(rhs)
+
+
+def _trigger_effective_ttl_days(trig: dict[str, Any]) -> int:
+    declared = research_archive.get_trigger_declared_ttl_days(trig)
+    return declared if declared is not None else research_archive.DEFAULT_VERIFICATION_TTL_DAYS
+
+
+def _trigger_preserve_key(trig: dict[str, Any]) -> tuple[str, str, str, str, str, str, int]:
+    return (
+        str(trig.get("kind") or "").strip().lower(),
+        str(trig.get("metric") or "").strip().lower(),
+        str(trig.get("operator") or "").strip().lower(),
+        str(trig.get("evaluation_mode") or "").strip().lower(),
+        str(trig.get("status") or "armed").strip().lower() or "armed",
+        " ".join(str(trig.get("description") or "").split()),
+        _trigger_effective_ttl_days(trig),
+    )
+
+
+def merge_preserved_trigger_verifications(
+    existing_triggers: list[dict[str, Any]],
+    new_triggers: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Preserve valid AI/manual trigger verifications across deep-research refreshes when definition is unchanged."""
+    if not isinstance(new_triggers, list):
+        return []
+
+    non_auto_existing: list[tuple[int, dict[str, Any]]] = []
+    if isinstance(existing_triggers, list):
+        for idx, old_trig in enumerate(existing_triggers):
+            if not isinstance(old_trig, dict):
+                continue
+            old_mode = str(old_trig.get("evaluation_mode") or "").strip().lower()
+            if old_mode not in {"ai_web", "manual"}:
+                continue
+            if research_archive.is_trigger_auto_metric(old_trig):
+                continue
+            non_auto_existing.append((idx, old_trig))
+
+    new_ids = {
+        str(t.get("id") or "").strip()
+        for t in new_triggers
+        if isinstance(t, dict) and str(t.get("id") or "").strip()
+    }
+    used_existing_indices: set[int] = set()
+
+    merged_list: list[dict[str, Any]] = []
+    for raw_new in new_triggers:
+        if not isinstance(raw_new, dict):
+            continue
+        new_trig = copy.deepcopy(raw_new)
+        new_mode = str(new_trig.get("evaluation_mode") or "").strip().lower()
+
+        if new_mode == "auto" or research_archive.is_trigger_auto_metric(new_trig):
+            new_trig.pop("verification", None)
+            merged_list.append(new_trig)
+            continue
+
+        if new_mode not in {"ai_web", "manual"} or new_trig.get("verification") is not None:
+            merged_list.append(new_trig)
+            continue
+
+        target_key = _trigger_preserve_key(new_trig)
+        target_op = target_key[2]
+        target_threshold = new_trig.get("threshold")
+        all_matching = [
+            (orig_idx, old_trig)
+            for orig_idx, old_trig in non_auto_existing
+            if _trigger_preserve_key(old_trig) == target_key
+            and _thresholds_semantically_equal(old_trig.get("threshold"), target_threshold, target_op)
+        ]
+        if not all_matching:
+            merged_list.append(new_trig)
+            continue
+
+        new_id = str(new_trig.get("id") or "").strip()
+        is_auto_generated_id = bool(re.fullmatch(r"trig_ai_\d+", new_id))
+        chosen_entry: tuple[int, dict[str, Any]] | None = None
+        if len(all_matching) == 1:
+            sole_idx, sole_trig = all_matching[0]
+            sole_id = str(sole_trig.get("id") or "").strip()
+            if not (sole_id and sole_id != new_id and sole_id in new_ids):
+                chosen_entry = (sole_idx, sole_trig)
+        elif new_id and not is_auto_generated_id:
+            id_matches = [
+                entry
+                for entry in all_matching
+                if str(entry[1].get("id") or "").strip() == new_id
+            ]
+            if len(id_matches) == 1:
+                chosen_entry = id_matches[0]
+
+        if chosen_entry is None:
+            merged_list.append(new_trig)
+            continue
+
+        orig_idx, chosen = chosen_entry
+        if orig_idx in used_existing_indices or not isinstance(chosen.get("verification"), dict):
+            merged_list.append(new_trig)
+            continue
+
+        candidate_trig = copy.deepcopy(new_trig)
+        candidate_trig["verification"] = copy.deepcopy(chosen["verification"])
+        try:
+            research_archive._validate_state_patch({"triggers": [candidate_trig]})
+        except (ValueError, TypeError):
+            merged_list.append(new_trig)
+            continue
+        used_existing_indices.add(orig_idx)
+        merged_list.append(candidate_trig)
+
+    return merged_list
+
+
+preserve_unchanged_trigger_verifications = merge_preserved_trigger_verifications
+
+
 def normalize_research_output(
     payload: dict[str, Any],
     *,
@@ -793,7 +1038,7 @@ def normalize_research_output(
 ) -> dict[str, Any]:
     """Validate and sanitize parsed AI output into strict research_archive structures."""
     if not isinstance(payload, dict):
-        raise ValueError("研究输出必须是 JSON 对象")
+        raise ValueError("研究输出必须是 JSON 对象")  # noqa: TRY004
 
     thesis_md = str(payload.get("thesis_md") or "").strip()
     if len(thesis_md) < 80:
@@ -828,6 +1073,7 @@ def normalize_research_output(
     valuation_or_balance = (
         payload.get("valuation_or_balance") if isinstance(payload.get("valuation_or_balance"), dict) else {}
     )
+    expectation_gap = _coerce_expectation_gap_output(payload.get("expectation_gap"), valuation_or_balance)
 
     # Evidence normalization
     clean_evidence: list[dict[str, Any]] = []
@@ -904,6 +1150,9 @@ def normalize_research_output(
         desc = str(raw_trig.get("description") or "").strip()
         if desc:
             trig_obj["description"] = desc
+        declared_ttl = research_archive.get_trigger_declared_ttl_days(raw_trig)
+        if declared_ttl is not None:
+            trig_obj["verification_ttl_days"] = declared_ttl
         clean_triggers.append(trig_obj)
 
     # Events normalization
@@ -940,6 +1189,7 @@ def normalize_research_output(
             "direction_bias": direction_bias,
             "status": status,
             "layer1_drivers": layer1_drivers,
+            "expectation_gap": expectation_gap,
             "chanlun_anchors": chanlun_anchors,
             "valuation_or_balance": valuation_or_balance,
             "thesis_md": thesis_md,
@@ -1253,12 +1503,16 @@ def run_deep_research(
         "direction_bias": normalized["direction_bias"],
         "thesis_summary": normalized["thesis_summary"],
         "layer1_drivers": normalized["layer1_drivers"],
+        "expectation_gap": normalized["expectation_gap"],
         "chanlun_anchors": normalized["chanlun_anchors"],
         "valuation_or_balance": normalized["valuation_or_balance"],
         "pending_verifications": normalized["pending_verifications"],
     }
     if normalized["triggers"]:
-        state_patch["triggers"] = normalized["triggers"]
+        state_patch["triggers"] = merge_preserved_trigger_verifications(
+            latest_state.get("triggers") or [],
+            normalized["triggers"],
+        )
     if normalized["events"]:
         state_patch["events"] = normalized["events"]
 

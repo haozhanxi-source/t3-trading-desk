@@ -4,6 +4,7 @@ import { api, ApiError, errorMessage } from "../../api/client";
 import type { Position, ScaleInBody, ScaleInResponse } from "../../api/types";
 import {
   fmtInputPrice,
+  fmtMoney,
   fmtNum,
   fmtPct,
   fmtPlanNum,
@@ -110,6 +111,67 @@ function computeValidScaledQuantity(pos: Position, ratio: number, spec: Position
   return isStepAligned(result, spec) ? result : null;
 }
 
+const _f64Buf = new ArrayBuffer(8);
+const _f64View = new DataView(_f64Buf);
+
+function splitIeee754(x: number): { neg: boolean; num: bigint; den: bigint } | null {
+  if (!Number.isFinite(x)) return null;
+  if (x === 0) return { neg: false, num: 0n, den: 1n };
+  _f64View.setFloat64(0, x, false);
+  const bits = _f64View.getBigUint64(0, false);
+  const neg = (bits >> 63n) !== 0n;
+  const expBits = Number((bits >> 52n) & 0x7ffn);
+  const fracBits = bits & 0xfffffffffffffn;
+  const mantissa = expBits === 0 ? fracBits : (1n << 52n) | fracBits;
+  const exp = expBits === 0 ? -1074 : expBits - 1075;
+  if (exp >= 0) {
+    return { neg, num: mantissa << BigInt(exp), den: 1n };
+  }
+  return { neg, num: mantissa, den: 1n << BigInt(-exp) };
+}
+
+function scaledIntToNumber(q: bigint, neg: boolean, decimals: number): number {
+  if (q === 0n) return 0;
+  const s = q.toString().padStart(decimals + 1, "0");
+  const intPart = s.slice(0, s.length - decimals);
+  const fracPart = s.slice(s.length - decimals);
+  return Number(`${neg ? "-" : ""}${intPart}.${fracPart}`);
+}
+
+/** Exact bit-for-bit match to Python 3 `round(x, decimals)` (half-to-even on exact IEEE-754 value, zero float pre-scaling). */
+function roundPython(x: number, decimals: number): number {
+  const parts = splitIeee754(x);
+  if (!parts || parts.num === 0n) return 0;
+  const scale = 10n ** BigInt(decimals);
+  const scaledNum = parts.num * scale;
+  let q = scaledNum / parts.den;
+  const rem = scaledNum % parts.den;
+  const twiceRem = rem * 2n;
+  if (twiceRem > parts.den || (twiceRem === parts.den && (q & 1n) === 1n)) {
+    q += 1n;
+  }
+  return scaledIntToNumber(q, parts.neg, decimals);
+}
+
+function roundPython6(x: number): number {
+  return roundPython(x, 6);
+}
+
+/** Format stop/price values without hiding sub-cent precision needed by 6-decimal ledger validation (e.g. 83.000001 vs 83.000002). */
+function fmtStopPrice(val: number | null | undefined): string {
+  if (val == null || !Number.isFinite(val)) return "—";
+  const p = roundPython6(val);
+  const abs = Math.abs(p);
+  const fixed6 = p.toFixed(6).replace(/0+$/, "");
+  const fracLen = fixed6.includes(".") ? fixed6.split(".")[1]!.length : 0;
+  const minFrac = abs >= 1 ? 2 : 4;
+  const digits = Math.max(minFrac, fracLen);
+  return p.toLocaleString("en-US", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+
 function createScaleInIdempotencyKey(positionId: string): string {
   const uid =
     typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
@@ -129,6 +191,9 @@ export function ScaleInPositionDialog({
   const [addQty, setAddQty] = useState("");
   const [addPrice, setAddPrice] = useState("");
   const [newStopLoss, setNewStopLoss] = useState("");
+  const [newDailyStop, setNewDailyStop] = useState("");
+  const [requireBreakevenLock, setRequireBreakevenLock] = useState(true);
+  const [maxCushionRatio, setMaxCushionRatio] = useState("0.65");
   const [fxRate, setFxRate] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -141,14 +206,38 @@ export function ScaleInPositionDialog({
 
   const direction = position?.direction === "short" ? "short" : "long";
   const isLong = direction === "long";
+  const isDailyRegime = position?.active_stop_regime === "daily_structure";
   const avgEntry = position ? (position.avg_entry_price ?? position.entry_price ?? null) : null;
   const currentStop = position?.tactical_stop_30m ?? null;
   const dailyStop = position?.structural_stop_daily ?? null;
+  const activeOldStop = isDailyRegime ? dailyStop : currentStop;
+  const partialRealized = Number(position?.partial_realized_pnl ?? 0);
+  const hasPriorRealizedLoss = Number.isFinite(partialRealized) && partialRealized < -1e-9;
   const currentTrancheCount =
     position && Array.isArray(position.tranches) && position.tranches.length > 0
       ? position.tranches.length
       : 1;
   const nextTrancheTag = `T${currentTrancheCount + 1}`;
+
+  const contractMult = useMemo(() => {
+    if (!position) return 1;
+    if (typeof position.multiplier === "number" && Number.isFinite(position.multiplier) && position.multiplier > 0) {
+      return position.multiplier;
+    }
+    const rawSpec =
+      position.contract_spec && typeof position.contract_spec === "object"
+        ? (position.contract_spec as Record<string, unknown>)
+        : null;
+    if (
+      rawSpec &&
+      typeof rawSpec.multiplier === "number" &&
+      Number.isFinite(rawSpec.multiplier) &&
+      rawSpec.multiplier > 0
+    ) {
+      return rawSpec.multiplier;
+    }
+    return 1;
+  }, [position]);
 
   const qtySpec = useMemo<PositionQtySpec>(
     () => (position ? inferPositionQtySpec(position) : { minOrderQty: 1, lotStep: 1, fractional: false }),
@@ -174,6 +263,14 @@ export function ScaleInPositionDialog({
     setAddQty(defaultQty > 0 ? fmtPlanNum(defaultQty, 6) : "");
     setAddPrice(currentPrice != null && Number.isFinite(currentPrice) ? fmtInputPrice(currentPrice) : "");
     setNewStopLoss("");
+    setNewDailyStop("");
+    const profitableNow =
+      currentPrice != null &&
+      Number.isFinite(currentPrice) &&
+      avgEntry != null &&
+      (isLong ? currentPrice > avgEntry : currentPrice < avgEntry);
+    setRequireBreakevenLock(isDailyRegime || profitableNow || currentPrice == null);
+    setMaxCushionRatio("0.65");
     setFxRate(
       position.fx_to_account != null && position.fx_to_account > 0
         ? fmtPlanNum(position.fx_to_account, 6)
@@ -181,7 +278,7 @@ export function ScaleInPositionDialog({
     );
     setNote("");
     setErr(null);
-  }, [open, position, currentPrice, currentTrancheCount, quickQtyFull, quickQtyHalf, qtySpec.minOrderQty]);
+  }, [open, position, currentPrice, avgEntry, isLong, isDailyRegime, currentTrancheCount, quickQtyFull, quickQtyHalf, qtySpec.minOrderQty]);
 
   const acctCcy = (accountCurrency || "USD").toUpperCase();
   const quoteCcy = inferAssetCurrency(position?.symbol, position?.asset_class);
@@ -197,56 +294,139 @@ export function ScaleInPositionDialog({
   const addQtyNum = optNum(addQty);
   const addPriceNum = optNum(addPrice);
   const newStopNum = optNum(newStopLoss);
+  const newDailyStopNum = optNum(newDailyStop);
+  const cushionRatioNum = optNum(maxCushionRatio);
   const fxVal = optNum(fxRate);
+
+  // Align all inputs & position prices with backend ledger persistence precision (_PRICE_PERSIST_DECIMALS = 6, _FX_PERSIST_DECIMALS = 10)
+  const persistedAvgEntry = avgEntry != null && Number.isFinite(avgEntry) ? roundPython6(avgEntry) : null;
+  const persistedCurrentStop = currentStop != null && Number.isFinite(currentStop) ? roundPython6(currentStop) : null;
+  const persistedDailyStop = dailyStop != null && Number.isFinite(dailyStop) ? roundPython6(dailyStop) : null;
+  const persistedActiveOldStop = isDailyRegime ? persistedDailyStop : persistedCurrentStop;
+  const persistedAddPrice = addPriceNum !== undefined && addPriceNum > 0 ? roundPython6(addPriceNum) : undefined;
+  const persistedNewStop = newStopNum !== undefined && newStopNum > 0 ? roundPython6(newStopNum) : undefined;
+  const persistedNewDailyStop =
+    newDailyStopNum !== undefined && newDailyStopNum > 0 ? roundPython6(newDailyStopNum) : undefined;
+
+  const effectiveFx = useMemo(() => {
+    if (fxVal !== undefined && fxVal > 0) return roundPython(fxVal, 10);
+    if (position?.fx_to_account != null && Number.isFinite(position.fx_to_account) && position.fx_to_account > 0) {
+      return roundPython(position.fx_to_account, 10);
+    }
+    return 1;
+  }, [fxVal, position]);
 
   const isCurrentUnprofitable =
     currentPrice != null &&
     Number.isFinite(currentPrice) &&
-    avgEntry != null &&
-    (isLong ? currentPrice <= avgEntry : currentPrice >= avgEntry);
+    persistedAvgEntry != null &&
+    (isLong ? currentPrice <= persistedAvgEntry : currentPrice >= persistedAvgEntry);
 
   const isAddPriceUnprofitable =
-    addPriceNum !== undefined &&
-    avgEntry != null &&
-    (isLong ? addPriceNum <= avgEntry : addPriceNum >= avgEntry);
+    persistedAddPrice !== undefined &&
+    persistedAddPrice > 0 &&
+    persistedAvgEntry != null &&
+    (isLong ? persistedAddPrice <= persistedAvgEntry : persistedAddPrice >= persistedAvgEntry);
 
   const isDisciplineBlocked = isAddPriceUnprofitable || isCurrentUnprofitable;
 
   const stopValidationError = useMemo(() => {
+    if (addPrice.trim() !== "") {
+      if (addPriceNum === undefined || addPriceNum <= 0 || persistedAddPrice === undefined || persistedAddPrice <= 0) {
+        return "加仓成交价在 6 位记账精度下必须大于 0";
+      }
+    }
+
+    if (newDailyStop.trim() !== "") {
+      if (
+        newDailyStopNum === undefined ||
+        newDailyStopNum <= 0 ||
+        persistedNewDailyStop === undefined ||
+        persistedNewDailyStop <= 0
+      ) {
+        return "新日线结构止损位在 6 位记账精度下必须大于 0";
+      }
+      if (persistedDailyStop != null) {
+        if (isLong && persistedNewDailyStop < persistedDailyStop) {
+          return `移动止损只紧不松：多单新日线结构止损 (${fmtStopPrice(persistedNewDailyStop)}) 不得低于原日线止损 (${fmtStopPrice(persistedDailyStop)})`;
+        }
+        if (!isLong && persistedNewDailyStop > persistedDailyStop) {
+          return `移动止损只紧不松：空单新日线结构止损 (${fmtStopPrice(persistedNewDailyStop)}) 不得高于原日线止损 (${fmtStopPrice(persistedDailyStop)})`;
+        }
+      }
+    }
+
     if (newStopLoss.trim() !== "") {
-      if (newStopNum === undefined || newStopNum <= 0) {
-        return "新 30m 止损位必须为大于 0 的有效数值";
+      if (newStopNum === undefined || newStopNum <= 0 || persistedNewStop === undefined || persistedNewStop <= 0) {
+        return "新 30m 止损位在 6 位记账精度下必须大于 0";
       }
-      if (currentStop != null) {
-        if (isLong && newStopNum < currentStop) {
-          return `移动止损只紧不松：多单新 30m 止损 (${fmtPrice(newStopNum)}) 不得低于原止损 (${fmtPrice(currentStop)})`;
+      if (persistedCurrentStop != null) {
+        if (isLong && persistedNewStop < persistedCurrentStop) {
+          return `移动止损只紧不松：多单新 30m 止损 (${fmtStopPrice(persistedNewStop)}) 不得低于原止损 (${fmtStopPrice(persistedCurrentStop)})`;
         }
-        if (!isLong && newStopNum > currentStop) {
-          return `移动止损只紧不松：空单新 30m 止损 (${fmtPrice(newStopNum)}) 不得高于原止损 (${fmtPrice(currentStop)})`;
+        if (!isLong && persistedNewStop > persistedCurrentStop) {
+          return `移动止损只紧不松：空单新 30m 止损 (${fmtStopPrice(persistedNewStop)}) 不得高于原止损 (${fmtStopPrice(persistedCurrentStop)})`;
         }
       }
     }
 
-    const effStop = newStopNum ?? currentStop;
-    if (addPriceNum !== undefined && effStop != null) {
-      if (isLong && addPriceNum <= effStop) {
-        return `多单加仓成交价 (${fmtPrice(addPriceNum)}) 必须严格高于有效 30m 止损位 (${fmtPrice(effStop)})`;
+    const effDailyStop = persistedNewDailyStop ?? persistedDailyStop;
+    if (isDailyRegime) {
+      if (effDailyStop == null) {
+        return "当前处于日线主升防线模式，请填写有效的日线主升防线 (new_daily_stop)";
       }
-      if (!isLong && addPriceNum >= effStop) {
-        return `空单加仓成交价 (${fmtPrice(addPriceNum)}) 必须严格低于有效 30m 止损位 (${fmtPrice(effStop)})`;
+      if (persistedAddPrice !== undefined && persistedAddPrice > 0) {
+        if (isLong && persistedAddPrice <= effDailyStop) {
+          return `多单加仓成交价 (${fmtStopPrice(persistedAddPrice)}) 必须严格高于有效日线主升防线 (${fmtStopPrice(effDailyStop)})`;
+        }
+        if (!isLong && persistedAddPrice >= effDailyStop) {
+          return `空单加仓成交价 (${fmtStopPrice(persistedAddPrice)}) 必须严格低于有效日线主升防线 (${fmtStopPrice(effDailyStop)})`;
+        }
       }
-    }
-
-    if (addPriceNum !== undefined && dailyStop != null) {
-      if (isLong && addPriceNum <= dailyStop) {
-        return `多单加仓成交价 (${fmtPrice(addPriceNum)}) 必须严格高于日线结构止损 (${fmtPrice(dailyStop)})`;
+      // In daily_structure regime, only validate add_price vs 30m stop if the user explicitly entered a new 30m stop.
+      if (persistedNewStop !== undefined && persistedAddPrice !== undefined && persistedAddPrice > 0) {
+        if (isLong && persistedAddPrice <= persistedNewStop) {
+          return `多单加仓成交价 (${fmtStopPrice(persistedAddPrice)}) 必须严格高于所填 30m 止损位 (${fmtStopPrice(persistedNewStop)})`;
+        }
+        if (!isLong && persistedAddPrice >= persistedNewStop) {
+          return `空单加仓成交价 (${fmtStopPrice(persistedAddPrice)}) 必须严格低于所填 30m 止损位 (${fmtStopPrice(persistedNewStop)})`;
+        }
       }
-      if (!isLong && addPriceNum >= dailyStop) {
-        return `空单加仓成交价 (${fmtPrice(addPriceNum)}) 必须严格低于日线结构止损 (${fmtPrice(dailyStop)})`;
+    } else {
+      const effStop30m = persistedNewStop ?? persistedCurrentStop;
+      if (persistedAddPrice !== undefined && persistedAddPrice > 0 && effStop30m != null) {
+        if (isLong && persistedAddPrice <= effStop30m) {
+          return `多单加仓成交价 (${fmtStopPrice(persistedAddPrice)}) 必须严格高于有效 30m 止损位 (${fmtStopPrice(effStop30m)})`;
+        }
+        if (!isLong && persistedAddPrice >= effStop30m) {
+          return `空单加仓成交价 (${fmtStopPrice(persistedAddPrice)}) 必须严格低于有效 30m 止损位 (${fmtStopPrice(effStop30m)})`;
+        }
+      }
+      if (persistedAddPrice !== undefined && persistedAddPrice > 0 && effDailyStop != null) {
+        if (isLong && persistedAddPrice <= effDailyStop) {
+          return `多单加仓成交价 (${fmtStopPrice(persistedAddPrice)}) 必须严格高于有效日线结构止损 (${fmtStopPrice(effDailyStop)})`;
+        }
+        if (!isLong && persistedAddPrice >= effDailyStop) {
+          return `空单加仓成交价 (${fmtStopPrice(persistedAddPrice)}) 必须严格低于有效日线结构止损 (${fmtStopPrice(effDailyStop)})`;
+        }
       }
     }
     return null;
-  }, [newStopLoss, newStopNum, currentStop, dailyStop, addPriceNum, isLong]);
+  }, [
+    addPrice,
+    addPriceNum,
+    persistedAddPrice,
+    isDailyRegime,
+    newStopLoss,
+    newStopNum,
+    persistedNewStop,
+    newDailyStop,
+    newDailyStopNum,
+    persistedNewDailyStop,
+    persistedCurrentStop,
+    persistedDailyStop,
+    isLong,
+  ]);
 
   const qtyValidationError = useMemo(() => {
     if (addQty.trim() === "") return null;
@@ -272,45 +452,255 @@ export function ScaleInPositionDialog({
     return null;
   }, [needsCrossFx, fxRate, fxVal, quoteCcy, acctCcy]);
 
+  const effectiveRequireBreakeven = requireBreakevenLock || isDailyRegime;
+  const effectiveCushionRatio =
+    effectiveRequireBreakeven && cushionRatioNum !== undefined && cushionRatioNum > 0 && cushionRatioNum <= 1
+      ? cushionRatioNum
+      : 0.65;
+
   const preview = useMemo(() => {
-    if (!position || avgEntry == null) return null;
+    if (!position || persistedAvgEntry == null) return null;
     const oldQty = position.quantity;
     const validQty = addQtyNum !== undefined && addQtyNum > 0;
-    const validPrice = addPriceNum !== undefined && addPriceNum > 0;
-    const newTotalQty = validQty ? oldQty + addQtyNum : null;
-    const newAvg =
+    const validPrice = persistedAddPrice !== undefined && persistedAddPrice > 0;
+    const newTotalQty = validQty
+      ? qtySpec.fractional
+        ? roundPython(oldQty + addQtyNum, 8)
+        : Math.round(oldQty + addQtyNum)
+      : null;
+    const rawNewAvg =
       validQty && validPrice && newTotalQty != null && newTotalQty > 0
-        ? (avgEntry * oldQty + addPriceNum * addQtyNum) / newTotalQty
+        ? (persistedAvgEntry * oldQty + persistedAddPrice * addQtyNum) / newTotalQty
         : null;
-    const effectiveStop = newStopNum !== undefined && newStopNum > 0 ? newStopNum : currentStop;
+    const newAvg = rawNewAvg != null ? roundPython6(rawNewAvg) : null;
+    const activeNewStopInput = isDailyRegime ? persistedNewDailyStop : persistedNewStop;
+    const effectiveStop =
+      activeNewStopInput !== undefined && activeNewStopInput > 0 ? activeNewStopInput : persistedActiveOldStop;
     const isStopTightened =
-      newStopNum !== undefined &&
-      currentStop != null &&
-      (isLong ? newStopNum > currentStop : newStopNum < currentStop);
+      activeNewStopInput !== undefined &&
+      persistedActiveOldStop != null &&
+      (isLong ? activeNewStopInput > persistedActiveOldStop : activeNewStopInput < persistedActiveOldStop);
+
+    const satisfiesBreakevenFor = (stopCand: number, avg: number, qty: number): boolean => {
+      if (!(qty > 0)) return false;
+      const effStop = roundPython6(stopCand);
+      if (!(effStop > 0)) return false;
+      const remOk = isLong ? effStop >= avg - 1e-9 : effStop <= avg + 1e-9;
+      if (!remOk) return false;
+      const remPnl =
+        (isLong ? effStop - avg : avg - effStop) * qty * contractMult * effectiveFx;
+      const netPnlRaw = partialRealized + remPnl;
+      const campOpenRisk = roundPython(Math.max(0, -netPnlRaw), 2);
+      return campOpenRisk <= 1e-6 && netPnlRaw >= -1e-6;
+    };
+
+    const satisfiesBackendBreakeven = (stopCand: number): boolean => {
+      if (newAvg == null || newTotalQty == null || newTotalQty <= 0) return false;
+      return satisfiesBreakevenFor(stopCand, newAvg, newTotalQty);
+    };
+
+    const priorUnrealizedProfit = validPrice
+      ? Math.max(
+          0,
+          (isLong ? persistedAddPrice - persistedAvgEntry : persistedAvgEntry - persistedAddPrice) *
+            oldQty *
+            contractMult *
+            effectiveFx,
+        )
+      : 0;
+    const netProfitCushionRaw = Math.max(0, priorUnrealizedProfit + partialRealized);
+    const allowedGivebackCeilingRaw = netProfitCushionRaw * effectiveCushionRatio;
+    const addDenom = validQty ? addQtyNum * contractMult * effectiveFx : 0;
+
+    const satisfiesCushionCeiling = (stopCand: number): boolean => {
+      if (!validPrice || !validQty || !(addDenom > 0)) return true;
+      const effStop = roundPython6(stopCand);
+      if (!(effStop > 0)) return false;
+      const addedTrancheRiskRaw =
+        Math.max(0, isLong ? persistedAddPrice - effStop : effStop - persistedAddPrice) * addDenom;
+      return addedTrancheRiskRaw <= allowedGivebackCeilingRaw + 1e-9;
+    };
+
+    const findMinimalStopForPredicate = (
+      rawStart: number | null,
+      predicate: (stopCand: number) => boolean,
+    ): number | null => {
+      if (rawStart == null) return null;
+      let cand = roundPython6(rawStart);
+      if (!(cand > 0)) return null;
+      const stepMoreProtective = isLong ? 1e-6 : -1e-6;
+      const stepLessProtective = isLong ? -1e-6 : 1e-6;
+      if (!predicate(cand)) {
+        for (let i = 0; i < 4; i += 1) {
+          const nextStop = roundPython6(cand + stepMoreProtective);
+          if (!(nextStop > 0)) return null;
+          cand = nextStop;
+          if (predicate(cand)) break;
+        }
+        if (!predicate(cand)) return null;
+      } else {
+        for (let i = 0; i < 4; i += 1) {
+          const relaxed = roundPython6(cand + stepLessProtective);
+          if (relaxed > 0 && predicate(relaxed)) {
+            cand = relaxed;
+          } else {
+            break;
+          }
+        }
+      }
+      return cand;
+    };
+
+    let rawCampaignBe = newAvg;
+    let coversPriorLoss = false;
+    if (newAvg != null && newTotalQty != null && newTotalQty > 0 && hasPriorRealizedLoss) {
+      const denom = newTotalQty * contractMult * effectiveFx;
+      if (denom > 0) {
+        const offset = Math.max(0, (Math.abs(partialRealized) - 1e-6) / denom);
+        rawCampaignBe = isLong ? newAvg + offset : newAvg - offset;
+        coversPriorLoss = true;
+      }
+    }
+
+    let rawCushionBound: number | null = null;
+    if (validPrice && validQty && addDenom > 0) {
+      const maxAddDist = (allowedGivebackCeilingRaw + 1e-9) / addDenom;
+      rawCushionBound = isLong ? persistedAddPrice - maxAddDist : persistedAddPrice + maxAddDist;
+    }
+
+    let rawCombinedBound = rawCampaignBe;
+    if (rawCombinedBound != null && rawCushionBound != null) {
+      if (isLong ? rawCushionBound > rawCombinedBound : rawCushionBound < rawCombinedBound) {
+        rawCombinedBound = rawCushionBound;
+      }
+    }
+
+    const breakevenOnlyStop = findMinimalStopForPredicate(rawCampaignBe, satisfiesBackendBreakeven);
+    const protectiveBreakevenStop = findMinimalStopForPredicate(
+      rawCombinedBound,
+      (stopCand) => satisfiesBackendBreakeven(stopCand) && satisfiesCushionCeiling(stopCand),
+    );
+    const isCushionTightened =
+      breakevenOnlyStop != null &&
+      protectiveBreakevenStop != null &&
+      (isLong ? protectiveBreakevenStop > breakevenOnlyStop : protectiveBreakevenStop < breakevenOnlyStop);
+
     const isBreakevenProtected =
-      effectiveStop != null &&
-      newAvg != null &&
-      (isLong ? effectiveStop >= newAvg : effectiveStop <= newAvg);
+      effectiveStop != null && satisfiesBackendBreakeven(effectiveStop);
+    const isCushionProtected =
+      effectiveStop != null && satisfiesCushionCeiling(effectiveStop);
+
+    let oldAvgBePrice = persistedAvgEntry;
+    if (hasPriorRealizedLoss && oldQty > 0) {
+      const denomOld = oldQty * contractMult * effectiveFx;
+      if (denomOld > 0) {
+        const offsetOld = Math.max(0, (Math.abs(partialRealized) - 1e-6) / denomOld);
+        oldAvgBePrice = isLong ? persistedAvgEntry + offsetOld : persistedAvgEntry - offsetOld;
+      }
+    }
+    const oldProtectiveBeStop = findMinimalStopForPredicate(oldAvgBePrice, (stopCand) =>
+      satisfiesBreakevenFor(stopCand, persistedAvgEntry, oldQty),
+    );
+    const oldStopViolatesCushion =
+      oldProtectiveBeStop != null &&
+      satisfiesBackendBreakeven(oldProtectiveBeStop) &&
+      !satisfiesCushionCeiling(oldProtectiveBeStop);
+
     return {
       oldQty,
       newTotalQty,
       newAvg,
+      rawCampaignBe,
+      coversPriorLoss,
+      breakevenOnlyStop,
+      protectiveBreakevenStop,
+      isCushionTightened,
+      oldProtectiveBeStop,
+      oldStopViolatesCushion,
       effectiveStop,
       isStopTightened,
       isBreakevenProtected,
+      isCushionProtected,
     };
-  }, [position, avgEntry, addQtyNum, addPriceNum, newStopNum, currentStop, isLong]);
+  }, [
+    position,
+    persistedAvgEntry,
+    addQtyNum,
+    persistedAddPrice,
+    qtySpec.fractional,
+    isDailyRegime,
+    persistedNewDailyStop,
+    persistedNewStop,
+    persistedActiveOldStop,
+    isLong,
+    hasPriorRealizedLoss,
+    partialRealized,
+    contractMult,
+    effectiveFx,
+    effectiveCushionRatio,
+  ]);
+
+  const breakevenLockError = useMemo(() => {
+    if (!preview || preview.newAvg == null) return null;
+    const stopFieldLabel = isDailyRegime ? "有效日线主升防线" : "有效 30m 止损";
+    const hasStrictValidAutoStop =
+      preview.protectiveBreakevenStop != null &&
+      (persistedAddPrice === undefined ||
+        (isLong
+          ? persistedAddPrice > preview.protectiveBreakevenStop
+          : persistedAddPrice < preview.protectiveBreakevenStop));
+    const cushionPctLabel = `${Math.round(effectiveCushionRatio * 10000) / 100}%`;
+    const beTargetLabel = preview.isCushionTightened
+      ? `保本与浮盈垫(${cushionPctLabel})上限止损位 ${fmtStopPrice(preview.protectiveBreakevenStop)}`
+      : preview.coversPriorLoss
+        ? `战役级保本线 ${fmtStopPrice(preview.protectiveBreakevenStop)}（含弥补既有减仓亏损 ${fmtMoney(partialRealized, acctCcy)}）`
+        : `综合成本保本位 ${fmtStopPrice(preview.protectiveBreakevenStop)}`;
+
+    if (effectiveRequireBreakeven) {
+      if (preview.effectiveStop == null) {
+        return `${isDailyRegime ? "日线主升模式" : "零新增本金风险推仓"}要求锁定保本：请填入覆及 ${beTargetLabel} 的${stopFieldLabel}`;
+      }
+      if (!preview.isBreakevenProtected) {
+        if (!hasStrictValidAutoStop) {
+          return `${isDailyRegime ? "日线主升防线保本底线" : "零新增本金风险推仓"}校验未通过：当前加仓价与既有损益下不存在严格位于加仓价保护侧的有效保本止损位，请缩减加仓数量或等待更高浮盈垫。`;
+        }
+        return `${isDailyRegime ? "日线主升防线保本底线" : "零新增本金风险推仓"}校验未通过：${stopFieldLabel} (${fmtStopPrice(preview.effectiveStop)}) 未覆盖 ${beTargetLabel}，请点击「自动填入保本止损位」锁死本金。`;
+      }
+    }
+
+    if (preview.isBreakevenProtected && !preview.isCushionProtected) {
+      if (!hasStrictValidAutoStop) {
+        return `浮盈垫回吐上限（${cushionPctLabel}）校验未通过：当前加仓数量与净浮盈垫下，不存在严格位于加仓价保护侧的有效止损位，请缩减加仓数量或提高浮盈垫后再推仓。`;
+      }
+      return `浮盈垫回吐上限（${cushionPctLabel}）校验未通过：${stopFieldLabel} (${fmtStopPrice(preview.effectiveStop)}) 使加仓腿回吐超出净浮盈垫上限，需至少收紧至 ${fmtStopPrice(preview.protectiveBreakevenStop)}（可点击「自动填入保本止损位」）。`;
+    }
+    return null;
+  }, [effectiveRequireBreakeven, effectiveCushionRatio, preview, isDailyRegime, persistedAddPrice, isLong, partialRealized, acctCcy]);
+
+  const applyActiveBreakevenStop = (val: number) => {
+    resetIdempotencyKey();
+    const formatted = fmtPlanNum(val, 6);
+    if (isDailyRegime) {
+      setNewDailyStop(formatted);
+    } else {
+      setNewStopLoss(formatted);
+    }
+  };
 
   const canApplyOldAvgStop =
-    avgEntry != null &&
-    (currentStop == null || (isLong ? avgEntry > currentStop : avgEntry < currentStop)) &&
-    (addPriceNum === undefined || (isLong ? addPriceNum > avgEntry : addPriceNum < avgEntry));
+    preview?.oldProtectiveBeStop != null &&
+    !preview.oldStopViolatesCushion &&
+    (persistedActiveOldStop == null ||
+      (isLong ? preview.oldProtectiveBeStop > persistedActiveOldStop : preview.oldProtectiveBeStop < persistedActiveOldStop)) &&
+    (persistedAddPrice === undefined ||
+      (isLong ? persistedAddPrice > preview.oldProtectiveBeStop : persistedAddPrice < preview.oldProtectiveBeStop));
 
   const canApplyNewAvgStop =
-    preview?.newAvg != null &&
-    (avgEntry == null || Math.abs(preview.newAvg - avgEntry) > 1e-6) &&
-    (currentStop == null || (isLong ? preview.newAvg > currentStop : preview.newAvg < currentStop)) &&
-    (addPriceNum === undefined || (isLong ? addPriceNum > preview.newAvg : addPriceNum < preview.newAvg));
+    preview?.protectiveBreakevenStop != null &&
+    (persistedActiveOldStop == null ||
+      (isLong ? preview.protectiveBreakevenStop >= persistedActiveOldStop : preview.protectiveBreakevenStop <= persistedActiveOldStop)) &&
+    (persistedAddPrice === undefined ||
+      (isLong ? persistedAddPrice > preview.protectiveBreakevenStop : persistedAddPrice < preview.protectiveBreakevenStop));
 
   const canSubmit =
     !busy &&
@@ -318,11 +708,12 @@ export function ScaleInPositionDialog({
     !isDisciplineBlocked &&
     !qtyValidationError &&
     !stopValidationError &&
+    !breakevenLockError &&
     !fxValidationError &&
     addQtyNum !== undefined &&
     addQtyNum > 0 &&
-    addPriceNum !== undefined &&
-    addPriceNum > 0;
+    persistedAddPrice !== undefined &&
+    persistedAddPrice > 0;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -337,6 +728,10 @@ export function ScaleInPositionDialog({
     }
     if (stopValidationError) {
       setErr(stopValidationError);
+      return;
+    }
+    if (breakevenLockError) {
+      setErr(breakevenLockError);
       return;
     }
     if (fxValidationError) {
@@ -360,9 +755,16 @@ export function ScaleInPositionDialog({
         add_quantity: addQtyNum,
         add_price: addPriceNum,
         idempotency_key: idemKey,
+        require_breakeven_lock: effectiveRequireBreakeven,
       };
+      if (effectiveRequireBreakeven && cushionRatioNum !== undefined && cushionRatioNum > 0 && cushionRatioNum <= 1) {
+        payload.max_profit_cushion_ratio = cushionRatioNum;
+      }
       if (newStopNum !== undefined) {
         payload.new_stop_loss = newStopNum;
+      }
+      if (newDailyStopNum !== undefined && newDailyStopNum > 0) {
+        payload.new_daily_stop = newDailyStopNum;
       }
       if (fxVal !== undefined) {
         payload.fx_rate_to_base = fxVal;
@@ -404,6 +806,15 @@ export function ScaleInPositionDialog({
             <span className="rounded border border-hairline-soft bg-sunken px-2 py-0.5 font-mono text-[11px] text-ink-2">
               当前第 {currentTrancheCount} 批 → 拟加仓 {nextTrancheTag}
             </span>
+            <span
+              className={`rounded border px-2 py-0.5 text-[11px] font-medium ${
+                isDailyRegime
+                  ? "border-bull/45 bg-bull/10 text-bull"
+                  : "border-hairline-soft bg-sunken text-ink-2"
+              }`}
+            >
+              {isDailyRegime ? "日线主升防线主控" : "30m 战术防线主控"}
+            </span>
             {position?.sector_theme ? (
               <span className="rounded border border-hairline-soft bg-sunken px-2 py-0.5 text-[11px] text-muted">
                 {position.sector_theme}
@@ -436,8 +847,8 @@ export function ScaleInPositionDialog({
             <span className="metric-val">{position ? fmtNum(position.quantity, 6) : "—"}</span>
           </div>
           <div className="metric-cell">
-            <span className="metric-label">当前 30m 止损</span>
-            <span className="metric-val text-bear">{fmtPrice(currentStop)}</span>
+            <span className="metric-label">{isDailyRegime ? "当前日线主升防线" : "当前 30m 止损"}</span>
+            <span className="metric-val text-bear">{fmtPrice(activeOldStop)}</span>
           </div>
           <div className="metric-cell">
             <span className="metric-label">参考最新价</span>
@@ -554,48 +965,179 @@ export function ScaleInPositionDialog({
           </div>
         ) : null}
 
+        {/* Zero-Principal-Risk Pyramid Lock Toggle */}
+        <div className="flex flex-col gap-2 rounded-md border border-bull/40 bg-bull/8 p-3 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <label className="inline-flex cursor-pointer items-center gap-2 font-semibold text-ink">
+              <input
+                type="checkbox"
+                className="accent-accent"
+                checked={effectiveRequireBreakeven}
+                disabled={isDailyRegime}
+                onChange={(e) => {
+                  resetIdempotencyKey();
+                  setRequireBreakevenLock(e.target.checked);
+                }}
+              />
+              <span>
+                零新增本金风险推仓（强制战役级保本锁死
+                {isDailyRegime ? " · 日线主升模式强制启用" : ""}）
+              </span>
+            </label>
+            {canApplyNewAvgStop && preview?.protectiveBreakevenStop != null ? (
+              <button
+                type="button"
+                className="btn btn-sm btn-primary"
+                onClick={() => applyActiveBreakevenStop(preview.protectiveBreakevenStop!)}
+              >
+                <ShieldCheck className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>
+                  自动填入保本止损位 ({fmtStopPrice(preview.protectiveBreakevenStop)}
+                  {isDailyRegime ? " → 日线防线" : " → 30m 止损"})
+                </span>
+              </button>
+            ) : null}
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-ink-2">
+            <span>
+              开启后，后端强制校验推仓后战役本金风险为 0（{isDailyRegime ? "日线主升防线" : "30m 止损"}必须覆及
+              {preview?.isCushionTightened
+                ? "保本与浮盈垫上限位 "
+                : preview?.coversPriorLoss
+                  ? "战役保本线 "
+                  : "综合均价 "}
+              <strong className="font-mono text-ink">
+                {fmtStopPrice(
+                  preview?.isCushionTightened || preview?.coversPriorLoss
+                    ? preview.protectiveBreakevenStop
+                    : preview?.newAvg,
+                )}
+              </strong>
+              {preview?.coversPriorLoss
+                ? `，已计入既往已实现减仓亏损 ${fmtMoney(partialRealized, acctCcy)}`
+                : ""}
+              ）；在零本金风险锁死下，加仓腿止损回吐严格封顶于「净浮盈垫 × 该比例」（严格硬上限，绝不会被板块风险预算绕过）。
+            </span>
+            {effectiveRequireBreakeven ? (
+              <label className="inline-flex items-center gap-1.5 whitespace-nowrap">
+                <span className="text-muted">浮盈垫最大允许回吐比例（严格硬上限）</span>
+                <input
+                  className="input h-6 w-16 px-1.5 font-mono text-[11px]"
+                  type="number"
+                  step="0.05"
+                  min="0.1"
+                  max="1"
+                  aria-label="浮盈垫最大允许回吐比例（严格硬上限）"
+                  value={maxCushionRatio}
+                  onChange={(e) => {
+                    resetIdempotencyKey();
+                    setMaxCushionRatio(e.target.value);
+                  }}
+                />
+              </label>
+            ) : null}
+          </div>
+        </div>
+
         {/* Optional Synchronized Stop-Loss Tightening */}
         <div className="flex flex-col gap-1.5">
-          <label className="field">
-            <span>同步收紧 30m 止损位（可选 · 只紧不松；上移至保本/浮盈区可自动释放风险预算）</span>
-            <input
-              className="input font-mono"
-              type="number"
-              inputMode="decimal"
-              step="any"
-              placeholder={currentStop != null ? `不改留空（当前 ${fmtPrice(currentStop)}）` : "不改留空"}
-              value={newStopLoss}
-              onChange={(e) => {
-                resetIdempotencyKey();
-                setNewStopLoss(e.target.value);
-              }}
-            />
-          </label>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {isDailyRegime ? (
+              <>
+                <label className="field">
+                  <span>同步收紧日线主升防线 (new_daily_stop) *</span>
+                  <input
+                    className="input font-mono"
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    placeholder={dailyStop != null ? `当前日线 ${fmtStopPrice(dailyStop)}` : "输入新日线防线"}
+                    value={newDailyStop}
+                    onChange={(e) => {
+                      resetIdempotencyKey();
+                      setNewDailyStop(e.target.value);
+                    }}
+                  />
+                </label>
+                <label className="field">
+                  <span>30m 战术参考止损（主升期非主控 · 可选）</span>
+                  <input
+                    className="input font-mono"
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    placeholder={currentStop != null ? `参考 30m ${fmtStopPrice(currentStop)}（不改留空）` : "不改留空"}
+                    value={newStopLoss}
+                    onChange={(e) => {
+                      resetIdempotencyKey();
+                      setNewStopLoss(e.target.value);
+                    }}
+                  />
+                </label>
+              </>
+            ) : (
+              <>
+                <label className="field">
+                  <span>
+                    同步收紧 30m 止损位{requireBreakevenLock ? " *" : "（可选 · 只紧不松）"}
+                  </span>
+                  <input
+                    className="input font-mono"
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    placeholder={currentStop != null ? `当前 ${fmtStopPrice(currentStop)}` : "输入新 30m 止损"}
+                    value={newStopLoss}
+                    onChange={(e) => {
+                      resetIdempotencyKey();
+                      setNewStopLoss(e.target.value);
+                    }}
+                  />
+                </label>
+                <label className="field">
+                  <span>同步上移日线结构防线（new_daily_stop，可选）</span>
+                  <input
+                    className="input font-mono"
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    placeholder={dailyStop != null ? `当前日线 ${fmtStopPrice(dailyStop)}` : "不改留空"}
+                    value={newDailyStop}
+                    onChange={(e) => {
+                      resetIdempotencyKey();
+                      setNewDailyStop(e.target.value);
+                    }}
+                  />
+                </label>
+              </>
+            )}
+          </div>
           {canApplyOldAvgStop || canApplyNewAvgStop ? (
             <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[11px] text-muted">快捷保本止损：</span>
-              {canApplyOldAvgStop && avgEntry != null ? (
+              <span className="text-[11px] text-muted">
+                快捷保本止损（填入{isDailyRegime ? "日线主升防线" : " 30m 止损"}）：
+              </span>
+              {canApplyOldAvgStop && preview?.oldProtectiveBeStop != null ? (
                 <button
                   type="button"
                   className="chip py-0.5 font-mono text-[11px]"
-                  onClick={() => {
-                    resetIdempotencyKey();
-                    setNewStopLoss(fmtPlanNum(avgEntry, 6));
-                  }}
+                  onClick={() => applyActiveBreakevenStop(preview.oldProtectiveBeStop!)}
                 >
-                  原均价保本 ({fmtPrice(avgEntry)})
+                  {hasPriorRealizedLoss ? "原仓位战役保本" : "原均价保本"} ({fmtStopPrice(preview.oldProtectiveBeStop)})
                 </button>
               ) : null}
-              {canApplyNewAvgStop && preview?.newAvg != null ? (
+              {canApplyNewAvgStop && preview?.protectiveBreakevenStop != null ? (
                 <button
                   type="button"
                   className="chip py-0.5 font-mono text-[11px]"
-                  onClick={() => {
-                    resetIdempotencyKey();
-                    setNewStopLoss(fmtPlanNum(preview.newAvg, 6));
-                  }}
+                  onClick={() => applyActiveBreakevenStop(preview.protectiveBreakevenStop!)}
                 >
-                  新均价保本 ({fmtPrice(preview.newAvg)})
+                  {preview.isCushionTightened
+                    ? "保本与浮盈垫上限"
+                    : preview.coversPriorLoss
+                      ? "推仓后战役保本"
+                      : "综合均价保本"}{" "}
+                  ({fmtStopPrice(preview.protectiveBreakevenStop)})
                 </button>
               ) : null}
             </div>
@@ -640,7 +1182,11 @@ export function ScaleInPositionDialog({
               {preview.isBreakevenProtected ? (
                 <span className="inline-flex items-center gap-1 text-[11px] font-medium text-bull">
                   <ShieldCheck className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-                  <span>新止损已进入保本/浮盈保护区</span>
+                  <span>
+                    {preview.coversPriorLoss
+                      ? "新止损已覆及战役保本线（含弥补既往减仓亏损）"
+                      : "新止损已进入保本/浮盈保护区"}
+                  </span>
                 </span>
               ) : null}
             </div>
@@ -654,17 +1200,26 @@ export function ScaleInPositionDialog({
                 </div>
               </div>
               <div className="flex flex-col gap-0.5">
-                <span className="text-[11px] text-muted">新加权均价</span>
+                <span className="text-[11px] text-muted">
+                  {preview.coversPriorLoss ? "新加权均价 / 战役保本线" : "新加权均价"}
+                </span>
                 <div className="tnum flex items-center gap-1 font-mono font-semibold text-ink">
                   <span className="text-muted">{fmtPrice(avgEntry)}</span>
                   <ArrowRight className="h-3 w-3 shrink-0 text-muted" aria-hidden="true" />
                   <span>{preview.newAvg != null ? fmtPrice(preview.newAvg) : "—"}</span>
+                  {preview.coversPriorLoss && preview.protectiveBreakevenStop != null ? (
+                    <span className="text-[11px] text-warning">
+                      (保本 {fmtPrice(preview.protectiveBreakevenStop)})
+                    </span>
+                  ) : null}
                 </div>
               </div>
               <div className="flex flex-col gap-0.5">
-                <span className="text-[11px] text-muted">30m 止损位变化</span>
+                <span className="text-[11px] text-muted">
+                  {isDailyRegime ? "日线主升防线变化" : "30m 止损位变化"}
+                </span>
                 <div className="tnum flex items-center gap-1 font-mono font-semibold text-ink">
-                  <span className="text-muted">{fmtPrice(currentStop)}</span>
+                  <span className="text-muted">{fmtPrice(activeOldStop)}</span>
                   <ArrowRight className="h-3 w-3 shrink-0 text-muted" aria-hidden="true" />
                   <span className={preview.isStopTightened ? "text-bull" : "text-ink"}>
                     {fmtPrice(preview.effectiveStop)}
@@ -672,16 +1227,25 @@ export function ScaleInPositionDialog({
                 </div>
               </div>
             </div>
+            {preview.coversPriorLoss ? (
+              <div className="mt-2 border-t border-hairline-soft pt-1.5 text-[11px] text-ink-2">
+                既往已实现减仓亏损{" "}
+                <strong className="font-mono text-bear">{fmtMoney(partialRealized, acctCcy)}</strong>{" "}
+                已折算进战役级保本止损位{" "}
+                <strong className="font-mono text-ink">{fmtPrice(preview.protectiveBreakevenStop)}</strong>
+                （综合均价 {fmtPrice(preview.newAvg)}）。
+              </div>
+            ) : null}
           </div>
         ) : null}
 
         {/* Inline Validation / Backend Risk Error */}
-        {qtyValidationError || stopValidationError || fxValidationError || err ? (
+        {qtyValidationError || stopValidationError || breakevenLockError || fxValidationError || err ? (
           <div
             role="alert"
             className="break-words rounded-md border border-critical/50 bg-critical/10 px-3 py-2 text-xs text-ink"
           >
-            {qtyValidationError || stopValidationError || fxValidationError || err}
+            {qtyValidationError || stopValidationError || breakevenLockError || fxValidationError || err}
           </div>
         ) : null}
 

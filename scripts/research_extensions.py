@@ -26,6 +26,8 @@ import sys
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
+from fractions import Fraction
 from typing import Any
 
 import numpy as np
@@ -586,8 +588,10 @@ def _parse_fred_csv(csv_text: str, series_id: str | None = None) -> dict[str, An
         "series_id": col_id,
         "latest_date": latest_date,
         "latest_value": _round_finite(latest_val, 6),
+        "latest_value_raw": float(latest_val),
         "previous_date": prev_date,
         "previous_value": _round_finite(prev_val, 6) if prev_val is not None else None,
+        "previous_value_raw": float(prev_val) if prev_val is not None else None,
         "observations_count": len(observations),
     }
 
@@ -842,6 +846,7 @@ def summarize_futures_curve(
         cleaned_pt = {
             "contract": contract,
             "expiry_ym": expiry_ym,
+            "_raw_price": float(price),
             "price": _round_finite(price, 4),
             "date": pt_date,
             "volume": _round_finite(vol, 2) if vol is not None else None,
@@ -854,8 +859,10 @@ def summarize_futures_curve(
         raise ValueError("No valid futures curve points with positive finite prices")
 
     ordered = [dedup[k] for k in sorted(dedup.keys())]
+    raw_prices = [float(pt.pop("_raw_price")) for pt in ordered]
     front = ordered[0]
     front_price = float(front["price"])
+    front_price_raw = raw_prices[0]
 
     if len(ordered) < 2:
         return _sanitize_for_json(
@@ -876,7 +883,11 @@ def summarize_futures_curve(
                 "months_front_to_second": None,
                 "months_front_to_far": None,
                 "annualized_roll_yield_near_pct": None,
+                "annualized_roll_yield_near_pct_raw": None,
+                "annualized_roll_yield_near_pct_exact": None,
                 "annualized_roll_yield_curve_pct": None,
+                "annualized_roll_yield_curve_pct_raw": None,
+                "annualized_roll_yield_curve_pct_exact": None,
                 "roll_yield_note": "有效合约不足2个，无法判断期限结构与年化展期收益。",
                 "contracts": ordered,
             }
@@ -886,6 +897,8 @@ def summarize_futures_curve(
     far = ordered[-1]
     second_price = float(second["price"])
     far_price = float(far["price"])
+    second_price_raw = raw_prices[1]
+    far_price_raw = raw_prices[-1]
 
     months_near = _months_diff(front["expiry_ym"], second["expiry_ym"])
     months_far = _months_diff(front["expiry_ym"], far["expiry_ym"])
@@ -899,16 +912,32 @@ def summarize_futures_curve(
         _round_finite((front_price / far_price - 1.0) * 100.0, 4) if far_price > 0 else None
     )
 
-    ann_roll_near = (
-        _round_finite(((front_price / second_price) - 1.0) * (12.0 / months_near) * 100.0, 3)
-        if second_price > 0 and months_near > 0
+    ann_roll_near_frac = (
+        ((Fraction(str(front_price_raw)) - Fraction(str(second_price_raw))) / Fraction(str(second_price_raw)))
+        * Fraction(1200, months_near)
+        if second_price_raw > 0 and months_near > 0
         else None
     )
-    ann_roll_curve = (
-        _round_finite(((front_price / far_price) - 1.0) * (12.0 / months_far) * 100.0, 3)
-        if far_price > 0 and months_far > 0
+    ann_roll_near_raw = float(ann_roll_near_frac) if ann_roll_near_frac is not None else None
+    ann_roll_near_exact = (
+        f"{ann_roll_near_frac.numerator}/{ann_roll_near_frac.denominator}"
+        if ann_roll_near_frac is not None
         else None
     )
+    ann_roll_near = _round_finite(ann_roll_near_raw, 3) if ann_roll_near_raw is not None else None
+    ann_roll_curve_frac = (
+        ((Fraction(str(front_price_raw)) - Fraction(str(far_price_raw))) / Fraction(str(far_price_raw)))
+        * Fraction(1200, months_far)
+        if far_price_raw > 0 and months_far > 0
+        else None
+    )
+    ann_roll_curve_raw = float(ann_roll_curve_frac) if ann_roll_curve_frac is not None else None
+    ann_roll_curve_exact = (
+        f"{ann_roll_curve_frac.numerator}/{ann_roll_curve_frac.denominator}"
+        if ann_roll_curve_frac is not None
+        else None
+    )
+    ann_roll_curve = _round_finite(ann_roll_curve_raw, 3) if ann_roll_curve_raw is not None else None
 
     if front_price > far_price * 1.002:
         structure = "Backwardation (现货升水/多头正展期)"
@@ -954,7 +983,11 @@ def summarize_futures_curve(
             "months_front_to_second": months_near,
             "months_front_to_far": months_far,
             "annualized_roll_yield_near_pct": ann_roll_near,
+            "annualized_roll_yield_near_pct_raw": ann_roll_near_raw,
+            "annualized_roll_yield_near_pct_exact": ann_roll_near_exact,
             "annualized_roll_yield_curve_pct": ann_roll_curve,
+            "annualized_roll_yield_curve_pct_raw": ann_roll_curve_raw,
+            "annualized_roll_yield_curve_pct_exact": ann_roll_curve_exact,
             "roll_yield_note": roll_note,
             "contracts": ordered,
         }
@@ -1132,10 +1165,14 @@ def _null_misaligned_curve_spreads(summary: dict[str, Any]) -> None:
         summary["front_second_spread"] = None
         summary["front_second_spread_pct"] = None
         summary["annualized_roll_yield_near_pct"] = None
+        summary["annualized_roll_yield_near_pct_raw"] = None
+        summary["annualized_roll_yield_near_pct_exact"] = None
     if front_dt != far_dt:
         summary["front_far_spread"] = None
         summary["front_far_spread_pct"] = None
         summary["annualized_roll_yield_curve_pct"] = None
+        summary["annualized_roll_yield_curve_pct_raw"] = None
+        summary["annualized_roll_yield_curve_pct_exact"] = None
         summary["structure"] = "unaligned_dates"
         summary["roll_yield_note"] = "首尾合约交易日期不一致，无法计算同日跨期价差与年化展期收益。"
 
@@ -1989,10 +2026,20 @@ def parse_bond_zh_us_rate_df(df: pd.DataFrame) -> dict[str, Any]:
     if (cn10_val is None or us10_val is None) and (cn2_val is None or us2_val is None):
         raise ValueError("Missing CN/US 10Y and 2Y yields in bond_zh_us_rate DataFrame")
 
-    diff_10y_pct = _round_finite(us10_val - cn10_val, 4) if (us10_val is not None and cn10_val is not None) else None
-    diff_10y_bp = _round_finite((us10_val - cn10_val) * 100.0, 2) if diff_10y_pct is not None else None
-    diff_2y_pct = _round_finite(us2_val - cn2_val, 4) if (us2_val is not None and cn2_val is not None) else None
-    diff_2y_bp = _round_finite((us2_val - cn2_val) * 100.0, 2) if diff_2y_pct is not None else None
+    diff_10y_pct_raw = (
+        float(Decimal(str(us10_val)) - Decimal(str(cn10_val)))
+        if (us10_val is not None and cn10_val is not None)
+        else None
+    )
+    diff_10y_pct = _round_finite(diff_10y_pct_raw, 4) if diff_10y_pct_raw is not None else None
+    diff_10y_bp = _round_finite(diff_10y_pct_raw * 100.0, 2) if diff_10y_pct_raw is not None else None
+    diff_2y_pct_raw = (
+        float(Decimal(str(us2_val)) - Decimal(str(cn2_val)))
+        if (us2_val is not None and cn2_val is not None)
+        else None
+    )
+    diff_2y_pct = _round_finite(diff_2y_pct_raw, 4) if diff_2y_pct_raw is not None else None
+    diff_2y_bp = _round_finite(diff_2y_pct_raw * 100.0, 2) if diff_2y_pct_raw is not None else None
 
     date_lag_10y = abs((us10_dt - cn10_dt).days) if (us10_dt and cn10_dt) else None
     latest_dates = [d for d in (cn10_dt, cn2_dt, us10_dt, us2_dt) if d is not None]
@@ -2006,10 +2053,13 @@ def parse_bond_zh_us_rate_df(df: pd.DataFrame) -> dict[str, Any]:
             "us10y": {"latest_date": us10_dt.isoformat() if us10_dt else None, "latest_value": _round_finite(us10_val, 4)},
             "us2y": {"latest_date": us2_dt.isoformat() if us2_dt else None, "latest_value": _round_finite(us2_val, 4)},
             "us_minus_cn_10y_pct": diff_10y_pct,
+            "us_minus_cn_10y_pct_raw": diff_10y_pct_raw,
             "us_minus_cn_10y_bp": diff_10y_bp,
             "us_minus_cn_2y_pct": diff_2y_pct,
+            "us_minus_cn_2y_pct_raw": diff_2y_pct_raw,
             "us_minus_cn_2y_bp": diff_2y_bp,
             "base_minus_quote_10y_pct": diff_10y_pct,
+            "base_minus_quote_10y_pct_raw": diff_10y_pct_raw,
             "base_minus_quote_10y_bp": diff_10y_bp,
             "date_lag_days": date_lag_10y,
         }
@@ -2042,12 +2092,17 @@ def fetch_fx_rate_differential(symbol: str) -> dict[str, Any]:
     if src == "fred_pair":
         base_obs = _fetch_fred_series(spec["base_series"])
         quote_obs = _fetch_fred_series(spec["quote_series"])
-        base_val = _to_float(base_obs.get("latest_value"))
-        quote_val = _to_float(quote_obs.get("latest_value"))
+        base_val = _to_float(base_obs.get("latest_value_raw"))
+        if base_val is None:
+            base_val = _to_float(base_obs.get("latest_value"))
+        quote_val = _to_float(quote_obs.get("latest_value_raw"))
+        if quote_val is None:
+            quote_val = _to_float(quote_obs.get("latest_value"))
         if base_val is None or quote_val is None:
             raise ValueError(f"Missing FRED yield value for {sym}")
-        diff_pct = _round_finite(base_val - quote_val, 4)
-        diff_bp = _round_finite((base_val - quote_val) * 100.0, 2)
+        diff_pct_raw = float(Decimal(str(base_val)) - Decimal(str(quote_val)))
+        diff_pct = _round_finite(diff_pct_raw, 4)
+        diff_bp = _round_finite(diff_pct_raw * 100.0, 2)
         d_base = _parse_date_obj(base_obs.get("latest_date"))
         d_quote = _parse_date_obj(quote_obs.get("latest_date"))
         lag_days = abs((d_base - d_quote).days) if (d_base and d_quote) else None
@@ -2067,6 +2122,7 @@ def fetch_fx_rate_differential(symbol: str) -> dict[str, Any]:
                     **quote_obs,
                 },
                 "base_minus_quote_10y_pct": diff_pct,
+                "base_minus_quote_10y_pct_raw": diff_pct_raw,
                 "base_minus_quote_10y_bp": diff_bp,
                 "date_lag_days": lag_days,
                 "frequency_note": spec["frequency_note"],
@@ -2091,7 +2147,9 @@ def fetch_fx_rate_differential(symbol: str) -> dict[str, Any]:
             item = series_data.get(label) or {}
             if item.get("status") != "ok":
                 return None, None
-            return _to_float(item.get("latest_value")), _parse_date_obj(item.get("latest_date"))
+            raw_v = _to_float(item.get("latest_value_raw"))
+            val = raw_v if raw_v is not None else _to_float(item.get("latest_value"))
+            return val, _parse_date_obj(item.get("latest_date"))
 
         us10, us10_dt = _val_and_date("US10Y")
         us2, _ = _val_and_date("US2Y")
@@ -2099,12 +2157,15 @@ def fetch_fx_rate_differential(symbol: str) -> dict[str, Any]:
         de10, de10_dt = _val_and_date("DE10Y")
         jp10, jp10_dt = _val_and_date("JP10Y")
 
-        us_2s10s_pct = _round_finite(us10 - us2, 4) if (us10 is not None and us2 is not None) else None
-        us_2s10s_bp = _round_finite((us10 - us2) * 100.0, 2) if us_2s10s_pct is not None else None
-        us_de_pct = _round_finite(us10 - de10, 4) if (us10 is not None and de10 is not None) else None
-        us_de_bp = _round_finite((us10 - de10) * 100.0, 2) if us_de_pct is not None else None
-        us_jp_pct = _round_finite(us10 - jp10, 4) if (us10 is not None and jp10 is not None) else None
-        us_jp_bp = _round_finite((us10 - jp10) * 100.0, 2) if us_jp_pct is not None else None
+        us_2s10s_raw = float(Decimal(str(us10)) - Decimal(str(us2))) if (us10 is not None and us2 is not None) else None
+        us_2s10s_pct = _round_finite(us_2s10s_raw, 4) if us_2s10s_raw is not None else None
+        us_2s10s_bp = _round_finite(us_2s10s_raw * 100.0, 2) if us_2s10s_raw is not None else None
+        us_de_raw = float(Decimal(str(us10)) - Decimal(str(de10))) if (us10 is not None and de10 is not None) else None
+        us_de_pct = _round_finite(us_de_raw, 4) if us_de_raw is not None else None
+        us_de_bp = _round_finite(us_de_raw * 100.0, 2) if us_de_raw is not None else None
+        us_jp_raw = float(Decimal(str(us10)) - Decimal(str(jp10))) if (us10 is not None and jp10 is not None) else None
+        us_jp_pct = _round_finite(us_jp_raw, 4) if us_jp_raw is not None else None
+        us_jp_bp = _round_finite(us_jp_raw * 100.0, 2) if us_jp_raw is not None else None
 
         status = "ok" if ok_count == len(spec["series"]) else "partial"
         return _sanitize_for_json(

@@ -158,6 +158,8 @@ FRED_SERIES: list[tuple[str, str]] = [
     ("DFII10", "US 10Y Real Yield (%)"),
     ("T10YIE", "US 10Y Breakeven Inflation (%)"),
     ("DGS10", "US 10Y Nominal Treasury Yield (%)"),
+    ("DGS2", "US 2Y Nominal Treasury Yield (%)"),
+    ("T10Y2Y", "US 10Y-2Y Treasury Spread (%)"),
     ("BAMLH0A0HYM2", "US High Yield OAS Credit Spread (%)"),
     ("FEDFUNDS", "Effective Federal Funds Rate (%)"),
     ("M2SL", "US M2 Money Stock (Bil. USD)"),
@@ -318,6 +320,34 @@ def parse_fred_csv(csv_text: str, series_id: str | None = None) -> dict[str, Any
         if prev_val is not None and prev_val != 0
         else None
     )
+
+    def _window_change(min_days: int, target_days: int, max_days: int) -> float | None:
+        try:
+            latest_dt = date.fromisoformat(latest_date[:10])
+        except ValueError:
+            return None
+        best_val: float | None = None
+        best_dist: int | None = None
+        for obs_dt_str, obs_val in reversed(observations[:-1]):
+            try:
+                obs_dt = date.fromisoformat(obs_dt_str[:10])
+            except ValueError:
+                continue
+            age = (latest_dt - obs_dt).days
+            if age < min_days:
+                continue
+            if age > max_days:
+                break
+            dist = abs(age - target_days)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_val = obs_val
+        if best_val is None:
+            return None
+        return round(latest_val - best_val, 6)
+
+    change_1m = _window_change(min_days=20, target_days=30, max_days=65)
+    change_3m = _window_change(min_days=70, target_days=90, max_days=130)
     return {
         "series_id": col_id,
         "latest_date": latest_date,
@@ -326,6 +356,8 @@ def parse_fred_csv(csv_text: str, series_id: str | None = None) -> dict[str, Any
         "previous_value": round(prev_val, 6) if prev_val is not None else None,
         "change": change,
         "change_pct": change_pct,
+        "change_1m": change_1m,
+        "change_3m": change_3m,
         "observations_count": len(observations),
     }
 

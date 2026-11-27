@@ -2666,6 +2666,166 @@ def test_compass_logged_opportunities_hydration_on_history_and_latest(tmp_path, 
     assert r_latest.json()["latest"]["logged_opportunities"]["cards"]["power_grid_long"] == opp_id
 
 
+def test_anchor_strict_2y_and_1y_windows_preserve_6m_slice():
+    from datetime import datetime, timezone
+
+    meta = {"symbol": "XLK", "name": "美股科技", "bucket": "us_sector"}
+    end_dt = pd.Timestamp(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
+    # 1) Short 80-bar series: strictly None for 1Y range and 2Y return
+    idx_short = pd.bdate_range(end=end_dt, periods=80)
+    s_short = pd.Series([100.0 + i * 0.5 for i in range(80)], index=idx_short)
+    short_item = macro_compass._anchor_item_from_close_series(meta, s_short)
+    assert short_item["range_pos_6m_pct"] == 100.0
+    assert short_item["range_pos_1y_pct"] is None
+    assert short_item["ret_2y_pct"] is None
+
+    # 2) Full 520-bar series: 6M range uses trailing 126 bars, 1Y uses 252 bars, 2Y uses 505 bars
+    idx_long = pd.bdate_range(end=end_dt, periods=520)
+    vals = [100.0] * 268 + [200.0] * 126 + [150.0 + i * (40.0 / 125.0) for i in range(126)]
+    s_long = pd.Series(vals, index=idx_long)
+    long_item = macro_compass._anchor_item_from_close_series(meta, s_long)
+    # Trailing 126 bars go 150 -> 190 => 6M pos is 100%, while 1Y (252 bars) peaked at 200 and low was 150 => 80%
+    assert long_item["range_pos_6m_pct"] == 100.0
+    assert long_item["range_pos_1y_pct"] == 80.0
+    assert long_item["ret_2y_pct"] == 90.0
+
+
+def test_macro_inflection_radar_and_offensive_structure_signals():
+    from datetime import datetime, timezone
+
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    base_fred_series: dict[str, dict[str, object]] = {
+        "DFII10": {"status": "ok", "latest_value": 1.65, "change": -0.04, "latest_date": today_iso},
+        "T10YIE": {"status": "ok", "latest_value": 2.30, "change": 0.01, "latest_date": today_iso},
+        "DGS10": {"status": "ok", "latest_value": 4.05, "change": -0.03, "latest_date": today_iso},
+        "DGS2": {
+            "status": "ok",
+            "latest_value": 3.70,
+            "change": -0.05,
+            "change_1m": -0.18,
+            "change_3m": -0.42,
+            "latest_date": today_iso,
+        },
+        "T10Y2Y": {
+            "status": "ok",
+            "latest_value": 0.35,
+            "change": 0.02,
+            "change_1m": 0.15,
+            "change_3m": 0.38,
+            "latest_date": today_iso,
+        },
+        "BAMLH0A0HYM2": {"status": "ok", "latest_value": 3.45, "change": -0.05, "latest_date": today_iso},
+    }
+    base_live_macro: dict[str, dict[str, object]] = {
+        "VIX": {"last": 16.5, "as_of": today_iso},
+        "US10Y_Yield": {"last": 4.05, "as_of": today_iso},
+        "DXY_USD_Index": {"last": 102.0, "chg_1d_pct": -0.2, "as_of": today_iso},
+    }
+    base_ov: dict[str, object] = {
+        "sources_status": {"us_fred": "ok", "live_macro": "ok"},
+        "stale_sources": {},
+        "live_macro": base_live_macro,
+        "us_fred": {"series": base_fred_series},
+    }
+    anchors = [
+        {
+            "symbol": "XLK",
+            "name": "科技",
+            "status": "ok",
+            "ret_20d_pct": 6.2,
+            "ret_60d_pct": 14.5,
+            "ret_2y_pct": 65.0,
+            "range_pos_6m_pct": 94.0,
+            "range_pos_1y_pct": 92.5,
+            "chanlun_hint": {"direction": "long", "confirmed": True, "zd": 200.0, "zg": 220.0, "shield_state": "bullish_shield_intact"},
+        },
+        {
+            "symbol": "XLE",
+            "name": "能源",
+            "status": "ok",
+            "ret_20d_pct": -6.0,
+            "ret_60d_pct": -9.0,
+            "ret_2y_pct": 58.0,
+            "range_pos_6m_pct": 35.0,
+            "range_pos_1y_pct": 40.0,
+            "chanlun_hint": {"direction": "short", "confirmed": True, "zd": 92.0, "zg": 100.0, "shield_state": "below_zd_breakdown"},
+        },
+        {
+            "symbol": "SIL",
+            "name": "深坑破位对照",
+            "status": "ok",
+            "ret_20d_pct": -14.0,
+            "ret_60d_pct": -18.0,
+            "ret_2y_pct": 70.0,
+            "range_pos_6m_pct": 5.0,
+            "range_pos_1y_pct": 8.0,
+            "chanlun_hint": {"direction": "short", "confirmed": True, "zd": 30.0, "zg": 36.0, "shield_state": "below_zd_breakdown"},
+        },
+        {
+            "symbol": "GC=F",
+            "name": "高位卖点对照",
+            "status": "ok",
+            "ret_20d_pct": 2.0,
+            "ret_60d_pct": 15.0,
+            "ret_2y_pct": 55.0,
+            "range_pos_6m_pct": 91.0,
+            "range_pos_1y_pct": 93.0,
+            "chanlun_hint": {"direction": "short", "confirmed": True, "zd": 2500.0, "zg": 2700.0, "shield_state": "high_sell_above_zd_watch"},
+        },
+    ]
+
+    diag = macro_compass.compute_constitutional_diagnostics(macro_overview=base_ov, anchor_items=anchors)
+    radar = diag["macro_inflection_radar"]
+    assert radar["data_status"] == "ok"
+    assert radar["easing_or_steepening_active"] is True
+    assert radar["tightening_2y_shock"] is False
+    assert len(radar["inflection_signals"]) == 2
+
+    off = diag["offensive_structure_signals"]
+    assert [x["symbol"] for x in off["high_breakout_intact_leaders"]] == ["XLK"]
+    assert [x["symbol"] for x in off["post_boom_zd_breakdown_alerts"]] == ["XLE"]
+
+    # Unanchored inflation must block easing authorization
+    stagflation_ov = {
+        **base_ov,
+        "live_macro": {**base_live_macro, "US10Y_Yield": {"last": 4.65, "as_of": today_iso}},
+        "us_fred": {
+            "series": {
+                **base_fred_series,
+                "T10YIE": {"status": "ok", "latest_value": 2.90, "change": 0.08, "latest_date": today_iso},
+                "DGS10": {"status": "ok", "latest_value": 4.65, "change": 0.16, "latest_date": today_iso},
+            }
+        },
+    }
+    diag_stag = macro_compass.compute_constitutional_diagnostics(macro_overview=stagflation_ov, anchor_items=[])
+    assert diag_stag["macro_inflection_radar"]["easing_or_steepening_active"] is False
+    assert "滞胀" in diag_stag["macro_inflection_radar"]["guidance"]
+
+    # Credit crisis must also block easing authorization
+    crisis_ov = {
+        **base_ov,
+        "us_fred": {
+            "series": {
+                **base_fred_series,
+                "BAMLH0A0HYM2": {"status": "ok", "latest_value": 5.40, "change": 0.40, "latest_date": today_iso},
+            }
+        },
+    }
+    diag_crisis = macro_compass.compute_constitutional_diagnostics(macro_overview=crisis_ov, anchor_items=[])
+    assert diag_crisis["macro_inflection_radar"]["easing_or_steepening_active"] is False
+    assert "危机" in diag_crisis["macro_inflection_radar"]["guidance"]
+
+    # Prompt carries all 3 verified clauses while keeping A-share long-only intact
+    prompt = macro_compass.build_compass_prompt(brief_path="/tmp/brief.json")
+    assert "macro_inflection_radar.easing_or_steepening_active" in prompt
+    assert "high_breakout_intact_leaders" in prompt
+    assert "post_boom_zd_breakdown_alerts" in prompt
+    assert "反恐高铁律" in prompt
+    assert "A 股在任何情形下均严格禁止直接做空" in prompt
+
+
+
 
 
 

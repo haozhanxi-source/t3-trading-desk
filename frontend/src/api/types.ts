@@ -1315,6 +1315,7 @@ export interface CrossAssetAnchorItem {
   name: string;
   group: string;
   group_label: string;
+  tier?: "macro_core" | "sector_leader" | string;
   status: "ok" | "unavailable" | string;
   last: number | null;
   ret_5d_pct: number | null;
@@ -1349,6 +1350,7 @@ export interface CompassTapeMovers {
     severe_drawdown_count: number;
     strong_rally_count: number;
     breadth_label: string;
+    scope?: "macro_core" | "all" | string;
   };
 }
 

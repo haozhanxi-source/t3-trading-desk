@@ -179,7 +179,7 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
   const baseId = useId();
   const [activeTab, setActiveTab] = useState<RadarTabId>("anchors");
   const [anchorView, setAnchorView] = useState<AnchorViewMode>("bars");
-  const [anchorGroup, setAnchorGroup] = useState<string>("all");
+  const [anchorGroup, setAnchorGroup] = useState<string>("macro_core");
   const [tableView, setTableView] = useState(false);
   const [hoveredAnchor, setHoveredAnchor] = useState<CrossAssetAnchorItem | null>(null);
   const [hoveredCftc, setHoveredCftc] = useState<CftcCrowdingBenchmarkItem | null>(null);
@@ -213,6 +213,16 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
     [macro],
   );
 
+  const macroCoreItems = useMemo(() => {
+    const core = anchorItems.filter((it) => it.tier === "macro_core");
+    return core.length > 0 ? core : anchorItems;
+  }, [anchorItems]);
+
+  const hasTierHierarchy = useMemo(
+    () => anchorItems.some((it) => it.tier === "macro_core"),
+    [anchorItems],
+  );
+
   const anchorGroups = useMemo(() => {
     const seen = new Map<string, string>();
     for (const it of anchorItems) {
@@ -223,10 +233,18 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
     return Array.from(seen.entries());
   }, [anchorItems]);
 
+  const activeAnchorPool = useMemo(
+    () =>
+      anchorGroup === "macro_core"
+        ? macroCoreItems
+        : anchorItems.filter((it) => it.group === anchorGroup),
+    [anchorItems, macroCoreItems, anchorGroup],
+  );
+
   /* Balanced selection for 20D bar chart: surface top gainers AND biggest losers cleanly within 8 visible rows */
   const barAnchors = useMemo(() => {
-    const filtered = anchorGroup === "all" ? anchorItems : anchorItems.filter((it) => it.group === anchorGroup);
-    if (anchorGroup !== "all" || filtered.length <= 8) {
+    const filtered = activeAnchorPool;
+    if (anchorGroup !== "macro_core" || filtered.length <= 8) {
       return [...filtered].sort((a, b) => (b.ret_20d_pct ?? 0) - (a.ret_20d_pct ?? 0));
     }
     const pos = filtered
@@ -239,17 +257,17 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
     const negBudget = Math.max(5, 8 - topPos.length);
     const topNeg = neg.slice(0, negBudget).reverse(); // milder drops above, biggest drop at bottom
     return [...topPos, ...topNeg];
-  }, [anchorItems, anchorGroup]);
+  }, [activeAnchorPool, anchorGroup]);
 
   const scatterAnchors = useMemo(() => {
-    const filtered = anchorGroup === "all" ? anchorItems : anchorItems.filter((it) => it.group === anchorGroup);
+    const filtered = activeAnchorPool;
     return [...filtered].sort((a, b) => Math.abs(b.ret_20d_pct ?? 0) - Math.abs(a.ret_20d_pct ?? 0)).slice(0, 26);
-  }, [anchorItems, anchorGroup]);
+  }, [activeAnchorPool]);
 
   const tableAnchors = useMemo(() => {
-    const filtered = anchorGroup === "all" ? anchorItems : anchorItems.filter((it) => it.group === anchorGroup);
+    const filtered = activeAnchorPool;
     return [...filtered].sort((a, b) => (b.ret_20d_pct ?? 0) - (a.ret_20d_pct ?? 0));
-  }, [anchorItems, anchorGroup]);
+  }, [activeAnchorPool]);
 
   const cftcItems = useMemo(
     () => (macro?.cftc_crowding?.items ?? []).filter((it) => it.percentile_52w !== null && it.percentile_52w !== undefined),
@@ -519,10 +537,10 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                   : "neutral"
               }
             />
-            {/* Market Breadth Segmented Thermometer: Adv (green) on LEFT matching "3涨 / 17跌" */}
+            {/* Market Breadth Segmented Thermometer: Adv (green) on LEFT matching "3涨 / 11跌" */}
             <div
               className="flex flex-col gap-1"
-              title={`20D 跨资产定价锚宽度：上涨 ${advCount} / 持平 ${flatCount} / 下跌 ${decCount}（共 ${totalBreadth} 只）· ${breadth?.breadth_label || ""}`}
+              title={`${breadth?.scope === "macro_core" ? "宏观大类 " : ""}20D 跨资产定价锚宽度：上涨 ${advCount} / 持平 ${flatCount} / 下跌 ${decCount}（共 ${totalBreadth} 只）· ${breadth?.breadth_label || ""}`}
             >
               <div className="flex items-baseline justify-between gap-2 text-[11px]">
                 <span className="truncate text-muted">20D 盘面宽度</span>
@@ -755,10 +773,10 @@ export function MacroCockpit({ macro, loading, onJumpWarRoom }: MacroCockpitProp
                 <button
                   type="button"
                   className="chip !min-h-[20px] !px-2 !py-0 !text-[10px]"
-                  aria-pressed={anchorGroup === "all"}
-                  onClick={() => setAnchorGroup("all")}
+                  aria-pressed={anchorGroup === "macro_core"}
+                  onClick={() => setAnchorGroup("macro_core")}
                 >
-                  全资产({anchorItems.length})
+                  {hasTierHierarchy ? `宏观大类(${macroCoreItems.length})` : `全资产(${anchorItems.length})`}
                 </button>
                 {anchorGroups.map(([gKey, gLabel]) => (
                   <button

@@ -99,6 +99,8 @@ SYMBOL_ZH_NAMES: dict[str, str] = {
     "SPY": "标普500 ETF",
     "QQQ": "纳指100 ETF",
     "IWM": "罗素2000 ETF",
+    "DBC": "综合商品指数ETF",
+    "DBA": "农产品指数ETF",
     "XLK": "美股科技ETF",
     "SMH": "半导体ETF",
     "XLU": "公用事业ETF",

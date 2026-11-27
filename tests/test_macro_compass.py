@@ -849,9 +849,35 @@ def test_compute_tape_movers_and_cn_futures_sqlite_fallback():
     assert cu_item["status"] == "stale"
     assert cu_item["stale_fallback"] is True
     assert cu_item["ret_60d_pct"] is not None
-    sn_item = next(it for it in cn_res["items"] if it["symbol"] == "SN0")
-    assert sn_item["status"] == "ok"
-    assert sn_item["ret_20d_pct"] == -25.41
+    i0_item = next(it for it in cn_res["items"] if it["symbol"] == "I0")
+    assert i0_item["status"] == "ok"
+    assert i0_item["ret_20d_pct"] == -25.41
+    assert i0_item["tier"] == "sector_leader"
+
+    # 3. Tiered anchors isolate macro_core breadth from sector_leader / CN futures single-commodity noise
+    tiered_items = [
+        {"symbol": "SPY", "name": "标普500", "group": "us_equities", "tier": "macro_core", "status": "ok", "last": 580.0, "ret_5d_pct": 1.0, "ret_20d_pct": 3.0, "ret_60d_pct": 5.0, "as_of": "2026-11-25"},
+        {"symbol": "GC=F", "name": "黄金", "group": "commodities", "tier": "macro_core", "status": "ok", "last": 2700.0, "ret_5d_pct": 0.5, "ret_20d_pct": 4.0, "ret_60d_pct": 8.0, "as_of": "2026-11-25"},
+        {"symbol": "CL=F", "name": "WTI原油", "group": "commodities", "tier": "macro_core", "status": "ok", "last": 68.0, "ret_5d_pct": -1.0, "ret_20d_pct": -5.0, "ret_60d_pct": -8.0, "as_of": "2026-11-25"},
+        {"symbol": "SMH", "name": "半导体", "group": "us_equities", "tier": "sector_leader", "status": "ok", "last": 210.0, "ret_5d_pct": -7.0, "ret_20d_pct": -22.0, "ret_60d_pct": -24.0, "as_of": "2026-11-25"},
+        {"symbol": "EC0", "name": "集运欧线(航运)", "group": "cn_futures", "tier": "sector_leader", "status": "ok", "last": 3276.0, "ret_5d_pct": 6.0, "ret_20d_pct": 24.8, "ret_60d_pct": 30.0, "as_of": "2026-11-27"},
+    ]
+    tiered_radar = macro_compass.compute_tape_movers(tiered_items)
+    assert tiered_radar["regime_breadth"]["scope"] == "macro_core"
+    assert tiered_radar["regime_breadth"]["total_available"] == 3
+    assert tiered_radar["regime_breadth"]["advancing_20d_count"] == 2
+    assert tiered_radar["regime_breadth"]["declining_20d_count"] == 1
+    assert any(m["symbol"] == "SMH" for m in tiered_radar["top_losers"])
+    assert any(m["symbol"] == "EC0" for m in tiered_radar["top_gainers"])
+
+    # 4. Anchor hierarchy invariants: no ALI=F, no CN base-metal clustering, all CN futures are sector_leader
+    cn_syms = [m["symbol"] for m in macro_compass.CN_FUTURES_ANCHORS]
+    assert cn_syms == ["CU0", "I0", "SC0", "AU0", "M0", "LC0", "EC0"]
+    assert all(m["tier"] == "sector_leader" for m in macro_compass.CN_FUTURES_ANCHORS)
+    yf_syms = {m["symbol"] for m in macro_compass.CROSS_ASSET_ANCHORS}
+    assert "ALI=F" not in yf_syms
+    assert "COPX" not in yf_syms
+    assert {"DBC", "DBA", "XLF", "XLV"}.issubset(yf_syms)
 
 
 def test_codex_review_regressions_a_share_bypasses_stale_breadth_mixed_radar_and_timeout_clamp(tmp_path: Path):
